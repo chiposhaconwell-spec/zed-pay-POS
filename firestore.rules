@@ -1,0 +1,160 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 1. Global default deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+    
+    // Primitives & Hardened Shared Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    // Relational synchronize parent business validator
+    function isBusinessOwner(businessId) {
+      return isSignedIn() && get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid;
+    }
+
+    // Helper validation for Business entity of custom multi-tenant workspaces
+    function isValidBusiness(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.owner is string && data.owner.size() > 0 && data.owner.size() <= 200 &&
+             data.email is string && data.email.size() > 0 && data.email.size() <= 200 &&
+             data.ownerUid is string && data.ownerUid == request.auth.uid &&
+             data.keys().hasAll(['id', 'name', 'owner', 'email', 'ownerUid', 'createdAt']) &&
+             data.keys().size() == 6;
+    }
+
+    // Helper validation for individual store branches
+    function isValidStore(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             data.business_id is string && data.business_id.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.location is string && data.location.size() <= 200 &&
+             data.allow_discounts is int &&
+             data.allow_refunds is int &&
+             data.allow_laybys is int &&
+             data.require_manager_discount is int &&
+             data.keys().hasAll(['id', 'business_id', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+             data.keys().size() == 8;
+    }
+
+    // Helper validation for catalog products
+    function isValidProduct(data) {
+      return data.id is int &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 250 &&
+             data.sku is string && data.sku.size() <= 100 &&
+             data.category is string && data.category.size() <= 100 &&
+             data.price is number && data.price >= 0.0 &&
+             data.cost is number && data.cost >= 0.0 &&
+             data.stock is int &&
+             data.imageUrl is string && data.imageUrl.size() <= 300000 && // accommodate rich image URLs
+             data.business_id is string && data.business_id.size() <= 128 &&
+             data.keys().hasAll(['id', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'business_id']) &&
+             data.keys().size() == 9;
+    }
+
+    // Helper validation for Customer CRM records
+    function isValidCustomer(data) {
+      return data.id is int &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+             data.phone is string && data.phone.size() <= 50 &&
+             data.email is string && data.email.size() <= 200 &&
+             data.loyalPoints is int && data.loyalPoints >= 0 &&
+             data.tpin is string && data.tpin.size() <= 100 &&
+             data.zra_connected is int &&
+             data.tax_band is string && data.tax_band.size() <= 100 &&
+             data.business_id is string && data.business_id.size() <= 128 &&
+             data.keys().hasAll(['id', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band', 'business_id']) &&
+             data.keys().size() == 9;
+    }
+
+    // Helper validation for historical completed orders
+    function isValidOrder(data) {
+      return data.id is string && data.id.size() <= 128 &&
+             (data.customerId is int || data.customerId == null) &&
+             data.orderDate is string && data.orderDate.size() <= 100 &&
+             data.subtotal is number && data.subtotal >= 0.0 &&
+             data.tax is number && data.tax >= 0.0 &&
+             data.discount is number && data.discount >= 0.0 &&
+             data.total is number && data.total >= 0.0 &&
+             data.paymentMethod is string && data.paymentMethod.size() <= 50 &&
+             data.status is string && data.status.size() <= 50 &&
+             data.store_id is string && data.store_id.size() <= 128 &&
+             data.performed_by is string && data.performed_by.size() <= 100 &&
+             data.keys().hasAll(['id', 'customerId', 'orderDate', 'subtotal', 'tax', 'discount', 'total', 'paymentMethod', 'status', 'store_id', 'performed_by']) &&
+             data.keys().size() == 11;
+    }
+
+    // Primary matching boundary for Businesses
+    match /businesses/{businessId} {
+      allow get: if isSignedIn() && existing().ownerUid == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(businessId) && isValidBusiness(incoming()) && incoming().createdAt == request.time;
+      allow update: if isSignedIn() && isValidId(businessId) && isValidBusiness(incoming()) && 
+                       incoming().ownerUid == existing().ownerUid && 
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'owner', 'email']);
+      allow delete: if false; // Locked to maintain consistent historical bookkeeping context
+
+      // Nested Store routes
+      match /stores/{storeId} {
+        allow get: if isBusinessOwner(businessId);
+        allow list: if isBusinessOwner(businessId);
+        allow create: if isBusinessOwner(businessId) && isValidId(storeId) && isValidStore(incoming());
+        allow update: if isBusinessOwner(businessId) && isValidId(storeId) && isValidStore(incoming()) &&
+                         incoming().business_id == existing().business_id &&
+                         incoming().id == existing().id &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']);
+        allow delete: if isBusinessOwner(businessId);
+      }
+
+      // Nested Product catalog routes
+      match /products/{productId} {
+        allow get: if isBusinessOwner(businessId);
+        allow list: if isBusinessOwner(businessId);
+        allow create: if isBusinessOwner(businessId) && isValidId(productId) && isValidProduct(incoming());
+        allow update: if isBusinessOwner(businessId) && isValidId(productId) && isValidProduct(incoming()) &&
+                         incoming().business_id == existing().business_id &&
+                         incoming().id == existing().id &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl']);
+        allow delete: if isBusinessOwner(businessId);
+      }
+
+      // Nested Customer CRM accounts database
+      match /customers/{customerId} {
+        allow get: if isBusinessOwner(businessId);
+        allow list: if isBusinessOwner(businessId);
+        allow create: if isBusinessOwner(businessId) && isValidId(customerId) && isValidCustomer(incoming());
+        allow update: if isBusinessOwner(businessId) && isValidId(customerId) && isValidCustomer(incoming()) &&
+                         incoming().business_id == existing().business_id &&
+                         incoming().id == existing().id &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']);
+        allow delete: if isBusinessOwner(businessId);
+      }
+
+      // Nested order logs audits
+      match /orders/{orderId} {
+        allow get: if isBusinessOwner(businessId);
+        allow list: if isBusinessOwner(businessId);
+        allow create: if isBusinessOwner(businessId) && isValidId(orderId) && isValidOrder(incoming());
+        allow update: if false; // Immutable invoices path locks historical logs
+        allow delete: if false; // Invoice deletion disabled
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+	"appId": "com.pos.retail.app",
+	"appName": "RetailPOS",
+	"webDir": "dist"
+}

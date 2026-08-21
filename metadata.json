@@ -1,0 +1,6 @@
+{
+  "name": "Android POS with SQL Database",
+  "description": "An immersive Android-style Point of Sale (POS) system for SMEs, featuring a live, interactive SQL database, real POS terminal billing, product inventory control, sales analytics, and a raw SQL query execution console.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

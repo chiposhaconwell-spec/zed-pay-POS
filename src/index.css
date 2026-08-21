@@ -1,0 +1,99 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;750;900&family=JetBrains+Mono:wght@400;500;600;750&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Corporate Yellow / Warm Golden theme mapping */
+  --color-indigo-50: #fefce8;   /* yellow-50 */
+  --color-indigo-100: #fef08a;  /* yellow-200 */
+  --color-indigo-150: #fde047;  /* yellow-300 */
+  --color-indigo-200: #fde047;  /* yellow-300 */
+  --color-indigo-300: #facc15;  /* yellow-400 */
+  --color-indigo-400: #eab308;  /* yellow-500 */
+  --color-indigo-500: #ca8a04;  /* yellow-600 */
+  --color-indigo-600: #a16207;  /* yellow-700 - high contrast yellow-gold */
+  --color-indigo-650: #854d0e;  /* yellow-800 */
+  --color-indigo-700: #854d0e;  /* yellow-800 */
+  --color-indigo-800: #713f12;  /* yellow-900 */
+  --color-indigo-900: #422006;  /* yellow-950 */
+  --color-indigo-950: #221500;  /* extra dark golden brown for deep highlights */
+}
+
+/* Hide webkit/chrome scrollbars to make POS catalog look like native android screens */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;  /* Firefox */
+}
+
+/* Touch scrolling helper for Android WebViews */
+.scroll-x-touch {
+  overflow-x: auto !important;
+  -webkit-overflow-scrolling: touch !important;
+  scroll-behavior: smooth;
+}
+.scroll-y-touch {
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch !important;
+  scroll-behavior: smooth;
+}
+
+/* Print CSS to isolate the printable receipt section and hide everything else */
+@media print {
+  /* Hide every element on the page */
+  body * {
+    visibility: hidden !important;
+  }
+  /* Show only the print section and its children */
+  .document-print-section, .document-print-section * {
+    visibility: visible !important;
+  }
+  /* Position the print section at the top-left of the paper */
+  .document-print-section {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  /* Force hide elements with print:hidden */
+  .print\:hidden {
+    display: none !important;
+  }
+}
+
+/* Force Times New Roman font for all receipt elements and printed document sections */
+.receipt-times-font, .document-print-section, .document-print-section * {
+  font-family: "Times New Roman", Times, "Times CY", "Nimbus Roman No9 L", serif !important;
+}
+
+body { 
+  overscroll-behavior-y: none; 
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+/* Mobile Safe Area Inset Support for notch & home indicator */
+.pb-safe {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+.pt-safe {
+  padding-top: max(0.5rem, env(safe-area-inset-top));
+}
+
+/* Active touch feedback */
+.active-touch {
+  transition: transform 0.1s ease, opacity 0.1s ease;
+}
+.active-touch:active {
+  transform: scale(0.97);
+  opacity: 0.9;
+}

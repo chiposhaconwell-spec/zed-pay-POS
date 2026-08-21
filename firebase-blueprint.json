@@ -1,0 +1,109 @@
+{
+  "entities": {
+    "Business": {
+      "title": "Business",
+      "description": "Enterprise business profile",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier for the business" },
+        "name": { "type": "string", "description": "Business Name" },
+        "owner": { "type": "string", "description": "Owner Full Name" },
+        "email": { "type": "string", "description": "Business Corporate Email" },
+        "ownerUid": { "type": "string", "description": "Firebase Auth UID of the owner" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["id", "name", "owner", "email", "ownerUid"]
+    },
+    "Store": {
+      "title": "Store Branch",
+      "description": "Retail store outlet branch",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique store branch ID" },
+        "business_id": { "type": "string", "description": "Parent business ID" },
+        "name": { "type": "string", "description": "Outlet Name" },
+        "location": { "type": "string", "description": "City/Region location" },
+        "allow_discounts": { "type": "integer", "description": "Is discount enabled (1/0)" },
+        "allow_refunds": { "type": "integer", "description": "Is refund allowed (1/0)" },
+        "allow_laybys": { "type": "integer", "description": "Is layaway support enabled (1/0)" },
+        "require_manager_discount": { "type": "integer", "description": "Is manager level signature needed for discount (1/0)" }
+      },
+      "required": ["id", "business_id", "name"]
+    },
+    "Product": {
+      "title": "Product Asset",
+      "description": "Inventory product item",
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer", "description": "Auto-increment ID" },
+        "name": { "type": "string", "description": "Item product name" },
+        "sku": { "type": "string", "description": "Stockkeeping unit SKU code" },
+        "category": { "type": "string", "description": "Product category" },
+        "price": { "type": "number", "description": "Selling retail price" },
+        "cost": { "type": "number", "description": "Acquisition cost" },
+        "stock": { "type": "integer", "description": "Total available warehouse stock" },
+        "imageUrl": { "type": "string", "description": "Base64 or external photo URL" },
+        "business_id": { "type": "string", "description": "Associated business identifier" }
+      },
+      "required": ["id", "name", "sku", "price", "business_id"]
+    },
+    "Customer": {
+      "title": "Customer CRM",
+      "description": "Client CRM details",
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer", "description": "Unique Client ID" },
+        "name": { "type": "string", "description": "Client name" },
+        "phone": { "type": "string", "description": "Primary phone" },
+        "email": { "type": "string", "description": "Client email" },
+        "loyalPoints": { "type": "integer", "description": "Accumulated loyalty rewards points" },
+        "tpin": { "type": "string", "description": "Taxpayer identification number" },
+        "zra_connected": { "type": "integer", "description": "ZRA taxation link status (1/0)" },
+        "tax_band": { "type": "string", "description": "Zambian Revenue tax bracket" },
+        "business_id": { "type": "string", "description": "Associated business id" }
+      },
+      "required": ["id", "name"]
+    },
+    "Order": {
+      "title": "POS Invoice Order",
+      "description": "Completed client sales receipt transaction invoice",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Invoice number" },
+        "customerId": { "type": "integer", "description": "Associated customer ID" },
+        "orderDate": { "type": "string", "description": "ISO date-time or date string" },
+        "subtotal": { "type": "number", "description": "Subtotal" },
+        "tax": { "type": "number", "description": "Tax" },
+        "discount": { "type": "number", "description": "Discount" },
+        "total": { "type": "number", "description": "Final invoice total receivable" },
+        "paymentMethod": { "type": "string", "description": "Payment channel: CASH, CARD, MOMO" },
+        "status": { "type": "string", "description": "Receipt status" },
+        "store_id": { "type": "string", "description": "Origin outlet branch" },
+        "performed_by": { "type": "string", "description": "Origin cashier agent" }
+      },
+      "required": ["id", "orderDate", "subtotal", "tax", "total"]
+    }
+  },
+  "firestore": {
+    "businesses/{businessId}": {
+      "schema": "Business",
+      "description": "Core client business collection keyed by businessId"
+    },
+    "businesses/{businessId}/stores/{storeId}": {
+      "schema": "Store",
+      "description": "Branch stores nested within local business workspaces"
+    },
+    "businesses/{businessId}/products/{productId}": {
+      "schema": "Product",
+      "description": "Inventory listings of specific businesses"
+    },
+    "businesses/{businessId}/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "Customer accounts belonging to a business"
+    },
+    "businesses/{businessId}/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Completed invoices list for accounting auditing trail tracking"
+    }
+  }
+}
