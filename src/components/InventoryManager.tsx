@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf } from '../androidUtils';
 import { 
   Package, 
   Plus, 
@@ -995,7 +996,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         doc.setFontSize(7);
         doc.text('Double-entry ledger status has changed to APPROVED in the SQL database. Retain this co-signed slip for multi-branch audits.', 10, 115);
         
-        doc.save(`APPROVED_STOCK_TRANSFER_${st.id}.pdf`);
+        exportAndSharePdf(`APPROVED_STOCK_TRANSFER_${st.id}.pdf`, doc);
       } catch (pdfErr) {
         console.error('Failed to generate approval PDF:', pdfErr);
       }
@@ -2424,7 +2425,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                   doc.setFontSize(7);
                                   doc.text('Double-entry ledger status has changed to APPROVED in the SQL database. Retain this co-signed slip for multi-branch audits.', 10, 115);
                                   
-                                  doc.save(`APPROVED_STOCK_TRANSFER_${tr.id}.pdf`);
+                                   exportAndSharePdf(`APPROVED_STOCK_TRANSFER_${tr.id}.pdf`, doc);
                                 } catch(err) {
                                   console.error(err);
                                 }

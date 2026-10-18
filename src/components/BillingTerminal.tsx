@@ -28,6 +28,7 @@ import {
   Copy,
   Download,
   ArrowRight,
+  ArrowLeft,
   ShieldCheck,
   History,
   Move,
@@ -44,6 +45,7 @@ import { Product, Customer, StoreSettings } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf, safeSystemPrint } from '../androidUtils';
 import { getTransportSecurityStatus } from '../firebase';
 
 const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
@@ -1158,9 +1160,9 @@ export default function BillingTerminal({
     if (pendingPrintMode === 'bluetooth') {
       handleBluetoothPrint();
     } else if (pendingPrintMode === 'system') {
-      window.print();
+      safeSystemPrint();
     } else {
-      window.print();
+      safeSystemPrint();
     }
   };
 
@@ -1488,8 +1490,8 @@ export default function BillingTerminal({
       doc.setFontSize(is58 ? 5.5 : 6.5);
       doc.text(`*${receipt.id}*`, midPoint, headingOffset, { align: 'center' });
 
-      // Trigger automatic receipt PDF file generation and browser download
-      doc.save(`receipt-${selectedSize}-${receipt.id}.pdf`);
+      // Trigger automatic receipt PDF file generation and device share/download
+      exportAndSharePdf(`receipt-${selectedSize}-${receipt.id}.pdf`, doc);
     } catch (err) {
       console.error('jsPDF generation error:', err);
     }
@@ -2385,7 +2387,7 @@ export default function BillingTerminal({
         doc.text('⚠️ ISSUED IN HIGH-AVAILABILITY OFFLINE RESERVE', 40, 83, { align: 'center' });
         doc.text(settings.receiptFooter, 40, 86, { align: 'center' });
         
-        doc.save(`CHIPOSHA_QUICK_SALE_OFFLINE_${orderId}.pdf`);
+        exportAndSharePdf(`CHIPOSHA_QUICK_SALE_OFFLINE_${orderId}.pdf`, doc);
       } catch (pdfErr) {
         console.error('Failed generating quick sale offline PDF:', pdfErr);
       }
@@ -2569,7 +2571,7 @@ export default function BillingTerminal({
         doc.text('Double-Entry Pos System Checked', 40, 83, { align: 'center' });
         doc.text(settings.receiptFooter, 40, 86, { align: 'center' });
         
-        doc.save(`CHIPOSHA_QUICK_SALE_${orderId}.pdf`);
+        exportAndSharePdf(`CHIPOSHA_QUICK_SALE_${orderId}.pdf`, doc);
       } catch (pdfErr) {
         console.error('Failed generating quick sale PDF:', pdfErr);
       }
@@ -3546,8 +3548,17 @@ export default function BillingTerminal({
             : 'hidden md:flex bg-white'
         }`}>
         
-        <div className="flex items-center justify-between mb-3 shrink-0 uppercase select-none">
+        <div className="flex items-center justify-between mb-3 shrink-0 uppercase select-none flex-wrap gap-2">
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveMobileTab('catalog')}
+              className="md:hidden flex items-center gap-1 px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold cursor-pointer"
+              title="Return to Product Catalog Grid"
+            >
+              <ArrowLeft size={13} />
+              <span>Catalog</span>
+            </button>
             <ShoppingCart size={15} className="text-slate-800" />
             <h3 className="text-xs font-extrabold text-slate-900 tracking-wider">Client Basket</h3>
             <span className="bg-slate-800 text-white font-mono font-bold text-[10px] px-1.5 py-0.5 rounded">
@@ -4498,7 +4509,7 @@ export default function BillingTerminal({
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           type="button"
-                          onClick={() => window.print()}
+                          onClick={() => safeSystemPrint()}
                           className="py-2.5 bg-indigo-650 hover:bg-indigo-700 text-white text-[10px] font-black rounded-xl cursor-pointer flex items-center justify-center gap-1.5 shadow-3xs transition-all uppercase tracking-wider font-sans"
                         >
                           <Printer size={12} />

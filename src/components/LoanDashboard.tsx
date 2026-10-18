@@ -39,6 +39,7 @@ import { runSql, persistTablesToStorage, logEmployeeAudit } from '../db';
 import { StoreSettings, Loan, LoanAmortizationSchedule, AutomatedDeductionLog } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf } from '../androidUtils';
 
 interface LoanDashboardProps {
   settings: StoreSettings;
@@ -1059,7 +1060,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
       doc.setFontSize(7.5);
       doc.text('This printed ledger is co-signed on blockchain secure AlaSQL double-entry memory logs.', 20, offset + 35);
 
-      doc.save(`CREDIT_AGREEMENT_${ln.id}.pdf`);
+      exportAndSharePdf(`CREDIT_AGREEMENT_${ln.id}.pdf`, doc);
     } catch(err) {
       console.error(err);
     }
@@ -1411,7 +1412,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
       doc.setFontSize(7.5);
       doc.text('This co-signed accounting PDF complies with the Microfinance Interest Cap and ZRA VAT compliance code ZM-55B.', 20, y + 20);
       
-      doc.save(`FINANCIAL_REPORT_${selectedPeriod}_${activeStore}.pdf`);
+      exportAndSharePdf(`FINANCIAL_REPORT_${selectedPeriod}_${activeStore}.pdf`, doc);
     } catch (e) {
       console.error(e);
       alert('Error rendering statements PDF document: ' + String(e));

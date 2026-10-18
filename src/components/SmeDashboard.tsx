@@ -5,6 +5,7 @@ import { StoreSettings } from '../types';
 import { TrendingUp, Award, Wallet, Activity, Code, Play, Download, FileText } from 'lucide-react';
 import { motion } from 'motion/react';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf } from '../androidUtils';
 
 interface SmeDashboardProps {
   settings: StoreSettings;
@@ -561,8 +562,8 @@ FROM view_account_balances;
     const generationTime = new Date().toISOString().replace('T', ' ').substring(0, 19);
     doc.text(`DocuHash ID: POS-LEDGER-${todayStr} | Generated at ${generationTime} UTC`, 190, y, { align: 'right' });
 
-    // Save PDF
-    doc.save(`daily-sales-report-${todayStr}.pdf`);
+    // Save / Share PDF
+    exportAndSharePdf(`daily-sales-report-${todayStr}.pdf`, doc);
   };
 
   const PIE_COLORS = ['#4f46e5', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6'];
@@ -1348,7 +1349,7 @@ ORDER BY total_value DESC;`}
                           doc.text('EXPIRES 30 DAYS FROM ISSUANCE | ID: LYL-' + Math.floor(Math.random() * 90000), 40, 72, { align: 'center' });
                           doc.text('CHIPOSHA SME INVENTORY COMPLIANCE LOGS', 40, 76, { align: 'center' });
                           
-                          doc.save(`LOYALTY_TICKET_${selectedRewardingCustomer.id}.pdf`);
+                          exportAndSharePdf(`LOYALTY_TICKET_${selectedRewardingCustomer.id}.pdf`, doc);
                           
                           // Update loyalty points counter in the SQLite DB!
                           runSql(`UPDATE customers SET loyalPoints = loyalPoints + 120 WHERE id = ${selectedRewardingCustomer.id}`, 'CRM: Update customer account points balance');

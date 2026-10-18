@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { runSql, persistTablesToStorage } from '../db';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf } from '../androidUtils';
 import { 
   FileText, 
   Search, 
@@ -697,7 +698,7 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
       doc.text('This document is dynamically generated via SME Core Corporate POS.', 105, 284, { align: 'center' });
       
       const fileName = `${docData.status.replace(/\s+/g, '_')}_${docData.id}.pdf`;
-      doc.save(fileName);
+      exportAndSharePdf(fileName, doc);
       return fileName;
     } catch (err) {
       console.error('PDF Download Error:', err);

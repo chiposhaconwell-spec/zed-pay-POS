@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { runSql, persistTablesToStorage } from '../db';
+import { safeSystemPrint } from '../androidUtils';
 import { 
   Users, 
   Clock, 
@@ -443,8 +444,8 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
   const totalCompanyOutstandingPayroll: number = Object.values(payrollSummary).reduce((sum: number, item: any) => sum + item.pendingWages, 0) as number;
 
   const handlePrintPayrollPDF = () => {
-    // Print window triggers standard platform styled print event
-    window.print();
+    // Print window triggers safe system print event
+    safeSystemPrint();
   };
 
   return (

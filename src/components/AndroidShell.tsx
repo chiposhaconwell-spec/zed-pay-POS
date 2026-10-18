@@ -107,7 +107,7 @@ export default function AndroidShell({
       {/* Main Device Outer Housing Container */}
       <motion.div
         layout
-        className={`relative bg-slate-900 shadow-none sm:shadow-2xl border-0 sm:border-4 border-slate-700/60 rounded-none sm:rounded-3xl transition-all duration-300 w-full h-screen sm:h-auto ${
+        className={`relative bg-slate-900 shadow-none sm:shadow-2xl border-0 sm:border-4 border-slate-700/60 rounded-none sm:rounded-3xl transition-all duration-300 w-full h-[100dvh] sm:h-auto ${
           deviceMode === 'tablet'
             ? 'sm:w-full sm:max-w-6xl sm:aspect-[16/10.5] sm:p-4 md:p-6 flex flex-col'
             : 'sm:w-full sm:max-w-sm sm:aspect-[9/18.5] sm:p-3 flex flex-col'

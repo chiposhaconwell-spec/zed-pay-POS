@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { App as CapApp } from '@capacitor/app';
 import { 
   ShoppingCart, Package, TrendingUp, Terminal, Sliders, 
   Layers, Clock, Coins, FileText, Users, Briefcase, Plus, 
@@ -108,6 +109,25 @@ export default function App() {
   const [newCustName, setNewCustName] = useState('');
   const [newCustPhone, setNewCustPhone] = useState('');
 
+  const navigationBackStateRef = useRef({
+    showNavDrawer,
+    showHelpChatModal,
+    showCustomersModal,
+    showExpenseModal,
+    showBusinessModal,
+    billingCounterAction,
+    activeTab
+  });
+  navigationBackStateRef.current = {
+    showNavDrawer,
+    showHelpChatModal,
+    showCustomersModal,
+    showExpenseModal,
+    showBusinessModal,
+    billingCounterAction,
+    activeTab
+  };
+
   const fetchCustomersList = () => {
     try {
       const cRes = runSql('SELECT * FROM customers ORDER BY name ASC', 'CRM: Query central customers database');
@@ -180,11 +200,63 @@ export default function App() {
 
     window.addEventListener('pos_sale_completed', handleSaleOrDataUpdate);
     window.addEventListener('pos_data_updated', handleSaleOrDataUpdate);
+    window.addEventListener('database-rehydrated', handleSaleOrDataUpdate);
     window.addEventListener('storage', handleSaleOrDataUpdate);
 
+    // Handle native Android hardware back button
+    let backListenerHandle: any = null;
+    try {
+      CapApp.addListener('backButton', () => {
+        const state = navigationBackStateRef.current;
+        if (state.showNavDrawer) {
+          setShowNavDrawer(false);
+          return;
+        }
+        if (state.showHelpChatModal) {
+          setShowHelpChatModal(false);
+          return;
+        }
+        if (state.showCustomersModal) {
+          setShowCustomersModal(false);
+          return;
+        }
+        if (state.showExpenseModal) {
+          setShowExpenseModal(false);
+          return;
+        }
+        if (state.showBusinessModal) {
+          setShowBusinessModal(false);
+          return;
+        }
+        if (state.billingCounterAction) {
+          setBillingCounterAction(null);
+          return;
+        }
+        if (state.activeTab !== 'billing') {
+          setActiveTab2('billing');
+          return;
+        }
+        try {
+          CapApp.exitApp();
+        } catch (e) {
+          // ignore
+        }
+      }).then(handle => {
+        backListenerHandle = handle;
+      }).catch(() => {
+        // web fallback
+      });
+    } catch (e) {
+      // not in capacitor
+    }
+
     return () => {
+      if (backListenerHandle && backListenerHandle.remove) {
+        backListenerHandle.remove();
+      }
       window.removeEventListener('pos_sale_completed', handleSaleOrDataUpdate);
       window.removeEventListener('pos_data_updated', handleSaleOrDataUpdate);
+      window.removeEventListener('database-rehydrated', handleSaleOrDataUpdate);
       window.removeEventListener('storage', handleSaleOrDataUpdate);
     };
   }, []);
@@ -399,9 +471,9 @@ export default function App() {
       <div className="flex-1 flex flex-col overflow-hidden relative h-full">
         
         {/* Top Header Bar with 3-Lines Hamburger Menu Button on Upper Corner */}
-        <div className="bg-slate-900 border-b border-slate-800 px-3 py-2 flex items-center justify-between gap-2 text-slate-300 shadow-md z-20">
+        <div className="bg-slate-900 border-b border-slate-800 px-2 py-1.5 sm:px-3 sm:py-2 flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 text-slate-300 shadow-md z-20 shrink-0">
           
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-1.5 sm:gap-2.5 flex-wrap">
             {/* Upper Corner 3-Lines Hamburger Menu Button */}
             <button
               id="hamburger-main-menu"
@@ -409,10 +481,10 @@ export default function App() {
                 updateBadgeCounts();
                 setShowNavDrawer(true);
               }}
-              className="p-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg transition-all cursor-pointer flex items-center justify-center shrink-0 shadow-md font-bold group"
+              className="p-1.5 sm:p-2 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg transition-all cursor-pointer flex items-center justify-center shrink-0 shadow-md font-bold group"
               title="Open Hidden Functions Drawer"
             >
-              <Menu size={20} className="group-hover:scale-110 transition-transform" />
+              <Menu size={18} className="group-hover:scale-110 transition-transform" />
             </button>
 
             {/* Active Business / Store Badge */}
@@ -421,10 +493,10 @@ export default function App() {
                 loadBusinessData();
                 setShowBusinessModal(true);
               }}
-              className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-950/80 text-indigo-200 border border-indigo-800/80 rounded-lg text-xs font-extrabold hover:bg-indigo-900 hover:text-white transition-all cursor-pointer shadow-sm font-sans"
+              className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 bg-indigo-950/80 text-indigo-200 border border-indigo-800/80 rounded-lg text-xs font-extrabold hover:bg-indigo-900 hover:text-white transition-all cursor-pointer shadow-sm font-sans"
             >
-              <Building2 size={13} className="text-emerald-400 animate-pulse" />
-              <span className="truncate max-w-[110px] sm:max-w-[160px]">{activeBusiness.name}</span>
+              <Building2 size={13} className="text-emerald-400 animate-pulse shrink-0" />
+              <span className="truncate max-w-[90px] sm:max-w-[160px]">{activeBusiness.name}</span>
             </button>
 
             {/* Direct Sale Register Navigation Button */}
@@ -434,19 +506,19 @@ export default function App() {
                 setBillingCounterAction(null);
                 setActiveTab2('billing');
               }}
-              className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-lg text-xs font-black tracking-wider uppercase transition-all cursor-pointer border shadow-sm font-sans ${
+              className={`flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1 rounded-lg text-xs font-black tracking-wider uppercase transition-all cursor-pointer border shadow-sm font-sans ${
                 activeTab === 'billing'
                   ? 'bg-emerald-500 text-slate-950 border-emerald-400 shadow-emerald-500/20'
                   : 'bg-emerald-950/80 hover:bg-emerald-900 text-emerald-300 border-emerald-800 hover:text-white'
               }`}
               title="Return to Point of Sale Billing Register"
             >
-              <ShoppingCart size={14} className="stroke-[2.5]" />
+              <ShoppingCart size={13} className="stroke-[2.5] shrink-0" />
               <span className="hidden sm:inline">POS SALE REGISTER</span>
               <span className="sm:hidden">SALE</span>
             </button>
 
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1">
               <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider font-mono hidden md:inline">Branch:</span>
               <select
                 value={activeStore}
@@ -455,7 +527,7 @@ export default function App() {
                   setActiveStore(e.target.value);
                   setSqlSeedTrigger(prev => prev + 1);
                 }}
-                className={`bg-slate-800 text-slate-100 text-xs font-bold px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer uppercase font-sans ${userRole === 'sales' ? 'opacity-65 cursor-not-allowed bg-slate-950 text-slate-400' : ''}`}
+                className={`bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer uppercase font-sans ${userRole === 'sales' ? 'opacity-65 cursor-not-allowed bg-slate-950 text-slate-400' : ''}`}
               >
                 {stores.map(st => (
                   <option key={st.id} value={st.id}>{st.name}</option>
@@ -465,18 +537,18 @@ export default function App() {
           </div>
 
           {/* User Role Badge */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2">
             <select
               value={userRole}
               onChange={(e) => {
                 setUserRole(e.target.value);
                 setSqlSeedTrigger(prev => prev + 1);
               }}
-              className="bg-slate-800 text-slate-100 text-xs font-bold px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer font-sans"
+              className="bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer font-sans"
             >
               <option value="owner">Owner</option>
               <option value="manager">Manager</option>
-              <option value="sales">Sales Person</option>
+              <option value="sales">Sales</option>
             </select>
 
             <div className="hidden sm:flex items-center gap-1 text-[10px] px-2 py-1 rounded-md bg-indigo-950 text-indigo-300 border border-indigo-900/60 font-mono font-bold">
@@ -681,7 +753,82 @@ export default function App() {
               </AnimatePresence>
             </div>
           </div>
+
+        {/* MOBILE ADAPTIVE BOTTOM NAVIGATION BAR */}
+        <div className="md:hidden flex items-center justify-around bg-slate-900 border-t border-slate-800 px-1 py-1 shrink-0 z-20 select-none shadow-lg text-slate-400">
+          <button
+            id="mobile_nav_sale"
+            type="button"
+            onClick={() => {
+              setBillingCounterAction(null);
+              setActiveTab2('billing');
+            }}
+            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
+              activeTab === 'billing'
+                ? 'bg-emerald-500/15 text-emerald-400 font-extrabold'
+                : 'hover:text-slate-200'
+            }`}
+          >
+            <ShoppingCart size={17} className={activeTab === 'billing' ? 'text-emerald-400 stroke-[2.5]' : ''} />
+            <span className="mt-0.5 tracking-tight">Sale POS</span>
+          </button>
+
+          <button
+            id="mobile_nav_inventory"
+            type="button"
+            onClick={() => setActiveTab2('inventory')}
+            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold relative ${
+              activeTab === 'inventory'
+                ? 'bg-blue-500/15 text-blue-400 font-extrabold'
+                : 'hover:text-slate-200'
+            }`}
+          >
+            <Package size={17} className={activeTab === 'inventory' ? 'text-blue-400 stroke-[2.5]' : ''} />
+            <span className="mt-0.5 tracking-tight">Stock</span>
+          </button>
+
+          <button
+            id="mobile_nav_laybys"
+            type="button"
+            onClick={() => setActiveTab2('laybys')}
+            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
+              activeTab === 'laybys'
+                ? 'bg-amber-500/15 text-amber-400 font-extrabold'
+                : 'hover:text-slate-200'
+            }`}
+          >
+            <Layers size={17} className={activeTab === 'laybys' ? 'text-amber-400 stroke-[2.5]' : ''} />
+            <span className="mt-0.5 tracking-tight">Laybys</span>
+          </button>
+
+          <button
+            id="mobile_nav_finance"
+            type="button"
+            onClick={() => setActiveTab2('finance')}
+            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
+              activeTab === 'finance'
+                ? 'bg-purple-500/15 text-purple-400 font-extrabold'
+                : 'hover:text-slate-200'
+            }`}
+          >
+            <FileText size={17} className={activeTab === 'finance' ? 'text-purple-400 stroke-[2.5]' : ''} />
+            <span className="mt-0.5 tracking-tight">Finance</span>
+          </button>
+
+          <button
+            id="mobile_nav_menu"
+            type="button"
+            onClick={() => {
+              updateBadgeCounts();
+              setShowNavDrawer(true);
+            }}
+            className="flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold hover:text-slate-200"
+          >
+            <Menu size={17} />
+            <span className="mt-0.5 tracking-tight">Menu</span>
+          </button>
         </div>
+      </div>
 
       {/* SLIDE-OUT NAVIGATION DRAWER (3-LINES HAMBURGER MENU) */}
       <AnimatePresence>

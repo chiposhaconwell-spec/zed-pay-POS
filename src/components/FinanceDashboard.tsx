@@ -26,6 +26,7 @@ import { runSql, persistTablesToStorage, logEmployeeAudit } from '../db';
 import { StoreSettings } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf } from '../androidUtils';
 
 interface FinanceDashboardProps {
   settings: StoreSettings;
@@ -510,7 +511,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       doc.setFontSize(14);
       doc.text(`NET INCOME / PROFIT: ${settings.currency}${financials.netProfit.toFixed(2)}`, 14, y);
 
-      doc.save(`Financial_Statement_${new Date().toISOString().split('T')[0]}.pdf`);
+      exportAndSharePdf(`Financial_Statement_${new Date().toISOString().split('T')[0]}.pdf`, doc);
     } catch (e) {
       alert('Error exporting PDF statement: ' + String(e));
     }

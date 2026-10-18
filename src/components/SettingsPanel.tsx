@@ -23,6 +23,7 @@ import {
   Upload
 } from 'lucide-react';
 import { runSql, initializeDatabase, SeedTemplate, persistTablesToStorage } from '../db';
+import { exportAndShareText } from '../androidUtils';
 import { StoreSettings } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
 import { auth, googleProvider, backupToCloud, restoreFromCloud, getTransportSecurityStatus } from '../firebase';
@@ -344,7 +345,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     triggerNotify(`Database flushed and re-seeded for ${seedIndustry.toUpperCase()} shop layout.`);
   };
 
-  const handleExportPortableAppPackage = () => {
+  const handleExportPortableAppPackage = async () => {
     try {
       const settingsStr = localStorage.getItem('android_pos_settings') || JSON.stringify(settings);
       const bizProfile = localStorage.getItem('active_business_profile') || '';
@@ -374,15 +375,8 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
       };
 
       const jsonStr = JSON.stringify(appBundle, null, 2);
-      const blob = new Blob([jsonStr], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `sme_pos_app_bundle_${new Date().toISOString().slice(0, 10)}.pospack`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      const filename = `sme_pos_app_bundle_${new Date().toISOString().slice(0, 10)}.pospack`;
+      await exportAndShareText(filename, jsonStr, 'application/json');
 
       triggerNotify("🎉 Portable POS App Package (.pospack) exported successfully!");
     } catch (e: any) {

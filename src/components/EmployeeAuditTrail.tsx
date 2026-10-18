@@ -7,6 +7,7 @@ import {
   Maximize2, Minimize2, Copy, Check, SlidersHorizontal, ArrowLeftRight, Landmark
 } from 'lucide-react';
 import { runSql, persistTablesToStorage } from '../db';
+import { exportAndShareCsv } from '../androidUtils';
 import { StoreSettings } from '../types';
 
 interface EmployeeAuditTrailProps {
@@ -312,13 +313,8 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
       csvContent += line + "\n";
     });
 
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `employee_audit_trail_${new Date().toISOString().split('T')[0]}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const filename = `employee_audit_trail_${new Date().toISOString().split('T')[0]}.csv`;
+    exportAndShareCsv(filename, csvContent);
   };
 
   return (

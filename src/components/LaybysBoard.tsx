@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { jsPDF } from 'jspdf';
+import { exportAndSharePdf, safeSystemPrint } from '../androidUtils';
 import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit } from '../db';
 import { 
   Users, 
@@ -301,7 +302,7 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
         doc.text(settings.receiptFooter, 40, headingOffset, { align: 'center' });
       }
 
-      doc.save(`Layby_Receipt_${receiptData.installmentId}.pdf`);
+      exportAndSharePdf(`Layby_Receipt_${receiptData.installmentId}.pdf`, doc);
     } catch (err: any) {
       alert('Error generating PDF receipt: ' + err.message);
     }
@@ -638,7 +639,7 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
     if (!selectedLayby) return;
     
     // Play sound click and load interactive receipt popup print view
-    window.print();
+    safeSystemPrint();
   };
 
   return (
@@ -723,7 +724,9 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
         
         {/* LEFTSIDE BAR: CLIENTS LAYBY LIST */}
-        <div className="w-full md:w-5/12 bg-white border-r border-slate-200 flex flex-col overflow-hidden">
+        <div className={`w-full md:w-5/12 bg-white border-r border-slate-200 flex-col overflow-hidden ${
+          selectedLayby ? 'hidden md:flex' : 'flex-1 md:flex flex'
+        }`}>
           
           {/* Keyword search filter */}
           <div className="p-3.5 border-b border-slate-100 relative">
@@ -793,11 +796,25 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
         </div>
 
         {/* RIGHTSIDE DETAIL DISPLAY PANEL */}
-        <div className="flex-1 bg-slate-50 overflow-y-auto p-5 pb-16 flex flex-col gap-4">
+        <div className={`flex-1 bg-slate-50 overflow-y-auto p-3 sm:p-5 pb-16 flex-col gap-4 ${
+          selectedLayby ? 'flex' : 'hidden md:flex'
+        }`}>
           
           {selectedLayby ? (
             <div className="flex flex-col gap-4">
               
+              {/* Back button for mobile view */}
+              <div className="md:hidden flex items-center mb-1">
+                <button
+                  type="button"
+                  onClick={() => setSelectedLayby(null)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 rounded-lg text-xs font-extrabold shadow-xs cursor-pointer"
+                >
+                  <ArrowRight size={14} className="rotate-180" />
+                  <span>← Back to Laybys List</span>
+                </button>
+              </div>
+
               {/* Customer Profile Summary banner */}
               <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs">
                 <div className="flex justify-between items-start flex-wrap gap-2">

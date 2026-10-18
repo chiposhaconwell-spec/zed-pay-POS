@@ -1,5 +1,12 @@
 import alasql from 'alasql';
 import { Product, Customer, Order, OrderItem, SqlLogEntry, StoreSettings } from './types';
+import { 
+  initSqliteStorage, 
+  registerPendingSync, 
+  loadTablesFromPersistentStorage, 
+  triggerImmediateFlush, 
+  ALL_TABLE_NAMES 
+} from './sqliteStorage';
 
 // In-memory SQL Logs state (we will also notify listeners when it changes)
 let sqlLogs: SqlLogEntry[] = [];
@@ -322,96 +329,34 @@ const LOCAL_STORAGE_KEY_PREFIX = 'android_pos_db_';
 
 export function persistTablesToStorage() {
   try {
-    if (alasql.tables && alasql.tables.products) {
-      const products = alasql('SELECT * FROM products');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}products`, JSON.stringify(products));
+    const allTablesData: Record<string, any[]> = {};
+    if (alasql && alasql.tables) {
+      for (const tableName of ALL_TABLE_NAMES) {
+        if (alasql.tables[tableName]) {
+          try {
+            const rows = alasql(`SELECT * FROM ${tableName}`) as any[];
+            if (Array.isArray(rows)) {
+              allTablesData[tableName] = rows;
+            }
+            // Also store in localStorage with prefix for instant web fallback
+            try {
+              localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${tableName}`, JSON.stringify(rows));
+            } catch (lsErr) {
+              // quota exceeded or restricted in WebView
+            }
+          } catch (tErr) {
+            // ignore table query errors
+          }
+        }
+      }
     }
-    if (alasql.tables && alasql.tables.customers) {
-      const customers = alasql('SELECT * FROM customers');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}customers`, JSON.stringify(customers));
-    }
-    if (alasql.tables && alasql.tables.orders) {
-      const orders = alasql('SELECT * FROM orders');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}orders`, JSON.stringify(orders));
-    }
-    if (alasql.tables && alasql.tables.order_items) {
-      const orderItems = alasql('SELECT * FROM order_items');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}order_items`, JSON.stringify(orderItems));
-    }
-    
-    // If double-entry tables exist, persist them as well
-    if (alasql.tables && alasql.tables.accounts) {
-      const accounts = alasql('SELECT * FROM accounts');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}accounts`, JSON.stringify(accounts));
-    }
-    if (alasql.tables && alasql.tables.transactions) {
-      const txs = alasql('SELECT * FROM transactions');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}transactions`, JSON.stringify(txs));
-    }
-    if (alasql.tables && alasql.tables.ledger_entries) {
-      const le = alasql('SELECT * FROM ledger_entries');
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}ledger_entries`, JSON.stringify(le));
-    }
-
-    // Custom new tables persistence
-    if (alasql.tables && alasql.tables.laybys) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}laybys`, JSON.stringify(alasql('SELECT * FROM laybys')));
-    }
-    if (alasql.tables && alasql.tables.layby_installments) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}layby_installments`, JSON.stringify(alasql('SELECT * FROM layby_installments')));
-    }
-    if (alasql.tables && alasql.tables.time_attendance) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}time_attendance`, JSON.stringify(alasql('SELECT * FROM time_attendance')));
-    }
-    if (alasql.tables && alasql.tables.staff) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}staff`, JSON.stringify(alasql('SELECT * FROM staff')));
-    }
-    if (alasql.tables && alasql.tables.store_products) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}store_products`, JSON.stringify(alasql('SELECT * FROM store_products')));
-    }
-    if (alasql.tables && alasql.tables.stock_transfers) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}stock_transfers`, JSON.stringify(alasql('SELECT * FROM stock_transfers')));
-    }
-    if (alasql.tables && alasql.tables.cash_ups) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}cash_ups`, JSON.stringify(alasql('SELECT * FROM cash_ups')));
-    }
-    if (alasql.tables && alasql.tables.quotations) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}quotations`, JSON.stringify(alasql('SELECT * FROM quotations')));
-    }
-    if (alasql.tables && alasql.tables.loans) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}loans`, JSON.stringify(alasql('SELECT * FROM loans')));
-    }
-    if (alasql.tables && alasql.tables.loan_amortization_schedule) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}loan_amortization_schedule`, JSON.stringify(alasql('SELECT * FROM loan_amortization_schedule')));
-    }
-    if (alasql.tables && alasql.tables.automated_deduction_logs) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}automated_deduction_logs`, JSON.stringify(alasql('SELECT * FROM automated_deduction_logs')));
-    }
-    if (alasql.tables && alasql.tables.businesses) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}businesses`, JSON.stringify(alasql('SELECT * FROM businesses')));
-    }
-    if (alasql.tables && alasql.tables.stores) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}stores`, JSON.stringify(alasql('SELECT * FROM stores')));
-    }
-    if (alasql.tables && alasql.tables.audit_logs) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}audit_logs`, JSON.stringify(alasql('SELECT * FROM audit_logs')));
-    }
-    if (alasql.tables && alasql.tables.stock_takes) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}stock_takes`, JSON.stringify(alasql('SELECT * FROM stock_takes')));
-    }
-    if (alasql.tables && alasql.tables.stock_take_items) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}stock_take_items`, JSON.stringify(alasql('SELECT * FROM stock_take_items')));
-    }
-    if (alasql.tables && alasql.tables.expenses) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}expenses`, JSON.stringify(alasql('SELECT * FROM expenses')));
-    }
-    if (alasql.tables && alasql.tables.purchases_transit) {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}purchases_transit`, JSON.stringify(alasql('SELECT * FROM purchases_transit')));
-    }
+    // Asynchronously flush to native SQLite database on Android filesystem & JSON snapshot
+    registerPendingSync(allTablesData);
   } catch (e) {
-    console.error('Failed to save state to localStorage:', e);
+    console.error('Failed to save state to storage:', e);
   }
 }
+
 
 // Seed Store Data Types
 export type SeedTemplate = 'cafe' | 'boutique' | 'grocer' | 'ledger';
@@ -484,6 +429,27 @@ export function seedHistoricalOrders() {
   persistTablesToStorage();
 }
 
+export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
+  if (!tablesData || typeof tablesData !== 'object') return;
+  for (const [table, rows] of Object.entries(tablesData)) {
+    if (!Array.isArray(rows) || rows.length === 0) continue;
+    try {
+      if (!alasql.tables || !alasql.tables[table]) continue;
+      alasql(`DELETE FROM ${table}`);
+      for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        const keys = Object.keys(row);
+        if (keys.length === 0) continue;
+        const placeholders = keys.map(() => '?').join(', ');
+        const values = keys.map(k => row[k]);
+        alasql(`INSERT INTO ${table} (${keys.join(', ')}) VALUES (${placeholders})`, values);
+      }
+    } catch (err) {
+      console.warn(`Failed rehydrating table ${table}:`, err);
+    }
+  }
+}
+
 export function initializeDatabase(template: SeedTemplate = 'cafe', forceReset: boolean = false) {
   if (!forceReset && alasql.tables && alasql.tables.products) {
     try {
@@ -526,6 +492,14 @@ export function initializeDatabase(template: SeedTemplate = 'cafe', forceReset: 
     runSql('DROP TABLE IF EXISTS stores', 'Clean database: Drops old stores');
     runSql('DROP TABLE IF EXISTS stock_takes', 'Clean database: Drops old stock takes');
     runSql('DROP TABLE IF EXISTS stock_take_items', 'Clean database: Drops old stock take items');
+    runSql('DROP TABLE IF EXISTS expenses', 'Clean database: Drops old expenses');
+    runSql('DROP TABLE IF EXISTS purchases_transit', 'Clean database: Drops old purchases transit');
+    runSql('DROP TABLE IF EXISTS transit_purchases', 'Clean database: Drops old transit purchases');
+    runSql('DROP TABLE IF EXISTS money_transfers', 'Clean database: Drops old money transfers');
+    runSql('DROP TABLE IF EXISTS assets', 'Clean database: Drops old assets');
+    runSql('DROP TABLE IF EXISTS equity', 'Clean database: Drops old equity');
+    runSql('DROP TABLE IF EXISTS double_entry_journal', 'Clean database: Drops old double entry journal');
+    runSql('DROP TABLE IF EXISTS audit_logs', 'Clean database: Drops old audit logs');
 
     // Create Business Identity container
     runSql(`
@@ -689,7 +663,8 @@ export function initializeDatabase(template: SeedTemplate = 'cafe', forceReset: 
       balance_due NUMERIC,
       status STRING,
       items_json STRING,
-      created_at STRING
+      created_at STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create LAYBYS layaway tracking table');
 
@@ -865,9 +840,11 @@ export function initializeDatabase(template: SeedTemplate = 'cafe', forceReset: 
       amount NUMERIC,
       description STRING,
       ref_number STRING,
+      reference_no STRING,
       expense_date STRING,
       store_id STRING,
       performed_by STRING,
+      created_by STRING,
       created_at STRING
     )
   `, 'Durable Schema: Create EXPENSES ledger table');
@@ -893,6 +870,78 @@ export function initializeDatabase(template: SeedTemplate = 'cafe', forceReset: 
     )
   `, 'Durable Schema: Create PURCHASES_TRANSIT goods-in-transit procurement table');
 
+  runSql(`
+    CREATE TABLE transit_purchases (
+      id STRING PRIMARY KEY,
+      supplier_name STRING,
+      store_id STRING,
+      payment_account STRING,
+      payment_method STRING,
+      base_total NUMERIC,
+      additional_expenses_total NUMERIC,
+      grand_landed_total NUMERIC,
+      status STRING,
+      items_json STRING,
+      additional_expenses_json STRING,
+      notes STRING,
+      created_at STRING,
+      updated_at STRING,
+      received_at STRING,
+      received_by STRING
+    )
+  `, 'Durable Schema: Create TRANSIT_PURCHASES procurement table');
+
+  runSql(`
+    CREATE TABLE money_transfers (
+      id STRING PRIMARY KEY,
+      source_account STRING,
+      dest_account STRING,
+      amount NUMERIC,
+      reference_no STRING,
+      transfer_date STRING,
+      performed_by STRING,
+      notes STRING
+    )
+  `, 'Durable Schema: Create MONEY_TRANSFERS liquidity balancing table');
+
+  runSql(`
+    CREATE TABLE assets (
+      id STRING PRIMARY KEY,
+      name STRING,
+      category STRING,
+      type STRING,
+      purchase_date STRING,
+      value NUMERIC,
+      depreciation_method STRING,
+      depreciation_rate NUMERIC,
+      status STRING,
+      notes STRING,
+      linked_equity_id STRING
+    )
+  `, 'Durable Schema: Create ASSETS balance sheet table');
+
+  runSql(`
+    CREATE TABLE equity (
+      id STRING PRIMARY KEY,
+      name STRING,
+      value NUMERIC,
+      linked_asset_id STRING
+    )
+  `, 'Durable Schema: Create EQUITY capital accounts table');
+
+  runSql(`
+    CREATE TABLE double_entry_journal (
+      id STRING PRIMARY KEY,
+      date STRING,
+      reference STRING,
+      description STRING,
+      account_debit STRING,
+      account_credit STRING,
+      amount NUMERIC,
+      currency STRING
+    )
+  `, 'Durable Schema: Create DOUBLE_ENTRY_JOURNAL accounting records');
+
   // Create account balance formula view
   runSql(`
     CREATE VIEW view_account_balances AS
@@ -914,219 +963,59 @@ export function initializeDatabase(template: SeedTemplate = 'cafe', forceReset: 
     GROUP BY a.id, a.name, a.currency
   `, 'Durable Schema: Complete VIEW_ACCOUNT_BALANCES view aggregation');
 
-  // Check if we can recover data from localStorage, unless a forceReset is requested
-  const hasLocalProducts = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}products`);
-  if (hasLocalProducts && !forceReset) {
+  // Check if we can recover data from localStorage synchronously, unless a forceReset is requested
+  let hasRecoveredData = false;
+  if (!forceReset) {
     try {
-      const localProds = JSON.parse(localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}products`) || '[]');
-      const uniqueProdsMap = new Map();
-      localProds.forEach((p: any) => { if (p && p.id) uniqueProdsMap.set(p.id, p); });
-      Array.from(uniqueProdsMap.values()).forEach((p: any) => {
-        alasql('INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [p.id, p.name, p.sku, p.category, p.price, p.cost, p.stock, p.imageUrl, p.business_id || 'default_biz', p.is_service || 0, p.batch_number || '', p.expiry_date || '']);
-      });
-
-      const localCusts = JSON.parse(localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}customers`) || '[]');
-      const uniqueCustsMap = new Map();
-      localCusts.forEach((c: any) => { if (c && c.id) uniqueCustsMap.set(c.id, c); });
-      Array.from(uniqueCustsMap.values()).forEach((c: any) => {
-        alasql('INSERT INTO customers VALUES (?,?,?,?,?,?,?,?,?)', [c.id, c.name, c.phone, c.email, c.loyalPoints, c.tpin || '', c.zra_connected || 0, c.tax_band || 'A - Standard Rate (16%)', c.business_id || 'default_biz']);
-      });
-
-      const localOrd = JSON.parse(localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}orders`) || '[]');
-      const uniqueOrdMap = new Map();
-      localOrd.forEach((o: any) => { if (o && o.id) uniqueOrdMap.set(o.id, o); });
-      Array.from(uniqueOrdMap.values()).forEach((o: any) => {
-        alasql('INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?)', [o.id, o.customerId, o.orderDate, o.subtotal, o.tax, o.discount, o.total, o.paymentMethod, o.status, o.store_id || 'lusaka', o.performed_by || 'owner']);
-      });
-
-      if (uniqueOrdMap.size === 0) {
-        seedHistoricalOrders();
-      }
-
-      const localOrdItems = JSON.parse(localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}order_items`) || '[]');
-      const uniqueOrdItemsMap = new Map();
-      localOrdItems.forEach((oi: any) => { if (oi && oi.id) uniqueOrdItemsMap.set(oi.id, oi); });
-      Array.from(uniqueOrdItemsMap.values()).forEach((oi: any) => {
-        alasql('INSERT INTO order_items VALUES (?,?,?,?,?)', [oi.id, oi.orderId, oi.productId, oi.quantity, oi.unitPrice]);
-      });
-
-      // Recover double entry tables if stored
-      const localAccounts = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}accounts`);
-      if (localAccounts) {
-        JSON.parse(localAccounts).forEach((acc: any) => {
-          alasql('INSERT INTO accounts VALUES (?,?,?,?,?,?,?)', [acc.id, acc.name, acc.type, acc.currency, acc.merchant_id, acc.created_at, acc.updated_at]);
-        });
-      }
-      const localTxs = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}transactions`);
-      if (localTxs) {
-        JSON.parse(localTxs).forEach((tx: any) => {
-          alasql('INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [tx.id, tx.idempotency_key, tx.pos_terminal_id, tx.channel, tx.provider_reference, tx.amount, tx.fee_amount, tx.status, tx.narration, tx.created_at, tx.updated_at, tx.performed_by || 'owner']);
-        });
-      }
-      const localLE = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}ledger_entries`);
-      if (localLE) {
-        JSON.parse(localLE).forEach((le: any) => {
-          alasql('INSERT INTO ledger_entries VALUES (?,?,?,?,?,?)', [le.id, le.transaction_id, le.account_id, le.type, le.amount, le.created_at]);
-        });
-      }
-
-      // Recover custom extra tables
-      const localLaybys = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}laybys`);
-      if (localLaybys) {
-        const uniqueLaybysMap = new Map();
-        JSON.parse(localLaybys).forEach((ly: any) => { if (ly && ly.id) uniqueLaybysMap.set(ly.id, ly); });
-        Array.from(uniqueLaybysMap.values()).forEach((ly: any) => {
-          alasql('INSERT INTO laybys VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [ly.id, ly.customer_id, ly.customer_name, ly.customer_phone, ly.customer_email, ly.total_amount, ly.deposit_amount, ly.amount_paid, ly.balance_due, ly.status, ly.items_json, ly.created_at]);
-        });
-      }
-      const localInstallments = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}layby_installments`);
-      if (localInstallments) {
-        const uniqueInstallmentsMap = new Map();
-        JSON.parse(localInstallments).forEach((ins: any) => { if (ins && ins.id) uniqueInstallmentsMap.set(ins.id, ins); });
-        Array.from(uniqueInstallmentsMap.values()).forEach((ins: any) => {
-          alasql('INSERT INTO layby_installments VALUES (?,?,?,?,?,?)', [ins.id, ins.layby_id, ins.amount, ins.payment_method, ins.received_by, ins.created_at]);
-        });
-      }
-      const localAttendance = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}time_attendance`);
-      if (localAttendance) {
-        const uniqueAttendanceMap = new Map();
-        JSON.parse(localAttendance).forEach((at: any) => {
-          if (at && at.id && !['attend-091', 'attend-092', 'attend-093', 'attend-094'].includes(at.id)) {
-            uniqueAttendanceMap.set(at.id, at);
+      const recovered: Record<string, any[]> = {};
+      for (const table of ALL_TABLE_NAMES) {
+        const raw = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}${table}`);
+        if (raw) {
+          try {
+            const rows = JSON.parse(raw);
+            if (Array.isArray(rows) && rows.length > 0) {
+              recovered[table] = rows;
+            }
+          } catch (e) {
+            // ignore
           }
-        });
-        Array.from(uniqueAttendanceMap.values()).forEach((at: any) => {
-          alasql('INSERT INTO time_attendance VALUES (?,?,?,?,?,?,?,?,?,?)', [at.id, at.employee_name, at.employee_role, at.date, at.clock_in, at.clock_out, at.hours_worked, at.hourly_rate, at.gross_payment, at.status]);
-        });
+        }
       }
-      const localStaff = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}staff`);
-      if (localStaff) {
-        const uniqueStaffMap = new Map();
-        JSON.parse(localStaff).forEach((st: any) => {
-          if (st && st.id && !['staff-101', 'staff-102', 'staff-103'].includes(st.id)) {
-            uniqueStaffMap.set(st.id, st);
-          }
-        });
-        Array.from(uniqueStaffMap.values()).forEach((st: any) => {
-          alasql('INSERT INTO staff VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [
-            st.id, st.first_name, st.surname, st.contact, st.email, st.residential_address,
-            st.joining_date, st.nrc_file || '', st.nrc_filename || '', st.contract_file || '', st.contract_filename || '',
-            st.basic_salary, st.permissions_json, st.business_id || 'default_biz', st.password || '1234'
-          ]);
-        });
+      if (recovered['products'] && recovered['products'].length > 0) {
+        rehydrateAlasqlFromRecords(recovered);
+        hasRecoveredData = true;
+        runSql('SELECT COUNT(*) AS prod_count FROM products', 'Persistent DB Recovery: Recovered data from LocalStorage');
       }
-      const localStoreProducts = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}store_products`);
-      if (localStoreProducts) {
-        JSON.parse(localStoreProducts).forEach((sp: any) => {
-          alasql('INSERT INTO store_products VALUES (?,?,?,?,?)', [sp.id, sp.product_id, sp.store_id, sp.stock, sp.price]);
-        });
-      }
-      const localTransfers = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}stock_transfers`);
-      if (localTransfers) {
-        JSON.parse(localTransfers).forEach((st: any) => {
-          alasql('INSERT INTO stock_transfers VALUES (?,?,?,?,?,?,?,?)', [st.id, st.product_id, st.from_store, st.to_store, st.quantity, st.status, st.created_at, st.rejection_reason || '']);
-        });
-      }
-      const localCashUps = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}cash_ups`);
-      if (localCashUps) {
-        JSON.parse(localCashUps).forEach((cu: any) => {
-          alasql('INSERT INTO cash_ups VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)', [cu.id, cu.date, cu.store_id, cu.cashier_name, cu.sum_cash_expected, cu.sum_cash_actual, cu.sum_card_expected, cu.sum_card_actual, cu.sum_momo_expected, cu.sum_momo_actual, cu.variance, cu.notes, cu.created_at]);
-        });
-      }
-      const localQuotations = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}quotations`);
-      if (localQuotations) {
-        JSON.parse(localQuotations).forEach((qt: any) => {
-          alasql('INSERT INTO quotations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [qt.id, qt.customer_name, qt.customer_phone, qt.customer_email, qt.items_json, qt.subtotal, qt.tax, qt.discount, qt.total, qt.bank_name, qt.bank_account, qt.bank_branch, qt.status, qt.created_at]);
-        });
-      }
-
-      const localLoans = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}loans`);
-      if (localLoans) {
-        JSON.parse(localLoans).forEach((l: any) => {
-          alasql('INSERT INTO loans VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', [l.id, l.merchant_id, l.loan_account_id, l.principal_amount, l.interest_amount, l.total_repayable, l.daily_deduction_percentage, l.status, l.disbursed_at, l.due_date, l.created_at, l.updated_at]);
-        });
-      }
-      const localSchedule = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}loan_amortization_schedule`);
-      if (localSchedule) {
-        JSON.parse(localSchedule).forEach((s: any) => {
-          alasql('INSERT INTO loan_amortization_schedule VALUES (?,?,?,?,?,?,?,?,?,?)', [s.id, s.loan_id, s.installment_number, s.principal_due, s.interest_due, s.total_due, s.amount_paid, s.is_settled, s.due_date, s.settled_at]);
-        });
-      }
-      const localDeductions = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}automated_deduction_logs`);
-      if (localDeductions) {
-        JSON.parse(localDeductions).forEach((d: any) => {
-          alasql('INSERT INTO automated_deduction_logs VALUES (?,?,?,?,?,?,?)', [d.id, d.loan_id, d.source_transaction_id, d.amount_deducted, d.status, d.failure_reason, d.created_at]);
-        });
-      }
-
-      // Restore custom multi-tenant records
-      const localBusinesses = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}businesses`);
-      if (localBusinesses) {
-        JSON.parse(localBusinesses).forEach((bz: any) => {
-          alasql('INSERT INTO businesses VALUES (?,?,?,?,?,?)', [bz.id, bz.name, bz.owner, bz.email, bz.password, bz.created_at]);
-        });
-      }
-      const localStores = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}stores`);
-      if (localStores) {
-        JSON.parse(localStores).forEach((st: any) => {
-          alasql('INSERT INTO stores VALUES (?,?,?,?,?,?,?,?,?)', [st.id, st.business_id, st.name, st.location, st.allow_discounts, st.allow_refunds, st.allow_laybys, st.require_manager_discount, st.stocktake_frequency || 'weekly']);
-        });
-      }
-      const localStockTakes = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}stock_takes`);
-      if (localStockTakes) {
-        JSON.parse(localStockTakes).forEach((st: any) => {
-          alasql('INSERT INTO stock_takes VALUES (?,?,?,?,?)', [st.id, st.store_id, st.taken_at, st.performed_by, st.status]);
-        });
-      }
-      const localStockTakeItems = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}stock_take_items`);
-      if (localStockTakeItems) {
-        JSON.parse(localStockTakeItems).forEach((it: any) => {
-          alasql('INSERT INTO stock_take_items VALUES (?,?,?,?,?,?)', [it.id, it.stock_take_id, it.product_id, it.recorded_stock, it.counted_stock, it.variance]);
-        });
-      }
-
-      const localExpenses = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}expenses`);
-      if (localExpenses) {
-        JSON.parse(localExpenses).forEach((ex: any) => {
-          alasql('INSERT INTO expenses VALUES (?,?,?,?,?,?,?,?,?,?,?)', [
-            ex.id, ex.category, ex.payment_method, ex.account_id, ex.amount,
-            ex.description, ex.ref_number, ex.expense_date, ex.store_id || 'lusaka',
-            ex.performed_by || 'owner', ex.created_at
-          ]);
-        });
-      }
-
-      const localTransitPurchases = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}purchases_transit`);
-      if (localTransitPurchases) {
-        JSON.parse(localTransitPurchases).forEach((pt: any) => {
-          alasql('INSERT INTO purchases_transit VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', [
-            pt.id, pt.supplier_name, pt.store_id, pt.payment_account_id, pt.payment_method,
-            pt.items_json, pt.additional_expenses_json, pt.total_base_amount, pt.total_additional_expenses,
-            pt.total_landed_cost, pt.stage, pt.notes, pt.created_at, pt.updated_at,
-            pt.received_at || '', pt.received_by || ''
-          ]);
-        });
-      }
-
-      const localAuditLogs = localStorage.getItem(`${LOCAL_STORAGE_KEY_PREFIX}audit_logs`);
-      if (localAuditLogs) {
-        JSON.parse(localAuditLogs).forEach((al: any) => {
-          alasql('INSERT INTO audit_logs VALUES (?,?,?,?,?,?,?,?)', [
-            al.id, al.module, al.action, al.details, al.amount,
-            al.store_id || 'lusaka', al.performed_by || 'owner', al.created_at
-          ]);
-        });
-      }
-
-      runSql('SELECT COUNT(*) AS prod_count FROM products', 'Persistent DB Recovery: Recovered data from LocalStorage');
-      return;
     } catch (err) {
-      console.error('Error recovering local DB, seeding default template.', err);
+      console.warn('LocalStorage recovery notice:', err);
     }
   }
 
-  // Otherwise, Seed template-based data
-  seedTemplateData(template);
+  // Trigger background SQLite and persistent Android filesystem initialization
+  initSqliteStorage().then(async (ready) => {
+    if (ready && !forceReset) {
+      try {
+        const persistentData = await loadTablesFromPersistentStorage();
+        if (persistentData && persistentData['products'] && persistentData['products'].length > 0) {
+          console.log('[DB] Recovered tables from persistent SQLite / Filesystem storage layer');
+          rehydrateAlasqlFromRecords(persistentData);
+          notifySqlLogsUpdated();
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('database-rehydrated'));
+          }
+        }
+      } catch (sqErr) {
+        console.warn('[DB] Persistent storage background rehydrate error:', sqErr);
+      }
+    }
+  }).catch((err) => {
+    console.warn('[DB] initSqliteStorage error:', err);
+  });
+
+  if (!hasRecoveredData) {
+    // Fresh install or reset requested: Seed template-based data
+    seedTemplateData(template);
+  }
   } finally {
     isDbInitializing = false;
     persistTablesToStorage();
@@ -1325,7 +1214,8 @@ function seedTemplateData(template: SeedTemplate) {
       150.00,
       'PENDING',
       '[{"id":6,"name":"Almond Butter Croissant","quantity":10,"unitPrice":4.75},{"id":8,"name":"Gourmet Club Sandwich","quantity":24,"unitPrice":10.50}]',
-      '2026-06-05T09:00:00Z'
+      '2026-06-05T09:00:00Z',
+      'lusaka'
     )
   `, 'Seed Laybys: Jane Carter item contract');
 
@@ -1474,6 +1364,41 @@ function seedTemplateData(template: SeedTemplate) {
       '2026-06-04T11:15:00Z'
     )
   `, 'Seed Sweep: Recorded $210 split deduction on order checkout');
+
+  // Seed staff members so user accounts and staff management are ready out of the box
+  runSql(`
+    INSERT INTO staff VALUES (
+      'staff-101',
+      'Alice',
+      'Mwansa',
+      '+260 971 123456',
+      'alice@pos.zm',
+      'Plot 41 Rhodes Park, Lusaka',
+      '2026-01-15',
+      '', '', '', '',
+      6500.00,
+      '{"sales":{"create_sale":true,"apply_discounts":true,"issue_refunds":true,"void_transactions":false},"inventory":{"view_stock":true,"edit_stock":false,"adjust_pricing":false},"customer":{"create_customer":true,"edit_customer":true},"reports":{"view_daily_sales":true,"export_reports":false},"expense":{"record_expense":false},"settings":{"configure_system":false},"staff":{"attendance_management":true,"payroll_management":false,"manage_staff":false},"receipt":{"reprint_receipt":true}}',
+      'default_biz',
+      '1234'
+    )
+  `, 'Seed Staff: Alice Mwansa Cashier Profile');
+
+  runSql(`
+    INSERT INTO staff VALUES (
+      'staff-102',
+      'Brian',
+      'Banda',
+      '+260 962 654321',
+      'brian@pos.zm',
+      'Woodlands, Lusaka',
+      '2026-02-01',
+      '', '', '', '',
+      8500.00,
+      '{"sales":{"create_sale":true,"apply_discounts":true,"issue_refunds":true,"void_transactions":true},"inventory":{"view_stock":true,"edit_stock":true,"adjust_pricing":true},"customer":{"create_customer":true,"edit_customer":true},"reports":{"view_daily_sales":true,"export_reports":true},"expense":{"record_expense":true},"settings":{"configure_system":true},"staff":{"attendance_management":true,"payroll_management":true,"manage_staff":true},"receipt":{"reprint_receipt":true}}',
+      'default_biz',
+      'admin123'
+    )
+  `, 'Seed Staff: Brian Banda Store Manager Profile');
 }
 
 // ==========================================
