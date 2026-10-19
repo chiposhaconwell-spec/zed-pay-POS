@@ -225,6 +225,14 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
         alert(`✓ Staff Profile Updated: Changed details for ${firstName} ${surname}.`);
       }
     } else {
+      let activeBizId = 'default_biz';
+      try {
+        const savedBiz = localStorage.getItem('active_business_profile');
+        if (savedBiz) {
+          const parsed = JSON.parse(savedBiz);
+          if (parsed && parsed.id) activeBizId = parsed.id;
+        }
+      } catch (e) {}
       const sql = `
         INSERT INTO staff (id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password)
         VALUES (
@@ -241,7 +249,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
           '${contractFilename.replace(/'/g, "''")}',
           ${salaryNum},
           '${permissionsString.replace(/'/g, "''")}',
-          'default_biz',
+          '${activeBizId.replace(/'/g, "''")}',
           '${password.replace(/'/g, "''")}'
         )
       `;
@@ -255,6 +263,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     setShowRegisterModal(false);
     loadStaffMembers();
     persistTablesToStorage();
+    window.dispatchEvent(new Event('pos_data_updated'));
   };
 
   const handleEditStaff = (st: any) => {

@@ -215,7 +215,7 @@ export async function backupToCloud(businessId: string): Promise<{ success: bool
   }
 
   // 3. Fetch and backup Products catalog
-  const productsRes = runSql(`SELECT * FROM products WHERE business_id = '${businessId}'`, 'Cloud Sync: Fetch local products');
+  const productsRes = runSql(`SELECT * FROM products WHERE business_id = '${businessId}' OR business_id IS NULL OR business_id = 'default_biz'`, 'Cloud Sync: Fetch local products');
   if (productsRes.success && Array.isArray(productsRes.data)) {
     for (const prod of productsRes.data) {
       const prodPath = `businesses/${businessId}/products/${prod.id}`;
@@ -230,6 +230,9 @@ export async function backupToCloud(businessId: string): Promise<{ success: bool
           stock: parseInt(prod.stock as any) || 0,
           imageUrl: prod.imageUrl || '',
           business_id: businessId,
+          is_service: parseInt(prod.is_service as any) || 0,
+          batch_number: prod.batch_number || '',
+          expiry_date: prod.expiry_date || '',
         });
         totalProductsSynced++;
       } catch (err) {
@@ -371,8 +374,10 @@ export async function restoreFromCloud(businessId: string): Promise<{ success: b
       pSnap.forEach(docSnap => {
         const d = docSnap.data();
         const cleanImgUrl = d.imageUrl ? d.imageUrl.replace(/'/g, "''") : '';
+        const cleanBatch = d.batch_number ? String(d.batch_number).replace(/'/g, "''") : '';
+        const cleanExpiry = d.expiry_date ? String(d.expiry_date).replace(/'/g, "''") : '';
         runSql(`
-          INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id) VALUES (
+          INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
             ${d.id}, 
             '${d.name.replace(/'/g, "''")}', 
             '${d.sku || ''}', 
@@ -381,7 +386,10 @@ export async function restoreFromCloud(businessId: string): Promise<{ success: b
             ${d.cost || 0.0}, 
             ${d.stock || 0}, 
             '${cleanImgUrl}', 
-            '${businessId}'
+            '${businessId}',
+            ${d.is_service || 0},
+            '${cleanBatch}',
+            '${cleanExpiry}'
           )
         `, 'Restore: Sink catalog products');
         totalProductsRestored++;

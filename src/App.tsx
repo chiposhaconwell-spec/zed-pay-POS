@@ -6,12 +6,13 @@ import {
   Key, ShieldCheck, Check, Lock, Building, Building2, UserCheck, User,
   RefreshCw, Percent, ChevronRight, Sparkles, CheckSquare,
   Menu, X, Phone, Receipt, ShoppingBag, Share2, RotateCcw,
-  LayoutDashboard, FileSpreadsheet, MessageSquare, Send, HelpCircle, Truck
+  LayoutDashboard, FileSpreadsheet, MessageSquare, Send, HelpCircle, Truck,
+  Cloud, CloudUpload, CloudDownload
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 // Database API
-import { initializeDatabase, SeedTemplate, runSql, upsertCustomerSync, logEmployeeAudit } from './db';
+import { initializeDatabase, SeedTemplate, runSql, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer } from './db';
 import { StoreSettings, ActiveTab } from './types';
 
 // Custom sub-components
@@ -31,16 +32,16 @@ import EmployeeAuditTrail from './components/EmployeeAuditTrail';
 export const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
 const DEFAULT_SETTINGS: StoreSettings = {
-  storeName: 'Zambia Retail POS',
+  storeName: 'New Business POS',
   currency: 'K',
-  taxRate: 16, // Zambian standard VAT 16%
-  loyaltyRatio: 10, // 10 points per dollar spent
-  receiptHeader: 'Brewing premium artisan batches daily',
-  receiptFooter: 'Proudly supporting local SME trade communities!',
+  taxRate: 16,
+  loyaltyRatio: 10,
+  receiptHeader: 'Official Tax Invoice & Sales Receipt',
+  receiptFooter: 'Thank you for your business!',
   paperWidth: '58mm',
   logoUrl: DEFAULT_COMPANY_LOGO,
-  tpin: '1004829399',
-  termsAndConditions: '1. All goods sold are subject to 16% VAT unless exempted.\n2. Goods returned in original state are exchangeable within 7 business days.\n3. Keep receipt for warranty queries.',
+  tpin: '',
+  termsAndConditions: '1. All goods sold are subject to standard VAT unless exempted.\n2. Goods returned in original state are exchangeable within 7 business days.\n3. Keep receipt for warranty queries.',
   printerName: 'ZPOS-Bluetooth-58M (Default Linked)',
   printerInterface: 'Bluetooth Low Energy (BLE)',
   printerStatus: 'Linked',
@@ -55,26 +56,38 @@ export default function App() {
 
   // SME global states: Permission levels & Branch store locations
   const [userRole, setUserRole] = useState<string>('owner'); // 'owner' | 'manager' | 'sales'
-  const [activeStore, setActiveStore] = useState<string>('lusaka'); // 'lusaka' | 'kitwe' | 'ndola'
+  const [activeStore, setActiveStore] = useState<string>('');
 
   // Navigation Drawer state (3-lines hamburger)
   const [showNavDrawer, setShowNavDrawer] = useState(false);
 
-  // Dynamic Enterprise & Multi-Business Gating State
+  // Dynamic Enterprise & Multi-Business Gating State (Blank on default)
   const [activeBusiness, setActiveBusiness] = useState<{ id: string; name: string; owner: string; email: string }>({
-    id: 'default_biz',
-    name: 'Zambia Retail POS',
-    owner: 'Chiposha Conwell',
-    email: 'cornbtechnologies@gmail.com'
+    id: '',
+    name: 'Setup Business Account',
+    owner: '',
+    email: ''
   });
   const [businesses, setBusinesses] = useState<any[]>([]);
   const [stores, setStores] = useState<any[]>([]);
   const [showBusinessModal, setShowBusinessModal] = useState(false);
+  const [hubMode, setHubMode] = useState<'register' | 'sync_login' | 'store'>('register');
   const [newBizName, setNewBizName] = useState('');
   const [newBizOwner, setNewBizOwner] = useState('');
   const [newBizEmail, setNewBizEmail] = useState('');
   const [newBizPassword, setNewBizPassword] = useState('');
   const [newBizFirstStore, setNewBizFirstStore] = useState('');
+  const [newBizLocation, setNewBizLocation] = useState('Lusaka');
+  const [newBizCurrency, setNewBizCurrency] = useState('K');
+  const [newBizTaxRate, setNewBizTaxRate] = useState('16');
+  const [newBizTpin, setNewBizTpin] = useState('');
+  const [newBizOpeningCash, setNewBizOpeningCash] = useState('0.00');
+
+  // Existing Business Cloud Sign-In / Sync states
+  const [syncLoginEmail, setSyncLoginEmail] = useState('');
+  const [syncLoginPassword, setSyncLoginPassword] = useState('');
+  const [isHeaderSyncing, setIsHeaderSyncing] = useState(false);
+  const [lastHeaderSyncMsg, setLastHeaderSyncMsg] = useState<string | null>(null);
 
   // Floating Store Creation Form inside switcher
   const [showStoreForm, setShowStoreForm] = useState(false);
@@ -86,8 +99,8 @@ export default function App() {
   const [newStoreAllowLaybys, setNewStoreAllowLaybys] = useState(true);
   const [newStoreReqManager, setNewStoreReqManager] = useState(false);
 
-  // Drawer Modals & Counts
-  const [badgeCounts, setBadgeCounts] = useState({ products: 138, customers: 342, staff: 0 });
+  // Drawer Modals & Counts (Blank on default)
+  const [badgeCounts, setBadgeCounts] = useState({ products: 0, customers: 0, staff: 0 });
   
   // Expense Modal state
   const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -140,14 +153,14 @@ export default function App() {
     }
   };
 
-  // Update badge counts from DB
+  // Update badge counts from DB (strictly 0 when empty)
   const updateBadgeCounts = () => {
     try {
       const pRes = runSql(`SELECT COUNT(*) as cnt FROM products`, 'Query product count');
-      const prodCnt = (pRes.success && pRes.data?.[0]?.cnt) ? pRes.data[0].cnt : 138;
+      const prodCnt = (pRes.success && pRes.data?.[0]?.cnt !== undefined) ? pRes.data[0].cnt : 0;
 
       const cRes = runSql(`SELECT COUNT(*) as cnt FROM customers`, 'Query customer count');
-      const custCnt = (cRes.success && cRes.data?.[0]?.cnt) ? cRes.data[0].cnt : 342;
+      const custCnt = (cRes.success && cRes.data?.[0]?.cnt !== undefined) ? cRes.data[0].cnt : 0;
 
       const sRes = runSql(`SELECT COUNT(*) as cnt FROM staff`, 'Query staff count');
       const staffCnt = (sRes.success && sRes.data?.[0]?.cnt !== undefined) ? sRes.data[0].cnt : 0;
@@ -164,30 +177,48 @@ export default function App() {
 
   // Load custom configurations on startup
   useEffect(() => {
-    // 1. Recover merchant preference details
+    // 1. Provision memory SQL tables in blank mode (no preseeded stock, batches, or login accounts)
+    initializeDatabase('blank');
+
+    // 2. Recover merchant preference details
     const localConf = localStorage.getItem('android_pos_settings');
     if (localConf) {
       try {
         setSettings(JSON.parse(localConf));
       } catch (err) {
-        console.warn('Failed restoring settings, falling back to corporate config details.', err);
+        console.warn('Failed restoring settings, falling back to default config details.', err);
       }
     }
-
-    // 2. Provision memory SQL tables and indices
-    initializeDatabase('cafe');
 
     // 3. Load initial CRM customers
     fetchCustomersList();
 
-    // 3. Load logged-in business session from localStorage
+    // 4. Load logged-in business session from localStorage if valid in DB
+    const bRes = runSql(`SELECT * FROM businesses`, 'Startup: Check registered business accounts');
+    const existingBusinesses = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
+
     const savedBiz = localStorage.getItem('active_business_profile');
-    if (savedBiz) {
+    if (savedBiz && existingBusinesses.length > 0) {
       try {
-        setActiveBusiness(JSON.parse(savedBiz));
+        const parsed = JSON.parse(savedBiz);
+        const match = existingBusinesses.find((b: any) => b.id === parsed.id);
+        if (match) {
+          setActiveBusiness(match);
+        } else {
+          setActiveBusiness(existingBusinesses[0]);
+          localStorage.setItem('active_business_profile', JSON.stringify(existingBusinesses[0]));
+        }
       } catch (e) {
-        console.warn('Failed to parse cached corporate profile context', e);
+        setActiveBusiness(existingBusinesses[0]);
       }
+    } else if (existingBusinesses.length > 0) {
+      setActiveBusiness(existingBusinesses[0]);
+      localStorage.setItem('active_business_profile', JSON.stringify(existingBusinesses[0]));
+    } else {
+      // No business exists yet: clear any stale default_biz profile and prompt new business setup
+      localStorage.removeItem('active_business_profile');
+      setShowBusinessModal(true);
+      setHubMode('register');
     }
 
     updateBadgeCounts();
@@ -262,37 +293,43 @@ export default function App() {
   }, []);
 
   const loadBusinessData = () => {
-    // 1. Fetch businesses which exist in DB
+    // 1. Fetch businesses which exist in DB (no preseeded fallback)
     const bResult = runSql(`SELECT * FROM businesses`, 'App: Query registered corporate business accounts');
-    if (bResult.success && Array.isArray(bResult.data) && bResult.data.length > 0) {
-      setBusinesses(bResult.data);
-    } else {
-      setBusinesses([{ id: 'default_biz', name: 'Zambia Retail POS', owner: 'Chiposha Conwell', email: 'owner@pos.zm' }]);
+    const bizRows = (bResult.success && Array.isArray(bResult.data)) ? bResult.data : [];
+    setBusinesses(bizRows);
+
+    let currentBiz = activeBusiness;
+    if (bizRows.length > 0) {
+      const matched = bizRows.find((b: any) => b.id === activeBusiness.id);
+      if (!matched) {
+        currentBiz = bizRows[0];
+        setActiveBusiness(currentBiz);
+        localStorage.setItem('active_business_profile', JSON.stringify(currentBiz));
+      }
+    } else if (activeBusiness.id) {
+      currentBiz = { id: '', name: 'Setup Business Account', owner: '', email: '' };
+      setActiveBusiness(currentBiz);
     }
 
-    // 2. Fetch stores of the activeBusiness
-    const sResult = runSql(`SELECT * FROM stores WHERE business_id = '${activeBusiness.id}'`, 'App: Query branch outlets for active business');
-    if (sResult.success && Array.isArray(sResult.data) && sResult.data.length > 0) {
-      setStores(sResult.data);
-      // Fallback selection if activeStore is not valid for this business
-      const exists = sResult.data.find(s => s.id === activeStore);
-      if (!exists) {
-        setActiveStore(sResult.data[0].id);
+    // 2. Fetch stores of the activeBusiness (no preseeded fallback stores)
+    if (currentBiz && currentBiz.id) {
+      const sResult = runSql(`SELECT * FROM stores WHERE business_id = '${currentBiz.id}'`, 'App: Query branch outlets for active business');
+      const allStoresRes = (!sResult.data || sResult.data.length === 0)
+        ? runSql(`SELECT * FROM stores`, 'App: Query all branch outlets')
+        : sResult;
+      if (allStoresRes.success && Array.isArray(allStoresRes.data) && allStoresRes.data.length > 0) {
+        setStores(allStoresRes.data);
+        const exists = allStoresRes.data.find((s: any) => s.id === activeStore);
+        if (!exists) {
+          setActiveStore(allStoresRes.data[0].id);
+        }
+      } else {
+        setStores([]);
+        setActiveStore('');
       }
     } else {
-      // Seed default fallback stores if table is currently initializing
-      const defaultStoresList = [
-        { id: 'lusaka', business_id: 'default_biz', name: 'Lusaka Main Office', location: 'Lusaka', allow_discounts: 1, allow_refunds: 1, allow_laybys: 1, require_manager_discount: 0 },
-        { id: 'kitwe', business_id: 'default_biz', name: 'Kitwe Regional Yard', location: 'Kitwe', allow_discounts: 1, allow_refunds: 1, allow_laybys: 1, require_manager_discount: 0 },
-        { id: 'ndola', business_id: 'default_biz', name: 'Ndola Branch Station', location: 'Ndola', allow_discounts: 0, allow_refunds: 0, allow_laybys: 1, require_manager_discount: 1 }
-      ];
-      setStores(defaultStoresList.filter(s => s.business_id === activeBusiness.id));
-      if (activeBusiness.id === 'default_biz') {
-        const exists = defaultStoresList.find(s => s.id === activeStore);
-        if (!exists) {
-          setActiveStore('lusaka');
-        }
-      }
+      setStores([]);
+      setActiveStore('');
     }
   };
 
@@ -301,6 +338,8 @@ export default function App() {
 
     const handleDbRestored = () => {
       setSqlSeedTrigger(prev => prev + 1);
+      loadBusinessData();
+      updateBadgeCounts();
     };
     window.addEventListener('local_db_restored', handleDbRestored);
     return () => {
@@ -309,78 +348,117 @@ export default function App() {
   }, [sqlSeedTrigger, activeBusiness.id]);
 
   const handleRefreshDatabase = (template: SeedTemplate) => {
-    // Trigger dropping and rebuilding tables using target templates
     initializeDatabase(template, true);
-    setSqlSeedTrigger(prev => prev + 1); // trigger state syncs
+    setSqlSeedTrigger(prev => prev + 1);
   };
 
-  const handleSetTerminalCode = (code: string) => {
-    // If we trigger a console sync, load it
+  const handleSetTerminalCode = (code: string) => {};
+
+  const handleQuickCloudSync = async () => {
+    setIsHeaderSyncing(true);
+    setLastHeaderSyncMsg('Syncing...');
+    try {
+      const targetBizId = activeBusiness?.id || undefined;
+      if (targetBizId) {
+        const pushRes = await pushDatabaseToServer(targetBizId);
+        if (pushRes.success) {
+          setLastHeaderSyncMsg('Synced');
+        } else {
+          setLastHeaderSyncMsg('Sync Retry');
+        }
+      } else {
+        const pullRes = await pullDatabaseFromServer();
+        if (pullRes.success) {
+          loadBusinessData();
+          updateBadgeCounts();
+          setSqlSeedTrigger(prev => prev + 1);
+          setLastHeaderSyncMsg('Pulled');
+        } else {
+          setLastHeaderSyncMsg('No Cloud Data');
+        }
+      }
+    } catch (e) {
+      setLastHeaderSyncMsg('Offline');
+    } finally {
+      setIsHeaderSyncing(false);
+      setTimeout(() => setLastHeaderSyncMsg(null), 3500);
+    }
   };
 
-  // Register and Switch Enterprise Corporate Accounts
-  const handleRegisterBusiness = (e: React.FormEvent) => {
+  // Register New Business Account (100% Blank Stock/Batches Setup + Immediate Cloud SQL Sync)
+  const handleRegisterBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newBizName || !newBizOwner || !newBizEmail || !newBizPassword) {
-      alert('Must fill out all profile credentials');
+      alert('Please fill out Business Name, Owner Name, Admin Email, and Password.');
       return;
     }
 
     const bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
     const storeId = 'store_' + Math.floor(1000 + Math.random() * 9000);
-    const rawStoreName = newBizFirstStore.trim() || `${newBizName} Head Office`;
+    const rawStoreName = newBizFirstStore.trim() || `${newBizName.trim()} Main Branch`;
+    const rawLocation = newBizLocation.trim() || 'Main Location';
     const nowStr = new Date().toISOString();
 
     // 1. Insert registration record into BUSINESSES
     runSql(`
       INSERT INTO businesses (id, name, owner, email, password, created_at) VALUES (
         '${bizId}',
-        '${newBizName.replace(/'/g, "''")}',
-        '${newBizOwner.replace(/'/g, "''")}',
-        '${newBizEmail.replace(/'/g, "''")}',
+        '${newBizName.trim().replace(/'/g, "''")}',
+        '${newBizOwner.trim().replace(/'/g, "''")}',
+        '${newBizEmail.trim().replace(/'/g, "''")}',
         '${newBizPassword.replace(/'/g, "''")}',
         '${nowStr}'
       )
-    `, `Registration: Boot Enterprise account [${newBizName}]`);
+    `, `Registration: Create blank enterprise account [${newBizName}]`);
 
-    // 2. Create first outlet branch into STORES table
+    // 2. Create primary outlet branch into STORES table (with 0 preseeded products/batches)
     runSql(`
-      INSERT INTO stores VALUES (
+      INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
         '${storeId}',
         '${bizId}',
         '${rawStoreName.replace(/'/g, "''")}',
-        'Lusaka',
+        '${rawLocation.replace(/'/g, "''")}',
         1, 1, 1, 0
       )
-    `, `Registration: Auto-provision first store outlet [${rawStoreName}]`);
+    `, `Registration: Provision primary store outlet [${rawStoreName}]`);
 
-    // 3. Create initial seed products for this new business 
-    const defaultProds = [
-      { id: Math.floor(10000 + Math.random() * 90000), name: 'Premium Copper Wire Reel', sku: 'ZAM-COP-' + Math.floor(100 + Math.random() * 900), category: 'Mining Goods', price: 950.00, cost: 420.00, stock: 50, imageUrl: 'https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=150&referrerPolicy=no-referrer' },
-      { id: Math.floor(10000 + Math.random() * 90000), name: 'Organic Zambia Honey (500g)', sku: 'ZAM-HON-' + Math.floor(100 + Math.random() * 900), category: 'Local Goods', price: 65.00, cost: 25.00, stock: 260, imageUrl: 'https://images.unsplash.com/photo-1587049352846-4a222e784d38?w=150&referrerPolicy=no-referrer' }
-    ];
-    defaultProds.forEach(p => {
-      runSql(`
-        INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id) VALUES (
-          ${p.id}, '${p.name}', '${p.sku}', '${p.category}', ${p.price}, ${p.cost}, ${p.stock}, '${p.imageUrl}', '${bizId}'
-        )
-      `, 'Corporate: Seed first assets');
-      
-      // Setup inventory link
-      const spId = `sp_${p.id}_${storeId}`;
-      runSql(`
-        INSERT INTO store_products VALUES (
-          '${spId}', ${p.id}, '${storeId}', ${p.stock}, ${p.price}
-        )
-      `, 'Corporate: Associate store product level');
-    });
+    // 3. Update StoreSettings with the new business configuration
+    const updatedSettings: StoreSettings = {
+      ...settings,
+      storeName: newBizName.trim(),
+      currency: newBizCurrency.trim() || 'K',
+      taxRate: !isNaN( parseFloat(newBizTaxRate) ) ? parseFloat(newBizTaxRate) : 16,
+      tpin: newBizTpin.trim()
+    };
+    setSettings(updatedSettings);
+    localStorage.setItem('android_pos_settings', JSON.stringify(updatedSettings));
 
-    const newlyRegisteredBusiness = { id: bizId, name: newBizName, owner: newBizOwner, email: newBizEmail };
-    // 4. Save and switch session to this active business workspace
-    setActiveBusiness(newlyRegisteredBusiness);
+    const newlyRegisteredBusiness = {
+      id: bizId,
+      name: newBizName.trim(),
+      owner: newBizOwner.trim(),
+      email: newBizEmail.trim()
+    };
+
+    // 4. Save session, activate shift on the newly created store so owner can immediately start working
+    const openCashNum = Math.max(0, parseFloat(newBizOpeningCash || '0') || 0);
     localStorage.setItem('active_business_profile', JSON.stringify(newlyRegisteredBusiness));
+    localStorage.setItem('pos_shift_active', 'true');
+    localStorage.setItem('shift_active_' + storeId, 'true');
+    localStorage.setItem('shift_opening_cash_' + storeId, openCashNum.toFixed(2));
+    localStorage.setItem('shift_opening_cash_global', openCashNum.toFixed(2));
+    localStorage.setItem('logged_in_user_email', newBizEmail.trim());
+    localStorage.setItem('logged_in_user_name', newBizOwner.trim());
+    localStorage.setItem('quick_salesperson_name', newBizOwner.trim());
+
+    setActiveBusiness(newlyRegisteredBusiness);
     setActiveStore(storeId);
+    setUserRole('owner');
+    persistTablesToStorage();
     setSqlSeedTrigger(prev => prev + 1);
+
+    // 5. Synchronize new business & store immediately to Cloud SQL
+    pushDatabaseToServer(bizId).catch(err => console.warn('Initial Cloud SQL push warning:', err));
 
     // Reset fields
     setNewBizName('');
@@ -390,11 +468,87 @@ export default function App() {
     setNewBizFirstStore('');
     setShowBusinessModal(false);
 
-    alert(`Congratulations! Enterprise [${newBizName}] created successfully with primary outlet [${rawStoreName}]!`);
+    window.dispatchEvent(new Event('pos_data_updated'));
+    alert(`✓ Business Account [${newlyRegisteredBusiness.name}] & Primary Branch [${rawStoreName}] created!\n\nYour inventory and accounting ledgers start 100% blank with zero preseeded stock or batches, and your workspace is synchronized with Cloud SQL.`);
+  };
+
+  // Sign In & Pull Existing Business Account from Cloud SQL
+  const handleSyncExistingAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetEmail = syncLoginEmail.trim();
+    const targetPass = syncLoginPassword.trim();
+    if (!targetEmail || !targetPass) {
+      alert('Please enter your registered Business Email and Password.');
+      return;
+    }
+
+    setIsHeaderSyncing(true);
+    try {
+      // Pull from Cloud SQL by email
+      const pullRes = await pullDatabaseFromServer(undefined, targetEmail);
+      const bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check businesses');
+      const bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
+      const matchedBiz = bizList.find((b: any) => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
+
+      if (!matchedBiz) {
+        alert(`No synchronized business account found for email [${targetEmail}]. Please verify your email or register a new business account.`);
+        setIsHeaderSyncing(false);
+        return;
+      }
+
+      if (matchedBiz.password && matchedBiz.password !== targetPass) {
+        alert('Invalid password for this business account.');
+        setIsHeaderSyncing(false);
+        return;
+      }
+
+      const activeBizObj = {
+        id: matchedBiz.id,
+        name: matchedBiz.name,
+        owner: matchedBiz.owner || 'Owner',
+        email: matchedBiz.email
+      };
+      setActiveBusiness(activeBizObj);
+      localStorage.setItem('active_business_profile', JSON.stringify(activeBizObj));
+
+      const updatedSettings: StoreSettings = {
+        ...settings,
+        storeName: matchedBiz.name
+      };
+      setSettings(updatedSettings);
+      localStorage.setItem('android_pos_settings', JSON.stringify(updatedSettings));
+
+      const sRes = runSql(`SELECT * FROM stores WHERE business_id = '${matchedBiz.id}'`, 'Cloud Login: Load stores');
+      if (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0) {
+        const firstStoreId = sRes.data[0].id;
+        setActiveStore(firstStoreId);
+        localStorage.setItem('pos_shift_active', 'true');
+        localStorage.setItem('shift_active_' + firstStoreId, 'true');
+      }
+
+      localStorage.setItem('logged_in_user_email', matchedBiz.email);
+      localStorage.setItem('logged_in_user_name', matchedBiz.owner || matchedBiz.name);
+      setUserRole('owner');
+      setSyncLoginEmail('');
+      setSyncLoginPassword('');
+      setShowBusinessModal(false);
+      setSqlSeedTrigger(prev => prev + 1);
+      window.dispatchEvent(new Event('pos_data_updated'));
+
+      alert(`✓ Synchronized & Signed In to [${matchedBiz.name}]!\n${pullRes.details || 'All stores, stock, batches, and accounting ledgers have been synchronized.'}`);
+    } catch (err: any) {
+      alert(`Sync Sign-In Error: ${err?.message || String(err)}`);
+    } finally {
+      setIsHeaderSyncing(false);
+    }
   };
 
   const handleCreateNewStore = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!activeBusiness.id) {
+      alert('Please register or sign into your business account first before adding extra branches.');
+      return;
+    }
     if (!newStoreName) {
       alert('Provide a valid Store Name');
       return;
@@ -415,7 +569,7 @@ export default function App() {
         '${finalId}',
         '${activeBusiness.id}',
         '${newStoreName.replace(/'/g, "''")}',
-        '${(newStoreLocation || 'Zambia').replace(/'/g, "''")}',
+        '${(newStoreLocation || 'Main').replace(/'/g, "''")}',
          ${newStoreAllowDiscounts ? 1 : 0},
          ${newStoreAllowRefunds ? 1 : 0},
          ${newStoreAllowLaybys ? 1 : 0},
@@ -423,24 +577,27 @@ export default function App() {
       )
     `, `SME Owner: Dynamic store creation commit for branch [${newStoreName}]`);
 
-    // Link existing product templates so they exist inside store_products too
+    // Link existing product templates for this business with 0 initial stock in the new branch
     const prodsResult = runSql(`SELECT * FROM products WHERE business_id = '${activeBusiness.id}'`, 'Store: Read business products');
     if (prodsResult.success && Array.isArray(prodsResult.data)) {
       prodsResult.data.forEach(p => {
         const spId = `sp_${p.id}_${finalId}`;
         runSql(`
           INSERT INTO store_products VALUES (
-            '${spId}', ${p.id}, '${finalId}', ${p.stock}, ${p.price}
+            '${spId}', ${p.id}, '${finalId}', 0, ${p.price}
           )
-        `, 'Store Link: Map stock overrides');
+        `, 'Store Link: Map branch product row');
       });
     }
 
-    alert(`Store outlet [${newStoreName}] with custom authorization rules has been registered dynamically as a node!`);
+    persistTablesToStorage();
+    pushDatabaseToServer(activeBusiness.id).catch(() => {});
+    alert(`Store outlet [${newStoreName}] has been registered and synchronized!`);
     setNewStoreName('');
     setNewStoreId('');
     setNewStoreLocation('');
     setShowStoreForm(false);
+    setActiveStore(finalId);
     setSqlSeedTrigger(prev => prev + 1);
   };
 
@@ -522,22 +679,36 @@ export default function App() {
               <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider font-mono hidden md:inline">Branch:</span>
               <select
                 value={activeStore}
-                disabled={userRole === 'sales'}
+                disabled={userRole === 'sales' || stores.length === 0}
                 onChange={(e) => {
                   setActiveStore(e.target.value);
                   setSqlSeedTrigger(prev => prev + 1);
                 }}
                 className={`bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer uppercase font-sans ${userRole === 'sales' ? 'opacity-65 cursor-not-allowed bg-slate-950 text-slate-400' : ''}`}
               >
-                {stores.map(st => (
-                  <option key={st.id} value={st.id}>{st.name}</option>
-                ))}
+                {stores.length === 0 ? (
+                  <option value="">No Branch Setup</option>
+                ) : (
+                  stores.map(st => (
+                    <option key={st.id} value={st.id}>{st.name}</option>
+                  ))
+                )}
               </select>
             </div>
           </div>
 
-          {/* User Role Badge */}
+          {/* Cloud Sync & User Role Badge */}
           <div className="flex items-center gap-1.5 sm:gap-2">
+            <button
+              onClick={handleQuickCloudSync}
+              disabled={isHeaderSyncing}
+              title="Synchronize business data with Cloud SQL"
+              className="flex items-center gap-1 px-2 py-1 rounded-md bg-sky-950/90 hover:bg-sky-900 text-sky-300 border border-sky-800/80 text-[10px] sm:text-[11px] font-bold cursor-pointer transition-all"
+            >
+              <RefreshCw size={12} className={isHeaderSyncing ? 'animate-spin text-sky-400' : 'text-sky-400'} />
+              <span className="hidden sm:inline">{lastHeaderSyncMsg || 'Sync'}</span>
+            </button>
+
             <select
               value={userRole}
               onChange={(e) => {
@@ -560,8 +731,8 @@ export default function App() {
         </div>
 
         {/* Dynamic Display Area (Defaults to clean Sale Register view) */}
-        <div className="flex-1 flex overflow-hidden relative">
-          <div className="flex-1 flex flex-col overflow-hidden bg-slate-50 relative z-0">
+        <div className="flex-1 flex overflow-hidden relative min-w-0 w-full">
+          <div className="flex-1 flex flex-col overflow-hidden bg-slate-50 relative z-0 min-w-0 w-full">
               <AnimatePresence mode="wait">
                 {activeTab === 'billing' && (
                   <motion.div
@@ -570,7 +741,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden"
+                    className="flex-1 flex flex-col overflow-hidden min-w-0 w-full"
                   >
                     <BillingTerminal
                       settings={settings}
@@ -592,7 +763,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden"
+                    className="flex-1 flex flex-col overflow-hidden min-w-0 w-full"
                   >
                     <LaybysBoard 
                       settings={settings} 
@@ -611,7 +782,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden"
+                    className="flex-1 flex flex-col overflow-hidden min-w-0 w-full"
                   >
                     <InventoryManager 
                       settings={settings} 
@@ -1610,9 +1781,9 @@ export default function App() {
         </div>
       )}
 
-      {/* ENTERPRISE WORKSPACE & REGISTER BUSINESS Hub Modal Overlay */}
+      {/* ENTERPRISE WORKSPACE, BLANK ACCOUNT SETUP & CLOUD SYNC HUB MODAL */}
       {showBusinessModal && (
-        <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto select-none">
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto select-none">
           <motion.div
             initial={{ scale: 0.95, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
@@ -1623,110 +1794,183 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <Building2 className="text-indigo-400" size={20} />
                 <div>
-                  <h3 className="text-sm font-black uppercase tracking-wider text-slate-100">Enterprise Business Hub</h3>
-                  <p className="text-[10px] text-slate-400 font-medium">Create and switch between separate businesses and stores dynamically</p>
+                  <h3 className="text-sm font-black uppercase tracking-wider text-slate-100">
+                    {businesses.length === 0 ? 'Welcome — Set Up Your New Business or Sync Account' : 'Enterprise Business & Cloud Sync Hub'}
+                  </h3>
+                  <p className="text-[10px] text-slate-400 font-medium">
+                    Starts 100% blank with zero preseeded stock or batches. All accounts & ledgers synchronize with Cloud SQL.
+                  </p>
                 </div>
               </div>
-              <button
-                onClick={() => {
-                  setShowBusinessModal(false);
-                  setShowStoreForm(false);
-                }}
-                className="text-slate-400 hover:text-white p-1 bg-slate-800 rounded-lg cursor-pointer"
-              >
-                ✕ Close
-              </button>
+              {businesses.length > 0 && (
+                <button
+                  onClick={() => {
+                    setShowBusinessModal(false);
+                    setShowStoreForm(false);
+                  }}
+                  className="text-slate-400 hover:text-white p-1.5 bg-slate-800 rounded-lg cursor-pointer text-xs font-bold"
+                >
+                  ✕ Close
+                </button>
+              )}
             </div>
 
-            {/* Split UI: Left (Registered list), Right (Actions / forms) */}
+            {/* Split UI: Left (Registered list & Cloud status), Right (Register / Sync Login / Add Store) */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
               
               {/* LEFT: Businesses list & active indicators */}
               <div className="flex flex-col gap-4">
                 <h4 className="text-[10px] uppercase font-bold text-slate-400 tracking-wider flex items-center gap-1.5 font-mono">
-                  <span>🏢 Active Workspaces ({businesses.length})</span>
+                  <span>🏢 Registered Workspaces ({businesses.length})</span>
                 </h4>
                 <div className="flex flex-col gap-2 overflow-y-auto max-h-[290px] pr-1">
-                  {businesses.map((b) => {
-                    const isActive = b.id === activeBusiness.id;
-                    return (
-                      <div
-                        key={b.id}
-                        onClick={() => handleSelectBusinessWorkspace(b)}
-                        className={`p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
-                          isActive
-                            ? 'bg-indigo-950/60 border-indigo-500 shadow-md text-white'
-                            : 'bg-slate-850 hover:bg-slate-800 border-slate-805 text-slate-300'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="font-bold text-xs font-sans tracking-wide truncate max-w-[170px]">{b.name}</span>
-                          {isActive && (
-                            <span className="text-[8px] bg-emerald-600 text-white font-extrabold px-1.5 py-0.5 rounded-full uppercase tracking-widest flex items-center gap-1 animate-pulse">
-                              <Check size={8} /> active
-                            </span>
-                          )}
+                  {businesses.length === 0 ? (
+                    <div className="p-4 rounded-xl border border-dashed border-slate-700 bg-slate-950/60 text-slate-400 text-xs flex flex-col gap-2">
+                      <span className="font-bold text-slate-200">No Business Account Configured Yet</span>
+                      <p className="text-[11px] leading-relaxed">
+                        This POS comes completely blank by default—no preseeded stock, batches, or login accounts—so your business starts with clean accounting and inventory records.
+                      </p>
+                      <p className="text-[10.5px] text-indigo-300 font-semibold">
+                        👉 Use the form to create your business account, or switch to "Sync Existing" to restore your account from Cloud SQL.
+                      </p>
+                    </div>
+                  ) : (
+                    businesses.map((b) => {
+                      const isActive = b.id === activeBusiness.id;
+                      return (
+                        <div
+                          key={b.id}
+                          onClick={() => handleSelectBusinessWorkspace(b)}
+                          className={`p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
+                            isActive
+                              ? 'bg-indigo-950/60 border-indigo-500 shadow-md text-white'
+                              : 'bg-slate-850 hover:bg-slate-800 border-slate-805 text-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="font-bold text-xs font-sans tracking-wide truncate max-w-[170px]">{b.name}</span>
+                            {isActive && (
+                              <span className="text-[8px] bg-emerald-600 text-white font-extrabold px-1.5 py-0.5 rounded-full uppercase tracking-widest flex items-center gap-1">
+                                <Check size={8} /> active
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between font-mono text-[9px] text-slate-400">
+                            <span className="truncate max-w-[130px]">{b.owner} ({b.email})</span>
+                            <span>ID: {b.id.toUpperCase()}</span>
+                          </div>
                         </div>
-                        <div className="flex items-center justify-between font-mono text-[9px] text-slate-400">
-                          <span className="truncate max-w-[120px]">{b.owner} ({b.email})</span>
-                          <span>ID: {b.id.toUpperCase()}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })
+                  )}
                 </div>
 
                 <div className="p-3 bg-slate-950 rounded-xl border border-slate-850 font-mono text-[9.5px] leading-relaxed text-slate-400">
-                  ⚡ Switching work-environments automatically filters the POS catalogs, customer registries, double-entry journals, and branch financial statistics correctly matching that entity!
+                  ☁️ Cloud SQL Synchronization: Every business account, branch store, stock item, batch, sale, and double-entry accounting ledger is automatically synchronized.
                 </div>
               </div>
 
-              {/* RIGHT ACTIONS: Account registration or dynamic stores addition */}
+              {/* RIGHT ACTIONS: Account registration, Cloud Sync Sign-In, or dynamic stores addition */}
               <div className="flex flex-col gap-4 border-t md:border-t-0 md:border-l border-slate-800 pt-5 md:pt-0 md:pl-6">
                 
                 {/* Mode Select Header */}
-                <div className="flex items-center justify-between gap-1 select-none">
-                  <span className="text-[10px] uppercase font-bold text-indigo-400 tracking-wider">Configure Enterprise</span>
-                  <div className="flex gap-1.5">
+                <div className="flex items-center justify-between gap-1 select-none flex-wrap">
+                  <div className="flex gap-1.5 flex-wrap">
                     <button
-                      onClick={() => setShowStoreForm(false)}
-                      className={`text-[9px] font-bold px-2.5 py-1 rounded cursor-pointer ${!showStoreForm ? 'bg-indigo-650 text-white' : 'bg-slate-800 text-slate-400'}`}
+                      type="button"
+                      onClick={() => { setHubMode('register'); setShowStoreForm(false); }}
+                      className={`text-[9.5px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${hubMode === 'register' && !showStoreForm ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
                     >
-                      + Business
+                      + New Business
                     </button>
                     <button
-                      onClick={() => setShowStoreForm(true)}
-                      className={`text-[9px] font-bold px-2.5 py-1 rounded cursor-pointer ${showStoreForm ? 'bg-indigo-650 text-white' : 'bg-slate-800 text-slate-400'}`}
+                      type="button"
+                      onClick={() => { setHubMode('sync_login'); setShowStoreForm(false); }}
+                      className={`text-[9.5px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${hubMode === 'sync_login' && !showStoreForm ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
                     >
-                      + Store Outlet
+                      ☁️ Sync Existing
                     </button>
+                    {businesses.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => { setHubMode('store'); setShowStoreForm(true); }}
+                        className={`text-[9.5px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${showStoreForm || hubMode === 'store' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
+                      >
+                        + Branch Outlet
+                      </button>
+                    )}
                   </div>
                 </div>
 
-                {!showStoreForm ? (
-                  /* REGISTER CORPORATE BUSINESS INTERACTIVE FORM */
-                  <form onSubmit={handleRegisterBusiness} className="flex flex-col gap-3">
-                    <h5 className="text-[11px] font-semibold text-slate-200 uppercase tracking-widest font-mono">Register Corporate Account</h5>
+                {hubMode === 'sync_login' && !showStoreForm ? (
+                  /* SIGN IN & SYNCHRONIZE EXISTING ACCOUNT FROM CLOUD SQL */
+                  <form onSubmit={handleSyncExistingAccount} className="flex flex-col gap-3">
+                    <h5 className="text-[11px] font-semibold text-emerald-400 uppercase tracking-widest font-mono">
+                      Synchronize Existing Business Account
+                    </h5>
+                    <p className="text-[10.5px] text-slate-400 leading-relaxed">
+                      Enter your registered Business Email and Password to pull your stores, stock catalog, batches, and accounting ledgers from Cloud SQL.
+                    </p>
+
+                    <div className="flex flex-col gap-1 text-[11px]">
+                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Registered Admin Email</label>
+                      <input
+                        type="email"
+                        value={syncLoginEmail}
+                        onChange={(e) => setSyncLoginEmail(e.target.value)}
+                        placeholder="e.g. admin@yourbusiness.com"
+                        required
+                        className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-1 text-[11px]">
+                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Account Password</label>
+                      <input
+                        type="password"
+                        value={syncLoginPassword}
+                        onChange={(e) => setSyncLoginPassword(e.target.value)}
+                        placeholder="••••••••"
+                        required
+                        className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={isHeaderSyncing}
+                      className="mt-1 py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider cursor-pointer shadow-md flex items-center justify-center gap-1.5 select-none"
+                    >
+                      <RefreshCw size={14} className={isHeaderSyncing ? 'animate-spin' : ''} />
+                      <span>{isHeaderSyncing ? 'Synchronizing from Cloud...' : 'Sync & Sign In'}</span>
+                    </button>
+                  </form>
+                ) : !showStoreForm ? (
+                  /* REGISTER NEW BLANK CORPORATE BUSINESS INTERACTIVE FORM */
+                  <form onSubmit={handleRegisterBusiness} className="flex flex-col gap-2.5">
+                    <h5 className="text-[11px] font-semibold text-slate-200 uppercase tracking-widest font-mono">
+                      Create New Business Account (Blank Slate)
+                    </h5>
                     
                     <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Business / Enterprise Name</label>
+                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Business / Company Name</label>
                       <input
                         type="text"
                         value={newBizName}
                         onChange={(e) => setNewBizName(e.target.value)}
-                        placeholder="e.g. Copper Belt Wholesalers"
+                        placeholder="e.g. Zambezi Hardware & General"
                         required
                         className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-bold focus:outline-hidden text-xs"
                       />
                     </div>
 
                     <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Owner / Administrator Name</label>
+                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Owner / Administrator Full Name</label>
                       <input
                         type="text"
                         value={newBizOwner}
                         onChange={(e) => setNewBizOwner(e.target.value)}
-                        placeholder="e.g. Chiposha Conwell"
+                        placeholder="e.g. Mutale Banda"
                         required
                         className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-bold focus:outline-hidden text-xs"
                       />
@@ -1734,45 +1978,93 @@ export default function App() {
 
                     <div className="grid grid-cols-2 gap-2 text-[11px]">
                       <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Admin Email</label>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Login Email</label>
                         <input
                           type="email"
                           value={newBizEmail}
                           onChange={(e) => setNewBizEmail(e.target.value)}
-                          placeholder="e.g. sales@copper.zm"
+                          placeholder="owner@company.com"
                           required
-                          className="w-full px-2 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
                         />
                       </div>
                       <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Password</label>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Login Password</label>
                         <input
                           type="password"
                           value={newBizPassword}
                           onChange={(e) => setNewBizPassword(e.target.value)}
                           placeholder="••••••"
                           required
-                          className="w-full px-2 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
                         />
                       </div>
                     </div>
 
-                    <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Primary Outlet Name</label>
-                      <input
-                        type="text"
-                        value={newBizFirstStore}
-                        onChange={(e) => setNewBizFirstStore(e.target.value)}
-                        placeholder="e.g. Lusaka Industrial Branch"
-                        className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 focus:outline-hidden text-xs"
-                      />
+                    <div className="grid grid-cols-2 gap-2 text-[11px]">
+                      <div>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Primary Branch / Store Name</label>
+                        <input
+                          type="text"
+                          value={newBizFirstStore}
+                          onChange={(e) => setNewBizFirstStore(e.target.value)}
+                          placeholder="e.g. Main Branch"
+                          required
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 text-xs focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">City / Location</label>
+                        <input
+                          type="text"
+                          value={newBizLocation}
+                          onChange={(e) => setNewBizLocation(e.target.value)}
+                          placeholder="e.g. Lusaka"
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 text-xs focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 text-[11px]">
+                      <div>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Currency</label>
+                        <input
+                          type="text"
+                          value={newBizCurrency}
+                          onChange={(e) => setNewBizCurrency(e.target.value)}
+                          placeholder="K"
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">VAT Rate (%)</label>
+                        <input
+                          type="number"
+                          step="0.1"
+                          value={newBizTaxRate}
+                          onChange={(e) => setNewBizTaxRate(e.target.value)}
+                          placeholder="16"
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Opening Cash</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={newBizOpeningCash}
+                          onChange={(e) => setNewBizOpeningCash(e.target.value)}
+                          placeholder="0.00"
+                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
+                        />
+                      </div>
                     </div>
 
                     <button
                       type="submit"
-                      className="mt-1 py-2 px-4 bg-indigo-600 hover:bg-indigo-505 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider cursor-pointer shadow-md flex items-center justify-center gap-1.5 select-none"
+                      className="mt-1.5 py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider cursor-pointer shadow-md flex items-center justify-center gap-1.5 select-none"
                     >
-                      <Plus size={14} /> Commit Corporate Account
+                      <Plus size={14} /> Create Blank Account & Launch POS
                     </button>
                   </form>
                 ) : (
@@ -1786,7 +2078,7 @@ export default function App() {
                         type="text"
                         value={newStoreName}
                         onChange={(e) => setNewStoreName(e.target.value)}
-                        placeholder="e.g. Kitwe Regional Depot"
+                        placeholder="e.g. Regional Branch"
                         required
                         className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-bold focus:outline-hidden text-xs"
                       />
@@ -1799,7 +2091,7 @@ export default function App() {
                           type="text"
                           value={newStoreId}
                           onChange={(e) => setNewStoreId(e.target.value)}
-                          placeholder="e.g. kitwe_depot"
+                          placeholder="e.g. branch_2"
                           className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
                         />
                       </div>
@@ -1849,7 +2141,7 @@ export default function App() {
                       </div>
 
                       <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-slate-300 text-slate-200 font-semibold text-amber-300">Require Manager Discount Key</span>
+                        <span className="text-slate-200 font-semibold text-amber-300">Require Manager Discount Key</span>
                         <input
                           type="checkbox"
                           checked={newStoreReqManager}

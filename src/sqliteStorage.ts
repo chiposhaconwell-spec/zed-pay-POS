@@ -43,7 +43,11 @@ export const ALL_TABLE_NAMES = [
   'assets',
   'equity',
   'double_entry_journal',
-  'audit_logs'
+  'audit_logs',
+  'receipt_refund_ledger',
+  'cash_flow_ledger',
+  'payment_method_ledger',
+  'financial_statements_ledger'
 ];
 
 /**
@@ -423,6 +427,97 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   store_id TEXT,
   performed_by TEXT,
   created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS receipt_refund_ledger (
+  id TEXT PRIMARY KEY,
+  order_id TEXT,
+  entry_type TEXT,
+  date TEXT,
+  store_id TEXT,
+  customer_name TEXT,
+  payment_method TEXT,
+  subtotal REAL,
+  tax REAL,
+  discount REAL,
+  total_amount REAL,
+  cogs_amount REAL,
+  net_revenue_impact REAL,
+  cash_impact REAL,
+  performed_by TEXT,
+  journal_ref TEXT,
+  status TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cash_flow_ledger (
+  id TEXT PRIMARY KEY,
+  date TEXT,
+  store_id TEXT,
+  activity_type TEXT,
+  category TEXT,
+  direction TEXT,
+  payment_method TEXT,
+  account_id TEXT,
+  inflow_amount REAL,
+  outflow_amount REAL,
+  net_cash_change REAL,
+  reference_id TEXT,
+  description TEXT,
+  performed_by TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS payment_method_ledger (
+  id TEXT PRIMARY KEY,
+  payment_method TEXT,
+  store_id TEXT,
+  account_id TEXT,
+  gross_receipts REAL,
+  layby_receipts REAL,
+  refunds_out REAL,
+  expenses_out REAL,
+  transfers_in REAL,
+  transfers_out REAL,
+  net_balance REAL,
+  transaction_count INTEGER,
+  updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS financial_statements_ledger (
+  id TEXT PRIMARY KEY,
+  store_id TEXT,
+  period_date TEXT,
+  gross_sales_revenue REAL,
+  sales_returns_refunds REAL,
+  discounts_allowed REAL,
+  vat_tax_collected REAL,
+  net_sales_revenue REAL,
+  cost_of_goods_sold REAL,
+  gross_profit REAL,
+  operating_expenses REAL,
+  payroll_expenses REAL,
+  net_operating_income REAL,
+  cash_and_equivalents REAL,
+  cash_drawer_balance REAL,
+  mobile_money_balance REAL,
+  bank_card_balance REAL,
+  inventory_asset_value REAL,
+  goods_in_transit_value REAL,
+  fixed_assets_value REAL,
+  total_assets REAL,
+  vat_payable_liability REAL,
+  layby_deposits_liability REAL,
+  loans_payable_liability REAL,
+  total_liabilities REAL,
+  owner_capital_equity REAL,
+  retained_earnings REAL,
+  total_equity REAL,
+  operating_cash_flow REAL,
+  investing_cash_flow REAL,
+  financing_cash_flow REAL,
+  net_cash_flow REAL,
+  updated_at TEXT
 );
 `;
 

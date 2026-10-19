@@ -65,8 +65,11 @@ service cloud.firestore {
              data.stock is int &&
              data.imageUrl is string && data.imageUrl.size() <= 300000 && // accommodate rich image URLs
              data.business_id is string && data.business_id.size() <= 128 &&
+             (!('is_service' in data) || data.is_service is int) &&
+             (!('batch_number' in data) || (data.batch_number is string && data.batch_number.size() <= 100)) &&
+             (!('expiry_date' in data) || (data.expiry_date is string && data.expiry_date.size() <= 100)) &&
              data.keys().hasAll(['id', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'business_id']) &&
-             data.keys().size() == 9;
+             data.keys().hasOnly(['id', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'business_id', 'is_service', 'batch_number', 'expiry_date']);
     }
 
     // Helper validation for Customer CRM records
@@ -131,7 +134,7 @@ service cloud.firestore {
         allow update: if isBusinessOwner(businessId) && isValidId(productId) && isValidProduct(incoming()) &&
                          incoming().business_id == existing().business_id &&
                          incoming().id == existing().id &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl']);
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']);
         allow delete: if isBusinessOwner(businessId);
       }
 

@@ -43,7 +43,10 @@
         "cost": { "type": "number", "description": "Acquisition cost" },
         "stock": { "type": "integer", "description": "Total available warehouse stock" },
         "imageUrl": { "type": "string", "description": "Base64 or external photo URL" },
-        "business_id": { "type": "string", "description": "Associated business identifier" }
+        "business_id": { "type": "string", "description": "Associated business identifier" },
+        "is_service": { "type": "integer", "description": "Whether item is a service (1/0)" },
+        "batch_number": { "type": "string", "description": "Batch or lot identifier" },
+        "expiry_date": { "type": "string", "description": "Expiry date string" }
       },
       "required": ["id", "name", "sku", "price", "business_id"]
     },

@@ -3,7 +3,10 @@
   "appId": "1:339466460685:web:e09bd4731daa029369ff44",
   "apiKey": "AIzaSyDZMQOprqEaxcaF_2XEc7u97hPgfQGRj3Y",
   "authDomain": "endless-mote-rk76w.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-32ea9ad7-3a6b-4977-b7b9-ef484b98c7f4",
   "storageBucket": "endless-mote-rk76w.firebasestorage.app",
   "messagingSenderId": "339466460685",
-  "measurementId": ""
+  "measurementId": "",
+  "oAuthClientId": "339466460685-ab6p5j4d2clbqthpva2n8q6op7p37afo.apps.googleusercontent.com",
+  "recaptchaSiteKey": ""
 }

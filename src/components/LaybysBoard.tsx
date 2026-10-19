@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint } from '../androidUtils';
-import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit } from '../db';
+import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems } from '../db';
 import { 
   Users, 
   Search, 
@@ -469,7 +469,11 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
       setCustomDeposit('');
       setItemSearchQuery('');
       setShowCreateModal(false);
+      syncAllAccountingSystems(`Layby Created #${laybyId}`);
       loadData();
+      try {
+        window.dispatchEvent(new Event('pos_data_updated'));
+      } catch (e) {}
       persistTablesToStorage();
       alert(`Layby account ${laybyId} successfully configured.`);
     } else {
@@ -622,7 +626,11 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
       setActiveInstReceipt(newReceipt);
       setWhatsappPhone(selectedLayby.customer_phone || '');
 
+      syncAllAccountingSystems(`Layby Installment #${instId}`);
       loadData();
+      try {
+        window.dispatchEvent(new Event('pos_data_updated'));
+      } catch (e) {}
       persistTablesToStorage();
     }
   };

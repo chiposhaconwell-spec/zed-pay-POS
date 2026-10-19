@@ -22,7 +22,7 @@ import {
   Package,
   Upload
 } from 'lucide-react';
-import { runSql, initializeDatabase, SeedTemplate, persistTablesToStorage } from '../db';
+import { runSql, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer } from '../db';
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
@@ -56,7 +56,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     plain: string;
   } | null>(null);
 
-  const [seedIndustry, setSeedIndustry] = useState<SeedTemplate>('cafe');
+  const [seedIndustry, setSeedIndustry] = useState<SeedTemplate>('blank');
   const [notification, setNotification] = useState<string | null>(null);
   const [generatedSqlDump, setGeneratedSqlDump] = useState<string>('');
 
@@ -143,11 +143,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     if (res.success && Array.isArray(res.data) && res.data.length > 0) {
       setStoresList(res.data);
     } else {
-      setStoresList([
-        { id: 'lusaka', name: 'Lusaka Main Office' },
-        { id: 'kitwe', name: 'Kitwe Regional Yard' },
-        { id: 'ndola', name: 'Ndola Branch Station' }
-      ]);
+      setStoresList([]);
     }
   };
 
@@ -198,14 +194,29 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
 
   const handleBackupToCloud = async () => {
     setIsSyncing(true);
-    setSyncStatus('Backing up local database registers to Firebase Cloud...');
+    setSyncStatus('Synchronizing local database, stock, batches & accounting ledgers to Cloud SQL...');
     setSyncError(null);
     try {
       const bizId = getActiveBusinessId();
-      const res = await backupToCloud(bizId);
-      if (res.success) {
-        triggerNotify('Cloud Sync backup succeeded!');
-        setSyncStatus(res.details);
+      const sqlRes = await pushDatabaseToServer(bizId);
+      let msg = sqlRes.details;
+
+      if (user) {
+        try {
+          const fbRes = await backupToCloud(bizId);
+          if (fbRes.success) {
+            msg += ' | Firebase Cloud Backup also synced.';
+          }
+        } catch (fbErr) {
+          console.warn('Firebase secondary backup notice:', fbErr);
+        }
+      }
+
+      if (sqlRes.success) {
+        triggerNotify('Cloud Synchronization Push succeeded!');
+        setSyncStatus(msg);
+      } else {
+        setSyncError(sqlRes.details);
       }
     } catch (err: any) {
       console.error(err);
@@ -216,20 +227,38 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
   };
 
   const handleRestoreFromCloud = async () => {
-    if (!window.confirm("Warning: This will pull the latest database state from Firebase Cloud and replace ALL local products, bills, and customers! \nDo you want to continue?")) {
-      return;
-    }
     setIsSyncing(true);
-    setSyncStatus('Pulling database state from Firebase Cloud...');
+    setSyncStatus('Pulling latest synchronized business, stock, batches & accounting state from Cloud...');
     setSyncError(null);
     try {
       const bizId = getActiveBusinessId();
-      const res = await restoreFromCloud(bizId);
-      if (res.success) {
-        triggerNotify('Cloud Restore database succeeded!');
-        setSyncStatus(res.details);
+      const sqlPull = await pullDatabaseFromServer(bizId !== 'default_biz' ? bizId : undefined);
+      if (sqlPull.success && sqlPull.found) {
+        if (sqlPull.settings) {
+          setSettings(sqlPull.settings);
+        }
+        loadUsersList();
+        loadStoresList();
+        triggerNotify('Cloud SQL Restore succeeded!');
+        setSyncStatus(sqlPull.details);
         window.dispatchEvent(new Event('local_db_restored'));
+        return;
       }
+
+      if (user) {
+        const res = await restoreFromCloud(bizId);
+        if (res.success) {
+          loadUsersList();
+          loadStoresList();
+          triggerNotify('Firebase Cloud Restore succeeded!');
+          setSyncStatus(res.details);
+          window.dispatchEvent(new Event('local_db_restored'));
+          return;
+        }
+      }
+
+      setSyncError(sqlPull.details || 'No cloud backup found for this business yet.');
+      setSyncStatus(null);
     } catch (err: any) {
       console.error(err);
       setSyncError(err?.message || 'Restore failed');
@@ -1018,23 +1047,52 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
                 </p>
               </div>
 
-              {!user ? (
-                <div className="flex flex-col gap-3">
-                  <p className="text-[11px] leading-relaxed text-slate-600 font-medium">
-                    💡 Connect your emulated local POS terminal to the secure cloud! Power dual-state database storage by logging in with standard Firebase Authentication.
-                  </p>
+              {/* Cloud SQL + Firebase Sync Actions (Available to all accounts) */}
+              <div className="flex flex-col gap-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    id="btn-cloud-backup"
+                    type="button"
+                    onClick={handleBackupToCloud}
+                    disabled={isSyncing}
+                    className="flex items-center justify-center gap-1.5 py-3 px-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-black text-[10px] tracking-widest uppercase rounded-lg shadow-xs transition-colors cursor-pointer"
+                  >
+                    🚀 Push Sync to Cloud
+                  </button>
+                  <button
+                    id="btn-cloud-restore"
+                    type="button"
+                    onClick={handleRestoreFromCloud}
+                    disabled={isSyncing}
+                    className="flex items-center justify-center gap-1.5 py-3 px-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-black text-[10px] tracking-widest uppercase rounded-lg shadow-xs transition-colors cursor-pointer"
+                  >
+                    📥 Pull Sync from Cloud
+                  </button>
+                </div>
+
+                {/* Status Indicator Messages */}
+                {(syncStatus || syncError) && (
+                  <div className={`p-3 rounded-lg text-[10.5px] leading-relaxed font-mono font-medium ${
+                    syncError ? 'bg-red-50 text-red-600 border border-red-150' : 'bg-slate-50 text-slate-600 border border-slate-150'
+                  }`}>
+                    {syncError ? (
+                      <span>⚠️ Error: {syncError}</span>
+                    ) : (
+                      <span>💡 Sync: {syncStatus}</span>
+                    )}
+                  </div>
+                )}
+
+                {!user ? (
                   <button
                     id="btn-google-login"
                     type="button"
                     onClick={handleGoogleLogin}
-                    className="flex items-center justify-center gap-2 py-3 px-4 bg-slate-900 hover:bg-slate-800 text-white font-extrabold text-xs tracking-wider uppercase rounded-lg shadow-sm transition-all cursor-pointer"
+                    className="flex items-center justify-center gap-2 py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 font-extrabold text-[10.5px] tracking-wider uppercase rounded-lg transition-all cursor-pointer"
                   >
-                    <LogIn size={14} /> Sign In with Google Credentials
+                    <LogIn size={13} /> Optional: Link Google Account for Secondary Firestore Mirror
                   </button>
-                </div>
-              ) : (
-                <div className="flex flex-col gap-4">
-                  {/* Profile Bar */}
+                ) : (
                   <div className="flex items-center justify-between bg-slate-50 border border-slate-150 p-3 rounded-lg">
                     <div className="flex items-center gap-2.5">
                       {user.photoURL ? (
@@ -1061,75 +1119,41 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
                       Disconnect
                     </button>
                   </div>
-
-                  {/* Sync Actions */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <button
-                      id="btn-cloud-backup"
-                      type="button"
-                      onClick={handleBackupToCloud}
-                      disabled={isSyncing}
-                      className="flex items-center justify-center gap-1.5 py-3 px-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-black text-[10px] tracking-widest uppercase rounded-lg shadow-xs transition-colors cursor-pointer"
-                    >
-                      🚀 Push Backup
-                    </button>
-                    <button
-                      id="btn-cloud-restore"
-                      type="button"
-                      onClick={handleRestoreFromCloud}
-                      disabled={isSyncing}
-                      className="flex items-center justify-center gap-1.5 py-3 px-2 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-black text-[10px] tracking-widest uppercase rounded-lg shadow-xs transition-colors cursor-pointer"
-                    >
-                      📥 Pull Restore
-                    </button>
-                  </div>
-
-                  {/* Status Indicator Messages */}
-                  {(syncStatus || syncError) && (
-                    <div className={`p-3 rounded-lg text-[10.5px] leading-relaxed font-mono font-medium ${
-                      syncError ? 'bg-red-50 text-red-600 border border-red-150' : 'bg-slate-50 text-slate-600 border border-slate-150'
-                    }`}>
-                      {syncError ? (
-                        <span>⚠️ Error: {syncError}</span>
-                      ) : (
-                        <span>💡 Log: {syncStatus}</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
+                )}
+              </div>
             </div>
 
             {/* Reseed DB Block */}
             <div className="bg-white rounded-xl border border-slate-200 p-5 flex flex-col gap-4">
               <h3 className="text-xs font-black text-slate-805 uppercase tracking-widest flex items-center gap-1.5 border-b border-slate-150 pb-3 select-none">
                 <RefreshCw size={14} className="text-amber-500" />
-                Wipe DB & Re-Seed Industry Layout
+                Wipe DB & Reset / Template Layout
               </h3>
 
               <div className="flex flex-col gap-1">
-                <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide select-none">Target Business industry layout</span>
+                <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide select-none">Target Database State</span>
                 <div className="flex items-center gap-1.5 select-none">
                   <select
                     value={seedIndustry}
                     onChange={(e) => setSeedIndustry(e.target.value as SeedTemplate)}
                     className="flex-1 px-3 py-2 bg-slate-50 border border-slate-250 focus:bg-white text-xs rounded-lg font-bold text-slate-700 cursor-pointer"
                   >
-                    <option value="cafe">Cozy Coffee Shop & Café</option>
-                    <option value="boutique">Minimalist Leather & Apparel Boutique</option>
-                    <option value="grocer">SME Organic Wellness Grocery</option>
-                    <option value="ledger">FinTech Double-Entry Ledger (ZMW)</option>
+                    <option value="blank">Blank Slate (Zero Stock, Batches & Accounts - Default)</option>
+                    <option value="cafe">Demo: Cozy Coffee Shop & Café</option>
+                    <option value="boutique">Demo: Minimalist Leather & Apparel Boutique</option>
+                    <option value="grocer">Demo: SME Organic Wellness Grocery</option>
+                    <option value="ledger">Demo: FinTech Double-Entry Ledger (ZMW)</option>
                   </select>
                   <button
                     id="btn-reseed-db-template"
                     onClick={handleResetDatabaseSelection}
                     className="px-4 py-2 bg-amber-500 hover:bg-amber-600 font-extrabold text-xs tracking-wider uppercase text-white rounded-lg cursor-pointer transition-colors"
                   >
-                    Flush Re-seed
+                    Reset DB
                   </button>
                 </div>
                 <p className="text-[10px] leading-relaxed text-slate-400 font-medium select-text mt-1.5">
-                  💡 Flush Re-seed runs `DROP TABLE IF EXISTS...` on all relational tables, sets up clean, robust column schemas, and seeds fresh mock products, historical invoices, and customer indexes tailored for that industry.
+                  💡 Choose "Blank Slate" to wipe all preseeded stock, batches, and accounts so a new business starts completely fresh.
                 </p>
               </div>
             </div>

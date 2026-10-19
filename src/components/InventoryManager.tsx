@@ -187,7 +187,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   const [newCat, setNewCat] = useState('');
   const [newPrice, setNewPrice] = useState('0.00');
   const [newCost, setNewCost] = useState('0.00');
-  const [newStock, setNewStock] = useState('10');
+  const [newStock, setNewStock] = useState('0');
   const [newImg, setNewImg] = useState('');
   const [newIsService, setNewIsService] = useState(false);
   const [newBatchNumber, setNewBatchNumber] = useState('');
@@ -196,15 +196,25 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   // Quick Add / Receive stock modal state
   const [showReceiveModal, setShowReceiveModal] = useState(false);
   const [receiveProduct, setReceiveProduct] = useState<Product | null>(null);
-  const [receiveQty, setReceiveQty] = useState('10');
+  const [receiveQty, setReceiveQty] = useState('1');
   const [receiveBatch, setReceiveBatch] = useState('');
   const [receiveExpiry, setReceiveExpiry] = useState('');
 
-  const getStoresList = () => [
-    { id: 'lusaka', name: 'Lusaka Main' },
-    { id: 'kitwe', name: 'Kitwe Outlet' },
-    { id: 'ndola', name: 'Ndola Depot' }
-  ];
+  const getStoresList = (): { id: string; name: string }[] => {
+    try {
+      const sRes = runSql('SELECT id, name FROM stores', 'Inventory: Fetch dynamic stores list', true);
+      if (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0) {
+        return sRes.data.map((s: any) => ({
+          id: String(s.id),
+          name: String(s.name || s.id),
+        }));
+      }
+    } catch {}
+    if (activeStore) {
+      return [{ id: activeStore, name: activeStore.toUpperCase() }];
+    }
+    return [];
+  };
 
   const loadMatrixData = () => {
     // 1. Get all products from products table
@@ -229,14 +239,16 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       };
     });
 
+    const dynamicStoreIds = getStoresList().map(s => s.id);
+
     // 3. Construct matrix rows
     return rawProds.map((p: any) => {
       const stores: Record<string, { stock: number; price: number }> = {};
       let totalStock = 0;
 
-      ['lusaka', 'kitwe', 'ndola'].forEach(storeId => {
+      dynamicStoreIds.forEach(storeId => {
         const override = spMap[p.id]?.[storeId];
-        const stockVal = override ? override.stock : 0;
+        const stockVal = override ? override.stock : (storeId === activeStore ? Number(p.stock || 0) : 0);
         const priceVal = override ? override.price : p.price;
         stores[storeId] = { stock: stockVal, price: priceVal };
         totalStock += stockVal;
@@ -630,6 +642,14 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const imgUrl = newImg || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=150';
 
     const nextId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 101;
+    let activeBizId = 'default_biz';
+    try {
+      const savedBiz = localStorage.getItem('active_business_profile');
+      if (savedBiz) {
+        const parsedBiz = JSON.parse(savedBiz);
+        if (parsedBiz?.id) activeBizId = parsedBiz.id;
+      }
+    } catch {}
 
     // Insert baseline primary with column specifiers to support optional/default is_service
     runSql(`
@@ -642,22 +662,23 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         ${costNum}, 
         ${stockNum}, 
         '${imgUrl}',
-        'default_biz',
+        '${activeBizId.replace(/'/g, "''")}',
         ${newIsService ? 1 : 0},
         '${newBatchNumber.replace(/'/g, "''")}',
         '${newExpiryDate}'
       )
     `, `Catalog: Add global model ${newName}`);
 
-    // Add store override values for ALL branches so pricing maps instantly
-    const storeCodes = ['lusaka', 'kitwe', 'ndola'];
+    // Add store override values for ALL active branches (stock allocated to current activeStore, 0 in other branches unless transferred)
+    const storeCodes = Array.from(new Set([...getStoresList().map(s => s.id), activeStore].filter(Boolean)));
     storeCodes.forEach(code => {
+      const branchStock = code === activeStore ? stockNum : 0;
       runSql(`
         INSERT INTO store_products VALUES (
           'sp_${nextId}_${code}',
           ${nextId},
           '${code}',
-          ${stockNum},
+          ${branchStock},
           ${priceNum}
         )
       `, `Catalog: Seed overrides in ${code}`);
@@ -671,7 +692,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         VALUES (
           '${refId}',
           'idem_${refId}',
-          'ALL-STORES',
+          '${(activeStore || 'MAIN').toUpperCase()}',
           'RECEIVE',
           'CATALOG_INIT',
           ${(stockNum * costNum).toFixed(2)},
@@ -693,7 +714,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setNewCat('');
     setNewPrice('0.00');
     setNewCost('0.00');
-    setNewStock('10');
+    setNewStock('0');
     setNewImg('');
     setNewIsService(false);
     setNewBatchNumber('');
@@ -1270,27 +1291,41 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   }, [filteredHistoryLogs]);
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-slate-50 relative select-text text-left">
+    <div className="flex-1 flex flex-col overflow-hidden bg-slate-50 relative select-text text-left min-w-0 w-full max-w-full">
       
       {/* Search and multi-store settings controls */}
-      <div className="p-4 bg-white border-b border-slate-200 flex flex-col gap-3 shrink-0">
+      <div className="p-3 sm:p-4 bg-white border-b border-slate-200 flex flex-col gap-3 shrink-0 w-full min-w-0">
         
-        <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 w-full min-w-0">
           {/* Main heading highlighting active store */}
-          <div>
-            <span className="text-[10px] text-indigo-600 font-extrabold tracking-widest uppercase font-mono">Store Inventory Hub</span>
-            <h2 className="text-sm font-black text-slate-900 uppercase tracking-tight flex items-center gap-1">
-              <Package size={16} className="text-slate-700" />
-              {activeStore.toUpperCase()} BRANCH STOCK
-            </h2>
+          <div className="flex items-center justify-between w-full sm:w-auto gap-2">
+            <div>
+              <span className="text-[10px] text-indigo-600 font-extrabold tracking-widest uppercase font-mono">Store Inventory Hub</span>
+              <h2 className="text-sm font-black text-slate-900 uppercase tracking-tight flex items-center gap-1">
+                <Package size={16} className="text-slate-700 shrink-0" />
+                <span>{activeStore.toUpperCase()} BRANCH STOCK</span>
+              </h2>
+            </div>
+
+            {onNavigateToSale && (
+              <button
+                id="btn_inventory_top_sale_mobile"
+                onClick={onNavigateToSale}
+                className="flex sm:hidden items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg text-[11px] font-black tracking-wider uppercase transition-all cursor-pointer shadow-xs border border-emerald-500 shrink-0"
+                title="Jump to Point of Sale (POS Terminal) Register"
+              >
+                <ShoppingCart size={13} className="stroke-[2.5]" />
+                <span>SALE REGISTER</span>
+              </button>
+            )}
           </div>
 
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto min-w-0">
             {onNavigateToSale && (
               <button
                 id="btn_inventory_top_sale"
                 onClick={onNavigateToSale}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg text-xs font-black tracking-wider uppercase transition-all cursor-pointer shadow-xs border border-emerald-500"
+                className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg text-xs font-black tracking-wider uppercase transition-all cursor-pointer shadow-xs border border-emerald-500 shrink-0"
                 title="Jump to Point of Sale (POS Terminal) Register"
               >
                 <ShoppingCart size={14} className="stroke-[2.5]" />
@@ -1298,11 +1333,11 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               </button>
             )}
 
-            {/* Tab switcher buttons */}
-            <div className="bg-slate-100 p-0.5 rounded-lg border border-slate-200 flex gap-0.5">
+            {/* Tab switcher buttons — wraps horizontally and scrolls on phone screens */}
+            <div className="bg-slate-100 p-1 rounded-xl border border-slate-200 flex flex-wrap items-center gap-1 w-full sm:w-auto overflow-x-auto touch-pan-x">
               <button
                 onClick={() => setActiveSubTab('catalog')}
-                className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded-md tracking-wider transition-all cursor-pointer ${
+                className={`px-2.5 py-1.5 text-[10px] uppercase font-bold rounded-lg tracking-wider transition-all cursor-pointer whitespace-nowrap flex-1 sm:flex-initial text-center ${
                   activeSubTab === 'catalog'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-500 hover:text-slate-800'
@@ -1314,13 +1349,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               {userRole === 'owner' && (
                 <button
                   onClick={() => setActiveSubTab('global_matrix')}
-                  className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded-md tracking-wider transition-all cursor-pointer ${
+                  className={`px-2.5 py-1.5 text-[10px] uppercase font-bold rounded-lg tracking-wider transition-all cursor-pointer whitespace-nowrap flex-1 sm:flex-initial text-center ${
                     activeSubTab === 'global_matrix'
                       ? 'bg-white text-slate-900 shadow-xs'
                       : 'text-slate-500 hover:text-slate-800'
                   }`}
                 >
-                  📊 Comparative Grid (All Stores)
+                  📊 Comparative Grid
                 </button>
               )}
 
@@ -1334,7 +1369,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   setCountedStocks(preCount);
                   setActiveSubTab('stock_take');
                 }}
-                className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded-md tracking-wider transition-all cursor-pointer ${
+                className={`px-2.5 py-1.5 text-[10px] uppercase font-bold rounded-lg tracking-wider transition-all cursor-pointer whitespace-nowrap flex-1 sm:flex-initial text-center ${
                   activeSubTab === 'stock_take'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-500 hover:text-slate-800'
@@ -1345,7 +1380,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
               <button
                 onClick={() => setActiveSubTab('inventory_history')}
-                className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded-md tracking-wider transition-all cursor-pointer ${
+                className={`px-2.5 py-1.5 text-[10px] uppercase font-bold rounded-lg tracking-wider transition-all cursor-pointer whitespace-nowrap flex-1 sm:flex-initial text-center ${
                   activeSubTab === 'inventory_history'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-500 hover:text-slate-800'
@@ -1356,7 +1391,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
               <button
                 onClick={() => setActiveSubTab('transfers_ledger')}
-                className={`px-3 py-1.5 text-[10px] uppercase font-bold rounded-md tracking-wider transition-all cursor-pointer ${
+                className={`px-2.5 py-1.5 text-[10px] uppercase font-bold rounded-lg tracking-wider transition-all cursor-pointer whitespace-nowrap flex-1 sm:flex-initial text-center ${
                   activeSubTab === 'transfers_ledger'
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-500 hover:text-slate-800'
@@ -1369,10 +1404,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         </div>
 
         {activeSubTab === 'catalog' && (
-          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-100 animate-fadeIn">
-            {/* Left Search Filter */}
-            <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto">
-              <div className="relative flex-1 min-w-[200px] max-w-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2.5 pt-2 border-t border-slate-100 animate-fadeIn w-full min-w-0">
+            {/* Left Search & Category Filters */}
+            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto flex-1 min-w-0">
+              <div className="relative flex-1 min-w-[160px] w-full sm:max-w-xs">
                 <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
                   type="text"
@@ -1383,7 +1418,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                 />
               </div>
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto">
                 <select
                   value={selectedCategory}
                   onChange={(e) => {
@@ -1393,7 +1428,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                       setSelectedCategory(e.target.value);
                     }
                   }}
-                  className="text-xs font-bold border border-slate-250 bg-white rounded-lg p-1.5 cursor-pointer text-slate-700"
+                  className="text-xs font-bold border border-slate-250 bg-white rounded-lg p-1.5 cursor-pointer text-slate-700 flex-1 sm:flex-initial min-w-[120px]"
                 >
                   {categories.map(c => (
                     <option key={c} value={c}>{c === 'All' ? 'All Categories' : c}</option>
@@ -1404,33 +1439,33 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                 {!isReadOnly && (
                   <button
                     onClick={() => setShowCategoryModal(true)}
-                    className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-extrabold flex items-center gap-1.5 cursor-pointer transition-all shadow-3xs"
+                    className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-extrabold flex items-center gap-1.5 cursor-pointer transition-all shadow-3xs shrink-0"
                     title="Create or edit item categories"
                   >
                     <Tag size={13} />
                     <span>Categories</span>
                   </button>
                 )}
-              </div>
 
-              <select
-                id="expiry-filter-select"
-                value={expiryFilter}
-                onChange={(e) => setExpiryFilter(e.target.value as any)}
-                className={`text-xs font-bold border rounded-lg p-1.5 cursor-pointer transition-colors ${
-                  expiryFilter !== 'all' 
-                    ? 'bg-amber-50 text-amber-900 border-amber-300 focus:ring-1 focus:ring-amber-400' 
-                    : 'bg-white text-slate-700 border-slate-250'
-                }`}
-              >
-                <option value="all">🗓️ All Expiries</option>
-                <option value="within30">⏳ Expiring within 30 days</option>
-                <option value="expired">🚨 Already Expired</option>
-              </select>
+                <select
+                  id="expiry-filter-select"
+                  value={expiryFilter}
+                  onChange={(e) => setExpiryFilter(e.target.value as any)}
+                  className={`text-xs font-bold border rounded-lg p-1.5 cursor-pointer transition-colors flex-1 sm:flex-initial min-w-[120px] ${
+                    expiryFilter !== 'all' 
+                      ? 'bg-amber-50 text-amber-900 border-amber-300 focus:ring-1 focus:ring-amber-400' 
+                      : 'bg-white text-slate-700 border-slate-250'
+                  }`}
+                >
+                  <option value="all">🗓️ All Expiries</option>
+                  <option value="within30">⏳ Expiring within 30 days</option>
+                  <option value="expired">🚨 Already Expired</option>
+                </select>
+              </div>
             </div>
 
             {/* Action button rails */}
-            <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-start sm:justify-end">
               <button
                 onClick={() => {
                   if (isReadOnly) {
@@ -1444,19 +1479,19 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   setTransferProductId(products.length > 0 ? products[0].id.toString() : '');
                   setShowTransferModal(true);
                 }}
-                className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-xs font-bold tracking-wider cursor-pointer shadow-3xs"
+                className="flex-1 sm:flex-initial justify-center flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-lg text-xs font-bold tracking-wider cursor-pointer shadow-3xs whitespace-nowrap"
               >
                 <ArrowRightLeft size={13} />
-                INTER-STORE TRANSFER
+                <span>INTER-STORE TRANSFER</span>
               </button>
 
               {!isReadOnly && (
                 <button
                   onClick={() => setShowAddModal(true)}
-                  className="flex items-center gap-1 px-3.5 py-2 bg-indigo-600 active:bg-indigo-700 text-white rounded-lg text-xs font-extrabold cursor-pointer h-full"
+                  className="flex-1 sm:flex-initial justify-center flex items-center gap-1 px-3.5 py-2 bg-indigo-600 active:bg-indigo-700 text-white rounded-lg text-xs font-extrabold cursor-pointer whitespace-nowrap"
                 >
                   <Plus size={14} />
-                  NEW ITEM
+                  <span>NEW ITEM</span>
                 </button>
               )}
             </div>
@@ -1465,96 +1500,213 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       </div>
 
       {isReadOnly && (
-        <div className="mx-4 mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-800 font-bold flex items-center gap-2.5 shadow-3xs shrink-0 select-none">
-          <ShieldAlert size={15} />
+        <div className="mx-3 sm:mx-4 mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-800 font-bold flex items-center gap-2.5 shadow-3xs shrink-0 select-none">
+          <ShieldAlert size={15} className="shrink-0" />
           <span>READ-ONLY SALES ACCESS LEVEL ACTIVE: PORT-LOCK PREVENTS YOU FROM ALTERING SYSTEM CATALOG METADATA OR MANUALLY EDITING MULTI-STORE OVERRIDES.</span>
         </div>
       )}
 
       {/* Primary Grid Workspace */}
-      <div className="flex-1 overflow-auto p-4 flex flex-col gap-4">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden p-2.5 sm:p-4 flex flex-col gap-4 w-full min-w-0">
 
         {activeSubTab === 'catalog' && (
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs animate-fadeIn">
-            <table className="w-full text-left font-sans text-xs border-collapse">
-              <thead>
-                <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9.5px] select-none">
-                  <th className="px-4 py-3">Product Name</th>
-                  <th className="px-4 py-3">Category</th>
-                  <th className="px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('price')}>Price ({activeStore.toUpperCase()})</th>
-                  <th className="px-4 py-3">Global Cost</th>
-                  <th className="px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('stock')}>Active Stock ({activeStore.toUpperCase()})</th>
-                  <th className="px-4 py-3 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
-                {filteredAndSorted.map(prod => {
-                  const isEditing = editingId === prod.id;
-                  const isService = prod.is_service === 1;
-                  const lowStock = !isService && prod.stock <= 5;
-                  const outOfStock = !isService && prod.stock === 0;
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs animate-fadeIn w-full min-w-0">
+            {/* Mobile Horizontal Scroll & Wrap Hint Banner */}
+            <div className="flex sm:hidden items-center justify-between px-3 py-1.5 bg-indigo-50/80 border-b border-indigo-100 text-[10px] font-extrabold text-indigo-700">
+              <span>↔ Swipe table horizontally or use quick buttons below</span>
+              <span className="font-mono text-[9px] bg-white px-1.5 py-0.5 rounded border border-indigo-200">{filteredAndSorted.length} items</span>
+            </div>
 
-                  return (
-                    <tr key={prod.id} className={`${outOfStock ? 'bg-red-50/15' : lowStock ? 'bg-amber-50/15' : ''}`}>
-                      <td className="px-4 py-2.5">
-                        <div className="flex items-start gap-3">
-                          <img src={prod.imageUrl} alt={prod.name} className="w-9 h-9 rounded-lg object-cover border mt-0.5" referrerPolicy="no-referrer" />
-                          <div className="flex-1 min-w-0 text-left">
-                            <p className="font-extrabold text-slate-800 text-xs">{prod.name}</p>
-                            <p className="text-[10px] font-mono font-semibold text-slate-400">SKU: {prod.sku}</p>
-                            {isEditing ? (
-                              <div className="mt-2 grid grid-cols-1 gap-1.5 bg-slate-50 p-2 rounded border border-slate-200">
-                                <div className="flex flex-col gap-0.5">
-                                  <span className="text-[8px] text-slate-400 font-bold uppercase">Batch / Lot Number</span>
-                                  <input
-                                    type="text"
-                                    value={editBatchNumber}
-                                    onChange={(e) => setEditBatchNumber(e.target.value)}
-                                    className="px-1.5 py-0.5 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
-                                    placeholder="Batch Number"
-                                  />
-                                </div>
-                                <div className="flex flex-col gap-0.5">
-                                  <span className="text-[8px] text-slate-400 font-bold uppercase">Expiry Date</span>
-                                  <input
-                                    type="date"
-                                    value={editExpiryDate}
-                                    onChange={(e) => setEditExpiryDate(e.target.value)}
-                                    className="px-1.5 py-0.5 text-[10px] border rounded bg-white text-slate-800 font-semibold"
-                                  />
-                                </div>
-                              </div>
-                            ) : (
-                              <>
-                                {prod.batch_number && (
-                                  <p className="text-[10px] font-mono font-semibold text-indigo-650 mt-0.5">
-                                    Batch: <span className="font-extrabold">{prod.batch_number}</span>
-                                  </p>
-                                )}
-                                {prod.expiry_date && (() => {
-                                  const exp = getExpirationStatus(prod.expiry_date);
-                                  if (exp.status === 'none') return null;
-                                  return (
-                                    <div className="mt-1 flex items-center gap-1.5 select-none">
-                                      <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider ${
-                                        exp.status === 'expired' 
-                                          ? 'bg-red-100 text-red-700 animate-pulse border border-red-200' 
-                                          : exp.status === 'today'
-                                            ? 'bg-amber-100 text-red-800 border border-red-300 font-black animate-pulse'
-                                            : exp.status === 'nearing'
-                                              ? 'bg-amber-100 text-amber-800 border border-amber-250 font-bold'
-                                              : 'bg-slate-100 text-slate-650 border border-slate-200'
-                                      }`}>
-                                        ⚠️ {exp.label} ({prod.expiry_date})
-                                      </span>
+            <div className="overflow-x-auto w-full touch-pan-x">
+              <table className="w-full min-w-[660px] text-left font-sans text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9.5px] select-none whitespace-nowrap">
+                    <th className="px-3 sm:px-4 py-3">Product Name</th>
+                    <th className="px-3 sm:px-4 py-3">Category</th>
+                    <th className="px-3 sm:px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('price')}>Price ({activeStore.toUpperCase()})</th>
+                    <th className="px-3 sm:px-4 py-3">Global Cost</th>
+                    <th className="px-3 sm:px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('stock')}>Active Stock ({activeStore.toUpperCase()})</th>
+                    <th className="px-3 sm:px-4 py-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
+                  {filteredAndSorted.map(prod => {
+                    const isEditing = editingId === prod.id;
+                    const isService = prod.is_service === 1;
+                    const lowStock = !isService && prod.stock <= 5;
+                    const outOfStock = !isService && prod.stock === 0;
+
+                    return (
+                      <tr key={prod.id} className={`${outOfStock ? 'bg-red-50/15' : lowStock ? 'bg-amber-50/15' : ''}`}>
+                        <td className="px-3 sm:px-4 py-2.5">
+                          <div className="flex items-start gap-2.5 sm:gap-3">
+                            <img src={prod.imageUrl} alt={prod.name} className="w-9 h-9 rounded-lg object-cover border mt-0.5 shrink-0" referrerPolicy="no-referrer" />
+                            <div className="flex-1 min-w-0 text-left">
+                              <p className="font-extrabold text-slate-800 text-xs">{prod.name}</p>
+                              <p className="text-[10px] font-mono font-semibold text-slate-400">SKU: {prod.sku}</p>
+                              {isEditing ? (
+                                <div className="mt-2 grid grid-cols-2 gap-1.5 bg-slate-50 p-2 rounded border border-slate-200">
+                                  {/* Mobile-wrapped Price, Cost, Stock & Category fields so phone users can edit everything in view */}
+                                  <div className="flex sm:hidden flex-col gap-0.5">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Price ({settings.currency})</span>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      value={editPrice}
+                                      onChange={(e) => setEditPrice(parseFloat(e.target.value) || 0)}
+                                      className="px-1.5 py-0.5 text-[10px] border rounded bg-white font-mono text-indigo-700 font-bold"
+                                    />
+                                  </div>
+                                  <div className="flex sm:hidden flex-col gap-0.5">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Cost ({settings.currency})</span>
+                                    <input
+                                      type="number"
+                                      step="0.01"
+                                      value={editCost}
+                                      onChange={(e) => setEditCost(parseFloat(e.target.value) || 0)}
+                                      className="px-1.5 py-0.5 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
+                                    />
+                                  </div>
+                                  {!isService && (
+                                    <div className="flex sm:hidden flex-col gap-0.5">
+                                      <span className="text-[8px] text-slate-400 font-bold uppercase">Stock ({activeStore.toUpperCase()})</span>
+                                      <input
+                                        type="number"
+                                        value={editStock}
+                                        onChange={(e) => setEditStock(parseInt(e.target.value) || 0)}
+                                        className="px-1.5 py-0.5 text-[10px] border rounded bg-white font-mono text-slate-800 font-bold"
+                                      />
                                     </div>
-                                  );
-                                })()}
-                              </>
-                            )}
+                                  )}
+                                  <div className="flex sm:hidden flex-col gap-0.5">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Category</span>
+                                    <select
+                                      value={editCategory}
+                                      onChange={(e) => setEditCategory(e.target.value)}
+                                      className="px-1 py-0.5 text-[10px] border rounded bg-white text-slate-800 font-bold"
+                                    >
+                                      {allCategoriesList.map(cat => (
+                                        <option key={cat} value={cat}>{cat}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Batch / Lot Number</span>
+                                    <input
+                                      type="text"
+                                      value={editBatchNumber}
+                                      onChange={(e) => setEditBatchNumber(e.target.value)}
+                                      className="px-1.5 py-0.5 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
+                                      placeholder="Batch Number"
+                                    />
+                                  </div>
+                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Expiry Date</span>
+                                    <input
+                                      type="date"
+                                      value={editExpiryDate}
+                                      onChange={(e) => setEditExpiryDate(e.target.value)}
+                                      className="px-1.5 py-0.5 text-[10px] border rounded bg-white text-slate-800 font-semibold"
+                                    />
+                                  </div>
+                                </div>
+                              ) : (
+                                <>
+                                  {prod.batch_number && (
+                                    <p className="text-[10px] font-mono font-semibold text-indigo-650 mt-0.5">
+                                      Batch: <span className="font-extrabold">{prod.batch_number}</span>
+                                    </p>
+                                  )}
+                                  {prod.expiry_date && (() => {
+                                    const exp = getExpirationStatus(prod.expiry_date);
+                                    if (exp.status === 'none') return null;
+                                    return (
+                                      <div className="mt-1 flex items-center gap-1.5 select-none">
+                                        <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider ${
+                                          exp.status === 'expired' 
+                                            ? 'bg-red-100 text-red-700 animate-pulse border border-red-200' 
+                                            : exp.status === 'today'
+                                              ? 'bg-amber-100 text-red-800 border border-red-300 font-black animate-pulse'
+                                              : exp.status === 'nearing'
+                                                ? 'bg-amber-100 text-amber-800 border border-amber-250 font-bold'
+                                                : 'bg-slate-100 text-slate-650 border border-slate-200'
+                                        }`}>
+                                          ⚠️ {exp.label} ({prod.expiry_date})
+                                        </span>
+                                      </div>
+                                    );
+                                  })()}
+                                </>
+                              )}
+
+                              {/* Wrapped Mobile Quick-Actions Row (visible on phone screens without needing to scroll far right) */}
+                              <div className="flex sm:hidden flex-wrap items-center gap-1.5 mt-2 pt-1.5 border-t border-slate-100">
+                                <span className="text-[10px] font-mono font-extrabold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded">
+                                  {settings.currency}{prod.price.toFixed(2)}
+                                </span>
+                                {!isService && (
+                                  <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                                    outOfStock ? 'bg-red-100 text-red-800' : lowStock ? 'bg-amber-100 text-amber-800' : 'bg-emerald-50 text-emerald-800'
+                                  }`}>
+                                    {prod.stock} u
+                                  </span>
+                                )}
+                                {!isReadOnly && !isService && !isEditing && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setReceiveProduct(prod);
+                                      setReceiveQty('10');
+                                      setReceiveBatch(prod.batch_number || '');
+                                      setReceiveExpiry(prod.expiry_date || '');
+                                      setShowReceiveModal(true);
+                                    }}
+                                    className="px-2 py-0.5 bg-indigo-600 text-white rounded text-[9.5px] font-black cursor-pointer"
+                                  >
+                                    + Stock
+                                  </button>
+                                )}
+                                {!isEditing ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleStartEdit(prod)}
+                                      className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-250 rounded text-[9.5px] font-bold cursor-pointer"
+                                    >
+                                      Edit
+                                    </button>
+                                    {userRole === 'owner' && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteProduct(prod.id, prod.name)}
+                                        className="px-2 py-0.5 bg-rose-50 text-rose-600 border border-rose-200 rounded text-[9.5px] font-bold cursor-pointer"
+                                      >
+                                        Delete
+                                      </button>
+                                    )}
+                                  </>
+                                ) : (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSaveEdit(prod.id)}
+                                      className="px-2 py-0.5 bg-emerald-600 text-white rounded text-[9.5px] font-bold cursor-pointer"
+                                    >
+                                      ✓ Save
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingId(null)}
+                                      className="px-2 py-0.5 bg-slate-200 text-slate-700 rounded text-[9.5px] font-bold cursor-pointer"
+                                    >
+                                      ✕ Cancel
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      </td>
+                        </td>
                       <td className="px-4 py-2.5 text-[10px] h-full font-bold text-slate-600">
                         {isEditing ? (
                           <div className="flex items-center gap-1">
@@ -1719,14 +1871,15 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   );
                 })}
               </tbody>
-            </table>
+              </table>
+            </div>
           </div>
         )}
 
         {/* COMPARATIVE OWNER OVERVIEW PIVOT MATRIX */}
         {activeSubTab === 'global_matrix' && userRole === 'owner' && (
-          <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs flex flex-col gap-4 animate-fadeIn">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+          <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-5 shadow-xs flex flex-col gap-4 animate-fadeIn w-full min-w-0">
+            <div className="flex flex-wrap justify-between items-start sm:items-center gap-3 w-full min-w-0">
               <div>
                 <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest font-mono">Multi-Store Consolidated Comparative Inventory Pivot</h3>
                 <p className="text-[10.5px] text-slate-400 font-medium">Real-time side-by-side branch comparisons with global cumulative balances</p>
@@ -1753,8 +1906,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               </div>
             </div>
 
-            <div className="overflow-x-auto border border-slate-150 rounded-lg">
-              <table className="w-full text-left font-sans text-xs border-collapse">
+            <div className="overflow-x-auto touch-pan-x border border-slate-150 rounded-lg w-full">
+              <table className="w-full min-w-[600px] text-left font-sans text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9px] select-none">
                     <th className="px-4 py-3 min-w-[180px]">Product SKU & Name</th>
@@ -1836,8 +1989,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
         {/* RECONSTRUCTED STOCK-TAKE PHYSICAL COUNT AUDIT SHEET */}
         {activeSubTab === 'stock_take' && (
-          <form onSubmit={handleSubmitStockTakeReconciliation} className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs flex flex-col gap-5 animate-fadeIn">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-100 pb-3">
+          <form onSubmit={handleSubmitStockTakeReconciliation} className="bg-white rounded-xl border border-slate-200 p-3 sm:p-5 shadow-xs flex flex-col gap-4 sm:gap-5 animate-fadeIn w-full min-w-0">
+            <div className="flex flex-wrap justify-between items-start sm:items-center gap-3 border-b border-slate-100 pb-3 w-full min-w-0">
               <div>
                 <span className="text-[8.5px] bg-indigo-600 text-white font-black py-0.5 px-2 rounded-full uppercase tracking-widest font-mono select-none">RECONCILER ACTIVE</span>
                 <h3 className="text-sm font-black text-slate-900 uppercase tracking-tight mt-1">
@@ -1848,10 +2001,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                 </p>
               </div>
 
-              <div className="flex flex-wrap gap-3.5 text-xs w-full sm:w-auto">
+              <div className="flex flex-wrap gap-3 text-xs w-full sm:w-auto">
                 {/* Admin Stocktake Scheduling Frequency Option */}
                 {userRole !== 'sales' ? (
-                  <div className="flex flex-col gap-1">
+                  <div className="flex flex-col gap-1 flex-1 sm:flex-initial min-w-[150px]">
                     <label className="text-[9px] uppercase font-black text-slate-450 font-mono tracking-wider">Assign Schedule (Admin Only)</label>
                     <select
                       value={stocktakeFreq}
@@ -1878,7 +2031,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   </div>
                 )}
 
-                <div className="flex flex-col gap-1 min-w-[200px]">
+                <div className="flex flex-col gap-1 flex-1 sm:flex-initial min-w-[160px]">
                   <label className="text-[9px] uppercase font-bold text-slate-400 font-mono">Performing Auditor Name</label>
                   <input
                     type="text"
@@ -1893,7 +2046,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
             </div>
 
             {/* Custom stocktake inventory search filter bar */}
-            <div className="flex border-t border-b border-slate-100 py-3 items-center justify-between gap-3">
+            <div className="flex flex-wrap border-t border-b border-slate-100 py-3 items-center justify-between gap-2.5 w-full min-w-0">
               <span className="text-[10px] text-indigo-800 font-black uppercase tracking-wider flex items-center gap-1">
                 🔎 Stocktake List Filtering
               </span>
@@ -1919,8 +2072,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
             </div>
 
             {/* Table counting items */}
-            <div className="overflow-x-auto border border-slate-150 rounded-lg">
-              <table className="w-full text-left font-sans text-xs border-collapse">
+            <div className="overflow-x-auto touch-pan-x border border-slate-150 rounded-lg w-full">
+              <table className="w-full min-w-[520px] text-left font-sans text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9.5px] select-none">
                     <th className="px-4 py-3">Product Name & SKU</th>
@@ -2002,21 +2155,21 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                 />
               </div>
 
-              <div className="flex justify-end gap-2.5">
+              <div className="flex flex-wrap justify-end gap-2.5 w-full">
                 <button
                   type="button"
                   onClick={() => {
                     setCountedStocks({});
                     setActiveSubTab('catalog');
                   }}
-                  className="px-4 py-2 bg-slate-205 border border-slate-300 hover:bg-slate-300 rounded-lg text-xs font-bold text-slate-700 cursor-pointer"
+                  className="flex-1 sm:flex-initial px-4 py-2 bg-slate-205 border border-slate-300 hover:bg-slate-300 rounded-lg text-xs font-bold text-slate-700 cursor-pointer"
                 >
                   ABORT SHEET
                 </button>
                 <button
                   type="submit"
                   disabled={isReadOnly}
-                  className={`px-5 py-2 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider shadow-md cursor-pointer ${
+                  className={`flex-1 sm:flex-initial px-5 py-2 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider shadow-md cursor-pointer ${
                     isReadOnly 
                       ? 'bg-slate-400 cursor-not-allowed' 
                       : 'bg-indigo-600 hover:bg-indigo-700'
@@ -2031,7 +2184,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
         {/* INVENTORY HISTORY & MOVEMENT LEDGER TAB LAYOUT */}
         {activeSubTab === 'inventory_history' && (
-          <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-2xs animate-fadeIn flex flex-col gap-4">
+          <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-4 shadow-2xs animate-fadeIn flex flex-col gap-4 w-full min-w-0">
             
             {/* Header & Metric Cards */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
@@ -2121,14 +2274,14 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               </div>
 
               {/* Movement Type & Branch Dropdowns */}
-              <div className="flex items-center gap-2 shrink-0 overflow-x-auto pb-1 sm:pb-0">
+              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
                 <span className="text-[10px] font-extrabold text-slate-400 uppercase tracking-wider flex items-center gap-1 shrink-0">
                   <Filter size={11} /> Filter:
                 </span>
                 <select
                   value={historyTypeFilter}
                   onChange={(e) => setHistoryTypeFilter(e.target.value)}
-                  className="text-xs bg-white border border-slate-200 rounded-md px-2 py-1.5 font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
+                  className="flex-1 sm:flex-initial text-xs bg-white border border-slate-200 rounded-md px-2 py-1.5 font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
                 >
                   <option value="all">All Movement Types</option>
                   <option value="sales">🛒 POS Sales</option>
@@ -2141,7 +2294,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                 <select
                   value={historyStoreFilter}
                   onChange={(e) => setHistoryStoreFilter(e.target.value)}
-                  className="text-xs bg-white border border-slate-200 rounded-md px-2 py-1.5 font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
+                  className="flex-1 sm:flex-initial text-xs bg-white border border-slate-200 rounded-md px-2 py-1.5 font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
                 >
                   <option value="all">All Store Branches</option>
                   <option value="lusaka">Lusaka Main</option>
@@ -2152,8 +2305,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
             </div>
 
             {/* Transactions & Inventory Log Table */}
-            <div className="overflow-x-auto max-h-[500px] overflow-y-auto border border-slate-200 rounded-lg">
-              <table className="w-full text-left text-xs border-collapse">
+            <div className="overflow-x-auto touch-pan-x max-h-[500px] overflow-y-auto border border-slate-200 rounded-lg w-full">
+              <table className="w-full min-w-[680px] text-left text-xs border-collapse">
                 <thead className="sticky top-0 bg-slate-100 z-10">
                   <tr className="text-slate-500 font-extrabold uppercase text-[9px] tracking-wider select-none border-b border-slate-200">
                     <th className="py-2.5 px-3">Date & Time</th>
@@ -2292,14 +2445,14 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
         {/* TRANSFERS history log Tab layout */}
         {activeSubTab === 'transfers_ledger' && (
-          <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-3xs animate-fadeIn">
+          <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-4 shadow-3xs animate-fadeIn w-full min-w-0">
             <h3 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider mb-2.5 flex items-center gap-1.5 border-b border-slate-100 pb-2">
-              <Activity size={14} className="text-indigo-600" />
-              Inter-Branch Stock Transfer Ledger History
+              <Activity size={14} className="text-indigo-600 shrink-0" />
+              <span>Inter-Branch Stock Transfer Ledger History</span>
             </h3>
 
-            <div className="overflow-x-auto max-h-96 overflow-y-auto">
-              <table className="w-full text-left text-xs border-collapse">
+            <div className="overflow-x-auto touch-pan-x max-h-96 overflow-y-auto w-full">
+              <table className="w-full min-w-[660px] text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-55 text-slate-400 font-extrabold uppercase text-[9px] select-none">
                     <th className="py-2 px-3">Transfer ID</th>
@@ -2456,12 +2609,12 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       {/* WIDGET: INTER-STORE STOCK TRANSFER DIALOG MODAL */}
       <AnimatePresence>
         {showTransferModal && (
-          <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4 z-50 overflow-y-auto">
             <motion.div
               initial={{ scale: 0.96, opacity: 0, y: 10 }}
               animate={{ scale: 1, opacity: 1, y: 0 }}
               exit={{ scale: 0.96, opacity: 0, y: 10 }}
-              className="bg-white rounded-2xl border border-slate-300 shadow-2xl w-full max-w-2xl overflow-hidden flex flex-col cursor-default"
+              className="bg-white rounded-2xl border border-slate-300 shadow-2xl w-full max-w-2xl max-h-[90dvh] overflow-hidden flex flex-col cursor-default"
             >
               <div 
                 className="p-4 bg-slate-900 text-white font-bold text-xs tracking-wider flex justify-between items-center shrink-0 uppercase text-left select-none border-b border-slate-800"
@@ -2664,12 +2817,12 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       {/* NEW ITEM CREATION DIALOG MODAL */}
       <AnimatePresence>
         {showAddModal && (
-          <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto select-none">
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4 z-50 overflow-y-auto select-none">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md overflow-hidden flex flex-col"
+              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md max-h-[90dvh] overflow-hidden flex flex-col"
             >
               <div className="p-4 bg-slate-905 text-white font-bold text-xs tracking-wider flex justify-between items-center shrink-0 uppercase text-left">
                 <span>ADD NEW WAREHOUSE RETAIL ITEM</span>
@@ -2940,12 +3093,12 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       {/* QUICK RECEIVE / ADD STOCK BATCH MODAL */}
       <AnimatePresence>
         {showReceiveModal && receiveProduct && (
-          <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto select-none">
+          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4 z-50 overflow-y-auto select-none">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md overflow-hidden flex flex-col"
+              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md max-h-[90dvh] overflow-hidden flex flex-col"
             >
               <div className="p-4 bg-indigo-900 text-white font-bold text-xs tracking-wider flex justify-between items-center shrink-0 uppercase text-left">
                 <span>RECEIVE PHYSICAL STOCK: {receiveProduct.name}</span>

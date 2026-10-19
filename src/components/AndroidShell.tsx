@@ -161,9 +161,9 @@ export default function AndroidShell({
           </div>
 
           {/* Display Working Surface Panel */}
-          <div className="flex-1 flex overflow-hidden relative">
+          <div className="flex-1 flex overflow-hidden relative min-w-0 w-full">
             {/* Inner Surface Slots Grid */}
-            <div className="flex-1 flex flex-col h-full relative">
+            <div className="flex-1 flex flex-col h-full relative min-w-0 w-full">
               {children}
             </div>
           </div>

@@ -40,7 +40,7 @@ import {
   AlertTriangle,
   Zap
 } from 'lucide-react';
-import { runSql, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit } from '../db';
+import { runSql, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer } from '../db';
 import { Product, Customer, StoreSettings } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
@@ -380,7 +380,9 @@ export default function BillingTerminal({
     alert(`⚡ Reconnect Synchronization Success!\n\nSuccessfully uploaded ${successCount} queued offline POS checkout invoices. Main ledger journals, stock valuations, and co-signed credit sweeps are now fully updated!`);
     
     onCartCheckedOut();
+    syncAllAccountingSystems('Offline Queue Reconnect Sync');
     refreshDbData();
+    handleTriggerCashUp();
     try {
       window.dispatchEvent(new Event('pos_data_updated'));
       window.dispatchEvent(new Event('storage'));
@@ -507,21 +509,33 @@ export default function BillingTerminal({
   const [selectedLoginStore, setSelectedLoginStore] = useState<string>(activeStore);
   const [loginStores, setLoginStores] = useState<any[]>([]);
 
-  useEffect(() => {
+  const loadDynamicLoginStores = () => {
     const res = runSql("SELECT * FROM stores", 'Fetch stores for login selection');
     if (res.success && Array.isArray(res.data) && res.data.length > 0) {
       setLoginStores(res.data);
+      if (!selectedLoginStore || !res.data.some((s: any) => s.id === selectedLoginStore)) {
+        setSelectedLoginStore(res.data[0].id);
+      }
     } else {
-      setLoginStores([
-        { id: 'lusaka', name: 'Lusaka Main Office' },
-        { id: 'kitwe', name: 'Kitwe Regional Yard' },
-        { id: 'ndola', name: 'Ndola Branch Station' }
-      ]);
+      setLoginStores([]);
     }
+  };
+
+  useEffect(() => {
+    loadDynamicLoginStores();
+    window.addEventListener('pos_data_updated', loadDynamicLoginStores);
+    window.addEventListener('local_db_restored', loadDynamicLoginStores);
+    return () => {
+      window.removeEventListener('pos_data_updated', loadDynamicLoginStores);
+      window.removeEventListener('local_db_restored', loadDynamicLoginStores);
+    };
   }, []);
 
   useEffect(() => {
-    setSelectedLoginStore(activeStore);
+    if (activeStore) {
+      setSelectedLoginStore(activeStore);
+    }
+    loadDynamicLoginStores();
   }, [activeStore]);
 
   // End of Day Cash Up Filters
@@ -846,17 +860,28 @@ export default function BillingTerminal({
       });
     }
 
-    // 3. Log a refund audit event
+    // 3. Log a refund audit event & synchronize all double-entry accounting tables immediately
     logEmployeeAudit('SALES', 'Processed Refund', `Refunded Order #${inv.id}, Supervisor Approved: ${supervisorName}`, Number(inv.total || 0), activeStore);
+    syncAllAccountingSystems(`POS Refund #${inv.id}`);
 
-    alert(`✓ Refund Processed Successfully!\n\nOrder Ref: ${inv.id}\nValue: ${settings.currency}${Number(inv.total || 0).toFixed(2)}\nSupervisor Approved: ${supervisorName}\n\nInventory levels have been successfully restored!`);
+    alert(`✓ Refund Processed Successfully!\n\nOrder Ref: ${inv.id}\nValue: ${settings.currency}${Number(inv.total || 0).toFixed(2)}\nSupervisor Approved: ${supervisorName}\n\nInventory levels and all Double-Entry Accounting Ledgers (EOD, Cash Flow, Payment Methods, P&L, Balance Sheet & Refund Ledger) have been updated!`);
 
-    // 4. Reload data
+    // 4. Reload data and notify all accounting views
     loadInvoices();
-    // Reselect invoice to refresh UI
     const updatedInv = { ...inv, status: 'Refunded' };
     setSelectedInvoice(updatedInv);
     refreshDbData();
+    handleTriggerCashUp();
+    try {
+      window.dispatchEvent(new CustomEvent('pos_sale_completed', {
+        detail: { orderId: inv.id, totalAmount: -Number(inv.total || 0), paymentMethod: inv.paymentMethod, store_id: activeStore, type: 'REFUND' }
+      }));
+      window.dispatchEvent(new Event('pos_data_updated'));
+      window.dispatchEvent(new Event('storage'));
+    } catch (evErr) {
+      console.warn('Event dispatch failed:', evErr);
+    }
+    persistTablesToStorage();
     setShowRefundAuth(false);
     setRefundSupervisorName('');
     setRefundSupervisorPassword('');
@@ -1857,11 +1882,14 @@ export default function BillingTerminal({
         if (!isTargetStore(ord.store_id)) return;
         if (!isTargetCashier(ord.performed_by)) return;
 
+        const method = String(ord.paymentMethod || 'Cash').trim();
+        const methodLower = method.toLowerCase();
+        // Layby completion order cash was already counted in layby_installments
+        if (methodLower.includes('layby')) return;
+
         const ordId = String(ord.id || '');
         if (ordId) processedTxIds.add(ordId);
 
-        const method = String(ord.paymentMethod || 'Cash').trim();
-        const methodLower = method.toLowerCase();
         const tot = parseFloat(ord.total || 0);
 
         if (methodLower === 'cash') {
@@ -1894,9 +1922,9 @@ export default function BillingTerminal({
           let splitMomo = 0;
           if (legRes.success && Array.isArray(legRes.data) && legRes.data.length > 0) {
             legRes.data.forEach((le: any) => {
-              if (le.account_id === 'cash-clearing-account-uuid') {
+              if (le.account_id === 'cash-clearing-account-uuid' || le.account_id === 'acc_cash') {
                 splitCash += parseFloat(le.amount || 0);
-              } else {
+              } else if (le.account_id === 'acc_momo' || le.account_id.includes('clearing')) {
                 splitMomo += parseFloat(le.amount || 0);
               }
             });
@@ -1919,6 +1947,32 @@ export default function BillingTerminal({
           sOther += tot;
           txList.push({ id: ord.id, type: 'Completed Sale', method: method, amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
         }
+      });
+    }
+
+    // Also include Refunded orders in todayTxList for full EOD audit transparency
+    const refundedRes = runSql(`
+      SELECT o.*, c.name AS customer_name 
+      FROM orders o
+      LEFT JOIN customers c ON o.customerId = c.id
+      WHERE LOWER(TRIM(o.status)) = 'refunded'
+      ORDER BY o.orderDate DESC
+    `, 'EOD Cash Up: Query database refunded orders');
+    if (refundedRes.success && Array.isArray(refundedRes.data)) {
+      refundedRes.data.forEach((rOrd: any) => {
+        if (!isTargetDate(rOrd.orderDate)) return;
+        if (!isTargetStore(rOrd.store_id)) return;
+        if (!isTargetCashier(rOrd.performed_by)) return;
+        const rTot = parseFloat(rOrd.total || 0);
+        txList.push({
+          id: `${rOrd.id} (REFUND)`,
+          type: 'Refunded Credit Note',
+          method: `${rOrd.paymentMethod || 'Cash'} (Reversed)`,
+          amount: -rTot,
+          time: rOrd.orderDate,
+          customer: rOrd.customer_name || 'Walk-in Customer',
+          cashier: rOrd.performed_by || 'Cashier'
+        });
       });
     }
 
@@ -2590,7 +2644,8 @@ export default function BillingTerminal({
       // 5. Notify inside local session
       alert(`✓ Quick Sale Confirmed Successfully!\n\nTicket Ref: ${orderId}\nInvoice value: ${settings.currency}${totalAmountQS.toFixed(2)}\nSalesperson: ${salesperson}\n\nPDF Receipt has been generated & downloaded!${sweepMessage}`);
 
-      // 6. Reset states and refresh
+      // 6. Synchronize all double-entry accounting systems immediately, reset states and refresh
+      syncAllAccountingSystems(`POS Quick Sale #${orderId}`);
       setQuickSearchQuery('');
       setQuickSelectedProduct(null);
       setQuickSaleQty('1');
@@ -2986,6 +3041,8 @@ export default function BillingTerminal({
     setSplitCashAmount('');
     setSplitMobileAmount('');
     setCheckoutStep('success');
+    // Immediately update all Double-Entry Accounting Ledgers (EOD, Cash Flow, Payment Methods, P&L, Balance Sheet, Receipt & Refund Ledger)
+    syncAllAccountingSystems(`POS Sale #${orderId}`);
     onCartCheckedOut();
     refreshDbData();
     loadInvoices();
@@ -3099,11 +3156,11 @@ export default function BillingTerminal({
               </div>
 
               <form
-                onSubmit={(e) => {
+                onSubmit={async (e) => {
                   e.preventDefault();
                   const targetEmail = loginEmail.trim();
                   const targetPassword = loginPassword.trim();
-                  const amt = parseFloat(inputOpeningCash.trim());
+                  const amt = parseFloat(inputOpeningCash.trim() || '0');
 
                   if (!targetEmail || !targetPassword) {
                     alert('Please enter your login username (email) and password.');
@@ -3111,84 +3168,112 @@ export default function BillingTerminal({
                   }
 
                   if (isNaN(amt) || amt < 0) {
-                    alert('Invalid Balance: Please input a correct positive opening register cash value.');
+                    alert('Invalid Balance: Please input a correct non-negative opening register cash value.');
                     return;
                   }
 
-                  // 1. Authenticate user
-                  let authenticatedUser = null;
-                  let userRoleFound = 'sales';
-                  let userFullName = 'Default Cashier';
+                  const findLocalAuth = () => {
+                    let foundUser: any = null;
+                    let roleFound = 'sales';
+                    let fullName = 'Cashier';
 
-                  // Search businesses (owners) via robust JavaScript search
-                  const bizRes = runSql('SELECT * FROM businesses', 'Auth: Retrieve businesses');
-                  if (bizRes.success && Array.isArray(bizRes.data)) {
-                    const matchBiz = bizRes.data.find(b => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
-                    if (matchBiz && matchBiz.password === targetPassword) {
-                      authenticatedUser = matchBiz;
-                      userRoleFound = 'owner';
-                      userFullName = matchBiz.owner || 'Business Owner';
+                    const bizRes = runSql('SELECT * FROM businesses', 'Auth: Retrieve businesses');
+                    if (bizRes.success && Array.isArray(bizRes.data)) {
+                      const matchBiz = bizRes.data.find(b => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
+                      if (matchBiz && (!matchBiz.password || matchBiz.password === targetPassword)) {
+                        foundUser = matchBiz;
+                        roleFound = 'owner';
+                        fullName = matchBiz.owner || matchBiz.name || 'Business Owner';
+                      }
                     }
-                  }
 
-                  // Search staff members via robust JavaScript search
-                  if (!authenticatedUser) {
-                    const staffRes = runSql('SELECT * FROM staff', 'Auth: Retrieve staff');
-                    if (staffRes.success && Array.isArray(staffRes.data)) {
-                      const matchStaff = staffRes.data.find(s => s.email && s.email.trim().toLowerCase() === targetEmail.toLowerCase());
-                      if (matchStaff) {
-                        let parsedPerms: any = {};
-                        try {
-                          if (matchStaff.permissions_json) {
-                            parsedPerms = JSON.parse(matchStaff.permissions_json);
-                          }
-                        } catch (e) {
-                          console.error('Error parsing permissions json', e);
-                        }
-
-                        // Determine valid password: check custom password inside perms, or falls back to 'staff123' or surname
-                        const customPass = parsedPerms.password;
-                        const isPasswordValid = customPass 
-                          ? targetPassword === customPass
-                          : (targetPassword === 'staff123' || targetPassword.toLowerCase() === matchStaff.surname.toLowerCase());
-
-                        if (isPasswordValid) {
-                          // Validate accessible branches restrictions!
-                          const branches = parsedPerms.accessible_branches;
-                          if (Array.isArray(branches) && branches.length > 0) {
-                            if (!branches.includes(selectedLoginStore)) {
-                              // Retrieve human-friendly store names for visual alert
-                              const storeNamesStr = branches.join(', ').toUpperCase();
-                              alert(`Access Denied: Your staff account is not authorized to access this branch (${selectedLoginStore.toUpperCase()}).\n\nAuthorized Branch Access: [${storeNamesStr}]`);
-                              return;
+                    if (!foundUser) {
+                      const staffRes = runSql('SELECT * FROM staff', 'Auth: Retrieve staff');
+                      if (staffRes.success && Array.isArray(staffRes.data)) {
+                        const matchStaff = staffRes.data.find(s => s.email && s.email.trim().toLowerCase() === targetEmail.toLowerCase());
+                        if (matchStaff) {
+                          let parsedPerms: any = {};
+                          try {
+                            if (matchStaff.permissions_json) {
+                              parsedPerms = JSON.parse(matchStaff.permissions_json);
                             }
-                          }
+                          } catch (e) {}
 
-                          authenticatedUser = matchStaff;
-                          userFullName = `${matchStaff.first_name} ${matchStaff.surname}`;
-                          
-                          // Set userRole: check permission-based role override, else falls back to salary logic
-                          if (parsedPerms.role) {
-                            userRoleFound = parsedPerms.role;
-                          } else if (matchStaff.email.toLowerCase().includes('chintu') || parseFloat(matchStaff.basic_salary) > 10000) {
-                            userRoleFound = 'manager';
-                          } else {
-                            userRoleFound = 'sales';
+                          const customPass = matchStaff.password || parsedPerms.password;
+                          const isPasswordValid = customPass
+                            ? targetPassword === customPass
+                            : (matchStaff.surname && targetPassword.toLowerCase() === matchStaff.surname.toLowerCase());
+
+                          if (isPasswordValid) {
+                            const branches = parsedPerms.accessible_branches;
+                            if (Array.isArray(branches) && branches.length > 0 && selectedLoginStore) {
+                              if (!branches.includes(selectedLoginStore)) {
+                                const storeNamesStr = branches.join(', ').toUpperCase();
+                                return { error: `Access Denied: Your staff account is not authorized to access this branch (${selectedLoginStore.toUpperCase()}).\n\nAuthorized Branch Access: [${storeNamesStr}]` };
+                              }
+                            }
+
+                            foundUser = matchStaff;
+                            fullName = `${matchStaff.first_name} ${matchStaff.surname}`;
+                            if (parsedPerms.role) {
+                              roleFound = parsedPerms.role;
+                            } else if (parseFloat(matchStaff.basic_salary) > 10000) {
+                              roleFound = 'manager';
+                            } else {
+                              roleFound = 'sales';
+                            }
                           }
                         }
                       }
                     }
-                  }
 
-                  if (!authenticatedUser) {
-                    alert('Authentication Failed: Invalid Email or Password. Please try again.');
+                    return { foundUser, roleFound, fullName };
+                  };
+
+                  // 1. Check local database first
+                  let authResult = findLocalAuth();
+                  if (authResult.error) {
+                    alert(authResult.error);
                     return;
                   }
 
-                  // 2. Clear previous active shift and open the selected store's shift
+                  // 2. If not found locally, try pulling synchronized business/staff from Cloud SQL server!
+                  if (!authResult.foundUser) {
+                    const pullRes = await pullDatabaseFromServer(undefined, targetEmail);
+                    if (pullRes.success) {
+                      loadDynamicLoginStores();
+                      refreshDbData();
+                      authResult = findLocalAuth();
+                      if (authResult.error) {
+                        alert(authResult.error);
+                        return;
+                      }
+                    }
+                  }
+
+                  if (!authResult.foundUser) {
+                    alert('Authentication Failed: Account not found or invalid password. If you are a new business, please create your business account first.');
+                    return;
+                  }
+
+                  const userFullName = authResult.fullName;
+                  const userRoleFound = authResult.roleFound;
+
+                  // Determine store to activate
+                  let targetStoreId = selectedLoginStore || activeStore;
+                  const currentStoresRes = runSql('SELECT * FROM stores', 'Auth: Check stores');
+                  if (currentStoresRes.success && Array.isArray(currentStoresRes.data) && currentStoresRes.data.length > 0) {
+                    if (!targetStoreId || !currentStoresRes.data.some((s: any) => s.id === targetStoreId)) {
+                      targetStoreId = currentStoresRes.data[0].id;
+                    }
+                  }
+
+                  // 3. Open the selected store's shift
                   localStorage.setItem('pos_shift_active', 'true');
-                  localStorage.setItem('shift_active_' + selectedLoginStore, 'true');
-                  localStorage.setItem('shift_active_' + activeStore, 'true');
+                  if (targetStoreId) {
+                    localStorage.setItem('shift_active_' + targetStoreId, 'true');
+                    localStorage.setItem('shift_opening_cash_' + targetStoreId, amt.toFixed(2));
+                  }
                   if (Array.isArray(loginStores)) {
                     loginStores.forEach(st => {
                       if (st && st.id) {
@@ -3197,18 +3282,18 @@ export default function BillingTerminal({
                       }
                     });
                   }
-                  localStorage.setItem('shift_opening_cash_' + selectedLoginStore, amt.toFixed(2));
-                  localStorage.setItem('shift_opening_cash_' + activeStore, amt.toFixed(2));
                   localStorage.setItem('shift_opening_cash_global', amt.toFixed(2));
                   localStorage.setItem('quick_salesperson_name', userFullName);
                   localStorage.setItem('logged_in_user_email', targetEmail);
                   localStorage.setItem('logged_in_user_name', userFullName);
 
-                  // 3. Callback props to update main App state dynamically!
-                  onStoreChange?.(selectedLoginStore);
+                  // 4. Callback props to update main App state dynamically
+                  if (targetStoreId) {
+                    onStoreChange?.(targetStoreId);
+                  }
                   onUserRoleChange?.(userRoleFound);
 
-                  // 4. Update local states
+                  // 5. Update local states
                   setIsShiftActive(true);
                   setOpeningCash(amt.toFixed(2));
                   setQuickSalespersonName(userFullName);
@@ -3216,7 +3301,7 @@ export default function BillingTerminal({
                   setLoginPassword('');
                   setInputOpeningCash('');
 
-                  alert(`✓ Access Granted! Welcome ${userFullName}.\n\nYour shift has been successfully started for branch: ${selectedLoginStore.toUpperCase()}.`);
+                  alert(`✓ Access Granted! Welcome ${userFullName}.\n\nYour shift has been started for branch: ${(targetStoreId || 'MAIN').toUpperCase()}.`);
                 }}
                 className="flex flex-col gap-3 text-left"
               >
@@ -3228,7 +3313,7 @@ export default function BillingTerminal({
                     <input
                       required
                       type="email"
-                      placeholder="e.g. lombe@pos.zm"
+                      placeholder="Enter your registered business or staff email"
                       value={loginEmail}
                       onChange={(e) => setLoginEmail(e.target.value)}
                       className="w-full pl-8 pr-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs font-semibold outline-hidden transition-all text-slate-800"
@@ -3262,9 +3347,13 @@ export default function BillingTerminal({
                       onChange={(e) => setSelectedLoginStore(e.target.value)}
                       className="w-full pl-8 pr-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs font-bold outline-hidden transition-all text-slate-800 select-none cursor-pointer uppercase tracking-wider font-mono"
                     >
-                      {loginStores.map(store => (
-                        <option key={store.id} value={store.id}>{store.name}</option>
-                      ))}
+                      {loginStores.length === 0 ? (
+                        <option value="">No Branch Configured Yet</option>
+                      ) : (
+                        loginStores.map(store => (
+                          <option key={store.id} value={store.id}>{store.name}</option>
+                        ))
+                      )}
                     </select>
                   </div>
                 </div>
@@ -3273,15 +3362,15 @@ export default function BillingTerminal({
                 <div className="flex flex-col gap-1 border-t border-slate-100 pt-3">
                   <label className="text-[10px] font-black text-rose-500 uppercase tracking-wider font-sans flex items-center gap-1">
                     <Coins size={11} />
-                    <span>Opening Cash Balance (ZMW)</span>
+                    <span>Opening Cash Balance ({settings.currency})</span>
                   </label>
                   <div className="relative">
-                    <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono font-bold">K</span>
+                    <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono font-bold">{settings.currency}</span>
                     <input
                       required
                       type="number"
                       step="0.01"
-                      placeholder="Opening drawer cash, e.g. 500.00"
+                      placeholder="Opening drawer cash, e.g. 0.00"
                       value={inputOpeningCash}
                       onChange={(e) => setInputOpeningCash(e.target.value)}
                       className="w-full pl-8 pr-3 py-2 bg-rose-50/30 border border-rose-200/50 focus:bg-white focus:border-rose-500 rounded-lg text-xs font-mono font-bold outline-hidden transition-all text-slate-850"
@@ -3298,14 +3387,14 @@ export default function BillingTerminal({
                 </button>
               </form>
 
-              {/* Help & guide credentials widget to guarantee flawless out-of-the-box usage */}
-              <div className="mt-1 bg-slate-50 border border-slate-150 p-3 rounded-2xl text-[10px] text-slate-500 font-sans text-left">
-                <strong className="text-slate-700 text-[10px] block mb-1">💡 SEEDED CREDENTIALS PREVIEWS:</strong>
-                <ul className="list-disc pl-3.5 space-y-1">
-                  <li><strong>Business Owner:</strong> <span className="font-mono text-slate-700 select-all">owner@pos.zm</span> / <span className="font-mono text-slate-700 select-all">admin123</span> (Full Access)</li>
-                  <li><strong>Store Manager:</strong> <span className="font-mono text-slate-700 select-all">chintu@pos.zm</span> / <span className="font-mono text-slate-700 select-all">staff123</span> (or <span className="font-mono text-slate-700 select-all">Mulenga</span>)</li>
-                  <li><strong>Sales Operator:</strong> <span className="font-mono text-slate-700 select-all">lombe@pos.zm</span> / <span className="font-mono text-slate-700 select-all">staff123</span> (or <span className="font-mono text-slate-700 select-all">Kapambwe</span>)</li>
-                </ul>
+              <div className="mt-1 bg-slate-50 border border-slate-200 p-3 rounded-2xl text-[10px] text-slate-600 font-sans text-left flex flex-col gap-1.5">
+                <strong className="text-slate-800 text-[10px] flex items-center gap-1">
+                  <ShieldCheck size={12} className="text-emerald-600 shrink-0" />
+                  <span>CLOUD-SYNCHRONIZED LOGIN</span>
+                </strong>
+                <p className="leading-relaxed text-slate-500">
+                  Sign in with your Business Owner email & password or a Staff account created in Staff Management. Entering an existing cloud account email automatically synchronizes your business data from Cloud SQL.
+                </p>
               </div>
             </div>
           </div>
