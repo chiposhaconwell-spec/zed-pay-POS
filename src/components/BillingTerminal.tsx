@@ -46,7 +46,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint } from '../androidUtils';
-import { getTransportSecurityStatus } from '../firebase';
+import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud } from '../firebase';
 
 const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
@@ -135,7 +135,7 @@ export default function BillingTerminal({
   // Invoice History and Refund state management
   const [showInvoiceHistoryModal, setShowInvoiceHistoryModal] = useState(false);
   const [invoiceSearchQuery, setInvoiceSearchQuery] = useState('');
-  const [historyStoreFilter, setHistoryStoreFilter] = useState<string>('all');
+  const [historyStoreFilter, setHistoryStoreFilter] = useState<string>(() => activeStore || 'all');
   const [selectedInvoice, setSelectedInvoice] = useState<any>(null);
   const [selectedInvoiceItems, setSelectedInvoiceItems] = useState<any[]>([]);
   const [invoiceList, setInvoiceList] = useState<any[]>([]);
@@ -496,7 +496,11 @@ export default function BillingTerminal({
 
   // Shift & Handover active states
   const [isShiftActive, setIsShiftActive] = useState<boolean>(() => {
-    return localStorage.getItem('pos_shift_active') === 'true' || localStorage.getItem('shift_active_' + activeStore) === 'true';
+    return (
+      localStorage.getItem('pos_authenticated_session') === 'true' ||
+      localStorage.getItem('pos_shift_active') === 'true' ||
+      localStorage.getItem('shift_active_' + activeStore) === 'true'
+    );
   });
   const [openingCash, setOpeningCash] = useState<string>(() => {
     return localStorage.getItem('shift_opening_cash_' + activeStore) || localStorage.getItem('shift_opening_cash_global') || '0.00';
@@ -512,9 +516,18 @@ export default function BillingTerminal({
   const loadDynamicLoginStores = () => {
     const res = runSql("SELECT * FROM stores", 'Fetch stores for login selection');
     if (res.success && Array.isArray(res.data) && res.data.length > 0) {
-      setLoginStores(res.data);
-      if (!selectedLoginStore || !res.data.some((s: any) => s.id === selectedLoginStore)) {
-        setSelectedLoginStore(res.data[0].id);
+      let accessibleIds: string[] = [];
+      try {
+        const savedAcc = localStorage.getItem('logged_in_accessible_branches');
+        if (savedAcc) accessibleIds = JSON.parse(savedAcc);
+      } catch {}
+      const filteredStores = (userRole !== 'owner' && accessibleIds.length > 0)
+        ? res.data.filter((s: any) => accessibleIds.includes(s.id))
+        : res.data;
+      const finalStores = filteredStores.length > 0 ? filteredStores : res.data;
+      setLoginStores(finalStores);
+      if (!selectedLoginStore || !finalStores.some((s: any) => s.id === selectedLoginStore)) {
+        setSelectedLoginStore(finalStores[0].id);
       }
     } else {
       setLoginStores([]);
@@ -529,21 +542,29 @@ export default function BillingTerminal({
       window.removeEventListener('pos_data_updated', loadDynamicLoginStores);
       window.removeEventListener('local_db_restored', loadDynamicLoginStores);
     };
-  }, []);
+  }, [userRole]);
 
   useEffect(() => {
     if (activeStore) {
       setSelectedLoginStore(activeStore);
+      setCashUpStore(activeStore);
+      setHistoryStoreFilter(activeStore);
+      setOpeningCash(localStorage.getItem('shift_opening_cash_' + activeStore) || localStorage.getItem('shift_opening_cash_global') || '0.00');
+      setIsShiftActive(
+        localStorage.getItem('pos_authenticated_session') === 'true' ||
+        localStorage.getItem('pos_shift_active') === 'true' ||
+        localStorage.getItem('shift_active_' + activeStore) === 'true'
+      );
     }
     loadDynamicLoginStores();
   }, [activeStore]);
 
-  // End of Day Cash Up Filters
+  // End of Day Cash Up Filters (defaults strictly to logged-in branch)
   const [cashUpDate, setCashUpDate] = useState<string>(() => {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   });
-  const [cashUpStore, setCashUpStore] = useState<string>('all');
+  const [cashUpStore, setCashUpStore] = useState<string>(() => activeStore || 'all');
   const [cashUpCashier, setCashUpCashier] = useState<string>('all');
 
   // Daily expected aggregates split by channels
@@ -586,11 +607,15 @@ export default function BillingTerminal({
     '0.10': 0,
   });
 
-  // Fetch previous EOD reconciliation logs from the SQLite table cash_ups
+  // Fetch previous EOD reconciliation logs from the SQLite table cash_ups (scoped to branch)
   const loadReconciliationHistory = () => {
     const res = runSql(`SELECT * FROM cash_ups ORDER BY created_at DESC`, 'Retrieve reconciliation ledger history');
     if (res.success && Array.isArray(res.data)) {
-      setReconciliationHistory(res.data);
+      const targetBranch = cashUpStore || activeStore || 'all';
+      const filtered = targetBranch === 'all'
+        ? res.data
+        : res.data.filter((r: any) => !r.store_id || String(r.store_id).toLowerCase() === targetBranch.toLowerCase());
+      setReconciliationHistory(filtered);
     }
   };
 
@@ -619,26 +644,22 @@ export default function BillingTerminal({
     return 0;
   };
 
-  // Sync state with SQL database
+  // Sync state with SQL database (strictly separated by activeStore)
   const refreshDbData = () => {
-    // Read products using SELECT query WITH store_products branch-specific JOIN!
-    const query = `
-      SELECT 
-        p.id, 
-        p.name, 
-        p.sku, 
-        p.category, 
-        COALESCE(sp.price, p.price) AS price, 
-        p.cost, 
-        COALESCE(sp.stock, p.stock) AS stock, 
-        p.imageUrl,
-        p.is_service
-      FROM products p 
-      LEFT JOIN store_products sp ON p.id = sp.product_id AND sp.store_id = '${activeStore}'
-    `;
-    const prodResult = runSql(query, `Register: Retrieve product listings for store [${activeStore.toUpperCase()}]`);
+    const spAllRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Register: Check branch stock map', true);
+    const spList = (spAllRes.success && Array.isArray(spAllRes.data)) ? spAllRes.data : [];
+    const prodResult = runSql('SELECT * FROM products', `Register: Retrieve product listings for store [${(activeStore || 'MAIN').toUpperCase()}]`);
     if (prodResult.success && Array.isArray(prodResult.data)) {
-      setProducts(prodResult.data);
+      const branchProds = prodResult.data.map((p: any) => {
+        const override = spList.find((sp: any) => Number(sp.product_id) === Number(p.id) && String(sp.store_id) === String(activeStore));
+        const hasAnyBranchRecord = spList.some((sp: any) => Number(sp.product_id) === Number(p.id));
+        return {
+          ...p,
+          price: override !== undefined ? Number(override.price) : Number(p.price || 0),
+          stock: override !== undefined ? Number(override.stock) : (hasAnyBranchRecord ? 0 : Number(p.stock || 0))
+        };
+      });
+      setProducts(branchProds);
     }
 
     // Read customers using SELECT query
@@ -648,15 +669,15 @@ export default function BillingTerminal({
     }
 
     // Keep invoice history list in sync automatically on all refreshes
-    loadInvoices();
+    loadInvoices(activeStore || historyStoreFilter);
   };
 
   const loadInvoices = (overrideStoreFilter?: string) => {
-    // Select orders for the chosen store filter (or all stores if 'all')
-    const filterToUse = overrideStoreFilter !== undefined ? overrideStoreFilter : historyStoreFilter;
+    // Select orders for the chosen store filter (strictly scoped to branch when not 'all')
+    const filterToUse = overrideStoreFilter !== undefined ? overrideStoreFilter : (historyStoreFilter || activeStore || 'all');
     let whereClause = '';
     if (filterToUse && filterToUse !== 'all') {
-      whereClause = `WHERE (LOWER(store_id) = '${filterToUse.toLowerCase()}' OR store_id IS NULL OR store_id = '')`;
+      whereClause = `WHERE LOWER(store_id) = '${filterToUse.toLowerCase()}'`;
     }
 
     // Query orders directly without fragile LEFT JOIN on NULL customerId in AlaSQL
@@ -1664,6 +1685,10 @@ export default function BillingTerminal({
     let text = `===============================\n`;
     text += `   ${settings.storeName.toUpperCase()}\n`;
     if (settings.receiptHeader) text += `   ${settings.receiptHeader}\n`;
+    if (settings.billingAddress || settings.billingCity) {
+      text += `   ${[settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ')}\n`;
+    }
+    if (settings.billingPhone) text += `   TEL: ${settings.billingPhone}\n`;
     if (settings.tpin) text += `   TPIN: ${settings.tpin}\n`;
     text += `===============================\n`;
     text += `TICKET REF: ${activeReceipt.id}\n`;
@@ -1794,8 +1819,15 @@ export default function BillingTerminal({
     shouldOpenModal: boolean = false
   ) => {
     const targetDate = overrideDate !== undefined ? overrideDate : cashUpDate;
-    const targetStore = overrideStore !== undefined ? overrideStore : cashUpStore;
+    const rawTargetStore = overrideStore !== undefined ? overrideStore : (cashUpStore || activeStore || 'all');
+    const targetStore = rawTargetStore === 'all' && userRole !== 'owner' && activeStore ? activeStore : rawTargetStore;
     const targetCashier = overrideCashier !== undefined ? overrideCashier : cashUpCashier;
+
+    let accessibleIds: string[] = [];
+    try {
+      const savedAcc = localStorage.getItem('logged_in_accessible_branches');
+      if (savedAcc) accessibleIds = JSON.parse(savedAcc);
+    } catch {}
 
     // Helper to check if a date string/timestamp matches the target YYYY-MM-DD
     const isTargetDate = (rawDate: any) => {
@@ -1817,12 +1849,15 @@ export default function BillingTerminal({
       return false;
     };
 
-    // Helper for store matching
+    // Helper for store matching (strictly separates each branch and respects account accessible branches)
     const isTargetStore = (storeId: any) => {
+      const ordStoreLower = String(storeId || '').toLowerCase().trim();
+      if (userRole !== 'owner' && accessibleIds.length > 0 && ordStoreLower) {
+        if (!accessibleIds.some(id => id.toLowerCase() === ordStoreLower)) return false;
+      }
       if (targetStore === 'all' || !targetStore) return true;
       const tStoreLower = targetStore.toLowerCase().trim();
-      const ordStoreLower = String(storeId || '').toLowerCase().trim();
-      if (!ordStoreLower) return true;
+      if (!ordStoreLower) return activeStore ? activeStore.toLowerCase().trim() === tStoreLower : true;
       return ordStoreLower === tStoreLower;
     };
 
@@ -2074,7 +2109,9 @@ export default function BillingTerminal({
     setCashExpensesSum(cExp);
 
     const totalSales = sCash + sAirtel + sMtn + sZamtel + sOtherMomo + sCard + sOther;
-    const openFloat = parseFloat(openingCash) || 0;
+    const openFloat = targetStore !== 'all' && targetStore
+      ? (parseFloat(localStorage.getItem('shift_opening_cash_' + targetStore) || openingCash || '0') || 0)
+      : (parseFloat(openingCash) || 0);
     const expectedCashInDrawer = openFloat + sCash + lCash - cExp;
 
     setCashUpSummary({
@@ -3249,6 +3286,26 @@ export default function BillingTerminal({
                         return;
                       }
                     }
+                  }
+
+                  // 3. Authenticate with Firebase Email/Password Provider (and restore from Firebase if needed)
+                  try {
+                    await signInWithEmailPasswordAccount(
+                      targetEmail,
+                      targetPassword,
+                      Boolean(authResult.foundUser),
+                      authResult.fullName || undefined
+                    );
+                    if (!authResult.foundUser) {
+                      const fbPull = await restoreFromCloud();
+                      if (fbPull.success) {
+                        loadDynamicLoginStores();
+                        refreshDbData();
+                        authResult = findLocalAuth();
+                      }
+                    }
+                  } catch (fbErr) {
+                    console.warn('Pre-shift Firebase Email/Password notice:', fbErr);
                   }
 
                   if (!authResult.foundUser) {
@@ -5241,10 +5298,14 @@ export default function BillingTerminal({
                         }}
                         className="px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-semibold text-slate-200 focus:outline-none focus:border-emerald-500 cursor-pointer uppercase"
                       >
-                        <option value="all">🏢 All Branches</option>
                         {loginStores.map((st: any) => (
-                          <option key={st.id} value={st.id}>{st.name || st.id}</option>
+                          <option key={st.id} value={st.id}>
+                            🏬 {st.name || st.id}{st.id === activeStore ? ' (Logged-In Branch)' : ''}
+                          </option>
                         ))}
+                        {(userRole === 'owner' || loginStores.length > 1) && (
+                          <option value="all">🏢 All Accessible Branches ({loginStores.length || 1})</option>
+                        )}
                       </select>
                     </div>
 

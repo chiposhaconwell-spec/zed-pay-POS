@@ -29,6 +29,7 @@ import { DEFAULT_COMPANY_LOGO } from '../App';
 
 interface LaybysBoardProps {
   settings: StoreSettings;
+  activeStore?: string;
   onTriggerSalesCounterAction?: (action: 'camera' | 'cashup') => void;
 }
 
@@ -44,6 +45,7 @@ interface Layby {
   balance_due: number;
   status: 'PENDING' | 'COMPLETED' | 'CANCELLED';
   items_json: string; // serialized JSON array
+  store_id?: string;
   created_at: string;
 }
 
@@ -56,7 +58,7 @@ interface Installment {
   created_at: string;
 }
 
-export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: LaybysBoardProps) {
+export default function LaybysBoard({ settings, activeStore = '', onTriggerSalesCounterAction }: LaybysBoardProps) {
   const [laybys, setLaybys] = useState<Layby[]>([]);
   const [showSaleOptions, setShowSaleOptions] = useState(false);
   const [selectedLayby, setSelectedLayby] = useState<Layby | null>(null);
@@ -309,14 +311,26 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
   };
 
   const loadData = () => {
-    const res = runSql('SELECT * FROM laybys ORDER BY created_at DESC', 'Layby: Fetch layaway customer accounts');
+    const storeWhere = activeStore ? `WHERE LOWER(store_id) = '${activeStore.toLowerCase()}'` : '';
+    const res = runSql(`SELECT * FROM laybys ${storeWhere} ORDER BY created_at DESC`, 'Layby: Fetch branch layaway customer accounts');
     if (res.success && Array.isArray(res.data)) {
       setLaybys(res.data);
     }
     
-    const prodRes = runSql('SELECT * FROM products WHERE stock > 0', 'Layby: Load stock catalog');
+    const spAllRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Layby: Check branch stock map', true);
+    const spList = (spAllRes.success && Array.isArray(spAllRes.data)) ? spAllRes.data : [];
+    const prodRes = runSql('SELECT * FROM products', 'Layby: Load stock catalog');
     if (prodRes.success && Array.isArray(prodRes.data)) {
-      setAllProducts(prodRes.data);
+      const branchProds = prodRes.data.map((p: any) => {
+        const override = spList.find((sp: any) => Number(sp.product_id) === Number(p.id) && String(sp.store_id) === String(activeStore));
+        const hasAnyBranchRecord = spList.some((sp: any) => Number(sp.product_id) === Number(p.id));
+        return {
+          ...p,
+          price: override !== undefined ? Number(override.price) : Number(p.price || 0),
+          stock: override !== undefined ? Number(override.stock) : (hasAnyBranchRecord ? 0 : Number(p.stock || 0))
+        };
+      }).filter((p: any) => p.stock > 0 || p.is_service === 1);
+      setAllProducts(branchProds);
     }
 
     const custRes = runSql('SELECT * FROM customers ORDER BY name ASC', 'Layby: Load saved CRM customers');
@@ -341,7 +355,7 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
 
   useEffect(() => {
     loadData();
-  }, [selectedLayby?.id]);
+  }, [selectedLayby?.id, activeStore]);
 
   const filteredLaybys = laybys.filter(l => 
     l.customer_name.toLowerCase().includes(searchText.toLowerCase()) ||
@@ -426,9 +440,10 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
     });
     const finalCustId = syncedCust ? syncedCust.id : 100 + Math.floor(Math.random() * 900);
 
-    // Insert layby record
+    const targetBranch = activeStore || 'main';
+    // Insert layby record with branch store_id
     const insertLaybySql = `
-      INSERT INTO laybys (id, customer_id, customer_name, customer_phone, customer_email, total_amount, deposit_amount, amount_paid, balance_due, status, items_json, created_at)
+      INSERT INTO laybys (id, customer_id, customer_name, customer_phone, customer_email, total_amount, deposit_amount, amount_paid, balance_due, status, items_json, store_id, created_at)
       VALUES (
         '${laybyId}',
         ${finalCustId},
@@ -441,24 +456,27 @@ export default function LaybysBoard({ settings, onTriggerSalesCounterAction }: L
         ${(total - depositNum).toFixed(2)},
         'PENDING',
         '${itemsJson.replace(/'/g, "''")}',
+        '${targetBranch}',
         '${dateStr}'
       )
     `;
-    const laybyRes = runSql(insertLaybySql, `Layby: Provision client invoice tracking contract ${laybyId}`);
+    const laybyRes = runSql(insertLaybySql, `Layby: Provision client invoice tracking contract ${laybyId} for branch ${targetBranch}`);
     
     if (laybyRes.success) {
-      logEmployeeAudit('LAYBY', 'Created Layby Contract', `Contract #${laybyId} for ${clientName}, Total: K${total.toFixed(2)}, Deposit: K${depositNum.toFixed(2)}`, depositNum);
+      const activeCashier = localStorage.getItem('logged_in_user_name') || cashierName || 'Cashier';
+      logEmployeeAudit('LAYBY', 'Created Layby Contract', `Contract #${laybyId} for ${clientName}, Total: K${total.toFixed(2)}, Deposit: K${depositNum.toFixed(2)}`, depositNum, targetBranch, activeCashier);
 
       // Record initial installment
       const installmentId = 'inst-' + Math.floor(10000 + Math.random() * 90000);
       runSql(`
         INSERT INTO layby_installments (id, layby_id, amount, payment_method, received_by, created_at)
-        VALUES ('${installmentId}', '${laybyId}', ${depositNum.toFixed(2)}, 'Cash', 'Alice Mwansa', '${dateStr}')
+        VALUES ('${installmentId}', '${laybyId}', ${depositNum.toFixed(2)}, 'Cash', '${activeCashier.replace(/'/g, "''")}', '${dateStr}')
       `, `Layby: Log initial security deposit +K${depositNum}`);
 
-      // Decrement physical warehouse stock instantly to reserve items
+      // Decrement physical warehouse stock instantly to reserve items in the selected branch
       selectedItems.forEach((x) => {
         runSql(`UPDATE products SET stock = stock - ${x.quantity} WHERE id = ${x.id}`, `Layby: Reserve stock item ${x.sku}`);
+        runSql(`UPDATE store_products SET stock = stock - ${x.quantity} WHERE product_id = ${x.id} AND store_id = '${targetBranch}'`, `Layby: Reserve branch stock in ${targetBranch}`);
       });
 
       // Clear layout

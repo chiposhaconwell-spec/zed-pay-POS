@@ -326,7 +326,7 @@ export function triggerLoanSweep(orderId: string, orderTotal: number): { deducte
 
 // Persistent configuration tables
 const LOCAL_STORAGE_KEY_PREFIX = 'android_pos_db_';
-const CLEAN_SLATE_MIGRATION_KEY = 'pos_clean_slate_v3';
+const CLEAN_SLATE_MIGRATION_KEY = 'pos_clean_slate_v5';
 
 let cloudPushTimeout: any = null;
 
@@ -488,14 +488,51 @@ export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
 function isLegacyPreseededSnapshot(recovered: Record<string, any[]>): boolean {
   const biz = recovered['businesses'] || [];
   const prods = recovered['products'] || [];
+  const stores = recovered['stores'] || [];
+  const staff = recovered['staff'] || [];
+  const hasDefaultBiz = biz.some((b: any) => b?.id === 'default_biz' || b?.email === 'owner@pos.zm');
   const hasOnlyDefaultBiz =
     biz.length === 1 &&
-    biz[0]?.id === 'default_biz' &&
-    (biz[0]?.email === 'owner@pos.zm' || biz[0]?.owner === 'Chiposha Conwell');
+    (biz[0]?.id === 'default_biz' || biz[0]?.email === 'owner@pos.zm' || biz[0]?.owner === 'Chiposha Conwell');
   const hasLegacySeedSkus = prods.some((p: any) =>
     ['COF-001', 'COF-002', 'APP-01', 'GRO-01'].includes(String(p?.sku || ''))
   );
-  return hasOnlyDefaultBiz && (prods.length === 0 || hasLegacySeedSkus);
+  const hasOnlyLegacyStores =
+    stores.length > 0 &&
+    stores.every((s: any) => ['lusaka', 'kitwe', 'ndola'].includes(String(s?.id || '').toLowerCase()));
+  const hasLegacyStaff = staff.some((st: any) => st?.id === 'staff-101' || st?.email === 'alice@pos.zm');
+  return hasOnlyDefaultBiz || (hasDefaultBiz && (hasLegacySeedSkus || hasOnlyLegacyStores || hasLegacyStaff)) || (biz.length === 0 && (hasLegacySeedSkus || hasOnlyLegacyStores || hasLegacyStaff));
+}
+
+function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<string, any[]> {
+  const cleaned: Record<string, any[]> = { ...recovered };
+  if (Array.isArray(cleaned['businesses'])) {
+    cleaned['businesses'] = cleaned['businesses'].filter(
+      (b: any) => b?.id !== 'default_biz' && b?.email !== 'owner@pos.zm'
+    );
+  }
+  if (Array.isArray(cleaned['stores'])) {
+    cleaned['stores'] = cleaned['stores'].filter(
+      (s: any) => s?.business_id !== 'default_biz' && !(['lusaka', 'kitwe', 'ndola'].includes(String(s?.id || '')) && !s?.business_id)
+    );
+  }
+  if (Array.isArray(cleaned['products'])) {
+    const legacySkus = new Set(['COF-001', 'COF-002', 'COF-003', 'COF-004', 'FOD-101', 'FOD-102', 'FOD-103', 'FOD-104', 'APP-01', 'APP-02', 'APP-03', 'ACC-01', 'ACC-02', 'SHO-01', 'GRO-01', 'GRO-02', 'GRO-03', 'GRO-04', 'GRO-05', 'GRO-06']);
+    cleaned['products'] = cleaned['products'].filter(
+      (p: any) => p?.business_id !== 'default_biz' && !legacySkus.has(String(p?.sku || ''))
+    );
+  }
+  if (Array.isArray(cleaned['customers'])) {
+    cleaned['customers'] = cleaned['customers'].filter(
+      (c: any) => c?.business_id !== 'default_biz' && ![101, 102, 103, 104].includes(Number(c?.id))
+    );
+  }
+  if (Array.isArray(cleaned['staff'])) {
+    cleaned['staff'] = cleaned['staff'].filter(
+      (st: any) => st?.business_id !== 'default_biz' && !['staff-101', 'staff-102', 'staff-103'].includes(String(st?.id || ''))
+    );
+  }
+  return cleaned;
 }
 
 function hasAnyUserCreatedData(recovered: Record<string, any[]>): boolean {
@@ -553,7 +590,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     runSql('DROP TABLE IF EXISTS payment_method_ledger', 'Clean database: Drops old payment_method_ledger');
     runSql('DROP TABLE IF EXISTS financial_statements_ledger', 'Clean database: Drops old financial_statements_ledger');
 
-    // Create Business Identity container
+    // Create Business Identity container (with billing address, tax & admin role metadata)
     runSql(`
       CREATE TABLE businesses (
         id STRING PRIMARY KEY,
@@ -561,7 +598,15 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         owner STRING,
         email STRING,
         password STRING,
-        created_at STRING
+        created_at STRING,
+        billing_address STRING,
+        billing_city STRING,
+        billing_country STRING,
+        phone STRING,
+        tpin STRING,
+        currency STRING,
+        tax_rate NUMERIC,
+        role STRING
       )
     `, 'Multi-Business Schema: Create BUSINESSES table');
 
@@ -1133,7 +1178,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         }
       }
 
-      // One-time clean slate check: if localStorage only has old preseeded demo data ('default_biz' / 'COF-001'), wipe it so the app starts genuinely blank
+      // Clean slate check: if localStorage only has old preseeded demo data ('default_biz' / 'COF-001' / 'lusaka'), wipe it so the app starts genuinely blank
       const migratedClean = localStorage.getItem(CLEAN_SLATE_MIGRATION_KEY);
       if (!migratedClean) {
         localStorage.setItem(CLEAN_SLATE_MIGRATION_KEY, '1');
@@ -1142,14 +1187,17 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
             localStorage.removeItem(`${LOCAL_STORAGE_KEY_PREFIX}${table}`);
           }
           localStorage.removeItem('active_business_profile');
+          localStorage.removeItem('pos_authenticated_session');
+          localStorage.removeItem('pos_shift_active');
           for (const k of Object.keys(recovered)) {
             delete recovered[k];
           }
         }
       }
 
-      if (hasAnyUserCreatedData(recovered)) {
-        rehydrateAlasqlFromRecords(recovered);
+      const scrubbed = scrubLegacyPreseededRows(recovered);
+      if (hasAnyUserCreatedData(scrubbed)) {
+        rehydrateAlasqlFromRecords(scrubbed);
         hasRecoveredData = true;
         runSql('SELECT COUNT(*) AS biz_count FROM businesses', 'Persistent DB Recovery: Recovered user business data from LocalStorage');
       }
@@ -1172,8 +1220,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
   initSqliteStorage().then(async (ready) => {
     if (ready && !forceReset) {
       try {
-        const persistentData = await loadTablesFromPersistentStorage();
-        if (persistentData && !isLegacyPreseededSnapshot(persistentData) && hasAnyUserCreatedData(persistentData)) {
+        const rawPersistentData = await loadTablesFromPersistentStorage();
+        const persistentData = rawPersistentData ? scrubLegacyPreseededRows(rawPersistentData) : null;
+        if (persistentData && !isLegacyPreseededSnapshot(rawPersistentData || {}) && hasAnyUserCreatedData(persistentData)) {
           console.log('[DB] Recovered tables from persistent SQLite / Filesystem storage layer');
           rehydrateAlasqlFromRecords(persistentData);
           syncAllAccountingSystems('SQLite Rehydration');

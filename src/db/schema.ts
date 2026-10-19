@@ -202,10 +202,48 @@ export const usersRelations = relations(users, ({ many }) => ({
   orders: many(orders),
 }));
 
+export const businessesRelations = relations(businesses, ({ many }) => ({
+  stores: many(stores),
+  products: many(products),
+  customers: many(customers),
+}));
+
+export const storesRelations = relations(stores, ({ one, many }) => ({
+  business: one(businesses, {
+    fields: [stores.businessId],
+    references: [businesses.id],
+  }),
+  orders: many(orders),
+  cashUps: many(cashUps),
+  journalEntries: many(doubleEntryJournal),
+  receiptRefundEntries: many(receiptRefundLedger),
+  cashFlowEntries: many(cashFlowLedger),
+}));
+
+export const productsRelations = relations(products, ({ one, many }) => ({
+  business: one(businesses, {
+    fields: [products.businessId],
+    references: [businesses.id],
+  }),
+  orderItems: many(orderItems),
+}));
+
+export const customersRelations = relations(customers, ({ one, many }) => ({
+  business: one(businesses, {
+    fields: [customers.businessId],
+    references: [businesses.id],
+  }),
+  orders: many(orders),
+}));
+
 export const ordersRelations = relations(orders, ({ one, many }) => ({
   customer: one(customers, {
     fields: [orders.customerId],
     references: [customers.id],
+  }),
+  store: one(stores, {
+    fields: [orders.storeId],
+    references: [stores.id],
   }),
   items: many(orderItems),
 }));
@@ -220,4 +258,33 @@ export const orderItemsRelations = relations(orderItems, ({ one }) => ({
     references: [products.id],
   }),
 }));
+
+export const cashUpsRelations = relations(cashUps, ({ one }) => ({
+  store: one(stores, {
+    fields: [cashUps.storeId],
+    references: [stores.id],
+  }),
+}));
+
+export const doubleEntryJournalRelations = relations(doubleEntryJournal, ({ one }) => ({
+  store: one(stores, {
+    fields: [doubleEntryJournal.storeId],
+    references: [stores.id],
+  }),
+}));
+
+export const receiptRefundLedgerRelations = relations(receiptRefundLedger, ({ one }) => ({
+  store: one(stores, {
+    fields: [receiptRefundLedger.storeId],
+    references: [stores.id],
+  }),
+}));
+
+export const cashFlowLedgerRelations = relations(cashFlowLedger, ({ one }) => ({
+  store: one(stores, {
+    fields: [cashFlowLedger.storeId],
+    references: [stores.id],
+  }),
+}));
+
 

@@ -64,6 +64,11 @@ export interface StoreSettings {
   paperWidth: '58mm' | '80mm';
   logoUrl?: string;
   tpin?: string;
+  billingAddress?: string;
+  billingCity?: string;
+  billingCountry?: string;
+  billingPhone?: string;
+  billingEmail?: string;
   termsAndConditions?: string;
   printerName?: string;
   printerInterface?: string;

@@ -82,9 +82,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   const [showTransferModal, setShowTransferModal] = useState(false);
   const [transferSearchQuery, setTransferSearchQuery] = useState('');
   const [transferProductId, setTransferProductId] = useState<string>('');
-  const [transferFromStore, setTransferFromStore] = useState('lusaka');
-  const [transferToStore, setTransferToStore] = useState('kitwe');
-  const [transferQty, setTransferQty] = useState('5');
+  const [transferFromStore, setTransferFromStore] = useState(activeStore || '');
+  const [transferToStore, setTransferToStore] = useState('');
+  const [transferQty, setTransferQty] = useState('1');
   const [transferCart, setTransferCart] = useState<any[]>([]);
 
   // Drag controls for Inter-Store Transfer panel
@@ -132,12 +132,23 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
   // Editing state
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [editName, setEditName] = useState<string>('');
+  const [editSku, setEditSku] = useState<string>('');
   const [editPrice, setEditPrice] = useState<number>(0);
   const [editCost, setEditCost] = useState<number>(0);
   const [editStock, setEditStock] = useState<number>(0);
   const [editCategory, setEditCategory] = useState<string>('');
   const [editBatchNumber, setEditBatchNumber] = useState('');
   const [editExpiryDate, setEditExpiryDate] = useState('');
+  const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
+  const [addFormError, setAddFormError] = useState<string | null>(null);
+
+  const triggerSaveFeedback = (msg: string) => {
+    setSaveFeedback(msg);
+    setTimeout(() => {
+      setSaveFeedback(prev => (prev === msg ? null : prev));
+    }, 4500);
+  };
 
   // Category management modal state
   const [showCategoryModal, setShowCategoryModal] = useState(false);
@@ -192,6 +203,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   const [newIsService, setNewIsService] = useState(false);
   const [newBatchNumber, setNewBatchNumber] = useState('');
   const [newExpiryDate, setNewExpiryDate] = useState('');
+  const [newTargetBranch, setNewTargetBranch] = useState(activeStore || '');
 
   // Quick Add / Receive stock modal state
   const [showReceiveModal, setShowReceiveModal] = useState(false);
@@ -199,15 +211,34 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   const [receiveQty, setReceiveQty] = useState('1');
   const [receiveBatch, setReceiveBatch] = useState('');
   const [receiveExpiry, setReceiveExpiry] = useState('');
+  const [receiveTargetBranch, setReceiveTargetBranch] = useState(activeStore || '');
+
+  useEffect(() => {
+    if (activeStore) {
+      setNewTargetBranch(activeStore);
+      setReceiveTargetBranch(activeStore);
+      setTransferFromStore(activeStore);
+    }
+  }, [activeStore]);
 
   const getStoresList = (): { id: string; name: string }[] => {
     try {
       const sRes = runSql('SELECT id, name FROM stores', 'Inventory: Fetch dynamic stores list', true);
       if (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0) {
-        return sRes.data.map((s: any) => ({
+        let accessibleIds: string[] = [];
+        try {
+          const savedAcc = localStorage.getItem('logged_in_accessible_branches');
+          if (savedAcc) accessibleIds = JSON.parse(savedAcc);
+        } catch {}
+        const allMapped = sRes.data.map((s: any) => ({
           id: String(s.id),
           name: String(s.name || s.id),
         }));
+        if (userRole !== 'owner' && accessibleIds.length > 0) {
+          const filtered = allMapped.filter(s => accessibleIds.includes(s.id));
+          if (filtered.length > 0) return filtered;
+        }
+        return allMapped;
       }
     } catch {}
     if (activeStore) {
@@ -476,26 +507,21 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   };
 
   const loadRawData = () => {
-    // Left Join with store_products to load branch-specific price and stock override targets!
-    const query = `
-      SELECT 
-        p.id, 
-        p.name, 
-        p.sku, 
-        p.category, 
-        p.cost, 
-        p.imageUrl,
-        p.is_service,
-        p.batch_number,
-        p.expiry_date,
-        COALESCE(sp.price, p.price) AS price, 
-        COALESCE(sp.stock, p.stock) AS stock 
-      FROM products p 
-      LEFT JOIN store_products sp ON p.id = sp.product_id AND sp.store_id = '${activeStore}'
-    `;
-    const result = runSql(query, `Inventory: Fetch stock overrides for branch [${activeStore.toUpperCase()}]`);
-    if (result.success && Array.isArray(result.data)) {
-      setProducts(result.data);
+    // Load branch-specific price and stock strictly separated by activeStore
+    const spAllRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Inventory: Fetch all branch stock overrides', true);
+    const spList = (spAllRes.success && Array.isArray(spAllRes.data)) ? spAllRes.data : [];
+    const prodRes = runSql('SELECT * FROM products', `Inventory: Fetch base catalog for branch [${(activeStore || 'MAIN').toUpperCase()}]`);
+    if (prodRes.success && Array.isArray(prodRes.data)) {
+      const branchScopedProducts = prodRes.data.map((p: any) => {
+        const override = spList.find((sp: any) => Number(sp.product_id) === Number(p.id) && String(sp.store_id) === String(activeStore));
+        const hasAnyBranchRecord = spList.some((sp: any) => Number(sp.product_id) === Number(p.id));
+        return {
+          ...p,
+          price: override !== undefined ? Number(override.price) : Number(p.price || 0),
+          stock: override !== undefined ? Number(override.stock) : (hasAnyBranchRecord ? 0 : Number(p.stock || 0))
+        };
+      });
+      setProducts(branchScopedProducts);
     }
 
     // Load Stock Transfers log joined with product names
@@ -533,6 +559,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
     setEditingId(prod.id);
+    setEditName(prod.name || '');
+    setEditSku(prod.sku || '');
     setEditPrice(prod.price);
     setEditCost(prod.cost);
     setEditStock(prod.stock);
@@ -548,28 +576,31 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const oldStock = targetProd ? targetProd.stock : editStock;
     const stockDiff = editStock - oldStock;
     const catToSave = (editCategory || 'General').trim();
+    const nameToSave = (editName || targetProd?.name || `Product #${id}`).trim();
+    const skuToSave = (editSku || targetProd?.sku || `SKU-${id}`).trim();
 
     // 1. Update the default primary products table
-    const updateGlobalSql = `UPDATE products SET category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}' WHERE id = ${id}`;
+    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}' WHERE id = ${id}`;
     runSql(updateGlobalSql, `Inventory: Sync baseline pricing and category for Product ID #${id}`);
 
     // 2. Update or insert the store_products row for active branch store!
-    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${id} AND store_id = '${activeStore}'`, 'Override Guard');
+    const targetBranch = activeStore || 'main';
+    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${id} AND store_id = '${targetBranch}'`, 'Override Guard');
     
     if (selectCheck.success && Array.isArray(selectCheck.data) && selectCheck.data.length > 0) {
       const updateBranchSql = `
         UPDATE store_products 
         SET price = ${editPrice}, stock = ${editStock} 
-        WHERE product_id = ${id} AND store_id = '${activeStore}'
+        WHERE product_id = ${id} AND store_id = '${targetBranch}'
       `;
-      runSql(updateBranchSql, `Inventory: Alter specific override price to ${editPrice} on branch ${activeStore}`);
+      runSql(updateBranchSql, `Inventory: Alter specific override price to ${editPrice} on branch ${targetBranch}`);
     } else {
-      const spId = `sp_${id}_${activeStore}`;
+      const spId = `sp_${id}_${targetBranch}`;
       const insertBranchSql = `
         INSERT INTO store_products (id, product_id, store_id, stock, price)
-        VALUES ('${spId}', ${id}, '${activeStore}', ${editStock}, ${editPrice})
+        VALUES ('${spId}', ${id}, '${targetBranch}', ${editStock}, ${editPrice})
       `;
-      runSql(insertBranchSql, `Inventory: Create specific override price for product in branch ${activeStore}`);
+      runSql(insertBranchSql, `Inventory: Create specific override price for product in branch ${targetBranch}`);
     }
 
     // 3. Log transaction if stock level changed
@@ -582,13 +613,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         VALUES (
           '${refId}',
           'idem_${refId}',
-          '${activeStore.toUpperCase()}',
+          '${(targetBranch).toUpperCase()}',
           'MANUAL_EDIT',
           'CATALOG_EDIT',
           ${valueImpact.toFixed(2)},
           0.00,
           'SUCCESS',
-          'Manual stock edit for ${targetProd.name.replace(/'/g, "''")}: ${stockDiff > 0 ? '+' : ''}${stockDiff} units (New level: ${editStock})',
+          'Manual stock edit for ${nameToSave.replace(/'/g, "''")}: ${stockDiff > 0 ? '+' : ''}${stockDiff} units (New level: ${editStock})',
           '${nowStr}',
           '${nowStr}',
           '${userRole}'
@@ -596,12 +627,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       `, 'Log manual stock edit transaction');
     }
 
-    logEmployeeAudit('STOCK', 'Adjusted Product Stock/Price', `Updated ${targetProd ? targetProd.name : 'Product #' + id}: New Price = K${editPrice}, New Stock = ${editStock} (${stockDiff >= 0 ? '+' : ''}${stockDiff})`, Math.abs(stockDiff * editCost), activeStore);
+    logEmployeeAudit('STOCK', 'Adjusted Product Stock/Price', `Updated ${nameToSave}: New Price = K${editPrice}, New Stock = ${editStock} (${stockDiff >= 0 ? '+' : ''}${stockDiff})`, Math.abs(stockDiff * editCost), targetBranch);
 
     setEditingId(null);
     loadRawData();
     persistTablesToStorage();
-    alert('Changes applied successfully inside local SQL database.');
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerSaveFeedback(`✓ Changes saved for "${nameToSave}" (${settings.currency}${editPrice.toFixed(2)} | Stock: ${editStock})`);
   };
 
   const handleDeleteProduct = (id: number, name: string) => {
@@ -622,26 +654,36 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
     loadRawData();
     persistTablesToStorage();
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerSaveFeedback(`✓ Deleted "${name}" from inventory catalog.`);
   };
 
-  const handleAddProduct = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleAddProduct = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     if (isReadOnly) {
-      alert('Access Denied!');
+      setAddFormError('Access Denied: Read-only role cannot create products.');
       return;
     }
 
-    if (!newName || !newSku || !newCat) {
-      alert('Fill out all fields!');
+    const cleanName = newName.trim();
+    if (!cleanName) {
+      setAddFormError('Please enter a Product Display Name before saving.');
       return;
+    }
+
+    const nextId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 101;
+    const cleanSku = newSku.trim() || `SKU-${nextId}-${Date.now().toString().slice(-4)}`;
+    const cleanCat = newCat.trim() || 'General';
+
+    if (!customCategories.includes(cleanCat)) {
+      saveCustomCategories([...customCategories, cleanCat]);
     }
 
     const priceNum = parseFloat(newPrice) || 0;
     const costNum = parseFloat(newCost) || 0;
-    const stockNum = parseInt(newStock) || 0;
+    const stockNum = newIsService ? 0 : (parseInt(newStock) || 0);
     const imgUrl = newImg || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=150';
 
-    const nextId = products.length > 0 ? Math.max(...products.map(p => p.id)) + 1 : 101;
     let activeBizId = 'default_biz';
     try {
       const savedBiz = localStorage.getItem('active_business_profile');
@@ -655,9 +697,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     runSql(`
       INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
         ${nextId}, 
-        '${newName.replace(/'/g, "''")}', 
-        '${newSku.replace(/'/g, "''")}', 
-        '${newCat.replace(/'/g, "''")}', 
+        '${cleanName.replace(/'/g, "''")}', 
+        '${cleanSku.replace(/'/g, "''")}', 
+        '${cleanCat.replace(/'/g, "''")}', 
         ${priceNum}, 
         ${costNum}, 
         ${stockNum}, 
@@ -667,12 +709,22 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         '${newBatchNumber.replace(/'/g, "''")}',
         '${newExpiryDate}'
       )
-    `, `Catalog: Add global model ${newName}`);
+    `, `Catalog: Add global model ${cleanName}`);
 
-    // Add store override values for ALL active branches (stock allocated to current activeStore, 0 in other branches unless transferred)
-    const storeCodes = Array.from(new Set([...getStoresList().map(s => s.id), activeStore].filter(Boolean)));
+    // Add store override values for ALL active branches (stock allocated to selected targetBranch, 0 in other branches unless transferred)
+    const availableStores = getStoresList();
+    let targetBranch = newTargetBranch || activeStore || (availableStores[0]?.id ?? '');
+    if (!targetBranch) {
+      targetBranch = 'store_main';
+      runSql(`
+        INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency) VALUES (
+          '${targetBranch}', '${activeBizId.replace(/'/g, "''")}', 'Main Store Branch', 'Main', 1, 1, 1, 0, 'weekly'
+        )
+      `, 'Catalog: Auto-create Main Store branch');
+    }
+    const storeCodes = Array.from(new Set([...availableStores.map(s => s.id), targetBranch, activeStore].filter(Boolean)));
     storeCodes.forEach(code => {
-      const branchStock = code === activeStore ? stockNum : 0;
+      const branchStock = code === targetBranch ? stockNum : 0;
       runSql(`
         INSERT INTO store_products VALUES (
           'sp_${nextId}_${code}',
@@ -692,13 +744,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         VALUES (
           '${refId}',
           'idem_${refId}',
-          '${(activeStore || 'MAIN').toUpperCase()}',
+          '${targetBranch.toUpperCase()}',
           'RECEIVE',
           'CATALOG_INIT',
           ${(stockNum * costNum).toFixed(2)},
           0.00,
           'SUCCESS',
-          'Initial catalog creation for ${newName.replace(/'/g, "''")}: +${stockNum} units [Batch: ${newBatchNumber || 'N/A'}]',
+          'Initial catalog creation for ${cleanName.replace(/'/g, "''")} (${targetBranch.toUpperCase()}): +${stockNum} units [Batch: ${newBatchNumber || 'N/A'}]',
           '${nowStr}',
           '${nowStr}',
           '${userRole}'
@@ -706,8 +758,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       `, 'Log initial stock creation transaction');
     }
 
-    logEmployeeAudit('STOCK', 'Added New Product', `Product: ${newName} (SKU: ${newSku}, Category: ${newCat}), Price: K${priceNum}, Stock: ${stockNum}`, priceNum * stockNum, activeStore);
+    logEmployeeAudit('STOCK', 'Added New Product', `Product: ${cleanName} (SKU: ${cleanSku}, Category: ${cleanCat}), Price: K${priceNum}, Stock: ${stockNum} -> Branch: ${targetBranch.toUpperCase()}`, priceNum * stockNum, targetBranch);
 
+    setAddFormError(null);
     setShowAddModal(false);
     setNewName('');
     setNewSku('');
@@ -721,6 +774,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setNewExpiryDate('');
     loadRawData();
     persistTablesToStorage();
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerSaveFeedback(`✓ Saved new product "${cleanName}" (SKU: ${cleanSku}) with ${stockNum} units into branch [${targetBranch.toUpperCase()}]!`);
   };
 
   const handleReceiveStockSubmit = (e: React.FormEvent) => {
@@ -733,7 +788,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
     
-    const newStockLevel = receiveProduct.stock + parsedAdd;
+    const targetBranch = receiveTargetBranch || activeStore || (getStoresList()[0]?.id ?? 'main');
     
     // Update products table with quantity, batch, and expiry
     const updatePrimary = `
@@ -745,19 +800,19 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     `;
     runSql(updatePrimary, `Inventory Receive: Increase stock, set batch '${receiveBatch}', expiry '${receiveExpiry}' for Product ID #${receiveProduct.id}`);
     
-    // Update store override
-    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${receiveProduct.id} AND store_id = '${activeStore}'`, 'Override Guard');
+    // Update store override for the selected targetBranch
+    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${receiveProduct.id} AND store_id = '${targetBranch}'`, 'Override Guard');
     if (selectCheck.success && Array.isArray(selectCheck.data) && selectCheck.data.length > 0) {
       runSql(`
         UPDATE store_products 
         SET stock = stock + ${parsedAdd} 
-        WHERE product_id = ${receiveProduct.id} AND store_id = '${activeStore}'
-      `, `Inventory Receive: Increase override stock`);
+        WHERE product_id = ${receiveProduct.id} AND store_id = '${targetBranch}'
+      `, `Inventory Receive: Increase override stock for branch ${targetBranch}`);
     } else {
       runSql(`
         INSERT INTO store_products (id, product_id, store_id, stock, price)
-        VALUES ('sp_${receiveProduct.id}_${activeStore}', ${receiveProduct.id}, '${activeStore}', ${newStockLevel}, ${receiveProduct.price})
-      `, `Inventory Receive: Seed override stock`);
+        VALUES ('sp_${receiveProduct.id}_${targetBranch}', ${receiveProduct.id}, '${targetBranch}', ${parsedAdd}, ${receiveProduct.price})
+      `, `Inventory Receive: Seed override stock for branch ${targetBranch}`);
     }
     
     // Record a log for inventory increase inside transactions database
@@ -766,10 +821,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const valueImpact = parsedAdd * receiveProduct.cost;
     runSql(`
       INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-      VALUES ('${refId}', 'idem_${refId}', 'INVENTORY', 'RECEIVE', 'BATCH-ADD', ${valueImpact}, 0.00, 'SUCCESS', 'Received +${parsedAdd} units of ${receiveProduct.name.replace(/'/g, "''")} [Batch: ${receiveBatch || 'N/A'}]', '${nowStr}', '${nowStr}', '${userRole}')
+      VALUES ('${refId}', 'idem_${refId}', '${targetBranch.toUpperCase()}', 'RECEIVE', 'BATCH-ADD', ${valueImpact}, 0.00, 'SUCCESS', 'Received +${parsedAdd} units of ${receiveProduct.name.replace(/'/g, "''")} into branch ${targetBranch.toUpperCase()} [Batch: ${receiveBatch || 'N/A'}]', '${nowStr}', '${nowStr}', '${userRole}')
     `, `Log quick stock receive transaction`);
 
-    logEmployeeAudit('STOCK', 'Received Stock Batch', `Received +${parsedAdd} units of ${receiveProduct.name} [Batch: ${receiveBatch || 'N/A'}]`, valueImpact, activeStore);
+    logEmployeeAudit('STOCK', 'Received Stock Batch', `Received +${parsedAdd} units of ${receiveProduct.name} into branch ${targetBranch.toUpperCase()} [Batch: ${receiveBatch || 'N/A'}]`, valueImpact, targetBranch);
     
     setShowReceiveModal(false);
     setReceiveProduct(null);
@@ -778,7 +833,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setReceiveExpiry('');
     loadRawData();
     persistTablesToStorage();
-    alert(`✓ Successfully received +${parsedAdd} units of ${receiveProduct.name}!`);
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerSaveFeedback(`✓ Received +${parsedAdd} units of "${receiveProduct.name}" into branch [${targetBranch.toUpperCase()}]!`);
   };
 
   // EXECUTE STOCK ROUTING TRANSFER BETWEEN STORE SHIFT HOOKS
@@ -1509,6 +1565,38 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       {/* Primary Grid Workspace */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden p-2.5 sm:p-4 flex flex-col gap-4 w-full min-w-0">
 
+        {saveFeedback && (
+          <div className="p-3 bg-emerald-600 text-white rounded-xl text-xs font-extrabold flex items-center justify-between shadow-md animate-fadeIn">
+            <span>{saveFeedback}</span>
+            <button onClick={() => setSaveFeedback(null)} className="text-white/80 hover:text-white font-black px-2 cursor-pointer">✕</button>
+          </div>
+        )}
+
+        {editingId !== null && (
+          <div className="sticky top-0 z-20 p-3 bg-indigo-950 text-white rounded-xl border border-indigo-500 shadow-lg flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs font-bold">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+              <span>Editing Product: <strong className="text-amber-300">{editName || `#${editingId}`}</strong></span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleSaveEdit(editingId)}
+                className="px-4 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black uppercase rounded-lg text-xs cursor-pointer shadow-sm flex items-center gap-1"
+              >
+                <Check size={14} /> Save Changes
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditingId(null)}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold uppercase rounded-lg text-xs cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
         {activeSubTab === 'catalog' && (
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs animate-fadeIn w-full min-w-0">
             {/* Mobile Horizontal Scroll & Wrap Hint Banner */}
@@ -1517,15 +1605,36 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               <span className="font-mono text-[9px] bg-white px-1.5 py-0.5 rounded border border-indigo-200">{filteredAndSorted.length} items</span>
             </div>
 
+            {filteredAndSorted.length === 0 ? (
+              <div className="p-8 text-center flex flex-col items-center justify-center gap-3">
+                <Package size={36} className="text-slate-300" />
+                <div>
+                  <h4 className="text-sm font-extrabold text-slate-700">No Products in Stock Yet</h4>
+                  <p className="text-xs text-slate-400 mt-0.5">Click the button below to create your first product and save it to stock.</p>
+                </div>
+                {!isReadOnly && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddFormError(null);
+                      setShowAddModal(true);
+                    }}
+                    className="mt-1 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-extrabold uppercase tracking-wider flex items-center gap-1.5 cursor-pointer shadow-md"
+                  >
+                    <Plus size={15} /> Create New Product in Stock
+                  </button>
+                )}
+              </div>
+            ) : (
             <div className="overflow-x-auto w-full touch-pan-x">
               <table className="w-full min-w-[660px] text-left font-sans text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9.5px] select-none whitespace-nowrap">
                     <th className="px-3 sm:px-4 py-3">Product Name</th>
                     <th className="px-3 sm:px-4 py-3">Category</th>
-                    <th className="px-3 sm:px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('price')}>Price ({activeStore.toUpperCase()})</th>
+                    <th className="px-3 sm:px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('price')}>Price ({(activeStore || 'MAIN').toUpperCase()})</th>
                     <th className="px-3 sm:px-4 py-3">Global Cost</th>
-                    <th className="px-3 sm:px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('stock')}>Active Stock ({activeStore.toUpperCase()})</th>
+                    <th className="px-3 sm:px-4 py-3 cursor-pointer hover:bg-slate-800" onClick={() => toggleSort('stock')}>Active Stock ({(activeStore || 'MAIN').toUpperCase()})</th>
                     <th className="px-3 sm:px-4 py-3 text-right">Actions</th>
                   </tr>
                 </thead>
@@ -1545,7 +1654,27 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                               <p className="font-extrabold text-slate-800 text-xs">{prod.name}</p>
                               <p className="text-[10px] font-mono font-semibold text-slate-400">SKU: {prod.sku}</p>
                               {isEditing ? (
-                                <div className="mt-2 grid grid-cols-2 gap-1.5 bg-slate-50 p-2 rounded border border-slate-200">
+                                <div className="mt-2 grid grid-cols-2 gap-1.5 bg-slate-50 p-2.5 rounded-lg border border-indigo-200">
+                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Product Name</span>
+                                    <input
+                                      type="text"
+                                      value={editName}
+                                      onChange={(e) => setEditName(e.target.value)}
+                                      className="px-1.5 py-1 text-[10px] border rounded bg-white text-slate-800 font-bold"
+                                      placeholder="Product Name"
+                                    />
+                                  </div>
+                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">SKU / Barcode</span>
+                                    <input
+                                      type="text"
+                                      value={editSku}
+                                      onChange={(e) => setEditSku(e.target.value)}
+                                      className="px-1.5 py-1 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
+                                      placeholder="SKU"
+                                    />
+                                  </div>
                                   {/* Mobile-wrapped Price, Cost, Stock & Category fields so phone users can edit everything in view */}
                                   <div className="flex sm:hidden flex-col gap-0.5">
                                     <span className="text-[8px] text-slate-400 font-bold uppercase">Price ({settings.currency})</span>
@@ -1569,7 +1698,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                   </div>
                                   {!isService && (
                                     <div className="flex sm:hidden flex-col gap-0.5">
-                                      <span className="text-[8px] text-slate-400 font-bold uppercase">Stock ({activeStore.toUpperCase()})</span>
+                                      <span className="text-[8px] text-slate-400 font-bold uppercase">Stock ({(activeStore || 'MAIN').toUpperCase()})</span>
                                       <input
                                         type="number"
                                         value={editStock}
@@ -1596,7 +1725,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                       type="text"
                                       value={editBatchNumber}
                                       onChange={(e) => setEditBatchNumber(e.target.value)}
-                                      className="px-1.5 py-0.5 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
+                                      className="px-1.5 py-1 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
                                       placeholder="Batch Number"
                                     />
                                   </div>
@@ -1606,8 +1735,24 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                       type="date"
                                       value={editExpiryDate}
                                       onChange={(e) => setEditExpiryDate(e.target.value)}
-                                      className="px-1.5 py-0.5 text-[10px] border rounded bg-white text-slate-800 font-semibold"
+                                      className="px-1.5 py-1 text-[10px] border rounded bg-white text-slate-800 font-semibold"
                                     />
+                                  </div>
+                                  <div className="col-span-2 flex items-center gap-2 pt-1.5 border-t border-slate-200 mt-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSaveEdit(prod.id)}
+                                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md text-[11px] font-extrabold cursor-pointer flex items-center gap-1 shadow-xs"
+                                    >
+                                      <Check size={12} /> Save Changes
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingId(null)}
+                                      className="px-2.5 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-md text-[11px] font-bold cursor-pointer"
+                                    >
+                                      Cancel
+                                    </button>
                                   </div>
                                 </div>
                               ) : (
@@ -1873,6 +2018,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               </tbody>
               </table>
             </div>
+            )}
           </div>
         )}
 
@@ -2817,273 +2963,304 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       {/* NEW ITEM CREATION DIALOG MODAL */}
       <AnimatePresence>
         {showAddModal && (
-          <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4 z-50 overflow-y-auto select-none">
+          <div className="fixed inset-0 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4 z-[100] select-none">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.95, opacity: 0 }}
-              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md max-h-[90dvh] overflow-hidden flex flex-col"
+              className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-lg max-h-[82vh] sm:max-h-[78vh] overflow-hidden flex flex-col"
             >
-              <div className="p-4 bg-slate-905 text-white font-bold text-xs tracking-wider flex justify-between items-center shrink-0 uppercase text-left">
-                <span>ADD NEW WAREHOUSE RETAIL ITEM</span>
-                <button onClick={() => setShowAddModal(false)} className="hover:text-amber-400 font-extrabold cursor-pointer">✕</button>
+              {/* Sticky Modal Header with immediate Save Changes button */}
+              <div className="px-4 py-3 bg-slate-900 text-white font-bold text-xs tracking-wider flex justify-between items-center shrink-0 uppercase text-left border-b border-slate-800">
+                <div className="flex items-center gap-2">
+                  <Package size={15} className="text-indigo-400" />
+                  <span>CREATE NEW PRODUCT IN STOCK</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleAddProduct()}
+                    className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black rounded-lg text-[11px] uppercase tracking-wider flex items-center gap-1 cursor-pointer shadow-sm"
+                  >
+                    <Check size={13} /> Save Changes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddFormError(null);
+                      setShowAddModal(false);
+                    }}
+                    className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg font-extrabold cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
 
-              <form onSubmit={handleAddProduct} className="p-5 overflow-y-auto flex flex-col gap-4 text-left">
-                
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3 rounded-lg border border-slate-100">
-                  <div className="flex flex-col gap-1 col-span-2">
-                    <label className="text-[10px] text-slate-400 font-bold uppercase">Product Display Name</label>
-                    <input
-                      type="text"
-                      required
-                      value={newName}
-                      onChange={(e) => setNewName(e.target.value)}
-                      placeholder="Artisan Dark Roast Espresso"
-                      className="px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-md text-slate-800"
-                    />
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <label className="text-[10px] text-slate-400 font-bold uppercase">SKU Barcode</label>
-                    <input
-                      type="text"
-                      required
-                      value={newSku}
-                      onChange={(e) => setNewSku(e.target.value)}
-                      placeholder="BARCODE-99412"
-                      className="px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-md text-slate-800 font-mono"
-                    />
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <div className="flex justify-between items-center">
-                      <label className="text-[10px] text-slate-400 font-bold uppercase">Item Category</label>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const catName = window.prompt("Enter and register custom category name:");
-                          if (catName && catName.trim()) {
-                            setNewCat(catName.trim());
-                            alert(`Category "${catName.trim()}" successfully registered active!`);
-                          }
-                        }}
-                        className="text-[10px] text-indigo-650 hover:text-indigo-800 font-extrabold flex items-center gap-1 cursor-pointer bg-indigo-50 px-2 py-0.5 rounded-md"
-                        title="Add Custom Category Type"
-                      >
-                        <Plus size={10} className="stroke-indigo-600" />
-                        + Custom Cat
-                      </button>
+              <form onSubmit={handleAddProduct} className="flex flex-col flex-1 min-h-0 overflow-hidden text-left">
+                <div className="p-4 overflow-y-auto flex-1 min-h-0 flex flex-col gap-3.5">
+                  {addFormError && (
+                    <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs font-bold flex items-center justify-between">
+                      <span>⚠️ {addFormError}</span>
+                      <button type="button" onClick={() => setAddFormError(null)} className="text-rose-500 font-black">✕</button>
                     </div>
-                    <div className="flex gap-1.5 mt-0.5">
-                      <select
-                        value={newCat}
-                        onChange={(e) => setNewCat(e.target.value)}
-                        className="flex-1 px-2 py-1.5 text-xs bg-white border border-slate-200 rounded-md text-slate-850 focus:outline-hidden"
-                      >
-                        <option value="">-- Select/Existing --</option>
-                        {Array.from(new Set(products.map(p => p.category).filter(Boolean))).map(cat => (
-                          <option key={cat} value={cat}>{cat}</option>
-                        ))}
-                      </select>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                    <div className="flex flex-col gap-1 col-span-1 sm:col-span-2">
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Product Display Name *</label>
                       <input
                         type="text"
                         required
-                        value={newCat}
-                        onChange={(e) => setNewCat(e.target.value)}
-                        placeholder="Or customize"
-                        className="w-1/3 px-2 py-1.5 text-xs bg-white border border-slate-200 rounded-md text-slate-800 font-mono font-bold"
-                        title="Assigned Category Name"
+                        value={newName}
+                        onChange={(e) => {
+                          setNewName(e.target.value);
+                          if (addFormError) setAddFormError(null);
+                        }}
+                        placeholder="e.g. 2kg Sugar / Mineral Water / Cement"
+                        className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-md text-slate-900 font-bold focus:border-indigo-500 focus:outline-hidden"
                       />
                     </div>
-                  </div>
-                </div>
 
-                <div className="bg-slate-50 p-3 rounded-lg border border-slate-100 flex flex-col gap-2">
-                  <label className="text-[10px] text-slate-400 font-bold uppercase">Item Log Type</label>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setNewIsService(false);
-                        setNewStock('10');
-                      }}
-                      className={`py-1.5 px-3 rounded-lg text-xs font-bold border flex flex-col items-center justify-center cursor-pointer transition-all ${
-                        !newIsService
-                          ? 'bg-white border-indigo-600 text-indigo-700 shadow-xs'
-                          : 'bg-slate-50 border-slate-200 text-slate-400 hover:bg-slate-100 hover:text-slate-600'
-                      }`}
-                    >
-                      <span className="text-[10px] uppercase font-mono font-black">📦 Standard Good</span>
-                      <span className="text-[8px] font-medium leading-tight text-slate-400 mt-0.5">Tracks stock &amp; quantity</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setNewIsService(true);
-                        setNewStock('0');
-                      }}
-                      className={`py-1.5 px-3 rounded-lg text-xs font-bold border flex flex-col items-center justify-center cursor-pointer transition-all ${
-                        newIsService
-                          ? 'bg-white border-indigo-600 text-indigo-700 shadow-xs'
-                          : 'bg-slate-50 border-slate-200 text-slate-400 hover:bg-slate-100 hover:text-slate-600'
-                      }`}
-                    >
-                      <span className="text-[10px] uppercase font-mono font-black">💼 Company Service</span>
-                      <span className="text-[8px] font-medium leading-tight text-slate-400 mt-0.5">No quantity limits</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 bg-slate-50 p-3 rounded-lg border border-slate-100">
-                  <div className="flex flex-col gap-1">
-                    <label className="text-[9px] text-slate-400 font-bold uppercase">Price ({settings.currency})</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      required
-                      value={newPrice}
-                      onChange={(e) => setNewPrice(e.target.value)}
-                      className="px-2 py-1 bg-white border border-slate-200 rounded-md font-bold text-indigo-700 font-mono text-center text-xs"
-                    />
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <label className="text-[9px] text-slate-400 font-bold uppercase">Cost ({settings.currency})</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      required
-                      value={newCost}
-                      onChange={(e) => setNewCost(e.target.value)}
-                      className="px-2 py-1 bg-white border border-slate-200 rounded-md font-mono text-center text-xs text-slate-800"
-                    />
-                  </div>
-
-                  <div className="flex flex-col gap-1">
-                    <label className="text-[9px] text-slate-400 font-bold uppercase">{newIsService ? 'Service Stock' : 'Initial Stock'}</label>
-                    <input
-                      type="text"
-                      disabled={newIsService}
-                      required
-                      value={newIsService ? 'N/A' : newStock}
-                      onChange={(e) => !newIsService && setNewStock(e.target.value)}
-                      className="px-2 py-1 bg-white border border-slate-200 rounded-md font-bold font-mono text-center text-xs text-slate-850 disabled:bg-slate-100/70 disabled:text-slate-400"
-                    />
-                  </div>
-                </div>
-
-                {!newIsService && (
-                  <div className="grid grid-cols-2 gap-2 bg-indigo-50/40 p-3 rounded-lg border border-indigo-100/50">
-                    <div className="col-span-2">
-                      <h4 className="text-[10px] text-indigo-850 font-black uppercase tracking-wider mb-1 flex items-center gap-1.5">
-                        <span>🏷️ BATCH &amp; EXPIRATION TRACKING</span>
-                      </h4>
-                    </div>
                     <div className="flex flex-col gap-1">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase">Batch / Lot Number</label>
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">SKU / Barcode (Auto if blank)</label>
                       <input
                         type="text"
-                        value={newBatchNumber}
-                        onChange={(e) => setNewBatchNumber(e.target.value)}
-                        placeholder="e.g. BATCH-2026A"
-                        className="px-2.5 py-1 text-xs bg-white border border-slate-200 rounded-md text-slate-850 font-mono font-bold"
+                        value={newSku}
+                        onChange={(e) => setNewSku(e.target.value)}
+                        placeholder="Auto-generated if left blank"
+                        className="px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-800 font-mono"
                       />
                     </div>
+
                     <div className="flex flex-col gap-1">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase">Expiration Date</label>
-                      <input
-                        type="date"
-                        value={newExpiryDate}
-                        onChange={(e) => setNewExpiryDate(e.target.value)}
-                        className="px-2.5 py-1 text-xs bg-white border border-slate-200 rounded-md text-slate-850 font-bold"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                <div className="flex flex-col gap-1.5 border border-slate-150 rounded-xl p-3 bg-slate-50">
-                  <label className="text-[10px] text-indigo-805 font-extrabold uppercase tracking-wide flex items-center gap-1.5">
-                    Product Picture (Upload Image or Paste URL)
-                  </label>
-                  
-                  <div className="flex items-center gap-3">
-                    {newImg ? (
-                      <div className="relative w-14 h-14 bg-white border border-slate-250 rounded-lg overflow-hidden flex items-center justify-center group shrink-0 shadow-sm">
-                        <img src={newImg} alt="Thumbnail preview" className="max-w-full max-h-full object-cover" referrerPolicy="no-referrer" />
-                        <button
-                          type="button"
-                          onClick={() => setNewImg('')}
-                          className="absolute inset-x-0 bottom-0 bg-red-600/90 text-white py-0.5 text-center cursor-pointer text-[8px] font-black uppercase border-0"
-                          title="Clear Image"
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Item Category</label>
+                      <div className="flex gap-1.5">
+                        <select
+                          value={allCategoriesList.includes(newCat) ? newCat : ''}
+                          onChange={(e) => {
+                            if (e.target.value) setNewCat(e.target.value);
+                          }}
+                          className="w-1/2 px-2 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-800 focus:outline-hidden"
                         >
-                          Remove
-                        </button>
+                          <option value="">Select existing...</option>
+                          {allCategoriesList.map(cat => (
+                            <option key={cat} value={cat}>{cat}</option>
+                          ))}
+                        </select>
+                        <input
+                          type="text"
+                          value={newCat}
+                          onChange={(e) => setNewCat(e.target.value)}
+                          placeholder="Or type category (Default: General)"
+                          className="w-1/2 px-2 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-800 font-bold"
+                          title="Type or customize Category Name"
+                        />
                       </div>
-                    ) : (
-                      <div className="w-14 h-14 bg-slate-200/80 border border-dashed border-slate-300 rounded-lg flex flex-col items-center justify-center text-slate-400 text-[8px] font-bold shrink-0">
-                        <span>No Photo</span>
-                      </div>
-                    )}
-                    
-                    <div className="flex-1 flex flex-col gap-1">
-                      <input
-                        type="file"
-                        accept="image/*"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (!file) return;
-                          
-                          if (file.size > 500 * 1024) {
-                            alert("Please upload a picture smaller than 500KB to ensure quick processing.");
-                            return;
-                          }
-
-                          const reader = new FileReader();
-                          reader.onload = () => {
-                            if (typeof reader.result === 'string') {
-                              setNewImg(reader.result);
-                            }
-                          };
-                          reader.onerror = () => {
-                             alert("Failed to read image file.");
-                          };
-                          reader.readAsDataURL(file);
-                        }}
-                        className="text-[10px] text-slate-500 file:mr-2 file:py-1 file:px-2.5 file:rounded-lg file:border-0 file:text-[10px] file:font-black file:bg-indigo-50 file:text-indigo-750 hover:file:bg-indigo-100 cursor-pointer"
-                      />
-                      <span className="text-[8px] text-slate-400 font-medium">Accepts custom photos, PNG, JPEG, WebP.</span>
                     </div>
                   </div>
 
-                  <div className="mt-1">
-                    <span className="text-[8px] text-slate-400 block font-bold uppercase tracking-wider mb-0.5">Or paste standard web image URL :</span>
-                    <input
-                      type="url"
-                      value={newImg.startsWith('data:') ? '' : newImg}
-                      onChange={(e) => setNewImg(e.target.value)}
-                      placeholder="https://images.unsplash.com/photo-..."
-                      className="w-full px-2.5 py-1 text-[10px] bg-white border border-slate-200 focus:outline/none text-slate-800 rounded font-mono"
-                    />
+                  <div className="bg-slate-50 p-3 rounded-lg border border-slate-200 flex flex-col gap-2">
+                    <label className="text-[10px] text-slate-500 font-bold uppercase">Item Type</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNewIsService(false);
+                        }}
+                        className={`py-1.5 px-3 rounded-lg text-xs font-bold border flex flex-col items-center justify-center cursor-pointer transition-all ${
+                          !newIsService
+                            ? 'bg-white border-indigo-600 text-indigo-700 shadow-xs'
+                            : 'bg-slate-50 border-slate-200 text-slate-400 hover:bg-slate-100 hover:text-slate-600'
+                        }`}
+                      >
+                        <span className="text-[10px] uppercase font-mono font-black">📦 Physical Stock Good</span>
+                        <span className="text-[8px] font-medium leading-tight text-slate-400 mt-0.5">Tracks stock &amp; batch quantity</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNewIsService(true);
+                          setNewStock('0');
+                        }}
+                        className={`py-1.5 px-3 rounded-lg text-xs font-bold border flex flex-col items-center justify-center cursor-pointer transition-all ${
+                          newIsService
+                            ? 'bg-white border-indigo-600 text-indigo-700 shadow-xs'
+                            : 'bg-slate-50 border-slate-200 text-slate-400 hover:bg-slate-100 hover:text-slate-600'
+                        }`}
+                      >
+                        <span className="text-[10px] uppercase font-mono font-black">💼 Company Service</span>
+                        <span className="text-[8px] font-medium leading-tight text-slate-400 mt-0.5">No quantity limits</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-500 font-bold uppercase">Selling Price ({settings.currency}) *</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        required
+                        value={newPrice}
+                        onChange={(e) => setNewPrice(e.target.value)}
+                        className="px-2 py-1.5 bg-white border border-slate-300 rounded-md font-bold text-indigo-700 font-mono text-center text-xs"
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-500 font-bold uppercase">Unit Cost ({settings.currency})</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={newCost}
+                        onChange={(e) => setNewCost(e.target.value)}
+                        className="px-2 py-1.5 bg-white border border-slate-300 rounded-md font-mono text-center text-xs text-slate-800"
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-500 font-bold uppercase">{newIsService ? 'Service Stock' : 'Opening Stock Qty *'}</label>
+                      <input
+                        type="number"
+                        disabled={newIsService}
+                        value={newIsService ? '0' : newStock}
+                        onChange={(e) => !newIsService && setNewStock(e.target.value)}
+                        className="px-2 py-1.5 bg-white border border-slate-300 rounded-md font-bold font-mono text-center text-xs text-slate-900 disabled:bg-slate-100/70 disabled:text-slate-400"
+                      />
+                    </div>
+
+                    <div className="col-span-3 flex flex-col gap-1 pt-1 border-t border-slate-200/80">
+                      <label className="text-[10px] text-indigo-800 font-extrabold uppercase flex items-center gap-1">
+                        <span>🏬 Branch Associated with Stock Change *</span>
+                      </label>
+                      <select
+                        value={newTargetBranch || activeStore}
+                        onChange={(e) => setNewTargetBranch(e.target.value)}
+                        className="w-full px-2.5 py-2 bg-white border border-indigo-300 rounded-md text-xs font-bold text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                      >
+                        {getStoresList().length === 0 ? (
+                          <option value="">Auto-create Main Store Branch</option>
+                        ) : (
+                          getStoresList().map(st => (
+                            <option key={st.id} value={st.id}>
+                              {st.name} ({st.id.toUpperCase()}){st.id === activeStore ? ' — Logged-In Branch' : ''}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      <span className="text-[9px] text-slate-500 font-medium">
+                        Opening stock units will be allocated strictly to the selected branch (other branches remain separate at 0 units).
+                      </span>
+                    </div>
+                  </div>
+
+                  {!newIsService && (
+                    <div className="grid grid-cols-2 gap-2 bg-indigo-50/50 p-3 rounded-lg border border-indigo-100">
+                      <div className="col-span-2">
+                        <h4 className="text-[10px] text-indigo-900 font-black uppercase tracking-wider mb-0.5 flex items-center gap-1.5">
+                          <span>🏷️ BATCH &amp; EXPIRATION TRACKING (OPTIONAL)</span>
+                        </h4>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[9px] text-slate-500 font-bold uppercase">Batch / Lot Number</label>
+                        <input
+                          type="text"
+                          value={newBatchNumber}
+                          onChange={(e) => setNewBatchNumber(e.target.value)}
+                          placeholder="e.g. BATCH-2026A"
+                          className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-900 font-mono font-bold"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[9px] text-slate-500 font-bold uppercase">Expiration Date</label>
+                        <input
+                          type="date"
+                          value={newExpiryDate}
+                          onChange={(e) => setNewExpiryDate(e.target.value)}
+                          className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-900 font-bold"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-col gap-1.5 border border-slate-200 rounded-xl p-3 bg-slate-50">
+                    <label className="text-[10px] text-indigo-900 font-extrabold uppercase tracking-wide flex items-center gap-1.5">
+                      Product Picture (Optional — Upload Image or Paste URL)
+                    </label>
+                    
+                    <div className="flex items-center gap-3">
+                      {newImg ? (
+                        <div className="relative w-12 h-12 bg-white border border-slate-300 rounded-lg overflow-hidden flex items-center justify-center group shrink-0 shadow-sm">
+                          <img src={newImg} alt="Thumbnail preview" className="max-w-full max-h-full object-cover" referrerPolicy="no-referrer" />
+                          <button
+                            type="button"
+                            onClick={() => setNewImg('')}
+                            className="absolute inset-x-0 bottom-0 bg-red-600/90 text-white py-0.5 text-center cursor-pointer text-[8px] font-black uppercase border-0"
+                            title="Clear Image"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="w-12 h-12 bg-slate-200/80 border border-dashed border-slate-300 rounded-lg flex flex-col items-center justify-center text-slate-400 text-[8px] font-bold shrink-0">
+                          <span>No Photo</span>
+                        </div>
+                      )}
+                      
+                      <div className="flex-1 flex flex-col gap-1">
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            if (file.size > 500 * 1024) {
+                              setAddFormError("Please upload a picture smaller than 500KB.");
+                              return;
+                            }
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              if (typeof reader.result === 'string') {
+                                setNewImg(reader.result);
+                              }
+                            };
+                            reader.readAsDataURL(file);
+                          }}
+                          className="text-[10px] text-slate-500 file:mr-2 file:py-1 file:px-2.5 file:rounded-lg file:border-0 file:text-[10px] file:font-black file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100 cursor-pointer"
+                        />
+                        <input
+                          type="url"
+                          value={newImg.startsWith('data:') ? '' : newImg}
+                          onChange={(e) => setNewImg(e.target.value)}
+                          placeholder="Or paste image URL (https://...)"
+                          className="w-full px-2.5 py-1 text-[10px] bg-white border border-slate-300 text-slate-800 rounded font-mono"
+                        />
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 shrink-0">
+                {/* ALWAYS-VISIBLE STICKY BOTTOM FOOTER BAR FOR SAVING PRODUCT CHANGES */}
+                <div className="px-4 py-3 bg-slate-100 border-t border-slate-200 flex items-center justify-between gap-2 shrink-0">
                   <button
                     type="button"
-                    onClick={() => setShowAddModal(false)}
-                    className="px-4 py-2 bg-slate-100 rounded-lg text-xs font-bold text-slate-600 hover:bg-slate-200 cursor-pointer"
+                    onClick={() => {
+                      setAddFormError(null);
+                      setShowAddModal(false);
+                    }}
+                    className="px-4 py-2 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-700 hover:bg-slate-50 cursor-pointer"
                   >
-                    CANCEL
+                    Cancel
                   </button>
                   <button
                     type="submit"
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold shadow-xs cursor-pointer tracking-wider"
+                    className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-black uppercase shadow-md cursor-pointer tracking-wider flex items-center gap-1.5"
                   >
-                     SAVE ITEM IN DATABASES
+                    <Check size={15} />
+                    <span>Save Changes &amp; Add Product</span>
                   </button>
                 </div>
-
               </form>
             </motion.div>
           </div>
@@ -3127,18 +3304,36 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   </div>
                 </div>
 
-                <div className="flex flex-col gap-1 bg-slate-50 p-3 rounded-lg border border-slate-100">
-                  <label className="text-[10px] text-slate-400 font-bold uppercase">Quantity to Receive / Add</label>
-                  <input
-                    type="number"
-                    required
-                    min="1"
-                    value={receiveQty}
-                    onChange={(e) => setReceiveQty(e.target.value)}
-                    placeholder="10"
-                    className="px-3 py-2 text-xs font-extrabold bg-white border border-slate-200 rounded-md text-slate-800 font-mono"
-                  />
-                  <p className="text-[9px] text-slate-400 font-medium">This will increase the stock count by the entered quantity.</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3 rounded-lg border border-slate-100">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-slate-500 font-bold uppercase">Quantity to Receive / Add *</label>
+                    <input
+                      type="number"
+                      required
+                      min="1"
+                      value={receiveQty}
+                      onChange={(e) => setReceiveQty(e.target.value)}
+                      placeholder="10"
+                      className="px-3 py-2 text-xs font-extrabold bg-white border border-slate-200 rounded-md text-slate-800 font-mono"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] text-indigo-800 font-extrabold uppercase">🏬 Target Branch for Stock *</label>
+                    <select
+                      value={receiveTargetBranch || activeStore}
+                      onChange={(e) => setReceiveTargetBranch(e.target.value)}
+                      className="px-2.5 py-2 text-xs font-bold bg-white border border-indigo-200 rounded-md text-slate-900"
+                    >
+                      {getStoresList().map(st => (
+                        <option key={st.id} value={st.id}>
+                          {st.name} ({st.id.toUpperCase()}){st.id === activeStore ? ' — Active' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <p className="col-span-1 sm:col-span-2 text-[9px] text-slate-400 font-medium">
+                    This will increase the stock count strictly for the selected branch associated with this stock change.
+                  </p>
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 bg-indigo-50/40 p-3 rounded-lg border border-indigo-100/50">

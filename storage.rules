@@ -1,0 +1,23 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Default deny all
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Authenticated business backups for clients data, transactions, and accounting ledgers
+    match /backups/{businessId}/{fileName} {
+      allow read: if request.auth != null &&
+                     businessId.size() >= 1 &&
+                     businessId.size() <= 128 &&
+                     businessId.matches('^[a-zA-Z0-9_\\-]+$');
+      allow write: if request.auth != null &&
+                      businessId.size() >= 1 &&
+                      businessId.size() <= 128 &&
+                      businessId.matches('^[a-zA-Z0-9_\\-]+$') &&
+                      request.resource.size < 25 * 1024 * 1024 &&
+                      request.resource.contentType.matches('application/json.*|text/plain.*|image/.*|application/pdf');
+    }
+  }
+}

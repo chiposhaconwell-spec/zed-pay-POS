@@ -30,12 +30,18 @@ export interface AuditLogItem {
 export default function EmployeeAuditTrail({ settings, activeStore, userRole }: EmployeeAuditTrailProps) {
   const [logs, setLogs] = useState<AuditLogItem[]>([]);
   const [selectedModule, setSelectedModule] = useState<string>('ALL');
-  const [selectedStore, setSelectedStore] = useState<string>('ALL');
+  const [selectedStore, setSelectedStore] = useState<string>(() => activeStore || 'ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedStaff, setSelectedStaff] = useState<string>('ALL');
   const [staffList, setStaffList] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (activeStore) {
+      setSelectedStore(activeStore);
+    }
+  }, [activeStore]);
 
   // Pagination & view preferences
   const [pageSize, setPageSize] = useState<number>(50);

@@ -7,12 +7,13 @@ import {
   RefreshCw, Percent, ChevronRight, Sparkles, CheckSquare,
   Menu, X, Phone, Receipt, ShoppingBag, Share2, RotateCcw,
   LayoutDashboard, FileSpreadsheet, MessageSquare, Send, HelpCircle, Truck,
-  Cloud, CloudUpload, CloudDownload
+  Cloud, CloudUpload, CloudDownload, LogOut, UserPlus, MapPin
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
-// Database API
+// Database & Firebase Cloud API
 import { initializeDatabase, SeedTemplate, runSql, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer } from './db';
+import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud } from './firebase';
 import { StoreSettings, ActiveTab } from './types';
 
 // Custom sub-components
@@ -29,22 +30,27 @@ import FinanceDashboard from './components/FinanceDashboard';
 import WorkspaceCoordinator from './components/WorkspaceCoordinator';
 import EmployeeAuditTrail from './components/EmployeeAuditTrail';
 
-export const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
+export const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
 const DEFAULT_SETTINGS: StoreSettings = {
-  storeName: 'New Business POS',
-  currency: 'K',
-  taxRate: 16,
-  loyaltyRatio: 10,
-  receiptHeader: 'Official Tax Invoice & Sales Receipt',
-  receiptFooter: 'Thank you for your business!',
+  storeName: '',
+  currency: '',
+  taxRate: 0,
+  loyaltyRatio: 0,
+  receiptHeader: '',
+  receiptFooter: '',
   paperWidth: '58mm',
-  logoUrl: DEFAULT_COMPANY_LOGO,
+  logoUrl: '',
   tpin: '',
-  termsAndConditions: '1. All goods sold are subject to standard VAT unless exempted.\n2. Goods returned in original state are exchangeable within 7 business days.\n3. Keep receipt for warranty queries.',
-  printerName: 'ZPOS-Bluetooth-58M (Default Linked)',
-  printerInterface: 'Bluetooth Low Energy (BLE)',
-  printerStatus: 'Linked',
+  billingAddress: '',
+  billingCity: '',
+  billingCountry: '',
+  billingPhone: '',
+  billingEmail: '',
+  termsAndConditions: '',
+  printerName: '',
+  printerInterface: '',
+  printerStatus: 'Disconnected',
 };
 
 export default function App() {
@@ -61,43 +67,63 @@ export default function App() {
   // Navigation Drawer state (3-lines hamburger)
   const [showNavDrawer, setShowNavDrawer] = useState(false);
 
-  // Dynamic Enterprise & Multi-Business Gating State (Blank on default)
+  // Dynamic Enterprise & Multi-Business Gating State (100% Blank on default — no pre-seeded details, branches, or stock)
+  const [isAuthenticatedSession, setIsAuthenticatedSession] = useState<boolean>(() => {
+    return (
+      localStorage.getItem('pos_authenticated_session') === 'true' &&
+      Boolean(localStorage.getItem('active_business_profile'))
+    );
+  });
+  const [authScreenMode, setAuthScreenMode] = useState<'login' | 'register'>('login');
   const [activeBusiness, setActiveBusiness] = useState<{ id: string; name: string; owner: string; email: string }>({
     id: '',
-    name: 'Setup Business Account',
+    name: '',
     owner: '',
     email: ''
   });
   const [businesses, setBusinesses] = useState<any[]>([]);
   const [stores, setStores] = useState<any[]>([]);
-  const [showBusinessModal, setShowBusinessModal] = useState(false);
-  const [hubMode, setHubMode] = useState<'register' | 'sync_login' | 'store'>('register');
+  const [staffMembers, setStaffMembers] = useState<any[]>([]);
+  const [settingsInitialSubTab, setSettingsInitialSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'printer' | 'database'>('general');
   const [newBizName, setNewBizName] = useState('');
   const [newBizOwner, setNewBizOwner] = useState('');
   const [newBizEmail, setNewBizEmail] = useState('');
   const [newBizPassword, setNewBizPassword] = useState('');
   const [newBizFirstStore, setNewBizFirstStore] = useState('');
-  const [newBizLocation, setNewBizLocation] = useState('Lusaka');
-  const [newBizCurrency, setNewBizCurrency] = useState('K');
-  const [newBizTaxRate, setNewBizTaxRate] = useState('16');
+  const [newBizLocation, setNewBizLocation] = useState('');
+  const [newBizCurrency, setNewBizCurrency] = useState('');
+  const [newBizTaxRate, setNewBizTaxRate] = useState('');
   const [newBizTpin, setNewBizTpin] = useState('');
-  const [newBizOpeningCash, setNewBizOpeningCash] = useState('0.00');
+  const [newBizOpeningCash, setNewBizOpeningCash] = useState('');
+  const [newBizBillingAddress, setNewBizBillingAddress] = useState('');
+  const [newBizBillingCity, setNewBizBillingCity] = useState('');
+  const [newBizBillingCountry, setNewBizBillingCountry] = useState('');
+  const [newBizBillingPhone, setNewBizBillingPhone] = useState('');
+  const [newBizBillingEmail, setNewBizBillingEmail] = useState('');
 
-  // Existing Business Cloud Sign-In / Sync states
+  // Existing Business / Staff Sign-In / Sync states
   const [syncLoginEmail, setSyncLoginEmail] = useState('');
   const [syncLoginPassword, setSyncLoginPassword] = useState('');
+  const [syncLoginBranch, setSyncLoginBranch] = useState('');
+  const [accessibleStoreIds, setAccessibleStoreIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('logged_in_accessible_branches');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [showBranchChoiceGate, setShowBranchChoiceGate] = useState(false);
+  const [gateOpeningCash, setGateOpeningCash] = useState('');
   const [isHeaderSyncing, setIsHeaderSyncing] = useState(false);
   const [lastHeaderSyncMsg, setLastHeaderSyncMsg] = useState<string | null>(null);
 
-  // Floating Store Creation Form inside switcher
-  const [showStoreForm, setShowStoreForm] = useState(false);
-  const [newStoreId, setNewStoreId] = useState('');
-  const [newStoreName, setNewStoreName] = useState('');
-  const [newStoreLocation, setNewStoreLocation] = useState('');
-  const [newStoreAllowDiscounts, setNewStoreAllowDiscounts] = useState(true);
-  const [newStoreAllowRefunds, setNewStoreAllowRefunds] = useState(true);
-  const [newStoreAllowLaybys, setNewStoreAllowLaybys] = useState(true);
-  const [newStoreReqManager, setNewStoreReqManager] = useState(false);
+  const openUnifiedSettings = (subTab: 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'printer' | 'database' = 'general') => {
+    loadBusinessData();
+    setSettingsInitialSubTab(subTab);
+    setShowNavDrawer(false);
+    setActiveTab2('settings');
+  };
 
   // Drawer Modals & Counts (Blank on default)
   const [badgeCounts, setBadgeCounts] = useState({ products: 0, customers: 0, staff: 0 });
@@ -107,6 +133,7 @@ export default function App() {
   const [expenseAmount, setExpenseAmount] = useState('');
   const [expenseCategory, setExpenseCategory] = useState('Store Operations');
   const [expenseNotes, setExpenseNotes] = useState('');
+  const [expenseStoreId, setExpenseStoreId] = useState('');
 
   // Help Chat Modal state
   const [showHelpChatModal, setShowHelpChatModal] = useState(false);
@@ -127,7 +154,6 @@ export default function App() {
     showHelpChatModal,
     showCustomersModal,
     showExpenseModal,
-    showBusinessModal,
     billingCounterAction,
     activeTab
   });
@@ -136,7 +162,6 @@ export default function App() {
     showHelpChatModal,
     showCustomersModal,
     showExpenseModal,
-    showBusinessModal,
     billingCounterAction,
     activeTab
   };
@@ -153,16 +178,20 @@ export default function App() {
     }
   };
 
-  // Update badge counts from DB (strictly 0 when empty)
+  // Update badge counts from DB (scoped to activeStore when selected, strictly 0 when empty)
   const updateBadgeCounts = () => {
     try {
-      const pRes = runSql(`SELECT COUNT(*) as cnt FROM products`, 'Query product count');
+      const pRes = activeStore
+        ? runSql(`SELECT COUNT(*) as cnt FROM store_products WHERE store_id = '${activeStore}' AND stock > 0`, 'Query branch product count')
+        : runSql(`SELECT COUNT(*) as cnt FROM products`, 'Query product count');
       const prodCnt = (pRes.success && pRes.data?.[0]?.cnt !== undefined) ? pRes.data[0].cnt : 0;
 
       const cRes = runSql(`SELECT COUNT(*) as cnt FROM customers`, 'Query customer count');
       const custCnt = (cRes.success && cRes.data?.[0]?.cnt !== undefined) ? cRes.data[0].cnt : 0;
 
-      const sRes = runSql(`SELECT COUNT(*) as cnt FROM staff`, 'Query staff count');
+      const sRes = activeStore
+        ? runSql(`SELECT COUNT(*) as cnt FROM staff WHERE store_id = '${activeStore}' OR store_id = '' OR store_id IS NULL`, 'Query branch staff count')
+        : runSql(`SELECT COUNT(*) as cnt FROM staff`, 'Query staff count');
       const staffCnt = (sRes.success && sRes.data?.[0]?.cnt !== undefined) ? sRes.data[0].cnt : 0;
 
       setBadgeCounts({
@@ -193,32 +222,42 @@ export default function App() {
     // 3. Load initial CRM customers
     fetchCustomersList();
 
-    // 4. Load logged-in business session from localStorage if valid in DB
+    // 4. Load logged-in business session from localStorage ONLY if explicitly authenticated
     const bRes = runSql(`SELECT * FROM businesses`, 'Startup: Check registered business accounts');
     const existingBusinesses = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
 
     const savedBiz = localStorage.getItem('active_business_profile');
-    if (savedBiz && existingBusinesses.length > 0) {
+    const isSessionAuth = localStorage.getItem('pos_authenticated_session') === 'true';
+
+    if (isSessionAuth && savedBiz && existingBusinesses.length > 0) {
       try {
         const parsed = JSON.parse(savedBiz);
         const match = existingBusinesses.find((b: any) => b.id === parsed.id);
         if (match) {
           setActiveBusiness(match);
+          const savedRole = localStorage.getItem('logged_in_user_role') || 'owner';
+          setUserRole(savedRole);
+          const savedStore = localStorage.getItem('active_store_branch') || '';
+          if (savedStore) {
+            setActiveStore(savedStore);
+          }
+          setIsAuthenticatedSession(true);
         } else {
-          setActiveBusiness(existingBusinesses[0]);
-          localStorage.setItem('active_business_profile', JSON.stringify(existingBusinesses[0]));
+          localStorage.removeItem('active_business_profile');
+          localStorage.removeItem('pos_authenticated_session');
+          setIsAuthenticatedSession(false);
         }
       } catch (e) {
-        setActiveBusiness(existingBusinesses[0]);
+        localStorage.removeItem('active_business_profile');
+        localStorage.removeItem('pos_authenticated_session');
+        setIsAuthenticatedSession(false);
       }
-    } else if (existingBusinesses.length > 0) {
-      setActiveBusiness(existingBusinesses[0]);
-      localStorage.setItem('active_business_profile', JSON.stringify(existingBusinesses[0]));
     } else {
-      // No business exists yet: clear any stale default_biz profile and prompt new business setup
+      // No authenticated session: start on Log In / Create Account screen (blank state)
       localStorage.removeItem('active_business_profile');
-      setShowBusinessModal(true);
-      setHubMode('register');
+      localStorage.removeItem('pos_authenticated_session');
+      setIsAuthenticatedSession(false);
+      setAuthScreenMode(existingBusinesses.length === 0 ? 'register' : 'login');
     }
 
     updateBadgeCounts();
@@ -253,10 +292,6 @@ export default function App() {
         }
         if (state.showExpenseModal) {
           setShowExpenseModal(false);
-          return;
-        }
-        if (state.showBusinessModal) {
-          setShowBusinessModal(false);
           return;
         }
         if (state.billingCounterAction) {
@@ -298,37 +333,59 @@ export default function App() {
     const bizRows = (bResult.success && Array.isArray(bResult.data)) ? bResult.data : [];
     setBusinesses(bizRows);
 
+    // Also load staff members for Admin Setup view
+    const staffRes = runSql(`SELECT * FROM staff ORDER BY id ASC`, 'App: Query staff accounts');
+    if (staffRes.success && Array.isArray(staffRes.data)) {
+      setStaffMembers(staffRes.data);
+    } else {
+      setStaffMembers([]);
+    }
+
     let currentBiz = activeBusiness;
-    if (bizRows.length > 0) {
+    if (bizRows.length > 0 && isAuthenticatedSession) {
       const matched = bizRows.find((b: any) => b.id === activeBusiness.id);
-      if (!matched) {
+      if (!matched && activeBusiness.id) {
         currentBiz = bizRows[0];
         setActiveBusiness(currentBiz);
         localStorage.setItem('active_business_profile', JSON.stringify(currentBiz));
       }
-    } else if (activeBusiness.id) {
-      currentBiz = { id: '', name: 'Setup Business Account', owner: '', email: '' };
+    } else if (bizRows.length === 0 && activeBusiness.id) {
+      currentBiz = { id: '', name: '', owner: '', email: '' };
       setActiveBusiness(currentBiz);
+      setIsAuthenticatedSession(false);
     }
 
-    // 2. Fetch stores of the activeBusiness (no preseeded fallback stores)
+    // 2. Fetch stores of the activeBusiness (strictly 0 preseeded fallback stores)
     if (currentBiz && currentBiz.id) {
       const sResult = runSql(`SELECT * FROM stores WHERE business_id = '${currentBiz.id}'`, 'App: Query branch outlets for active business');
       const allStoresRes = (!sResult.data || sResult.data.length === 0)
         ? runSql(`SELECT * FROM stores`, 'App: Query all branch outlets')
         : sResult;
       if (allStoresRes.success && Array.isArray(allStoresRes.data) && allStoresRes.data.length > 0) {
-        setStores(allStoresRes.data);
-        const exists = allStoresRes.data.find((s: any) => s.id === activeStore);
+        const allStores = allStoresRes.data;
+        setStores(allStores);
+        // Filter by accessibleStoreIds if logged in as non-owner with restricted branches
+        const permittedStores = (userRole !== 'owner' && accessibleStoreIds.length > 0)
+          ? allStores.filter((s: any) => accessibleStoreIds.includes(s.id))
+          : allStores;
+        const listToUse = permittedStores.length > 0 ? permittedStores : allStores;
+        const exists = listToUse.find((s: any) => s.id === activeStore);
         if (!exists) {
-          setActiveStore(allStoresRes.data[0].id);
+          const nextStore = listToUse[0].id;
+          setActiveStore(nextStore);
+          localStorage.setItem('active_store_branch', nextStore);
         }
       } else {
         setStores([]);
         setActiveStore('');
       }
     } else {
-      setStores([]);
+      const sAll = runSql(`SELECT * FROM stores`, 'App: Query branch outlets for login');
+      if (sAll.success && Array.isArray(sAll.data)) {
+        setStores(sAll.data);
+      } else {
+        setStores([]);
+      }
       setActiveStore('');
     }
   };
@@ -361,14 +418,30 @@ export default function App() {
       const targetBizId = activeBusiness?.id || undefined;
       if (targetBizId) {
         const pushRes = await pushDatabaseToServer(targetBizId);
-        if (pushRes.success) {
+        let fbSuccess = false;
+        if (auth.currentUser) {
+          try {
+            const fbRes = await backupToCloud(targetBizId);
+            fbSuccess = fbRes.success;
+          } catch (fbErr) {
+            console.warn('Header Firebase backup notice:', fbErr);
+          }
+        }
+        if (pushRes.success || fbSuccess) {
           setLastHeaderSyncMsg('Synced');
         } else {
           setLastHeaderSyncMsg('Sync Retry');
         }
       } else {
         const pullRes = await pullDatabaseFromServer();
-        if (pullRes.success) {
+        let restored = pullRes.success && pullRes.found;
+        if (!restored && auth.currentUser) {
+          try {
+            const fbPull = await restoreFromCloud();
+            restored = fbPull.success;
+          } catch {}
+        }
+        if (restored) {
           loadBusinessData();
           updateBadgeCounts();
           setSqlSeedTrigger(prev => prev + 1);
@@ -385,50 +458,103 @@ export default function App() {
     }
   };
 
-  // Register New Business Account (100% Blank Stock/Batches Setup + Immediate Cloud SQL Sync)
+  // Register New Business Account (100% Blank Stock/Batches/Branches Setup + First Account Automatically Becomes Admin)
   const handleRegisterBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newBizName || !newBizOwner || !newBizEmail || !newBizPassword) {
-      alert('Please fill out Business Name, Owner Name, Admin Email, and Password.');
+    if (!newBizName.trim() || !newBizOwner.trim() || !newBizEmail.trim() || !newBizPassword) {
+      alert('Please fill out Business Name, Admin/Owner Full Name, Admin Email, and Password.');
+      return;
+    }
+    if (newBizPassword.trim().length < 6) {
+      alert('Please enter a password of at least 6 characters for Firebase Email/Password Authentication.');
       return;
     }
 
     const bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
-    const storeId = 'store_' + Math.floor(1000 + Math.random() * 9000);
-    const rawStoreName = newBizFirstStore.trim() || `${newBizName.trim()} Main Branch`;
-    const rawLocation = newBizLocation.trim() || 'Main Location';
+    const hasInitialStore = Boolean(newBizFirstStore.trim());
+    const storeId = hasInitialStore ? ('store_' + Math.floor(1000 + Math.random() * 9000)) : '';
+    const rawStoreName = newBizFirstStore.trim();
+    const rawLocation = newBizLocation.trim();
+    const resolvedCurrency = newBizCurrency.trim() || 'K';
+    const resolvedTaxRate = !isNaN(parseFloat(newBizTaxRate)) ? parseFloat(newBizTaxRate) : 0;
     const nowStr = new Date().toISOString();
 
-    // 1. Insert registration record into BUSINESSES
+    // 1. Register / Authenticate Admin in Firebase Email/Password Provider
+    try {
+      await registerOrSignInWithEmailPassword(newBizEmail.trim(), newBizPassword, newBizOwner.trim());
+    } catch (fbAuthErr: any) {
+      console.warn('Firebase Email/Password registration notice:', fbAuthErr);
+    }
+
+    // 2. Insert registration record into BUSINESSES (First account = Admin with full billing details)
     runSql(`
-      INSERT INTO businesses (id, name, owner, email, password, created_at) VALUES (
+      INSERT INTO businesses (
+        id, name, owner, email, password, billing_address, billing_city, billing_country,
+        billing_phone, billing_email, tpin, currency, tax_rate, admin_role, created_at
+      ) VALUES (
         '${bizId}',
         '${newBizName.trim().replace(/'/g, "''")}',
         '${newBizOwner.trim().replace(/'/g, "''")}',
         '${newBizEmail.trim().replace(/'/g, "''")}',
         '${newBizPassword.replace(/'/g, "''")}',
+        '${newBizBillingAddress.trim().replace(/'/g, "''")}',
+        '${newBizBillingCity.trim().replace(/'/g, "''")}',
+        '${newBizBillingCountry.trim().replace(/'/g, "''")}',
+        '${newBizBillingPhone.trim().replace(/'/g, "''")}',
+        '${(newBizBillingEmail.trim() || newBizEmail.trim()).replace(/'/g, "''")}',
+        '${newBizTpin.trim().replace(/'/g, "''")}',
+        '${resolvedCurrency.replace(/'/g, "''")}',
+        ${resolvedTaxRate},
+        'admin',
         '${nowStr}'
       )
-    `, `Registration: Create blank enterprise account [${newBizName}]`);
+    `, `Registration: Create blank enterprise account [${newBizName}] with Admin privileges`);
 
-    // 2. Create primary outlet branch into STORES table (with 0 preseeded products/batches)
-    runSql(`
-      INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
-        '${storeId}',
-        '${bizId}',
-        '${rawStoreName.replace(/'/g, "''")}',
-        '${rawLocation.replace(/'/g, "''")}',
-        1, 1, 1, 0
-      )
-    `, `Registration: Provision primary store outlet [${rawStoreName}]`);
+    // 3. Provision primary store outlet ONLY if the admin specified a branch name during setup (no pre-seeded branch)
+    if (hasInitialStore && storeId) {
+      runSql(`
+        INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
+          '${storeId}',
+          '${bizId}',
+          '${rawStoreName.replace(/'/g, "''")}',
+          '${rawLocation.replace(/'/g, "''")}',
+          1, 1, 1, 0
+        )
+      `, `Registration: Provision initial store outlet [${rawStoreName}]`);
+    }
 
-    // 3. Update StoreSettings with the new business configuration
+    // 4. Automatically register the first account as the Admin user in the STAFF table
+    const existingStaffRes = runSql(`SELECT * FROM staff WHERE email = '${newBizEmail.trim().replace(/'/g, "''")}'`, 'Registration: Check admin staff entry');
+    if (!existingStaffRes.data || existingStaffRes.data.length === 0) {
+      const nextStaffId = Date.now() % 1000000;
+      runSql(`
+        INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id) VALUES (
+          ${nextStaffId},
+          '${newBizOwner.trim().replace(/'/g, "''")}',
+          'owner',
+          0,
+          '0000',
+          '${newBizEmail.trim().replace(/'/g, "''")}',
+          '${newBizPassword.replace(/'/g, "''")}',
+          '${storeId}'
+        )
+      `, `Registration: Provision first account [${newBizOwner.trim()}] as Admin (owner)`);
+    }
+
+    // 5. Update StoreSettings with the new business configuration & billing address
     const updatedSettings: StoreSettings = {
       ...settings,
       storeName: newBizName.trim(),
-      currency: newBizCurrency.trim() || 'K',
-      taxRate: !isNaN( parseFloat(newBizTaxRate) ) ? parseFloat(newBizTaxRate) : 16,
-      tpin: newBizTpin.trim()
+      currency: resolvedCurrency,
+      taxRate: resolvedTaxRate,
+      tpin: newBizTpin.trim(),
+      billingAddress: newBizBillingAddress.trim(),
+      billingCity: newBizBillingCity.trim(),
+      billingCountry: newBizBillingCountry.trim(),
+      billingPhone: newBizBillingPhone.trim(),
+      billingEmail: newBizBillingEmail.trim() || newBizEmail.trim(),
+      receiptHeader: settings.receiptHeader || 'Official Tax Invoice & Sales Receipt',
+      receiptFooter: settings.receiptFooter || 'Thank you for your business!'
     };
     setSettings(updatedSettings);
     localStorage.setItem('android_pos_settings', JSON.stringify(updatedSettings));
@@ -440,12 +566,15 @@ export default function App() {
       email: newBizEmail.trim()
     };
 
-    // 4. Save session, activate shift on the newly created store so owner can immediately start working
+    // 6. Save authenticated Admin session
     const openCashNum = Math.max(0, parseFloat(newBizOpeningCash || '0') || 0);
     localStorage.setItem('active_business_profile', JSON.stringify(newlyRegisteredBusiness));
+    localStorage.setItem('pos_authenticated_session', 'true');
     localStorage.setItem('pos_shift_active', 'true');
-    localStorage.setItem('shift_active_' + storeId, 'true');
-    localStorage.setItem('shift_opening_cash_' + storeId, openCashNum.toFixed(2));
+    if (storeId) {
+      localStorage.setItem('shift_active_' + storeId, 'true');
+      localStorage.setItem('shift_opening_cash_' + storeId, openCashNum.toFixed(2));
+    }
     localStorage.setItem('shift_opening_cash_global', openCashNum.toFixed(2));
     localStorage.setItem('logged_in_user_email', newBizEmail.trim());
     localStorage.setItem('logged_in_user_name', newBizOwner.trim());
@@ -454,151 +583,243 @@ export default function App() {
     setActiveBusiness(newlyRegisteredBusiness);
     setActiveStore(storeId);
     setUserRole('owner');
+    setIsAuthenticatedSession(true);
     persistTablesToStorage();
     setSqlSeedTrigger(prev => prev + 1);
 
-    // 5. Synchronize new business & store immediately to Cloud SQL
+    // 7. Synchronize new business & store immediately to Cloud SQL + Firebase Firestore & Firebase Storage
     pushDatabaseToServer(bizId).catch(err => console.warn('Initial Cloud SQL push warning:', err));
+    if (auth.currentUser) {
+      backupToCloud(bizId).catch(err => console.warn('Initial Firebase backup warning:', err));
+    }
 
-    // Reset fields
+    // Reset form fields
     setNewBizName('');
     setNewBizOwner('');
     setNewBizEmail('');
     setNewBizPassword('');
     setNewBizFirstStore('');
-    setShowBusinessModal(false);
+    setNewBizLocation('');
+    setNewBizCurrency('');
+    setNewBizTaxRate('');
+    setNewBizTpin('');
+    setNewBizOpeningCash('');
+    setNewBizBillingAddress('');
+    setNewBizBillingCity('');
+    setNewBizBillingCountry('');
+    setNewBizBillingPhone('');
+    setNewBizBillingEmail('');
+
+    // Open unified Settings & Admin Business Control Panel if they haven't created a store yet so they can set up stores, users, stock & billing
+    if (!storeId) {
+      openUnifiedSettings('stores');
+    }
 
     window.dispatchEvent(new Event('pos_data_updated'));
-    alert(`✓ Business Account [${newlyRegisteredBusiness.name}] & Primary Branch [${rawStoreName}] created!\n\nYour inventory and accounting ledgers start 100% blank with zero preseeded stock or batches, and your workspace is synchronized with Cloud SQL.`);
   };
 
-  // Sign In & Pull Existing Business Account from Cloud SQL
+  // Sign In & Pull Existing Business or Staff Account from Firebase Auth + Cloud SQL / Firestore / Storage
   const handleSyncExistingAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     const targetEmail = syncLoginEmail.trim();
     const targetPass = syncLoginPassword.trim();
     if (!targetEmail || !targetPass) {
-      alert('Please enter your registered Business Email and Password.');
+      alert('Please enter your Email and Password.');
       return;
     }
 
     setIsHeaderSyncing(true);
     try {
-      // Pull from Cloud SQL by email
+      // 1. Pull from Cloud SQL by email
       const pullRes = await pullDatabaseFromServer(undefined, targetEmail);
-      const bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check businesses');
-      const bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
-      const matchedBiz = bizList.find((b: any) => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
+      let bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check businesses');
+      let bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
+      let matchedBiz = bizList.find((b: any) => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
+
+      // Also check if logging in as a Staff/User account created by Admin
+      let stRes = runSql(`SELECT * FROM staff`, 'Cloud Login: Check staff accounts');
+      let staffList = (stRes.success && Array.isArray(stRes.data)) ? stRes.data : [];
+      let matchedStaff = staffList.find(
+        (u: any) =>
+          (u.email && u.email.trim().toLowerCase() === targetEmail.toLowerCase()) ||
+          (u.name && u.name.trim().toLowerCase() === targetEmail.toLowerCase())
+      );
+
+      // 2. Authenticate with Firebase Email/Password Auth
+      const isLocallyVerified = Boolean(
+        (matchedBiz && (!matchedBiz.password || matchedBiz.password === targetPass)) ||
+        (matchedStaff && (matchedStaff.password === targetPass || matchedStaff.pin === targetPass))
+      );
+      try {
+        await signInWithEmailPasswordAccount(targetEmail, targetPass, isLocallyVerified, matchedBiz?.owner || matchedStaff?.name);
+      } catch (fbErr: any) {
+        if (!matchedBiz && !matchedStaff) {
+          throw new Error(fbErr?.message || 'Invalid email or password.');
+        }
+      }
+
+      // 3. If not found in Cloud SQL yet, restore from Firebase Firestore & Storage via authenticated UID
+      if (!matchedBiz && !matchedStaff && auth.currentUser) {
+        try {
+          await restoreFromCloud();
+          bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check businesses after Firebase restore');
+          bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
+          matchedBiz =
+            bizList.find((b: any) => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase()) ||
+            bizList[0];
+
+          stRes = runSql(`SELECT * FROM staff`, 'Cloud Login: Check staff after Firebase restore');
+          staffList = (stRes.success && Array.isArray(stRes.data)) ? stRes.data : [];
+          matchedStaff = staffList.find(
+            (u: any) =>
+              (u.email && u.email.trim().toLowerCase() === targetEmail.toLowerCase()) ||
+              (u.name && u.name.trim().toLowerCase() === targetEmail.toLowerCase())
+          );
+        } catch (restoreErr) {
+          console.warn('Firebase restore lookup notice:', restoreErr);
+        }
+      }
+
+      // If matched a Staff user and there's a business in DB
+      if (!matchedBiz && matchedStaff && bizList.length > 0) {
+        if (matchedStaff.password && matchedStaff.password !== targetPass && matchedStaff.pin !== targetPass) {
+          alert('Invalid password or PIN for this user account.');
+          setIsHeaderSyncing(false);
+          return;
+        }
+        matchedBiz = bizList[0];
+      }
 
       if (!matchedBiz) {
-        alert(`No synchronized business account found for email [${targetEmail}]. Please verify your email or register a new business account.`);
+        alert(`No account found for [${targetEmail}]. Please check your credentials or switch to "Create an Account" to set up your business.`);
         setIsHeaderSyncing(false);
         return;
       }
 
-      if (matchedBiz.password && matchedBiz.password !== targetPass) {
+      if (!matchedStaff && matchedBiz.password && matchedBiz.password !== 'cloud_recovered' && matchedBiz.password !== targetPass) {
         alert('Invalid password for this business account.');
         setIsHeaderSyncing(false);
         return;
       }
 
+      const resolvedRole = matchedStaff && matchedBiz.email?.toLowerCase() !== targetEmail.toLowerCase()
+        ? (matchedStaff.role || 'sales')
+        : 'owner';
+      const resolvedUserName = matchedStaff?.name || (matchedStaff?.first_name ? `${matchedStaff.first_name} ${matchedStaff.surname || ''}`.trim() : '') || matchedBiz.owner || 'Admin';
+
+      // Extract accessible branches for this account
+      let userAllowedBranches: string[] = [];
+      if (resolvedRole !== 'owner' && matchedStaff) {
+        try {
+          if (matchedStaff.permissions_json) {
+            const parsedPerms = JSON.parse(matchedStaff.permissions_json);
+            if (Array.isArray(parsedPerms.accessible_branches) && parsedPerms.accessible_branches.length > 0) {
+              userAllowedBranches = parsedPerms.accessible_branches;
+            }
+          }
+        } catch {}
+        if (userAllowedBranches.length === 0 && matchedStaff.store_id) {
+          userAllowedBranches = [matchedStaff.store_id];
+        }
+      }
+
+      const sRes = runSql(`SELECT * FROM stores WHERE business_id = '${matchedBiz.id}'`, 'Cloud Login: Load stores');
+      const allStores = (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0)
+        ? sRes.data
+        : (runSql(`SELECT * FROM stores`, 'Cloud Login: Load all stores').data || []);
+
+      // Check branch authorization if user picked a branch on the login form
+      if (syncLoginBranch && userAllowedBranches.length > 0 && !userAllowedBranches.includes(syncLoginBranch)) {
+        alert(`Access Denied: Account [${targetEmail}] does not have permission to access branch [${syncLoginBranch.toUpperCase()}].\n\nAccessible Branches: ${userAllowedBranches.join(', ').toUpperCase()}`);
+        setIsHeaderSyncing(false);
+        return;
+      }
+
+      setAccessibleStoreIds(userAllowedBranches);
+      localStorage.setItem('logged_in_accessible_branches', JSON.stringify(userAllowedBranches));
+      localStorage.setItem('logged_in_user_role', resolvedRole);
+
       const activeBizObj = {
         id: matchedBiz.id,
         name: matchedBiz.name,
-        owner: matchedBiz.owner || 'Owner',
+        owner: matchedBiz.owner || 'Admin',
         email: matchedBiz.email
       };
       setActiveBusiness(activeBizObj);
       localStorage.setItem('active_business_profile', JSON.stringify(activeBizObj));
+      localStorage.setItem('pos_authenticated_session', 'true');
+      setIsAuthenticatedSession(true);
 
       const updatedSettings: StoreSettings = {
         ...settings,
-        storeName: matchedBiz.name
+        storeName: matchedBiz.name || settings.storeName,
+        currency: matchedBiz.currency || settings.currency || 'K',
+        taxRate: matchedBiz.tax_rate !== undefined ? Number(matchedBiz.tax_rate) : settings.taxRate,
+        tpin: matchedBiz.tpin || settings.tpin || '',
+        billingAddress: matchedBiz.billing_address || settings.billingAddress || '',
+        billingCity: matchedBiz.billing_city || settings.billingCity || '',
+        billingCountry: matchedBiz.billing_country || settings.billingCountry || '',
+        billingPhone: matchedBiz.billing_phone || settings.billingPhone || '',
+        billingEmail: matchedBiz.billing_email || matchedBiz.email || settings.billingEmail || ''
       };
       setSettings(updatedSettings);
       localStorage.setItem('android_pos_settings', JSON.stringify(updatedSettings));
 
-      const sRes = runSql(`SELECT * FROM stores WHERE business_id = '${matchedBiz.id}'`, 'Cloud Login: Load stores');
-      if (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0) {
-        const firstStoreId = sRes.data[0].id;
-        setActiveStore(firstStoreId);
+      const permittedStores = (resolvedRole !== 'owner' && userAllowedBranches.length > 0)
+        ? allStores.filter((s: any) => userAllowedBranches.includes(s.id))
+        : allStores;
+      const availableStores = permittedStores.length > 0 ? permittedStores : allStores;
+      setStores(allStores);
+
+      if (Array.isArray(availableStores) && availableStores.length > 0) {
+        const chosenBranch = (syncLoginBranch && availableStores.some((s: any) => s.id === syncLoginBranch))
+          ? syncLoginBranch
+          : (matchedStaff?.store_id && availableStores.some((s: any) => s.id === matchedStaff.store_id))
+            ? matchedStaff.store_id
+            : availableStores[0].id;
+        setActiveStore(chosenBranch);
+        localStorage.setItem('active_store_branch', chosenBranch);
         localStorage.setItem('pos_shift_active', 'true');
-        localStorage.setItem('shift_active_' + firstStoreId, 'true');
+        localStorage.setItem('shift_active_' + chosenBranch, 'true');
+        // Prompt user to confirm/choose their branch when logging in if they didn't explicitly pick one in the dropdown
+        if (!syncLoginBranch) {
+          setShowBranchChoiceGate(true);
+        }
+      } else {
+        setActiveStore('');
       }
 
-      localStorage.setItem('logged_in_user_email', matchedBiz.email);
-      localStorage.setItem('logged_in_user_name', matchedBiz.owner || matchedBiz.name);
-      setUserRole('owner');
+      // Ensure Firebase Firestore + Storage mirror is up to date after sign-in
+      if (auth.currentUser) {
+        backupToCloud(matchedBiz.id).catch(() => {});
+      }
+
+      localStorage.setItem('logged_in_user_email', targetEmail);
+      localStorage.setItem('logged_in_user_name', resolvedUserName);
+      localStorage.setItem('quick_salesperson_name', resolvedUserName);
+      setUserRole(resolvedRole);
       setSyncLoginEmail('');
       setSyncLoginPassword('');
-      setShowBusinessModal(false);
+      setSyncLoginBranch('');
       setSqlSeedTrigger(prev => prev + 1);
       window.dispatchEvent(new Event('pos_data_updated'));
-
-      alert(`✓ Synchronized & Signed In to [${matchedBiz.name}]!\n${pullRes.details || 'All stores, stock, batches, and accounting ledgers have been synchronized.'}`);
     } catch (err: any) {
-      alert(`Sync Sign-In Error: ${err?.message || String(err)}`);
+      alert(`Sign-In Error: ${err?.message || String(err)}`);
     } finally {
       setIsHeaderSyncing(false);
     }
   };
 
-  const handleCreateNewStore = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeBusiness.id) {
-      alert('Please register or sign into your business account first before adding extra branches.');
-      return;
-    }
-    if (!newStoreName) {
-      alert('Provide a valid Store Name');
-      return;
-    }
-
-    const calculatedId = 'store_' + Math.floor(1000 + Math.random() * 9000);
-    const finalId = newStoreId.trim().toLowerCase().replace(/\s+/g, '_') || calculatedId;
-
-    // Check duplicate
-    const checkDup = runSql(`SELECT * FROM stores WHERE id = '${finalId}'`, 'Store: Duplicate check');
-    if (checkDup.success && Array.isArray(checkDup.data) && checkDup.data.length > 0) {
-      alert(`Error: A branch with identifier [${finalId}] already exists. Choose a unique code.`);
-      return;
-    }
-
-    runSql(`
-      INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
-        '${finalId}',
-        '${activeBusiness.id}',
-        '${newStoreName.replace(/'/g, "''")}',
-        '${(newStoreLocation || 'Main').replace(/'/g, "''")}',
-         ${newStoreAllowDiscounts ? 1 : 0},
-         ${newStoreAllowRefunds ? 1 : 0},
-         ${newStoreAllowLaybys ? 1 : 0},
-         ${newStoreReqManager ? 1 : 0}
-      )
-    `, `SME Owner: Dynamic store creation commit for branch [${newStoreName}]`);
-
-    // Link existing product templates for this business with 0 initial stock in the new branch
-    const prodsResult = runSql(`SELECT * FROM products WHERE business_id = '${activeBusiness.id}'`, 'Store: Read business products');
-    if (prodsResult.success && Array.isArray(prodsResult.data)) {
-      prodsResult.data.forEach(p => {
-        const spId = `sp_${p.id}_${finalId}`;
-        runSql(`
-          INSERT INTO store_products VALUES (
-            '${spId}', ${p.id}, '${finalId}', 0, ${p.price}
-          )
-        `, 'Store Link: Map branch product row');
-      });
-    }
-
-    persistTablesToStorage();
-    pushDatabaseToServer(activeBusiness.id).catch(() => {});
-    alert(`Store outlet [${newStoreName}] has been registered and synchronized!`);
-    setNewStoreName('');
-    setNewStoreId('');
-    setNewStoreLocation('');
-    setShowStoreForm(false);
-    setActiveStore(finalId);
-    setSqlSeedTrigger(prev => prev + 1);
+  const handleLogoutAccount = () => {
+    localStorage.removeItem('pos_authenticated_session');
+    localStorage.removeItem('active_business_profile');
+    localStorage.removeItem('pos_shift_active');
+    localStorage.removeItem('logged_in_accessible_branches');
+    localStorage.removeItem('logged_in_user_role');
+    setIsAuthenticatedSession(false);
+    setShowBranchChoiceGate(false);
+    setShowNavDrawer(false);
+    setAuthScreenMode('login');
   };
 
   // Switch workspace immediately
@@ -606,6 +827,21 @@ export default function App() {
     setActiveBusiness(biz);
     localStorage.setItem('active_business_profile', JSON.stringify(biz));
     setSqlSeedTrigger(prev => prev + 1);
+  };
+
+  // Compute branches accessible to the currently logged-in account
+  const accessibleStores = (userRole !== 'owner' && accessibleStoreIds.length > 0)
+    ? stores.filter(s => accessibleStoreIds.includes(s.id))
+    : stores;
+
+  const handleSwitchBranch = (branchId: string) => {
+    setActiveStore(branchId);
+    localStorage.setItem('active_store_branch', branchId);
+    localStorage.setItem('pos_shift_active', 'true');
+    localStorage.setItem('shift_active_' + branchId, 'true');
+    setSqlSeedTrigger(prev => prev + 1);
+    updateBadgeCounts();
+    window.dispatchEvent(new Event('pos_data_updated'));
   };
 
   // Get active store authorization rules
@@ -622,9 +858,349 @@ export default function App() {
       setActiveTab={setActiveTab2}
       showSqlSplit={showSqlSplit}
       setShowSqlSplit={setShowSqlSplit}
-      storeName={settings.storeName}
+      storeName={settings.storeName || activeBusiness.name || 'Enterprise POS'}
     >
-      {/* Main Container without congested permanent sidebar dock */}
+      {!isAuthenticatedSession || !activeBusiness.id ? (
+        /* FULL-SCREEN LOG IN OR CREATE ACCOUNT ONBOARDING GATE (NO PRE-SEEDED DETAILS, BRANCHES, OR STOCK) */
+        <div className="flex-1 flex flex-col items-center justify-center bg-slate-950 text-slate-100 p-4 sm:p-6 overflow-y-auto select-none">
+          <motion.div
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="w-full max-w-2xl bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto"
+          >
+            {/* Onboarding Banner Header */}
+            <div className="bg-gradient-to-r from-indigo-950 via-slate-900 to-slate-900 border-b border-slate-800 p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3.5">
+                <div className="w-11 h-11 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 shrink-0 shadow-inner">
+                  <ShieldCheck size={24} />
+                </div>
+                <div>
+                  <h1 className="text-base sm:text-lg font-black tracking-tight text-white uppercase font-sans">
+                    Enterprise POS & Cloud Accounting
+                  </h1>
+                  <p className="text-[11px] text-slate-400 font-medium mt-0.5">
+                    100% Blank Slate — No pre-seeded details, branches, or stock. First account automatically becomes Admin.
+                  </p>
+                </div>
+              </div>
+
+              {/* Switch between Log In & Create Account */}
+              <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 shrink-0 self-start sm:self-auto">
+                <button
+                  type="button"
+                  onClick={() => setAuthScreenMode('login')}
+                  className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
+                    authScreenMode === 'login'
+                      ? 'bg-emerald-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Log In
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthScreenMode('register')}
+                  className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
+                    authScreenMode === 'register'
+                      ? 'bg-indigo-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Create Account
+                </button>
+              </div>
+            </div>
+
+            {/* Form Body */}
+            <div className="p-5 sm:p-6 overflow-y-auto max-h-[76vh]">
+              {authScreenMode === 'login' ? (
+                <div className="flex flex-col gap-5">
+                  <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-800/50 flex items-start gap-3">
+                    <Lock size={16} className="text-emerald-400 shrink-0 mt-0.5" />
+                    <div className="text-xs text-slate-300 leading-relaxed">
+                      <span className="font-bold text-emerald-300 uppercase tracking-wide block mb-0.5">
+                        Sign In to Your Business or Staff Account
+                      </span>
+                      Enter your Admin or Staff email and password to authenticate with Firebase & synchronize your business setup, stores, stock, batches, and accounting ledgers from Cloud SQL & Firebase Storage.
+                    </div>
+                  </div>
+
+                  <form onSubmit={handleSyncExistingAccount} className="flex flex-col gap-4">
+                    <div>
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                        Email Address (Admin or Staff User) *
+                      </label>
+                      <input
+                        type="email"
+                        value={syncLoginEmail}
+                        onChange={(e) => setSyncLoginEmail(e.target.value)}
+                        placeholder="Enter your registered email address"
+                        required
+                        className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-mono text-xs focus:border-emerald-500 focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                        Password / Staff PIN *
+                      </label>
+                      <input
+                        type="password"
+                        value={syncLoginPassword}
+                        onChange={(e) => setSyncLoginPassword(e.target.value)}
+                        placeholder="Enter your account password"
+                        required
+                        className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-mono text-xs focus:border-emerald-500 focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                        Choose Branch to Log Into (Or Select After Sign-In)
+                      </label>
+                      <select
+                        value={syncLoginBranch}
+                        onChange={(e) => setSyncLoginBranch(e.target.value)}
+                        className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-bold text-xs focus:border-emerald-500 focus:outline-hidden cursor-pointer uppercase"
+                      >
+                        <option value="">— Choose Branch After Verification ({stores.length} Configured) —</option>
+                        {stores.map((st: any) => (
+                          <option key={st.id} value={st.id}>
+                            📍 {st.name} {st.location ? `(${st.location})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="text-[10px] text-slate-500 block mt-1">
+                        Each branch keeps separate stock, sales, laybys, expenses &amp; End-of-Day (EOD) totals.
+                      </span>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={isHeaderSyncing}
+                      className="mt-1 py-3 px-5 bg-emerald-600 hover:bg-emerald-500 text-white font-black uppercase rounded-xl text-xs tracking-wider cursor-pointer shadow-lg flex items-center justify-center gap-2 transition-all"
+                    >
+                      <RefreshCw size={15} className={isHeaderSyncing ? 'animate-spin' : ''} />
+                      <span>{isHeaderSyncing ? 'Authenticating & Synchronizing...' : 'Log In & Choose Branch'}</span>
+                    </button>
+                  </form>
+
+                  {/* If local workspaces already exist on this device, allow quick selection after login or switching to Create Account */}
+                  <div className="pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
+                    <span>Setting up a new business for the first time?</span>
+                    <button
+                      type="button"
+                      onClick={() => setAuthScreenMode('register')}
+                      className="text-indigo-400 hover:text-indigo-300 font-extrabold uppercase tracking-wider cursor-pointer"
+                    >
+                      Create Admin Account →
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <form onSubmit={handleRegisterBusiness} className="flex flex-col gap-4">
+                  <div className="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-800/60 flex items-start gap-3">
+                    <ShieldCheck size={17} className="text-indigo-400 shrink-0 mt-0.5" />
+                    <div className="text-[11px] text-slate-300 leading-relaxed">
+                      <span className="font-extrabold text-indigo-300 uppercase tracking-wide block mb-0.5">
+                        First Account Automatically Becomes the Admin Account
+                      </span>
+                      Everything starts blank with zero pre-seeded stock, batches, or branches. As Admin, you can configure your business setup, billing address, create stores/branches, add users, and add stock.
+                    </div>
+                  </div>
+
+                  {/* Section 1: Admin Account Credentials */}
+                  <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 flex flex-col gap-3">
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-indigo-400 font-mono flex items-center gap-1.5">
+                      <UserCheck size={13} /> 1. Admin Account Credentials (First Account = Admin)
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Admin Full Name *</label>
+                        <input
+                          type="text"
+                          value={newBizOwner}
+                          onChange={(e) => setNewBizOwner(e.target.value)}
+                          placeholder="Enter Admin / Owner full name"
+                          required
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs font-bold focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Admin Login Email *</label>
+                        <input
+                          type="email"
+                          value={newBizEmail}
+                          onChange={(e) => setNewBizEmail(e.target.value)}
+                          placeholder="Enter Admin email address"
+                          required
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Admin Password (Min 6 Characters) *</label>
+                      <input
+                        type="password"
+                        value={newBizPassword}
+                        onChange={(e) => setNewBizPassword(e.target.value)}
+                        placeholder="Create a strong password"
+                        required
+                        className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Section 2: Business Setup & Billing Address */}
+                  <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 flex flex-col gap-3">
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-emerald-400 font-mono flex items-center gap-1.5">
+                      <Building2 size={13} /> 2. Business Setup & Billing Address
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Business / Company Name *</label>
+                        <input
+                          type="text"
+                          value={newBizName}
+                          onChange={(e) => setNewBizName(e.target.value)}
+                          placeholder="Enter registered business name"
+                          required
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs font-bold focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Tax ID / TPIN</label>
+                        <input
+                          type="text"
+                          value={newBizTpin}
+                          onChange={(e) => setNewBizTpin(e.target.value)}
+                          placeholder="Optional Tax ID / TPIN"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div className="sm:col-span-2">
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Billing Street Address</label>
+                        <input
+                          type="text"
+                          value={newBizBillingAddress}
+                          onChange={(e) => setNewBizBillingAddress(e.target.value)}
+                          placeholder="Street address, plot number, building"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Billing City</label>
+                        <input
+                          type="text"
+                          value={newBizBillingCity}
+                          onChange={(e) => setNewBizBillingCity(e.target.value)}
+                          placeholder="City / Town"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Billing Country</label>
+                        <input
+                          type="text"
+                          value={newBizBillingCountry}
+                          onChange={(e) => setNewBizBillingCountry(e.target.value)}
+                          placeholder="Country"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Billing Phone</label>
+                        <input
+                          type="text"
+                          value={newBizBillingPhone}
+                          onChange={(e) => setNewBizBillingPhone(e.target.value)}
+                          placeholder="Business phone"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Currency & VAT %</label>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <input
+                            type="text"
+                            value={newBizCurrency}
+                            onChange={(e) => setNewBizCurrency(e.target.value)}
+                            placeholder="Curr (K/$)"
+                            className="w-full px-2 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                          />
+                          <input
+                            type="number"
+                            step="0.1"
+                            value={newBizTaxRate}
+                            onChange={(e) => setNewBizTaxRate(e.target.value)}
+                            placeholder="VAT %"
+                            className="w-full px-2 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Section 3: First Store / Branch Setup (Optional at signup or create inside Admin Setup) */}
+                  <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 flex flex-col gap-3">
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-amber-400 font-mono flex items-center gap-1.5">
+                      <MapPin size={13} /> 3. Initial Store / Branch Setup (Optional — Or Create Later in Admin Setup)
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Store / Branch Name</label>
+                        <input
+                          type="text"
+                          value={newBizFirstStore}
+                          onChange={(e) => setNewBizFirstStore(e.target.value)}
+                          placeholder="Leave blank or enter store name"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Store Location</label>
+                        <input
+                          type="text"
+                          value={newBizLocation}
+                          onChange={(e) => setNewBizLocation(e.target.value)}
+                          placeholder="Branch address / city"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9.5px] text-slate-400 font-bold uppercase block mb-1">Opening Cash Float</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={newBizOpeningCash}
+                          onChange={(e) => setNewBizOpeningCash(e.target.value)}
+                          placeholder="0.00"
+                          className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    className="py-3 px-5 bg-indigo-600 hover:bg-indigo-500 text-white font-black uppercase rounded-xl text-xs tracking-wider cursor-pointer shadow-lg flex items-center justify-center gap-2 transition-all"
+                  >
+                    <Plus size={16} />
+                    <span>Create Admin Account & Complete Business Setup</span>
+                  </button>
+                </form>
+              )}
+            </div>
+          </motion.div>
+        </div>
+      ) : (
+      /* Main Container without congested permanent sidebar dock */
       <div className="flex-1 flex flex-col overflow-hidden relative h-full">
         
         {/* Top Header Bar with 3-Lines Hamburger Menu Button on Upper Corner */}
@@ -644,16 +1220,18 @@ export default function App() {
               <Menu size={18} className="group-hover:scale-110 transition-transform" />
             </button>
 
-            {/* Active Business / Store Badge */}
+            {/* Active Business / Settings & Admin Control Panel Button */}
             <button
-              onClick={() => {
-                loadBusinessData();
-                setShowBusinessModal(true);
-              }}
-              className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 bg-indigo-950/80 text-indigo-200 border border-indigo-800/80 rounded-lg text-xs font-extrabold hover:bg-indigo-900 hover:text-white transition-all cursor-pointer shadow-sm font-sans"
+              onClick={() => openUnifiedSettings('general')}
+              className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-xs font-extrabold transition-all cursor-pointer shadow-sm font-sans border ${
+                activeTab === 'settings'
+                  ? 'bg-indigo-600 text-white border-indigo-400'
+                  : 'bg-indigo-950/80 text-indigo-200 border-indigo-800/80 hover:bg-indigo-900 hover:text-white'
+              }`}
+              title="Open Settings (Merged SME Configuration & Admin Business Control Panel)"
             >
               <Building2 size={13} className="text-emerald-400 animate-pulse shrink-0" />
-              <span className="truncate max-w-[90px] sm:max-w-[160px]">{activeBusiness.name}</span>
+              <span className="truncate max-w-[90px] sm:max-w-[160px]">{activeBusiness.name || 'Business Settings'}</span>
             </button>
 
             {/* Direct Sale Register Navigation Button */}
@@ -675,34 +1253,46 @@ export default function App() {
               <span className="sm:hidden">SALE</span>
             </button>
 
-            <div className="flex items-center gap-1">
+            <div className="flex items-center gap-1 bg-slate-800/90 border border-slate-700 rounded-lg px-2 py-0.5">
+              <MapPin size={12} className="text-emerald-400 shrink-0" />
               <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider font-mono hidden md:inline">Branch:</span>
               <select
                 value={activeStore}
-                disabled={userRole === 'sales' || stores.length === 0}
-                onChange={(e) => {
-                  setActiveStore(e.target.value);
-                  setSqlSeedTrigger(prev => prev + 1);
-                }}
-                className={`bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer uppercase font-sans ${userRole === 'sales' ? 'opacity-65 cursor-not-allowed bg-slate-950 text-slate-400' : ''}`}
+                disabled={accessibleStores.length === 0}
+                onChange={(e) => handleSwitchBranch(e.target.value)}
+                title="Switch active branch (Only branches your account has access to are shown)"
+                className="bg-transparent text-emerald-300 text-[11px] sm:text-xs font-black pr-1 py-0.5 focus:outline-hidden cursor-pointer uppercase font-sans"
               >
-                {stores.length === 0 ? (
-                  <option value="">No Branch Setup</option>
+                {accessibleStores.length === 0 ? (
+                  <option value="" className="bg-slate-900 text-slate-300">No Branch Setup</option>
                 ) : (
-                  stores.map(st => (
-                    <option key={st.id} value={st.id}>{st.name}</option>
+                  accessibleStores.map(st => (
+                    <option key={st.id} value={st.id} className="bg-slate-900 text-slate-100">{st.name}</option>
                   ))
                 )}
               </select>
             </div>
           </div>
 
-          {/* Cloud Sync & User Role Badge */}
+          {/* Cloud Sync, Settings & Log Out Badge */}
           <div className="flex items-center gap-1.5 sm:gap-2">
+            <button
+              onClick={() => openUnifiedSettings('general')}
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] sm:text-[11px] font-extrabold cursor-pointer transition-all shadow-xs ${
+                activeTab === 'settings'
+                  ? 'bg-indigo-500 text-white ring-2 ring-indigo-300'
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+              }`}
+              title="Settings: Unified SME Configuration & Admin Business Control Panel"
+            >
+              <Sliders size={12} />
+              <span className="hidden md:inline">Settings</span>
+            </button>
+
             <button
               onClick={handleQuickCloudSync}
               disabled={isHeaderSyncing}
-              title="Synchronize business data with Cloud SQL"
+              title="Synchronize business data with Cloud SQL & Firebase"
               className="flex items-center gap-1 px-2 py-1 rounded-md bg-sky-950/90 hover:bg-sky-900 text-sky-300 border border-sky-800/80 text-[10px] sm:text-[11px] font-bold cursor-pointer transition-all"
             >
               <RefreshCw size={12} className={isHeaderSyncing ? 'animate-spin text-sky-400' : 'text-sky-400'} />
@@ -717,16 +1307,19 @@ export default function App() {
               }}
               className="bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer font-sans"
             >
-              <option value="owner">Owner</option>
+              <option value="owner">Admin (Owner)</option>
               <option value="manager">Manager</option>
               <option value="sales">Sales</option>
             </select>
 
-            <div className="hidden sm:flex items-center gap-1 text-[10px] px-2 py-1 rounded-md bg-indigo-950 text-indigo-300 border border-indigo-900/60 font-mono font-bold">
-              <span className="uppercase text-emerald-400 font-extrabold">
-                {userRole === 'owner' ? 'ROOT_OWNER' : userRole === 'manager' ? 'MANAGER' : 'SALES'}
-              </span>
-            </div>
+            <button
+              onClick={handleLogoutAccount}
+              title="Log Out or Switch Account / Branch"
+              className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-rose-600 hover:bg-rose-500 text-white border border-rose-500 text-[10px] sm:text-[11px] font-extrabold uppercase tracking-wider cursor-pointer transition-all shadow-xs"
+            >
+              <LogOut size={12} />
+              <span>Log Out</span>
+            </button>
           </div>
         </div>
 
@@ -747,10 +1340,12 @@ export default function App() {
                       settings={settings}
                       activeStore={activeStore}
                       userRole={userRole}
+                      accessibleStores={accessibleStores}
+                      onLogout={handleLogoutAccount}
                       initialAction={billingCounterAction}
                       onClearInitialAction={() => setBillingCounterAction(null)}
                       onCartCheckedOut={() => setSqlSeedTrigger(prev => prev + 1)}
-                      onStoreChange={setActiveStore}
+                      onStoreChange={handleSwitchBranch}
                       onUserRoleChange={setUserRole}
                     />
                   </motion.div>
@@ -758,7 +1353,7 @@ export default function App() {
 
                 {activeTab === 'laybys' && (
                   <motion.div
-                    key={`laybys_${sqlSeedTrigger}`}
+                    key={`laybys_${sqlSeedTrigger}_${activeStore}`}
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
@@ -766,7 +1361,8 @@ export default function App() {
                     className="flex-1 flex flex-col overflow-hidden min-w-0 w-full"
                   >
                     <LaybysBoard 
-                      settings={settings} 
+                      settings={settings}
+                      activeStore={activeStore}
                       onTriggerSalesCounterAction={(action) => {
                         setBillingCounterAction(action);
                         setActiveTab2('billing');
@@ -788,6 +1384,7 @@ export default function App() {
                       settings={settings} 
                       userRole={userRole} 
                       activeStore={activeStore}
+                      accessibleStores={accessibleStores}
                       onNavigateToSale={() => {
                         setBillingCounterAction(null);
                         setActiveTab2('billing');
@@ -918,6 +1515,21 @@ export default function App() {
                       settings={settings}
                       setSettings={setSettings}
                       onRefreshDatabase={handleRefreshDatabase}
+                      activeStore={activeStore}
+                      setActiveStore={setActiveStore}
+                      userRole={userRole}
+                      activeBusiness={activeBusiness}
+                      setActiveBusiness={setActiveBusiness}
+                      businesses={businesses}
+                      onSelectBusinessWorkspace={handleSelectBusinessWorkspace}
+                      onSyncExistingAccount={handleSyncExistingAccount}
+                      syncLoginEmail={syncLoginEmail}
+                      setSyncLoginEmail={setSyncLoginEmail}
+                      syncLoginPassword={syncLoginPassword}
+                      setSyncLoginPassword={setSyncLoginPassword}
+                      isHeaderSyncing={isHeaderSyncing}
+                      onNavigateToTab={(tab) => setActiveTab2(tab as ActiveTab)}
+                      initialSubTab={settingsInitialSubTab}
                     />
                   </motion.div>
                 )}
@@ -1000,6 +1612,7 @@ export default function App() {
           </button>
         </div>
       </div>
+      )}
 
       {/* SLIDE-OUT NAVIGATION DRAWER (3-LINES HAMBURGER MENU) */}
       <AnimatePresence>
@@ -1026,44 +1639,75 @@ export default function App() {
               <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-col gap-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2 text-slate-800 font-extrabold text-xs">
-                    <User size={16} className="text-indigo-600" />
-                    <span className="truncate max-w-[210px] font-mono text-slate-600">
-                      {activeBusiness.email || 'owner@pos.zm'}
-                    </span>
+                    <User size={16} className="text-indigo-600 shrink-0" />
+                    <div className="flex flex-col min-w-0">
+                      <span className="truncate max-w-[180px] font-bold text-slate-800">
+                        {localStorage.getItem('logged_in_user_name') || activeBusiness.owner || 'Admin'}
+                      </span>
+                      <span className="truncate max-w-[180px] font-mono text-[10px] text-slate-500">
+                        {localStorage.getItem('logged_in_user_email') || activeBusiness.email}
+                      </span>
+                    </div>
                   </div>
-                  <button
-                    onClick={() => setShowNavDrawer(false)}
-                    className="text-slate-400 hover:text-slate-700 p-1 rounded-md transition-colors cursor-pointer"
-                  >
-                    <X size={18} />
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={handleLogoutAccount}
+                      className="px-2.5 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-[10px] font-extrabold uppercase tracking-wider flex items-center gap-1 cursor-pointer shadow-2xs"
+                      title="Log Out of Account"
+                    >
+                      <LogOut size={12} />
+                      <span>Log Out</span>
+                    </button>
+                    <button
+                      onClick={() => setShowNavDrawer(false)}
+                      className="text-slate-400 hover:text-slate-700 p-1 rounded-md transition-colors cursor-pointer"
+                    >
+                      <X size={18} />
+                    </button>
+                  </div>
                 </div>
 
-                {/* Corporate Business Action Buttons */}
+                {/* Active Branch Switcher inside Drawer */}
+                <div className="bg-white p-2.5 rounded-xl border border-slate-200 flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between text-[10px] font-extrabold uppercase text-slate-500">
+                    <span className="flex items-center gap-1">
+                      <MapPin size={12} className="text-emerald-600" /> Active Branch Logged In:
+                    </span>
+                    <span className="text-emerald-700 font-mono">{accessibleStores.length} Accessible</span>
+                  </div>
+                  <select
+                    value={activeStore}
+                    onChange={(e) => handleSwitchBranch(e.target.value)}
+                    disabled={accessibleStores.length === 0}
+                    className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-extrabold text-slate-900 uppercase cursor-pointer focus:outline-hidden focus:border-indigo-500"
+                  >
+                    {accessibleStores.length === 0 ? (
+                      <option value="">No Branch Configured</option>
+                    ) : (
+                      accessibleStores.map((st: any) => (
+                        <option key={st.id} value={st.id}>
+                          {st.name} {st.location ? `— ${st.location}` : ''}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+
+                {/* Unified Settings & Workspace Shortcuts */}
                 <div className="grid grid-cols-2 gap-2">
                   <button
-                    onClick={() => {
-                      setShowNavDrawer(false);
-                      loadBusinessData();
-                      setShowBusinessModal(true);
-                      setShowStoreForm(false);
-                    }}
+                    onClick={() => openUnifiedSettings('general')}
                     className="py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[10.5px] font-extrabold uppercase tracking-wider text-center shadow-xs transition-all cursor-pointer font-sans flex items-center justify-center gap-1"
                   >
-                    <Building size={14} />
-                    <span>CREATE</span>
+                    <Sliders size={14} />
+                    <span>SETTINGS</span>
                   </button>
                   <button
-                    onClick={() => {
-                      setShowNavDrawer(false);
-                      loadBusinessData();
-                      setShowBusinessModal(true);
-                      setShowStoreForm(false);
-                    }}
+                    onClick={() => openUnifiedSettings('database')}
                     className="py-2 px-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[10.5px] font-extrabold uppercase tracking-wider text-center shadow-xs transition-all cursor-pointer font-sans flex items-center justify-center gap-1"
                   >
                     <Building2 size={14} />
-                    <span>SWITCH</span>
+                    <span>WORKSPACES</span>
                   </button>
                 </div>
               </div>
@@ -1419,19 +2063,16 @@ export default function App() {
                   </div>
                 </button>
 
-                {/* Settings & Stores */}
+                {/* Settings (Unified SME Configuration & Admin Business Control Panel) */}
                 <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('settings');
-                  }}
+                  onClick={() => openUnifiedSettings('general')}
                   className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
                 >
                   <div className="flex items-center gap-2.5">
                     <div className="p-1.5 rounded-lg bg-slate-700 text-white shadow-xs group-hover:scale-105 transition-transform">
                       <Sliders size={16} />
                     </div>
-                    <span>Settings & Stores</span>
+                    <span>Settings (Admin & Business Control)</span>
                   </div>
                 </button>
               </div>
@@ -1469,6 +2110,108 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* CHOOSE BRANCH ON LOGIN GATE MODAL */}
+      {showBranchChoiceGate && isAuthenticatedSession && accessibleStores.length > 0 && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-none">
+          <motion.div
+            initial={{ scale: 0.95, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="w-full max-w-md bg-slate-900 border border-slate-800 text-slate-100 rounded-2xl p-5 flex flex-col gap-4 shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-emerald-600/20 border border-emerald-500/40 text-emerald-400">
+                  <MapPin size={20} />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black uppercase tracking-wider text-white">
+                    Choose Your Branch Location
+                  </h3>
+                  <p className="text-[10.5px] text-slate-400">
+                    Welcome {localStorage.getItem('logged_in_user_name') || 'Admin'} — Select the branch you are operating today
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleLogoutAccount}
+                className="px-2.5 py-1 bg-rose-950/80 hover:bg-rose-900 text-rose-200 border border-rose-800 rounded-lg text-[10px] font-bold uppercase cursor-pointer flex items-center gap-1"
+              >
+                <LogOut size={11} /> Log Out
+              </button>
+            </div>
+
+            <div className="flex flex-col gap-2 max-h-60 overflow-y-auto">
+              {accessibleStores.map((st: any) => {
+                const isSelected = activeStore === st.id;
+                return (
+                  <button
+                    key={st.id}
+                    type="button"
+                    onClick={() => handleSwitchBranch(st.id)}
+                    className={`p-3.5 rounded-xl border text-left flex items-center justify-between transition-all cursor-pointer ${
+                      isSelected
+                        ? 'bg-emerald-950/60 border-emerald-500 text-white shadow-md'
+                        : 'bg-slate-950/70 border-slate-800 text-slate-300 hover:border-slate-700'
+                    }`}
+                  >
+                    <div>
+                      <div className="font-black text-xs uppercase flex items-center gap-2">
+                        <span>{st.name}</span>
+                        <span className="text-[10px] font-mono text-slate-400">({st.id})</span>
+                      </div>
+                      <div className="text-[10.5px] text-slate-400 mt-0.5">
+                        Location: {st.location || 'Main Branch'}
+                      </div>
+                    </div>
+                    <span className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase ${
+                      isSelected ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-400'
+                    }`}>
+                      {isSelected ? '✓ Selected' : 'Select'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex flex-col gap-1.5">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                Opening Drawer Cash Float for Selected Branch ({settings.currency || 'K'})
+              </label>
+              <input
+                type="number"
+                step="0.01"
+                value={gateOpeningCash}
+                onChange={(e) => setGateOpeningCash(e.target.value)}
+                placeholder={localStorage.getItem('shift_opening_cash_' + activeStore) || '0.00'}
+                className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono font-bold text-emerald-300 focus:outline-hidden focus:border-emerald-500"
+              />
+              <span className="text-[9.5px] text-slate-500">
+                All stock, sales, expenses, and End-of-Day (EOD) totals are isolated to this branch.
+              </span>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (gateOpeningCash.trim() !== '' && activeStore) {
+                  const cashVal = Math.max(0, parseFloat(gateOpeningCash) || 0).toFixed(2);
+                  localStorage.setItem('shift_opening_cash_' + activeStore, cashVal);
+                }
+                setGateOpeningCash('');
+                setShowBranchChoiceGate(false);
+                setSqlSeedTrigger(prev => prev + 1);
+                window.dispatchEvent(new Event('pos_data_updated'));
+              }}
+              className="py-3 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-black uppercase tracking-wider text-xs rounded-xl cursor-pointer shadow-lg flex items-center justify-center gap-2"
+            >
+              <Check size={15} />
+              <span>Enter {(accessibleStores.find(s => s.id === activeStore)?.name || activeStore || 'Branch').toUpperCase()} Workspace</span>
+            </button>
+          </motion.div>
+        </div>
+      )}
+
       {/* ADD EXPENSE MODAL */}
       {showExpenseModal && (
         <div className="fixed inset-0 bg-slate-950/75 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-none">
@@ -1480,7 +2223,7 @@ export default function App() {
             <div className="flex justify-between items-center border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2 text-indigo-400">
                 <Receipt size={20} />
-                <h3 className="text-sm font-extrabold uppercase tracking-wider text-slate-100 font-sans">Record Operating Expense</h3>
+                <h3 className="text-sm font-extrabold uppercase tracking-wider text-slate-100 font-sans">Record Branch Operating Expense</h3>
               </div>
               <button
                 onClick={() => setShowExpenseModal(false)}
@@ -1498,12 +2241,35 @@ export default function App() {
                   return;
                 }
                 const amt = Number(expenseAmount);
+                const targetBranch = expenseStoreId || activeStore || (accessibleStores[0]?.id ?? '');
+                const nowIso = new Date().toISOString();
+                const expId = `EXP-${Date.now()}`;
+
+                runSql(`
+                  INSERT INTO expenses (id, category, payment_method, account_id, amount, description, ref_number, reference_no, expense_date, store_id, performed_by, created_by, created_at)
+                  VALUES (
+                    '${expId}',
+                    '${expenseCategory.replace(/'/g, "''")}',
+                    'Cash',
+                    'acc_cash',
+                    ${amt},
+                    '${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
+                    '${expId}',
+                    '${expId}',
+                    '${nowIso.split('T')[0]}',
+                    '${targetBranch.replace(/'/g, "''")}',
+                    '${(localStorage.getItem('logged_in_user_name') || userRole).replace(/'/g, "''")}',
+                    '${userRole}',
+                    '${nowIso}'
+                  )
+                `, 'Record branch operating expense');
+
                 runSql(`
                   INSERT INTO double_entry_journal (id, date, reference, description, account_debit, account_credit, amount, currency) VALUES (
                     'exp_${Date.now()}',
-                    '${new Date().toISOString()}',
-                    'EXP_${Date.now()}',
-                    '${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
+                    '${nowIso}',
+                    '${expId}',
+                    '[Branch: ${targetBranch}] ${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
                     'Operating Expenses',
                     'Cash Drawer',
                     ${amt},
@@ -1511,15 +2277,29 @@ export default function App() {
                   )
                 `, 'Record expense journal entry');
 
-                logEmployeeAudit('EXPENSES', 'Added Operating Expense', `Category: ${expenseCategory}, Notes: ${expenseNotes || 'Store Expense'}`, amt, activeStore, userRole);
+                logEmployeeAudit('EXPENSES', 'Added Operating Expense', `Category: ${expenseCategory}, Notes: ${expenseNotes || 'Store Expense'}`, amt, targetBranch, userRole);
 
-                alert(`Operating expense of ${settings.currency}${amt.toFixed(2)} recorded into double-entry ledger!`);
+                alert(`Operating expense of ${settings.currency}${amt.toFixed(2)} recorded for branch [${targetBranch.toUpperCase()}] and linked to branch EOD totals!`);
                 setExpenseAmount('');
                 setExpenseNotes('');
                 setShowExpenseModal(false);
+                window.dispatchEvent(new Event('pos_data_updated'));
               }}
               className="flex flex-col gap-3 text-xs"
             >
+              <div>
+                <label className="text-[10px] uppercase font-bold text-slate-400 block pb-1">Branch Associated with Expense *</label>
+                <select
+                  value={expenseStoreId || activeStore}
+                  onChange={(e) => setExpenseStoreId(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg p-2 text-emerald-300 font-extrabold uppercase focus:outline-hidden"
+                >
+                  {accessibleStores.map((st: any) => (
+                    <option key={st.id} value={st.id}>{st.name}</option>
+                  ))}
+                </select>
+              </div>
+
               <div>
                 <label className="text-[10px] uppercase font-bold text-slate-400 block pb-1">Expense Category</label>
                 <select
@@ -1777,397 +2557,6 @@ export default function App() {
                 </div>
               )}
             </div>
-          </motion.div>
-        </div>
-      )}
-
-      {/* ENTERPRISE WORKSPACE, BLANK ACCOUNT SETUP & CLOUD SYNC HUB MODAL */}
-      {showBusinessModal && (
-        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto select-none">
-          <motion.div
-            initial={{ scale: 0.95, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            className="w-full max-w-2xl bg-slate-900 border border-slate-800 text-slate-100 rounded-2xl p-6 flex flex-col gap-6 shadow-2xl overflow-y-auto max-h-[92vh] text-left"
-          >
-            {/* Modal Header */}
-            <div className="flex justify-between items-center border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-2">
-                <Building2 className="text-indigo-400" size={20} />
-                <div>
-                  <h3 className="text-sm font-black uppercase tracking-wider text-slate-100">
-                    {businesses.length === 0 ? 'Welcome — Set Up Your New Business or Sync Account' : 'Enterprise Business & Cloud Sync Hub'}
-                  </h3>
-                  <p className="text-[10px] text-slate-400 font-medium">
-                    Starts 100% blank with zero preseeded stock or batches. All accounts & ledgers synchronize with Cloud SQL.
-                  </p>
-                </div>
-              </div>
-              {businesses.length > 0 && (
-                <button
-                  onClick={() => {
-                    setShowBusinessModal(false);
-                    setShowStoreForm(false);
-                  }}
-                  className="text-slate-400 hover:text-white p-1.5 bg-slate-800 rounded-lg cursor-pointer text-xs font-bold"
-                >
-                  ✕ Close
-                </button>
-              )}
-            </div>
-
-            {/* Split UI: Left (Registered list & Cloud status), Right (Register / Sync Login / Add Store) */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
-              
-              {/* LEFT: Businesses list & active indicators */}
-              <div className="flex flex-col gap-4">
-                <h4 className="text-[10px] uppercase font-bold text-slate-400 tracking-wider flex items-center gap-1.5 font-mono">
-                  <span>🏢 Registered Workspaces ({businesses.length})</span>
-                </h4>
-                <div className="flex flex-col gap-2 overflow-y-auto max-h-[290px] pr-1">
-                  {businesses.length === 0 ? (
-                    <div className="p-4 rounded-xl border border-dashed border-slate-700 bg-slate-950/60 text-slate-400 text-xs flex flex-col gap-2">
-                      <span className="font-bold text-slate-200">No Business Account Configured Yet</span>
-                      <p className="text-[11px] leading-relaxed">
-                        This POS comes completely blank by default—no preseeded stock, batches, or login accounts—so your business starts with clean accounting and inventory records.
-                      </p>
-                      <p className="text-[10.5px] text-indigo-300 font-semibold">
-                        👉 Use the form to create your business account, or switch to "Sync Existing" to restore your account from Cloud SQL.
-                      </p>
-                    </div>
-                  ) : (
-                    businesses.map((b) => {
-                      const isActive = b.id === activeBusiness.id;
-                      return (
-                        <div
-                          key={b.id}
-                          onClick={() => handleSelectBusinessWorkspace(b)}
-                          className={`p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col gap-1.5 ${
-                            isActive
-                              ? 'bg-indigo-950/60 border-indigo-500 shadow-md text-white'
-                              : 'bg-slate-850 hover:bg-slate-800 border-slate-805 text-slate-300'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="font-bold text-xs font-sans tracking-wide truncate max-w-[170px]">{b.name}</span>
-                            {isActive && (
-                              <span className="text-[8px] bg-emerald-600 text-white font-extrabold px-1.5 py-0.5 rounded-full uppercase tracking-widest flex items-center gap-1">
-                                <Check size={8} /> active
-                              </span>
-                            )}
-                          </div>
-                          <div className="flex items-center justify-between font-mono text-[9px] text-slate-400">
-                            <span className="truncate max-w-[130px]">{b.owner} ({b.email})</span>
-                            <span>ID: {b.id.toUpperCase()}</span>
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-850 font-mono text-[9.5px] leading-relaxed text-slate-400">
-                  ☁️ Cloud SQL Synchronization: Every business account, branch store, stock item, batch, sale, and double-entry accounting ledger is automatically synchronized.
-                </div>
-              </div>
-
-              {/* RIGHT ACTIONS: Account registration, Cloud Sync Sign-In, or dynamic stores addition */}
-              <div className="flex flex-col gap-4 border-t md:border-t-0 md:border-l border-slate-800 pt-5 md:pt-0 md:pl-6">
-                
-                {/* Mode Select Header */}
-                <div className="flex items-center justify-between gap-1 select-none flex-wrap">
-                  <div className="flex gap-1.5 flex-wrap">
-                    <button
-                      type="button"
-                      onClick={() => { setHubMode('register'); setShowStoreForm(false); }}
-                      className={`text-[9.5px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${hubMode === 'register' && !showStoreForm ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
-                    >
-                      + New Business
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => { setHubMode('sync_login'); setShowStoreForm(false); }}
-                      className={`text-[9.5px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${hubMode === 'sync_login' && !showStoreForm ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
-                    >
-                      ☁️ Sync Existing
-                    </button>
-                    {businesses.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => { setHubMode('store'); setShowStoreForm(true); }}
-                        className={`text-[9.5px] font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${showStoreForm || hubMode === 'store' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'}`}
-                      >
-                        + Branch Outlet
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {hubMode === 'sync_login' && !showStoreForm ? (
-                  /* SIGN IN & SYNCHRONIZE EXISTING ACCOUNT FROM CLOUD SQL */
-                  <form onSubmit={handleSyncExistingAccount} className="flex flex-col gap-3">
-                    <h5 className="text-[11px] font-semibold text-emerald-400 uppercase tracking-widest font-mono">
-                      Synchronize Existing Business Account
-                    </h5>
-                    <p className="text-[10.5px] text-slate-400 leading-relaxed">
-                      Enter your registered Business Email and Password to pull your stores, stock catalog, batches, and accounting ledgers from Cloud SQL.
-                    </p>
-
-                    <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Registered Admin Email</label>
-                      <input
-                        type="email"
-                        value={syncLoginEmail}
-                        onChange={(e) => setSyncLoginEmail(e.target.value)}
-                        placeholder="e.g. admin@yourbusiness.com"
-                        required
-                        className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                      />
-                    </div>
-
-                    <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Account Password</label>
-                      <input
-                        type="password"
-                        value={syncLoginPassword}
-                        onChange={(e) => setSyncLoginPassword(e.target.value)}
-                        placeholder="••••••••"
-                        required
-                        className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                      />
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={isHeaderSyncing}
-                      className="mt-1 py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider cursor-pointer shadow-md flex items-center justify-center gap-1.5 select-none"
-                    >
-                      <RefreshCw size={14} className={isHeaderSyncing ? 'animate-spin' : ''} />
-                      <span>{isHeaderSyncing ? 'Synchronizing from Cloud...' : 'Sync & Sign In'}</span>
-                    </button>
-                  </form>
-                ) : !showStoreForm ? (
-                  /* REGISTER NEW BLANK CORPORATE BUSINESS INTERACTIVE FORM */
-                  <form onSubmit={handleRegisterBusiness} className="flex flex-col gap-2.5">
-                    <h5 className="text-[11px] font-semibold text-slate-200 uppercase tracking-widest font-mono">
-                      Create New Business Account (Blank Slate)
-                    </h5>
-                    
-                    <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Business / Company Name</label>
-                      <input
-                        type="text"
-                        value={newBizName}
-                        onChange={(e) => setNewBizName(e.target.value)}
-                        placeholder="e.g. Zambezi Hardware & General"
-                        required
-                        className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-bold focus:outline-hidden text-xs"
-                      />
-                    </div>
-
-                    <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Owner / Administrator Full Name</label>
-                      <input
-                        type="text"
-                        value={newBizOwner}
-                        onChange={(e) => setNewBizOwner(e.target.value)}
-                        placeholder="e.g. Mutale Banda"
-                        required
-                        className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-bold focus:outline-hidden text-xs"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 text-[11px]">
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Login Email</label>
-                        <input
-                          type="email"
-                          value={newBizEmail}
-                          onChange={(e) => setNewBizEmail(e.target.value)}
-                          placeholder="owner@company.com"
-                          required
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Login Password</label>
-                        <input
-                          type="password"
-                          value={newBizPassword}
-                          onChange={(e) => setNewBizPassword(e.target.value)}
-                          placeholder="••••••"
-                          required
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 text-[11px]">
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Primary Branch / Store Name</label>
-                        <input
-                          type="text"
-                          value={newBizFirstStore}
-                          onChange={(e) => setNewBizFirstStore(e.target.value)}
-                          placeholder="e.g. Main Branch"
-                          required
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 text-xs focus:outline-hidden"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">City / Location</label>
-                        <input
-                          type="text"
-                          value={newBizLocation}
-                          onChange={(e) => setNewBizLocation(e.target.value)}
-                          placeholder="e.g. Lusaka"
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 text-xs focus:outline-hidden"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2 text-[11px]">
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Currency</label>
-                        <input
-                          type="text"
-                          value={newBizCurrency}
-                          onChange={(e) => setNewBizCurrency(e.target.value)}
-                          placeholder="K"
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">VAT Rate (%)</label>
-                        <input
-                          type="number"
-                          step="0.1"
-                          value={newBizTaxRate}
-                          onChange={(e) => setNewBizTaxRate(e.target.value)}
-                          placeholder="16"
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Opening Cash</label>
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={newBizOpeningCash}
-                          onChange={(e) => setNewBizOpeningCash(e.target.value)}
-                          placeholder="0.00"
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                        />
-                      </div>
-                    </div>
-
-                    <button
-                      type="submit"
-                      className="mt-1.5 py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider cursor-pointer shadow-md flex items-center justify-center gap-1.5 select-none"
-                    >
-                      <Plus size={14} /> Create Blank Account & Launch POS
-                    </button>
-                  </form>
-                ) : (
-                  /* CREATE OUTLET FOR ACTIVE BUSINESS INTERACTIVE FORM */
-                  <form onSubmit={handleCreateNewStore} className="flex flex-col gap-3">
-                    <h5 className="text-[11px] font-semibold text-slate-200 uppercase tracking-widest font-mono">Create Outlet for {activeBusiness.name}</h5>
-                    
-                    <div className="flex flex-col gap-1 text-[11px]">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Outlet Store Name</label>
-                      <input
-                        type="text"
-                        value={newStoreName}
-                        onChange={(e) => setNewStoreName(e.target.value)}
-                        placeholder="e.g. Regional Branch"
-                        required
-                        className="w-full px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-bold focus:outline-hidden text-xs"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 text-[11px]">
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Branch Code (ID)</label>
-                        <input
-                          type="text"
-                          value={newStoreId}
-                          onChange={(e) => setNewStoreId(e.target.value)}
-                          placeholder="e.g. branch_2"
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 font-mono text-xs focus:outline-hidden"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-[9px] text-slate-400 font-bold uppercase pb-0.5">Location</label>
-                        <input
-                          type="text"
-                          value={newStoreLocation}
-                          onChange={(e) => setNewStoreLocation(e.target.value)}
-                          placeholder="e.g. Kitwe"
-                          className="w-full px-2.5 py-1.5 bg-slate-800 border border-slate-700 rounded-lg text-slate-100 text-xs focus:outline-hidden"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="p-3 bg-slate-950 rounded-lg border border-slate-850 flex flex-col gap-2">
-                      <span className="text-[8.5px] uppercase font-extrabold text-indigo-400 font-mono">Branch Permission Controls</span>
-                      
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-slate-300">Allow General Discounts</span>
-                        <input
-                          type="checkbox"
-                          checked={newStoreAllowDiscounts}
-                          onChange={(e) => setNewStoreAllowDiscounts(e.target.checked)}
-                          className="w-3.5 h-3.5 rounded cursor-pointerAccent"
-                        />
-                      </div>
-
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-slate-300">Allow Reversals / Refunds</span>
-                        <input
-                          type="checkbox"
-                          checked={newStoreAllowRefunds}
-                          onChange={(e) => setNewStoreAllowRefunds(e.target.checked)}
-                          className="w-3.5 h-3.5 rounded cursor-pointerAccent"
-                        />
-                      </div>
-
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-slate-300">Enable Laybys Deposits</span>
-                        <input
-                          type="checkbox"
-                          checked={newStoreAllowLaybys}
-                          onChange={(e) => setNewStoreAllowLaybys(e.target.checked)}
-                          className="w-3.5 h-3.5 rounded cursor-pointerAccent"
-                        />
-                      </div>
-
-                      <div className="flex items-center justify-between text-[10px]">
-                        <span className="text-slate-200 font-semibold text-amber-300">Require Manager Discount Key</span>
-                        <input
-                          type="checkbox"
-                          checked={newStoreReqManager}
-                          onChange={(e) => setNewStoreReqManager(e.target.checked)}
-                          className="w-3.5 h-3.5 rounded cursor-pointerAccent"
-                        />
-                      </div>
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={userRole !== 'owner'}
-                      className={`py-2 px-4 text-white font-extrabold uppercase rounded-lg text-xs tracking-wider flex items-center justify-center gap-1.5 select-none ${userRole === 'owner' ? 'bg-indigo-600 hover:bg-indigo-505 cursor-pointer shadow-md' : 'bg-slate-800 text-slate-550 cursor-not-allowed border border-slate-750'}`}
-                    >
-                      <Plus size={14} /> Provision Store Node
-                    </button>
-                    {userRole !== 'owner' && (
-                      <span className="text-[8.5px] text-amber-400 font-bold italic tracking-wide text-center">✕ Store creation restricted to Business Owner role</span>
-                    )}
-                  </form>
-                )}
-
-              </div>
-
-            </div>
-
           </motion.div>
         </div>
       )}

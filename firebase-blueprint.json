@@ -2,111 +2,155 @@
   "entities": {
     "Business": {
       "title": "Business",
-      "description": "Enterprise business profile",
+      "description": "Enterprise business profile linked to Firebase Auth ownerUid",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Unique identifier for the business" },
-        "name": { "type": "string", "description": "Business Name" },
-        "owner": { "type": "string", "description": "Owner Full Name" },
-        "email": { "type": "string", "description": "Business Corporate Email" },
-        "ownerUid": { "type": "string", "description": "Firebase Auth UID of the owner" },
-        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique identifier for the business" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Business Name" },
+        "owner": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Owner Full Name" },
+        "email": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Business Corporate Email" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
       },
-      "required": ["id", "name", "owner", "email", "ownerUid"]
+      "required": ["id", "name", "owner", "email", "ownerUid", "createdAt", "updatedAt"]
     },
     "Store": {
       "title": "Store Branch",
-      "description": "Retail store outlet branch",
+      "description": "Retail store outlet branch linked to parent Business",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Unique store branch ID" },
-        "business_id": { "type": "string", "description": "Parent business ID" },
-        "name": { "type": "string", "description": "Outlet Name" },
-        "location": { "type": "string", "description": "City/Region location" },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique store branch ID" },
+        "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Outlet Name" },
+        "location": { "type": "string", "maxLength": 200, "description": "City/Region location" },
         "allow_discounts": { "type": "integer", "description": "Is discount enabled (1/0)" },
         "allow_refunds": { "type": "integer", "description": "Is refund allowed (1/0)" },
         "allow_laybys": { "type": "integer", "description": "Is layaway support enabled (1/0)" },
         "require_manager_discount": { "type": "integer", "description": "Is manager level signature needed for discount (1/0)" }
       },
-      "required": ["id", "business_id", "name"]
+      "required": ["id", "business_id", "ownerUid", "name", "location", "allow_discounts", "allow_refunds", "allow_laybys", "require_manager_discount"]
     },
     "Product": {
       "title": "Product Asset",
-      "description": "Inventory product item",
+      "description": "Inventory product item and batch tracking linked to Business",
       "type": "object",
       "properties": {
         "id": { "type": "integer", "description": "Auto-increment ID" },
-        "name": { "type": "string", "description": "Item product name" },
-        "sku": { "type": "string", "description": "Stockkeeping unit SKU code" },
-        "category": { "type": "string", "description": "Product category" },
+        "business_id": { "type": "string", "maxLength": 128, "description": "Associated business identifier" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 250, "description": "Item product name" },
+        "sku": { "type": "string", "maxLength": 100, "description": "Stockkeeping unit SKU code" },
+        "category": { "type": "string", "maxLength": 100, "description": "Product category" },
         "price": { "type": "number", "description": "Selling retail price" },
         "cost": { "type": "number", "description": "Acquisition cost" },
         "stock": { "type": "integer", "description": "Total available warehouse stock" },
-        "imageUrl": { "type": "string", "description": "Base64 or external photo URL" },
-        "business_id": { "type": "string", "description": "Associated business identifier" },
+        "imageUrl": { "type": "string", "maxLength": 300000, "description": "Base64 or external photo URL" },
         "is_service": { "type": "integer", "description": "Whether item is a service (1/0)" },
-        "batch_number": { "type": "string", "description": "Batch or lot identifier" },
-        "expiry_date": { "type": "string", "description": "Expiry date string" }
+        "batch_number": { "type": "string", "maxLength": 100, "description": "Batch or lot identifier" },
+        "expiry_date": { "type": "string", "maxLength": 100, "description": "Expiry date string" }
       },
-      "required": ["id", "name", "sku", "price", "business_id"]
+      "required": ["id", "business_id", "ownerUid", "name", "sku", "category", "price", "cost", "stock", "imageUrl"]
     },
     "Customer": {
       "title": "Customer CRM",
-      "description": "Client CRM details",
+      "description": "Client CRM details and tax profile linked to Business",
       "type": "object",
       "properties": {
         "id": { "type": "integer", "description": "Unique Client ID" },
-        "name": { "type": "string", "description": "Client name" },
-        "phone": { "type": "string", "description": "Primary phone" },
-        "email": { "type": "string", "description": "Client email" },
+        "business_id": { "type": "string", "maxLength": 128, "description": "Associated business id" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Client name" },
+        "phone": { "type": "string", "maxLength": 50, "description": "Primary phone" },
+        "email": { "type": "string", "maxLength": 200, "description": "Client email" },
         "loyalPoints": { "type": "integer", "description": "Accumulated loyalty rewards points" },
-        "tpin": { "type": "string", "description": "Taxpayer identification number" },
+        "tpin": { "type": "string", "maxLength": 100, "description": "Taxpayer identification number" },
         "zra_connected": { "type": "integer", "description": "ZRA taxation link status (1/0)" },
-        "tax_band": { "type": "string", "description": "Zambian Revenue tax bracket" },
-        "business_id": { "type": "string", "description": "Associated business id" }
+        "tax_band": { "type": "string", "maxLength": 100, "description": "Zambian Revenue tax bracket" }
       },
-      "required": ["id", "name"]
+      "required": ["id", "business_id", "ownerUid", "name", "phone", "email", "loyalPoints", "tpin", "zra_connected", "tax_band"]
     },
     "Order": {
       "title": "POS Invoice Order",
-      "description": "Completed client sales receipt transaction invoice",
+      "description": "Client sales receipt transaction invoice linked to Business, Store, and Customer",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "description": "Invoice number" },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Invoice number" },
+        "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "customerId": { "type": "integer", "description": "Associated customer ID" },
-        "orderDate": { "type": "string", "description": "ISO date-time or date string" },
+        "orderDate": { "type": "string", "maxLength": 100, "description": "ISO date-time or date string" },
         "subtotal": { "type": "number", "description": "Subtotal" },
         "tax": { "type": "number", "description": "Tax" },
         "discount": { "type": "number", "description": "Discount" },
         "total": { "type": "number", "description": "Final invoice total receivable" },
-        "paymentMethod": { "type": "string", "description": "Payment channel: CASH, CARD, MOMO" },
-        "status": { "type": "string", "description": "Receipt status" },
-        "store_id": { "type": "string", "description": "Origin outlet branch" },
-        "performed_by": { "type": "string", "description": "Origin cashier agent" }
+        "paymentMethod": { "type": "string", "maxLength": 50, "description": "Payment channel: CASH, CARD, MOMO, SPLIT" },
+        "status": { "type": "string", "maxLength": 50, "description": "Receipt status (Completed, Refunded, Reversed)" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Origin outlet branch" },
+        "performed_by": { "type": "string", "maxLength": 100, "description": "Origin cashier agent" }
       },
-      "required": ["id", "orderDate", "subtotal", "tax", "total"]
+      "required": ["id", "business_id", "ownerUid", "orderDate", "subtotal", "tax", "discount", "total", "paymentMethod", "status", "store_id", "performed_by"]
+    },
+    "OrderItem": {
+      "title": "Order Line Item",
+      "description": "Individual product line item within a POS Order transaction",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique line item ID" },
+        "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "orderId": { "type": "string", "maxLength": 128, "description": "Parent Order ID" },
+        "productId": { "type": "integer", "description": "Referenced Product ID" },
+        "quantity": { "type": "integer", "description": "Quantity sold" },
+        "unitPrice": { "type": "number", "description": "Unit selling price at time of sale" }
+      },
+      "required": ["id", "business_id", "ownerUid", "orderId", "productId", "quantity", "unitPrice"]
+    },
+    "LedgerBackup": {
+      "title": "Accounting & Client Relational Ledger Backup",
+      "description": "Synchronized double-entry journal, EOD cash-up, cash flow, receipt/refund, layby, and staff ledgers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Ledger table key" },
+        "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "ledger_type": { "type": "string", "maxLength": 100, "description": "Ledger category name" },
+        "record_count": { "type": "integer", "description": "Total number of records in snapshot" },
+        "records": { "type": "array", "description": "Bounded array of native map records (up to 500 items)" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp of backup" }
+      },
+      "required": ["id", "business_id", "ownerUid", "ledger_type", "record_count", "records", "updatedAt"]
     }
   },
   "firestore": {
-    "businesses/{businessId}": {
+    "/businesses/{businessId}": {
       "schema": "Business",
       "description": "Core client business collection keyed by businessId"
     },
-    "businesses/{businessId}/stores/{storeId}": {
+    "/businesses/{businessId}/stores/{storeId}": {
       "schema": "Store",
-      "description": "Branch stores nested within local business workspaces"
+      "description": "Branch stores nested within business workspaces"
     },
-    "businesses/{businessId}/products/{productId}": {
+    "/businesses/{businessId}/products/{productId}": {
       "schema": "Product",
-      "description": "Inventory listings of specific businesses"
+      "description": "Inventory listings and batches of specific businesses"
     },
-    "businesses/{businessId}/customers/{customerId}": {
+    "/businesses/{businessId}/customers/{customerId}": {
       "schema": "Customer",
-      "description": "Customer accounts belonging to a business"
+      "description": "Client CRM accounts belonging to a business"
     },
-    "businesses/{businessId}/orders/{orderId}": {
+    "/businesses/{businessId}/orders/{orderId}": {
       "schema": "Order",
-      "description": "Completed invoices list for accounting auditing trail tracking"
+      "description": "Completed and refunded transaction invoices for accounting trail"
+    },
+    "/businesses/{businessId}/order_items/{itemId}": {
+      "schema": "OrderItem",
+      "description": "Relational order line items linking orders and products"
+    },
+    "/businesses/{businessId}/ledgers/{ledgerId}": {
+      "schema": "LedgerBackup",
+      "description": "Double-entry accounting ledgers, EOD cash-ups, cash flow, laybys, and client backups"
     }
   }
 }

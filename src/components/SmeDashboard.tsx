@@ -22,8 +22,15 @@ interface MetricState {
   avgOrderValue: number;
 }
 
-export default function SmeDashboard({ settings, setActiveTab, setTerminalCode, userRole = 'owner', activeStore = 'lusaka' }: SmeDashboardProps) {
-  const [selectedStoreFilter, setSelectedStoreFilter] = useState<string>('all');
+export default function SmeDashboard({ settings, setActiveTab, setTerminalCode, userRole = 'owner', activeStore = '' }: SmeDashboardProps) {
+  const [selectedStoreFilter, setSelectedStoreFilter] = useState<string>(() => activeStore || 'all');
+
+  useEffect(() => {
+    if (activeStore) {
+      setSelectedStoreFilter(activeStore);
+      calculateAnalytics(activeStore);
+    }
+  }, [activeStore]);
   const [metrics, setMetrics] = useState<MetricState>({ revenue: 0, profit: 0, transactions: 0, avgOrderValue: 0 });
   const [salesTrend, setSalesTrend] = useState<any[]>([]);
   const [paymentShare, setPaymentShare] = useState<any[]>([]);

@@ -26,15 +26,27 @@ import { runSql, initializeDatabase, SeedTemplate, persistTablesToStorage, pushD
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
-import { auth, googleProvider, backupToCloud, restoreFromCloud, getTransportSecurityStatus } from '../firebase';
+import { auth, googleProvider, backupToCloud, restoreFromCloud, getTransportSecurityStatus, registerOrSignInWithEmailPassword } from '../firebase';
 
 interface SettingsPanelProps {
   settings: StoreSettings;
   setSettings: (settings: StoreSettings) => void;
   onRefreshDatabase: (template: SeedTemplate) => void;
+  activeStore?: string;
+  setActiveStore?: (storeId: string) => void;
+  onNavigateToInventory?: () => void;
+  initialSubTab?: 'general' | 'stores' | 'users' | 'stock' | 'workspaces';
 }
 
-export default function SettingsPanel({ settings, setSettings, onRefreshDatabase }: SettingsPanelProps) {
+export default function SettingsPanel({
+  settings,
+  setSettings,
+  onRefreshDatabase,
+  activeStore = '',
+  setActiveStore,
+  onNavigateToInventory,
+  initialSubTab = 'general',
+}: SettingsPanelProps) {
   const [storeName, setStoreName] = useState(settings.storeName);
   const [currency, setCurrency] = useState(settings.currency);
   const [taxRate, setTaxRate] = useState(settings.taxRate);
@@ -44,6 +56,11 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
   const [paperWidth, setPaperWidth] = useState<'58mm' | '80mm'>(settings.paperWidth);
   const [logoUrl, setLogoUrl] = useState<string>(settings.logoUrl || '');
   const [tpin, setTpin] = useState<string>(settings.tpin || '');
+  const [billingAddress, setBillingAddress] = useState<string>(settings.billingAddress || '');
+  const [billingCity, setBillingCity] = useState<string>(settings.billingCity || '');
+  const [billingCountry, setBillingCountry] = useState<string>(settings.billingCountry || '');
+  const [billingPhone, setBillingPhone] = useState<string>(settings.billingPhone || '');
+  const [billingEmail, setBillingEmail] = useState<string>(settings.billingEmail || '');
   const [termsAndConditions, setTermsAndConditions] = useState<string>(settings.termsAndConditions || '');
 
   const [printerName, setPrinterName] = useState<string>(settings.printerName || 'ZPOS-Bluetooth-58M (Default Linked)');
@@ -61,15 +78,47 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
   const [generatedSqlDump, setGeneratedSqlDump] = useState<string>('');
 
   const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [fbAuthEmail, setFbAuthEmail] = useState('');
+  const [fbAuthPassword, setFbAuthPassword] = useState('');
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
 
-  // Active settings tab ('general' or 'users')
-  const [activeSubTab, setActiveSubTab] = useState<'general' | 'users'>('general');
-  // State for Users list and Stores/Branches list
+  // Unified settings & admin control tabs ('general' | 'stores' | 'users' | 'stock' | 'workspaces')
+  const [activeSubTab, setActiveSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'workspaces'>(initialSubTab);
+
+  useEffect(() => {
+    if (initialSubTab) {
+      setActiveSubTab(initialSubTab);
+    }
+  }, [initialSubTab]);
+
+  // State for Users list, Stores/Branches list, Products count, and Businesses list
   const [usersList, setUsersList] = useState<any[]>([]);
   const [storesList, setStoresList] = useState<any[]>([]);
+  const [businessesList, setBusinessesList] = useState<any[]>([]);
+  const [productsCount, setProductsCount] = useState<number>(0);
+
+  // Quick Add Stock states inside unified SettingsPanel
+  const [quickProdName, setQuickProdName] = useState('');
+  const [quickProdBarcode, setQuickProdBarcode] = useState('');
+  const [quickProdCategory, setQuickProdCategory] = useState('');
+  const [quickProdPrice, setQuickProdPrice] = useState('');
+  const [quickProdCost, setQuickProdCost] = useState('');
+  const [quickProdStock, setQuickProdStock] = useState('');
+  const [quickProdStoreId, setQuickProdStoreId] = useState('');
+  const [quickProdBatchNum, setQuickProdBatchNum] = useState('');
+  const [quickProdExpiry, setQuickProdExpiry] = useState('');
+  const [quickStockMsg, setQuickStockMsg] = useState<string | null>(null);
+
+  // Store creation states inside SettingsPanel
+  const [newBranchName, setNewBranchName] = useState('');
+  const [newBranchCode, setNewBranchCode] = useState('');
+  const [newBranchLocation, setNewBranchLocation] = useState('');
+  const [newBranchDiscounts, setNewBranchDiscounts] = useState(true);
+  const [newBranchRefunds, setNewBranchRefunds] = useState(true);
+  const [newBranchLaybys, setNewBranchLaybys] = useState(true);
+  const [newBranchManagerReq, setNewBranchManagerReq] = useState(false);
 
   // User form states
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
@@ -78,9 +127,27 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
   const [userEmail, setUserEmail] = useState('');
   const [userPassword, setUserPassword] = useState('');
   const [userRole, setUserRole] = useState<'sales' | 'manager' | 'owner'>('sales');
-  const [userSalary, setUserSalary] = useState('7500');
+  const [userSalary, setUserSalary] = useState('');
   const [userContact, setUserContact] = useState('');
   const [selectedBranches, setSelectedBranches] = useState<string[]>([]); // Array of store branch IDs
+
+  useEffect(() => {
+    setStoreName(settings.storeName);
+    setCurrency(settings.currency);
+    setTaxRate(settings.taxRate);
+    setLoyaltyRatio(settings.loyaltyRatio);
+    setReceiptHeader(settings.receiptHeader);
+    setReceiptFooter(settings.receiptFooter);
+    setPaperWidth(settings.paperWidth);
+    setLogoUrl(settings.logoUrl || '');
+    setTpin(settings.tpin || '');
+    setBillingAddress(settings.billingAddress || '');
+    setBillingCity(settings.billingCity || '');
+    setBillingCountry(settings.billingCountry || '');
+    setBillingPhone(settings.billingPhone || '');
+    setBillingEmail(settings.billingEmail || '');
+    setTermsAndConditions(settings.termsAndConditions || '');
+  }, [settings]);
 
   const loadUsersList = () => {
     // 1. Fetch standard staff profiles
@@ -94,16 +161,23 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
             perms = JSON.parse(st.permissions_json);
           }
         } catch (e) {}
+        const fullName = st.name || `${st.first_name || ''} ${st.surname || ''}`.trim() || 'Staff User';
+        const parts = fullName.split(' ');
+        const fName = st.first_name || parts[0] || 'Staff';
+        const sName = st.surname || parts.slice(1).join(' ') || '';
+        const branches = perms.accessible_branches && perms.accessible_branches.length > 0
+          ? perms.accessible_branches
+          : (st.store_id ? [st.store_id] : []);
         return {
           id: st.id,
-          first_name: st.first_name || '',
-          surname: st.surname || '',
+          first_name: fName,
+          surname: sName,
           email: st.email || '',
           contact: st.contact || '',
           basic_salary: st.basic_salary || 0,
-          role: perms.role || (parseFloat(st.basic_salary) > 10000 ? 'manager' : 'sales'),
-          password: perms.password || 'staff123',
-          accessible_branches: perms.accessible_branches || [],
+          role: st.role || perms.role || (parseFloat(st.basic_salary) > 10000 ? 'manager' : 'sales'),
+          password: st.password || perms.password || st.pin || '',
+          accessible_branches: branches,
           is_owner: false,
           raw: st
         };
@@ -114,6 +188,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     const bizRes = runSql('SELECT * FROM businesses', 'Load corporate directory for accounts management');
     let mappedBiz: any[] = [];
     if (bizRes.success && Array.isArray(bizRes.data)) {
+      setBusinessesList(bizRes.data);
       mappedBiz = bizRes.data.map(bz => {
         const ownerName = bz.owner || 'Business Owner';
         const spaceIdx = ownerName.indexOf(' ');
@@ -123,11 +198,11 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
           id: bz.id,
           first_name: fName,
           surname: sName,
-          email: bz.email || 'owner@pos.zm',
-          contact: '+260 970 000000',
+          email: bz.email || '',
+          contact: bz.phone || settings.billingPhone || '',
           basic_salary: 0,
           role: 'owner',
-          password: bz.password || 'admin123',
+          password: bz.password || '',
           accessible_branches: [], // implicit: all branches
           is_owner: true,
           raw: bz
@@ -144,6 +219,10 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
       setStoresList(res.data);
     } else {
       setStoresList([]);
+    }
+    const pRes = runSql('SELECT COUNT(*) AS cnt FROM products', 'Count products');
+    if (pRes.success && Array.isArray(pRes.data) && pRes.data[0]) {
+      setProductsCount(Number(pRes.data[0].cnt || 0));
     }
   };
 
@@ -171,7 +250,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
 
   const handleGoogleLogin = async () => {
     try {
-      setSyncStatus('Logging in...');
+      setSyncStatus('Logging in with Google...');
       setSyncError(null);
       await signInWithPopup(auth, googleProvider);
       triggerNotify('Logged in with Google via Firebase Auth successfully!');
@@ -183,10 +262,38 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     }
   };
 
+  const handleFirebaseEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!fbAuthEmail.trim() || !fbAuthPassword.trim()) {
+      setSyncError('Please enter both Email and Password (min 6 characters).');
+      return;
+    }
+    try {
+      setSyncStatus('Authenticating with Firebase Email/Password Provider...');
+      setSyncError(null);
+      const { user: authedUser, isNewUser } = await registerOrSignInWithEmailPassword(
+        fbAuthEmail.trim(),
+        fbAuthPassword.trim(),
+        storeName
+      );
+      setFbAuthPassword('');
+      triggerNotify(
+        isNewUser
+          ? `Registered & connected [${authedUser.email}] via Firebase Email/Password Auth!`
+          : `Signed in as [${authedUser.email}] via Firebase Email/Password Auth!`
+      );
+      setSyncStatus(`Connected to Firebase Auth (${authedUser.email}). Ready for Firestore & Firebase Storage backup.`);
+    } catch (err: any) {
+      console.error(err);
+      setSyncError(err?.message || 'Firebase Email/Password authentication failed');
+      setSyncStatus(null);
+    }
+  };
+
   const handleGoogleLogout = async () => {
     try {
       await signOut(auth);
-      triggerNotify('Logged out successfully!');
+      triggerNotify('Logged out of Firebase Auth successfully!');
     } catch (err: any) {
       console.error(err);
     }
@@ -194,7 +301,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
 
   const handleBackupToCloud = async () => {
     setIsSyncing(true);
-    setSyncStatus('Synchronizing local database, stock, batches & accounting ledgers to Cloud SQL...');
+    setSyncStatus('Synchronizing clients data, transactions, stock, batches & accounting ledgers to Cloud SQL, Firestore & Firebase Storage...');
     setSyncError(null);
     try {
       const bizId = getActiveBusinessId();
@@ -205,10 +312,11 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
         try {
           const fbRes = await backupToCloud(bizId);
           if (fbRes.success) {
-            msg += ' | Firebase Cloud Backup also synced.';
+            msg += ' | ' + fbRes.details;
           }
-        } catch (fbErr) {
-          console.warn('Firebase secondary backup notice:', fbErr);
+        } catch (fbErr: any) {
+          console.warn('Firebase backup notice:', fbErr);
+          msg += ` | Firebase note: ${fbErr?.message || String(fbErr)}`;
         }
       }
 
@@ -294,8 +402,8 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     reader.readAsDataURL(file);
   };
 
-  const handleSaveSettings = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSaveSettings = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     const updated: StoreSettings = {
       storeName,
       currency,
@@ -306,15 +414,220 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
       paperWidth,
       logoUrl,
       tpin,
+      billingAddress,
+      billingCity,
+      billingCountry,
+      billingPhone,
+      billingEmail,
       termsAndConditions,
       printerName,
       printerInterface,
       printerStatus
     };
     setSettings(updated);
-    // save to localStorage settings too
     localStorage.setItem('android_pos_settings', JSON.stringify(updated));
-    triggerNotify('Merchant business configurations committed successfully!');
+
+    const activeBizId = getActiveBusinessId();
+    if (activeBizId) {
+      runSql(`
+        UPDATE businesses
+        SET name = '${storeName.trim().replace(/'/g, "''")}',
+            billing_address = '${billingAddress.trim().replace(/'/g, "''")}',
+            billing_city = '${billingCity.trim().replace(/'/g, "''")}',
+            billing_country = '${billingCountry.trim().replace(/'/g, "''")}',
+            phone = '${billingPhone.trim().replace(/'/g, "''")}',
+            billing_phone = '${billingPhone.trim().replace(/'/g, "''")}',
+            billing_email = '${billingEmail.trim().replace(/'/g, "''")}',
+            tpin = '${tpin.trim().replace(/'/g, "''")}',
+            currency = '${currency.trim().replace(/'/g, "''")}',
+            tax_rate = ${parseFloat(taxRate as any) || 0}
+        WHERE id = '${activeBizId}'
+      `, 'SettingsPanel: Sync business & billing address details');
+      try {
+        const saved = localStorage.getItem('active_business_profile');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          parsed.name = storeName.trim() || parsed.name;
+          localStorage.setItem('active_business_profile', JSON.stringify(parsed));
+        }
+      } catch {}
+      persistTablesToStorage();
+      pushDatabaseToServer(activeBizId).catch(() => {});
+      if (auth.currentUser) {
+        backupToCloud(activeBizId).catch(() => {});
+      }
+      window.dispatchEvent(new Event('pos_data_updated'));
+    }
+
+    triggerNotify('✓ Business profile, billing address & receipt settings saved and synchronized!');
+  };
+
+  const handleQuickAddStockInSettings = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!quickProdName.trim()) {
+      setQuickStockMsg('⚠️ Please enter a Product / Stock Name before saving.');
+      return;
+    }
+    const activeBizId = getActiveBusinessId();
+    let targetStore = quickProdStoreId || activeStore || (storesList[0]?.id ?? '');
+    if (!targetStore) {
+      targetStore = 'store_main';
+      const defaultStoreName = (storeName || 'Main Store') + ' Branch';
+      runSql(`
+        INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency) VALUES (
+          '${targetStore}',
+          '${activeBizId}',
+          '${defaultStoreName.replace(/'/g, "''")}',
+          '${(billingCity || 'Main').replace(/'/g, "''")}',
+          1, 1, 1, 0, 'weekly'
+        )
+      `, 'SettingsPanel: Auto-create Main Store branch for first product');
+      if (setActiveStore) setActiveStore(targetStore);
+      localStorage.setItem('pos_shift_active', 'true');
+      localStorage.setItem('shift_active_' + targetStore, 'true');
+    }
+
+    const prodId = Math.floor(10000 + Math.random() * 90000);
+    const sku = quickProdBarcode.trim() || `SKU-${prodId}`;
+    const category = quickProdCategory.trim() || 'General';
+    const price = Math.max(0, parseFloat(quickProdPrice || '0') || 0);
+    const cost = Math.max(0, parseFloat(quickProdCost || '0') || 0);
+    const qty = Math.max(0, parseInt(quickProdStock || '0', 10) || 0);
+    const batchNum = quickProdBatchNum.trim() || `BATCH-${new Date().toISOString().slice(0, 10)}`;
+    const expiry = quickProdExpiry.trim() || '';
+    const imgUrl = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=150';
+
+    runSql(`
+      INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
+        ${prodId},
+        '${quickProdName.trim().replace(/'/g, "''")}',
+        '${sku.replace(/'/g, "''")}',
+        '${category.replace(/'/g, "''")}',
+        ${price},
+        ${cost},
+        ${qty},
+        '${imgUrl}',
+        '${activeBizId.replace(/'/g, "''")}',
+        0,
+        '${batchNum.replace(/'/g, "''")}',
+        '${expiry}'
+      )
+    `, `SettingsPanel: Create stock item [${quickProdName.trim()}]`);
+
+    const branchList = storesList.length > 0 ? storesList.map((s: any) => s.id) : [targetStore];
+    const uniqueBranches = Array.from(new Set([...branchList, targetStore].filter(Boolean)));
+    uniqueBranches.forEach((stId: string) => {
+      const spId = `sp_${prodId}_${stId}`;
+      const branchQty = stId === targetStore ? qty : 0;
+      runSql(`
+        INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES (
+          '${spId}', ${prodId}, '${stId}', ${branchQty}, ${price}
+        )
+      `, `SettingsPanel: Allocate stock for [${quickProdName.trim()}] to branch [${stId}]`);
+    });
+
+    if (qty > 0) {
+      const refId = `stock_init_${prodId}_${Date.now()}`;
+      const nowStr = new Date().toISOString();
+      runSql(`
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+        VALUES (
+          '${refId}',
+          'idem_${refId}',
+          '${targetStore.toUpperCase()}',
+          'RECEIVE',
+          'CATALOG_INIT',
+          ${(qty * cost).toFixed(2)},
+          0.00,
+          'SUCCESS',
+          'Initial catalog creation for ${quickProdName.trim().replace(/'/g, "''")}: +${qty} units [Batch: ${batchNum || 'N/A'}]',
+          '${nowStr}',
+          '${nowStr}',
+          'owner'
+        )
+      `, 'SettingsPanel: Log initial stock creation transaction');
+    }
+
+    const savedName = quickProdName.trim();
+    setQuickProdName('');
+    setQuickProdBarcode('');
+    setQuickProdCategory('');
+    setQuickProdPrice('');
+    setQuickProdCost('');
+    setQuickProdStock('');
+    setQuickProdBatchNum('');
+    setQuickProdExpiry('');
+    loadStoresList();
+    persistTablesToStorage();
+    pushDatabaseToServer(activeBizId).catch(() => {});
+    if (auth.currentUser) {
+      backupToCloud(activeBizId).catch(() => {});
+    }
+    window.dispatchEvent(new Event('pos_data_updated'));
+    setQuickStockMsg(`✓ Saved "${savedName}" (SKU: ${sku}, Price: ${currency || 'K'}${price.toFixed(2)}, Stock: ${qty}) to inventory & synchronized!`);
+    triggerNotify(`✓ Saved "${savedName}" to stock!`);
+  };
+
+  const handleCreateBranchInSettings = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newBranchName.trim()) {
+      alert('Please enter a Store / Branch Name.');
+      return;
+    }
+    const activeBizId = getActiveBusinessId();
+    const finalId = newBranchCode.trim().toLowerCase().replace(/\s+/g, '_') || ('store_' + Math.floor(1000 + Math.random() * 9000));
+    const dup = runSql(`SELECT * FROM stores WHERE id = '${finalId}'`);
+    if (dup.success && Array.isArray(dup.data) && dup.data.length > 0) {
+      alert(`A store branch with code [${finalId}] already exists.`);
+      return;
+    }
+    runSql(`
+      INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency)
+      VALUES (
+        '${finalId}',
+        '${activeBizId}',
+        '${newBranchName.trim().replace(/'/g, "''")}',
+        '${newBranchLocation.trim().replace(/'/g, "''")}',
+        ${newBranchDiscounts ? 1 : 0},
+        ${newBranchRefunds ? 1 : 0},
+        ${newBranchLaybys ? 1 : 0},
+        ${newBranchManagerReq ? 1 : 0},
+        'weekly'
+      )
+    `, `SettingsPanel: Create store branch [${newBranchName}]`);
+
+    const prodsRes = runSql(`SELECT * FROM products`);
+    if (prodsRes.success && Array.isArray(prodsRes.data)) {
+      prodsRes.data.forEach((p: any) => {
+        runSql(`INSERT INTO store_products VALUES ('sp_${p.id}_${finalId}', ${p.id}, '${finalId}', 0, ${p.price || 0})`);
+      });
+    }
+    if (!activeStore && setActiveStore) {
+      setActiveStore(finalId);
+    }
+    localStorage.setItem('pos_shift_active', 'true');
+    localStorage.setItem('shift_active_' + finalId, 'true');
+    setNewBranchName('');
+    setNewBranchCode('');
+    setNewBranchLocation('');
+    loadStoresList();
+    persistTablesToStorage();
+    pushDatabaseToServer(activeBizId).catch(() => {});
+    if (auth.currentUser) {
+      backupToCloud(activeBizId).catch(() => {});
+    }
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerNotify(`✓ Store branch [${newBranchName}] created & synchronized!`);
+  };
+
+  const handleDeleteBranchInSettings = (storeId: string, branchName: string) => {
+    if (!window.confirm(`Delete store branch "${branchName}"?`)) return;
+    runSql(`DELETE FROM stores WHERE id = '${storeId}'`, `SettingsPanel: Delete store ${storeId}`);
+    runSql(`DELETE FROM store_products WHERE store_id = '${storeId}'`, `SettingsPanel: Delete store_products for ${storeId}`);
+    loadStoresList();
+    persistTablesToStorage();
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerNotify(`Store branch [${branchName}] removed.`);
   };
 
   const triggerTestPrintPlay = () => {
@@ -329,10 +642,11 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     // Setup print ASCII visual representation
     const border = "================================";
     const divider = "--------------------------------";
+    const addressLine = [billingAddress, billingCity, billingCountry].filter(Boolean).join(', ') || 'Registered Business Address';
     const plainText = `
  ${storeName.toUpperCase()}
- ${tpin ? `TPIN: ${tpin}` : 'TPIN: 1004829399'}
- Lusaka Outlet, Main Street
+ ${tpin ? `TPIN: ${tpin}` : 'TPIN: Not Set'}
+ ${addressLine}
  ${divider}
         PRINTER SELF-TEST FEED
  ${divider}
@@ -631,6 +945,8 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
     } else {
       const salaryNum = parseFloat(userSalary) || 0;
       const targetStaffId = editingUserId && editingUserId !== 'default_biz' ? editingUserId : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
+      const fullStaffName = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
+      const primaryStore = selectedBranches[0] || activeStore || (storesList[0]?.id ?? '');
       
       const existsRes = runSql(`SELECT * FROM staff WHERE id = '${targetStaffId}'`);
       const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
@@ -638,40 +954,58 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
       if (alreadyExists) {
         const sql = `
           UPDATE staff
-          SET first_name = '${userFirstName.trim().replace(/'/g, "''")}',
+          SET name = '${fullStaffName.replace(/'/g, "''")}',
+              first_name = '${userFirstName.trim().replace(/'/g, "''")}',
               surname = '${userSurname.trim().replace(/'/g, "''")}',
+              role = '${userRole}',
+              pin = '${userPassword.trim().slice(0, 6).replace(/'/g, "''")}',
+              store_id = '${primaryStore.replace(/'/g, "''")}',
               contact = '${userContact.trim().replace(/'/g, "''")}',
               email = '${emailLower.replace(/'/g, "''")}',
               basic_salary = ${salaryNum},
-              permissions_json = '${permissionsString.replace(/'/g, "''")}'
+              permissions_json = '${permissionsString.replace(/'/g, "''")}',
+              password = '${userPassword.trim().replace(/'/g, "''")}'
           WHERE id = '${targetStaffId}'
         `;
         runSql(sql, `SettingsPanel: Modify staff profile ${targetStaffId}`);
       } else {
+        const activeBizId = getActiveBusinessId();
         const sql = `
-          INSERT INTO staff (id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id)
+          INSERT INTO staff (id, name, role, hourly_rate, pin, store_id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password)
           VALUES (
             '${targetStaffId}',
+            '${fullStaffName.replace(/'/g, "''")}',
+            '${userRole}',
+            0,
+            '${userPassword.trim().slice(0, 6).replace(/'/g, "''")}',
+            '${primaryStore.replace(/'/g, "''")}',
             '${userFirstName.trim().replace(/'/g, "''")}',
             '${userSurname.trim().replace(/'/g, "''")}',
             '${userContact.trim().replace(/'/g, "''")}',
             '${emailLower.replace(/'/g, "''")}',
-            'Lusaka, Zambia',
+            '${(billingCity || billingAddress || '').replace(/'/g, "''")}',
             '${new Date().toISOString().substring(0, 10)}',
             '', '', '', '',
             ${salaryNum},
             '${permissionsString.replace(/'/g, "''")}',
-            'default_biz'
+            '${activeBizId.replace(/'/g, "''")}',
+            '${userPassword.trim().replace(/'/g, "''")}'
           )
         `;
         runSql(sql, `SettingsPanel: Register new staff profile ${targetStaffId}`);
       }
     }
 
+    const activeBizId = getActiveBusinessId();
     handleResetUserForm();
     loadUsersList();
     persistTablesToStorage();
-    triggerNotify('User security credentials and branch routing updated!');
+    pushDatabaseToServer(activeBizId).catch(() => {});
+    if (auth.currentUser) {
+      backupToCloud(activeBizId).catch(() => {});
+    }
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerNotify('✓ User security credentials and branch routing saved & synchronized!');
   };
 
   const handleResetUserForm = () => {
@@ -712,6 +1046,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
       runSql(sql, `SettingsPanel: Delete staff account ${usr.id}`);
       loadUsersList();
       persistTablesToStorage();
+      window.dispatchEvent(new Event('pos_data_updated'));
       triggerNotify(`User account deleted successfully!`);
     }
   };
@@ -719,28 +1054,48 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
   return (
     <div className="flex-1 flex flex-col overflow-y-auto bg-slate-50 p-4 gap-4 select-text text-left">
       
-      {/* Sub-navigation bar for Settings */}
-      <div className="bg-white border border-slate-200 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3 shadow-xs select-none">
-        <div className="flex items-center gap-2">
-          <Settings className="text-indigo-600" size={18} />
+      {/* Unified Sub-navigation bar for Settings & Admin Business Control */}
+      <div className="bg-white border border-slate-200 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 shadow-xs select-none">
+        <div className="flex items-center gap-2.5">
+          <div className="p-2 rounded-xl bg-indigo-600 text-white shadow-xs">
+            <Settings size={18} />
+          </div>
           <div>
-            <h2 className="text-sm font-extrabold text-slate-800 tracking-tight">SME POS Configurations Panel</h2>
-            <p className="text-[10px] text-slate-400 font-medium">Configure merchant preferences, multi-store layouts, database seeds and user security permissions.</p>
+            <h2 className="text-sm font-black text-slate-900 tracking-tight uppercase">
+              Settings &amp; Admin Business Control Panel
+            </h2>
+            <p className="text-[10.5px] text-slate-500 font-medium">
+              Unified hub for Business Setup, Billing Address, Stores/Branches, User Accounts, Quick Stock &amp; Cloud Synchronization
+            </p>
           </div>
         </div>
         
-        {/* Navigation Tabs */}
-        <div className="flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200">
+        {/* Unified Navigation Tabs */}
+        <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 flex-wrap gap-1">
           <button
             type="button"
             onClick={() => setActiveSubTab('general')}
-            className={`px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md cursor-pointer transition-all ${
+            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
               activeSubTab === 'general'
-                ? 'bg-white text-indigo-700 shadow-xs border border-slate-200/40'
-                : 'text-slate-500 hover:text-slate-700'
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
             }`}
           >
-            🛠️ General Preferences
+            1. Business &amp; Billing
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveSubTab('stores');
+              loadStoresList();
+            }}
+            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+              activeSubTab === 'stores'
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+            }`}
+          >
+            2. Stores ({storesList.length})
           </button>
           <button
             type="button"
@@ -749,31 +1104,482 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
               loadUsersList();
               loadStoresList();
             }}
-            className={`px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md cursor-pointer transition-all ${
+            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
               activeSubTab === 'users'
-                ? 'bg-white text-indigo-700 shadow-xs border border-slate-200/40'
-                : 'text-slate-500 hover:text-slate-700'
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
             }`}
           >
-            👥 User Accounts & Access
+            3. Users &amp; Staff ({usersList.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveSubTab('stock');
+              loadStoresList();
+            }}
+            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+              activeSubTab === 'stock'
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+            }`}
+          >
+            4. Add Stock ({productsCount})
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveSubTab('workspaces');
+              loadUsersList();
+            }}
+            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+              activeSubTab === 'workspaces'
+                ? 'bg-indigo-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+            }`}
+          >
+            5. Cloud Sync &amp; Workspaces
           </button>
         </div>
       </div>
 
-      {activeSubTab === 'general' ? (
+      {activeSubTab === 'stores' ? (
+        <div className="flex flex-col lg:flex-row gap-5">
+          {/* STORES LIST */}
+          <div className="flex-1 bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Building2 className="text-indigo-600" size={16} />
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">Configured Store Outlets &amp; Branches</h3>
+              </div>
+              <span className="text-xs font-mono text-slate-500">{storesList.length} Branches</span>
+            </div>
+
+            {storesList.length === 0 ? (
+              <div className="p-6 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 text-xs text-slate-500">
+                No store branches have been created yet. Use the form on the right to create your first store branch.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {storesList.map((st: any) => {
+                  const isCurrentStore = activeStore === st.id;
+                  return (
+                    <div
+                      key={st.id}
+                      className={`p-4 rounded-xl border flex flex-col justify-between gap-3 transition-all ${
+                        isCurrentStore
+                          ? 'border-emerald-500 bg-emerald-50/40 shadow-xs'
+                          : 'border-slate-200 bg-slate-50/60'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-center justify-between">
+                          <span className="font-extrabold text-xs text-slate-900 uppercase">{st.name}</span>
+                          <div className="flex items-center gap-1.5">
+                            {isCurrentStore && (
+                              <span className="px-2 py-0.5 bg-emerald-600 text-white text-[9px] font-black uppercase rounded-full">
+                                Active Branch
+                              </span>
+                            )}
+                            <span className="font-mono text-[10px] text-slate-500">ID: {st.id}</span>
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-slate-600 mt-1">
+                          Location / Address: <span className="font-semibold text-slate-800">{st.location || 'Not specified'}</span>
+                        </p>
+                        <div className="flex flex-wrap gap-2 mt-2 text-[10px] text-slate-500">
+                          <span>Discounts: {st.allow_discounts ? 'Allowed' : 'Disabled'}</span>
+                          <span>·</span>
+                          <span>Refunds: {st.allow_refunds ? 'Allowed' : 'Disabled'}</span>
+                          <span>·</span>
+                          <span>Laybys: {st.allow_laybys ? 'Allowed' : 'Disabled'}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between border-t border-slate-200/70 pt-2">
+                        {!isCurrentStore && setActiveStore ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveStore(st.id);
+                              localStorage.setItem('pos_shift_active', 'true');
+                              localStorage.setItem('shift_active_' + st.id, 'true');
+                              triggerNotify(`Switched active terminal branch to [${st.name}]`);
+                            }}
+                            className="px-2.5 py-1 text-[10px] font-extrabold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded border border-indigo-200 cursor-pointer"
+                          >
+                            Switch to Branch
+                          </button>
+                        ) : (
+                          <span className="text-[10px] font-bold text-emerald-700">✓ Currently Selected</span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteBranchInSettings(st.id, st.name)}
+                          className="px-2.5 py-1 text-[10px] font-bold text-red-600 hover:bg-red-50 rounded border border-red-200 cursor-pointer flex items-center gap-1"
+                        >
+                          <Trash2 size={11} /> Remove Store
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* ADD NEW STORE FORM */}
+          <form onSubmit={handleCreateBranchInSettings} className="w-full lg:w-[360px] bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-3">
+            <div className="border-b border-slate-100 pb-2.5">
+              <h3 className="text-xs font-black text-slate-800 uppercase tracking-wide flex items-center gap-1.5">
+                <Building2 size={14} className="text-indigo-600" />
+                Create Store / Branch
+              </h3>
+              <p className="text-[10px] text-slate-500 mt-0.5">Add a new physical store or branch location for your business.</p>
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] text-slate-500 font-extrabold uppercase">Store / Branch Name</label>
+              <input
+                required
+                type="text"
+                value={newBranchName}
+                onChange={(e) => setNewBranchName(e.target.value)}
+                placeholder="Enter store or branch name"
+                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs font-bold text-slate-800 outline-hidden"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex flex-col gap-1">
+                <label className="text-[9px] text-slate-500 font-extrabold uppercase">Branch Code (Optional)</label>
+                <input
+                  type="text"
+                  value={newBranchCode}
+                  onChange={(e) => setNewBranchCode(e.target.value)}
+                  placeholder="e.g. main_store"
+                  className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs font-mono text-slate-800 outline-hidden"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[9px] text-slate-500 font-extrabold uppercase">Physical Location / Address</label>
+                <input
+                  type="text"
+                  value={newBranchLocation}
+                  onChange={(e) => setNewBranchLocation(e.target.value)}
+                  placeholder="Street / City"
+                  className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs text-slate-800 outline-hidden"
+                />
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200 flex flex-col gap-2 text-xs">
+              <span className="text-[9px] font-extrabold uppercase text-slate-500">Store Authorization Rules</span>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-slate-700 text-[11px]">Allow Discounts</span>
+                <input type="checkbox" checked={newBranchDiscounts} onChange={(e) => setNewBranchDiscounts(e.target.checked)} />
+              </label>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-slate-700 text-[11px]">Allow Refunds &amp; Returns</span>
+                <input type="checkbox" checked={newBranchRefunds} onChange={(e) => setNewBranchRefunds(e.target.checked)} />
+              </label>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-slate-700 text-[11px]">Enable Layby Sales</span>
+                <input type="checkbox" checked={newBranchLaybys} onChange={(e) => setNewBranchLaybys(e.target.checked)} />
+              </label>
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-slate-700 text-[11px]">Require Manager Key for Discounts</span>
+                <input type="checkbox" checked={newBranchManagerReq} onChange={(e) => setNewBranchManagerReq(e.target.checked)} />
+              </label>
+            </div>
+
+            <button
+              type="submit"
+              className="py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold uppercase text-xs rounded-lg cursor-pointer shadow-xs"
+            >
+              ✓ Save &amp; Create Store Branch
+            </button>
+          </form>
+        </div>
+      ) : activeSubTab === 'stock' ? (
+        <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+            <div className="flex items-center gap-2">
+              <Package className="text-indigo-600" size={18} />
+              <div>
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">
+                  Quick Add Stock &amp; Batches ({productsCount} Products in Catalog)
+                </h3>
+                <p className="text-[10px] text-slate-500">
+                  Create new products in stock with initial quantities, batch numbers, and expiry dates, or open the full Inventory Manager.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleQuickAddStockInSettings()}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-black uppercase tracking-wider cursor-pointer shadow-sm flex items-center gap-1"
+              >
+                <Check size={14} /> Save Changes
+              </button>
+              {onNavigateToInventory && (
+                <button
+                  type="button"
+                  onClick={onNavigateToInventory}
+                  className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-extrabold uppercase tracking-wider cursor-pointer shadow-xs"
+                >
+                  Open Full Inventory Manager →
+                </button>
+              )}
+            </div>
+          </div>
+
+          {quickStockMsg && (
+            <div className={`p-3 rounded-xl text-xs font-extrabold flex items-center justify-between ${
+              quickStockMsg.startsWith('⚠️')
+                ? 'bg-amber-50 border border-amber-200 text-amber-800'
+                : 'bg-emerald-50 border border-emerald-200 text-emerald-800'
+            }`}>
+              <span>{quickStockMsg}</span>
+              <button type="button" onClick={() => setQuickStockMsg(null)} className="font-black px-2 cursor-pointer">✕</button>
+            </div>
+          )}
+
+          <form onSubmit={handleQuickAddStockInSettings} className="flex flex-col gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Product / Stock Name *</label>
+                <input
+                  type="text"
+                  value={quickProdName}
+                  onChange={(e) => {
+                    setQuickProdName(e.target.value);
+                    if (quickStockMsg) setQuickStockMsg(null);
+                  }}
+                  placeholder="Enter product name"
+                  required
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 text-xs font-bold focus:outline-hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Barcode / SKU (Auto if blank)</label>
+                <input
+                  type="text"
+                  value={quickProdBarcode}
+                  onChange={(e) => setQuickProdBarcode(e.target.value)}
+                  placeholder="Auto-generated if blank"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 font-mono text-xs focus:outline-hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Category</label>
+                <input
+                  type="text"
+                  value={quickProdCategory}
+                  onChange={(e) => setQuickProdCategory(e.target.value)}
+                  placeholder="e.g. General, Groceries, Hardware"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 text-xs font-semibold focus:outline-hidden"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Selling Price ({currency || 'K'}) *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={quickProdPrice}
+                  onChange={(e) => setQuickProdPrice(e.target.value)}
+                  placeholder="0.00"
+                  required
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 font-mono text-xs font-bold focus:outline-hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Cost Price ({currency || 'K'})</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={quickProdCost}
+                  onChange={(e) => setQuickProdCost(e.target.value)}
+                  placeholder="0.00"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 font-mono text-xs focus:outline-hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Opening Stock Qty *</label>
+                <input
+                  type="number"
+                  value={quickProdStock}
+                  onChange={(e) => setQuickProdStock(e.target.value)}
+                  placeholder="0"
+                  required
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 font-mono text-xs font-bold focus:outline-hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Target Store Branch</label>
+                <select
+                  value={quickProdStoreId || activeStore}
+                  onChange={(e) => setQuickProdStoreId(e.target.value)}
+                  className="w-full px-2.5 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 text-xs font-semibold focus:outline-hidden"
+                >
+                  {storesList.length === 0 ? (
+                    <option value="">Auto-create Main Branch</option>
+                  ) : (
+                    storesList.map((st: any) => (
+                      <option key={st.id} value={st.id}>{st.name}</option>
+                    ))
+                  )}
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Batch / Lot Number</label>
+                <input
+                  type="text"
+                  value={quickProdBatchNum}
+                  onChange={(e) => setQuickProdBatchNum(e.target.value)}
+                  placeholder="Optional batch number"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 font-mono text-xs focus:outline-hidden"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Batch Expiry Date</label>
+                <input
+                  type="date"
+                  value={quickProdExpiry}
+                  onChange={(e) => setQuickProdExpiry(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 font-mono text-xs focus:outline-hidden"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-2 border-t border-slate-100">
+              <button
+                type="submit"
+                className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-black uppercase rounded-lg text-xs tracking-wider cursor-pointer shadow-md flex items-center gap-1.5"
+              >
+                <Check size={15} /> Save Changes &amp; Add Product to Stock
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : activeSubTab === 'workspaces' ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          {/* Registered Business Workspaces */}
+          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Building2 className="text-indigo-600" size={16} />
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">
+                  Registered Business Workspaces ({businessesList.length})
+                </h3>
+              </div>
+            </div>
+            <div className="flex flex-col gap-2.5">
+              {businessesList.length === 0 ? (
+                <div className="p-4 text-xs text-slate-500 bg-slate-50 rounded-lg border border-slate-200">
+                  No business workspaces found.
+                </div>
+              ) : (
+                businessesList.map((b: any) => {
+                  const isActiveBiz = b.id === getActiveBusinessId();
+                  return (
+                    <div
+                      key={b.id}
+                      className={`p-4 rounded-xl border flex items-center justify-between ${
+                        isActiveBiz
+                          ? 'bg-indigo-50/70 border-indigo-400 text-slate-900'
+                          : 'bg-slate-50 border-slate-200 text-slate-700'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-extrabold text-xs">{b.name}</div>
+                        <div className="text-[10px] font-mono text-slate-500 mt-0.5">
+                          Admin: {b.owner} ({b.email})
+                        </div>
+                      </div>
+                      {isActiveBiz && (
+                        <span className="px-2.5 py-1 bg-emerald-600 text-white text-[9px] font-black uppercase rounded-full">
+                          Active Workspace
+                        </span>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          {/* Cloud Synchronization Controls */}
+          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Database className="text-indigo-600" size={16} />
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">
+                  Cloud SQL, Firestore &amp; Storage Synchronization
+                </h3>
+              </div>
+              <span className="text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold px-2 py-0.5 rounded-full">
+                Connected
+              </span>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Push or pull your complete business setup, stores, staff accounts, stock, batches, customers, and accounting ledgers across devices.
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={handleBackupToCloud}
+                disabled={isSyncing}
+                className="py-3 px-3 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-black text-xs uppercase tracking-wider rounded-xl cursor-pointer shadow-xs"
+              >
+                🚀 Push Sync to Cloud
+              </button>
+              <button
+                type="button"
+                onClick={handleRestoreFromCloud}
+                disabled={isSyncing}
+                className="py-3 px-3 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-black text-xs uppercase tracking-wider rounded-xl cursor-pointer shadow-xs"
+              >
+                📥 Pull Sync from Cloud
+              </button>
+            </div>
+            {(syncStatus || syncError) && (
+              <div className={`p-3 rounded-lg text-xs font-mono ${
+                syncError ? 'bg-red-50 text-red-600 border border-red-200' : 'bg-slate-50 text-slate-700 border border-slate-200'
+              }`}>
+                {syncError ? `⚠️ ${syncError}` : `✓ ${syncStatus}`}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : activeSubTab === 'general' ? (
         <div className="flex flex-col md:flex-row gap-5">
           
-          {/* LEFT COLUMN: MERCHANT PREFERENCE CONFIGURATION */}
+          {/* LEFT COLUMN: MERCHANT PREFERENCE & BILLING ADDRESS CONFIGURATION */}
           <form onSubmit={handleSaveSettings} className="flex-1 max-w-xl bg-white rounded-xl border border-slate-200 p-5 flex flex-col gap-4">
-            <h3 className="text-xs font-black text-slate-800 uppercase tracking-widest flex items-center gap-1.5 border-b border-slate-150 pb-3 select-none">
-              <Settings size={15} className="text-indigo-600" />
-              Store business Profile settings
-            </h3>
+            <div className="flex items-center justify-between border-b border-slate-150 pb-3 select-none">
+              <h3 className="text-xs font-black text-slate-800 uppercase tracking-widest flex items-center gap-1.5">
+                <Settings size={15} className="text-indigo-600" />
+                Business Setup &amp; Billing Address
+              </h3>
+              <button
+                type="submit"
+                className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-black text-[10.5px] uppercase tracking-wider rounded-lg cursor-pointer shadow-xs flex items-center gap-1"
+              >
+                <Check size={13} /> Save Changes
+              </button>
+            </div>
 
             {/* Store Name & Currency */}
             <div className="grid grid-cols-2 gap-4">
               <div className="flex flex-col gap-1">
-                <label className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide">Business store name</label>
+                <label className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide">Business / Company Name</label>
                 <input
                   type="text"
                   value={storeName}
@@ -797,6 +1603,67 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
                     <option value="₦">NGN (₦) - Naira</option>
                     <option value="R">ZAR (R) - Rand</option>
                   </select>
+              </div>
+            </div>
+
+            {/* BILLING ADDRESS SECTION */}
+            <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl flex flex-col gap-3">
+              <span className="text-[10px] font-black uppercase tracking-wider text-indigo-800">
+                Registered Billing Address & Contact Details
+              </span>
+              <div className="flex flex-col gap-1">
+                <label className="text-[9.5px] text-slate-500 font-bold uppercase">Street / Physical Billing Address</label>
+                <input
+                  type="text"
+                  value={billingAddress}
+                  onChange={(e) => setBillingAddress(e.target.value)}
+                  placeholder="Enter street address, plot number, or building"
+                  className="w-full px-3 py-2 bg-white border border-slate-200 focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-semibold text-slate-800"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[9.5px] text-slate-500 font-bold uppercase">Billing City / Town</label>
+                  <input
+                    type="text"
+                    value={billingCity}
+                    onChange={(e) => setBillingCity(e.target.value)}
+                    placeholder="City or Town"
+                    className="w-full px-3 py-1.5 bg-white border border-slate-200 focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-semibold text-slate-800"
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[9.5px] text-slate-500 font-bold uppercase">Country / Postal Code</label>
+                  <input
+                    type="text"
+                    value={billingCountry}
+                    onChange={(e) => setBillingCountry(e.target.value)}
+                    placeholder="Country"
+                    className="w-full px-3 py-1.5 bg-white border border-slate-200 focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-semibold text-slate-800"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[9.5px] text-slate-500 font-bold uppercase">Billing Phone Number</label>
+                  <input
+                    type="text"
+                    value={billingPhone}
+                    onChange={(e) => setBillingPhone(e.target.value)}
+                    placeholder="Business contact phone"
+                    className="w-full px-3 py-1.5 bg-white border border-slate-200 focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-mono text-slate-800"
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[9.5px] text-slate-500 font-bold uppercase">Billing Email</label>
+                  <input
+                    type="email"
+                    value={billingEmail}
+                    onChange={(e) => setBillingEmail(e.target.value)}
+                    placeholder="Billing / invoice email"
+                    className="w-full px-3 py-1.5 bg-white border border-slate-200 focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-mono text-slate-800"
+                  />
+                </div>
               </div>
             </div>
 
@@ -845,7 +1712,7 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
                   type="text"
                   value={tpin}
                   onChange={(e) => setTpin(e.target.value)}
-                  placeholder="e.g. 100XXXXXXX"
+                  placeholder="Enter Tax ID / TPIN"
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-505 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-850"
                 />
               </div>
@@ -1084,40 +1951,86 @@ export default function SettingsPanel({ settings, setSettings, onRefreshDatabase
                 )}
 
                 {!user ? (
-                  <button
-                    id="btn-google-login"
-                    type="button"
-                    onClick={handleGoogleLogin}
-                    className="flex items-center justify-center gap-2 py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 font-extrabold text-[10.5px] tracking-wider uppercase rounded-lg transition-all cursor-pointer"
-                  >
-                    <LogIn size={13} /> Optional: Link Google Account for Secondary Firestore Mirror
-                  </button>
-                ) : (
-                  <div className="flex items-center justify-between bg-slate-50 border border-slate-150 p-3 rounded-lg">
-                    <div className="flex items-center gap-2.5">
-                      {user.photoURL ? (
-                        <img src={user.photoURL} alt={user.displayName || 'User'} className="w-8 h-8 rounded-full border border-slate-250" referrerPolicy="no-referrer" />
-                      ) : (
-                        <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-xs">
-                          {user.displayName?.charAt(0) || 'U'}
-                        </div>
-                      )}
-                      <div className="flex flex-col gap-0.5">
-                        <span className="text-[11px] font-black text-slate-800 leading-tight">
-                          {user.displayName || 'Connected Business Agent'}
-                        </span>
-                        <span className="text-[9px] font-mono font-medium text-slate-400 leading-none">
-                          {user.email}
-                        </span>
-                      </div>
+                  <div className="flex flex-col gap-2.5 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-black uppercase tracking-wider text-indigo-800">
+                        Firebase Email/Password Authentication
+                      </span>
+                      <span className="text-[8.5px] font-mono font-bold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">
+                        Firestore + Storage Backup
+                      </span>
                     </div>
+                    <form onSubmit={handleFirebaseEmailAuth} className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <input
+                        type="email"
+                        value={fbAuthEmail}
+                        onChange={(e) => setFbAuthEmail(e.target.value)}
+                        placeholder="Business Email"
+                        required
+                        className="px-2.5 py-2 bg-white border border-slate-250 rounded-lg text-xs font-mono text-slate-800 focus:outline-indigo-500"
+                      />
+                      <input
+                        type="password"
+                        value={fbAuthPassword}
+                        onChange={(e) => setFbAuthPassword(e.target.value)}
+                        placeholder="Password (min 6 chars)"
+                        minLength={6}
+                        required
+                        className="px-2.5 py-2 bg-white border border-slate-250 rounded-lg text-xs font-mono text-slate-800 focus:outline-indigo-500"
+                      />
+                      <button
+                        type="submit"
+                        className="py-2 px-3 bg-indigo-600 hover:bg-indigo-700 text-white font-black text-[10px] uppercase tracking-wider rounded-lg cursor-pointer transition-colors"
+                      >
+                        Connect Email Auth
+                      </button>
+                    </form>
                     <button
+                      id="btn-google-login"
                       type="button"
-                      onClick={handleGoogleLogout}
-                      className="p-1 px-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded text-[9px] font-black uppercase transition-all tracking-wider cursor-pointer border border-red-100"
+                      onClick={handleGoogleLogin}
+                      className="flex items-center justify-center gap-2 py-2 px-4 bg-white hover:bg-slate-100 text-slate-700 border border-slate-250 font-extrabold text-[10px] tracking-wider uppercase rounded-lg transition-all cursor-pointer"
                     >
-                      Disconnect
+                      <LogIn size={13} /> Or Connect with Google OAuth
                     </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2 bg-slate-50 border border-slate-200 p-3 rounded-lg">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        {user.photoURL ? (
+                          <img src={user.photoURL} alt={user.displayName || 'User'} className="w-8 h-8 rounded-full border border-slate-250" referrerPolicy="no-referrer" />
+                        ) : (
+                          <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center font-bold text-xs">
+                            {(user.displayName || user.email || 'U').charAt(0).toUpperCase()}
+                          </div>
+                        )}
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[11px] font-black text-slate-800 leading-tight">
+                              {user.displayName || 'Connected Business Owner'}
+                            </span>
+                            <span className="text-[8px] font-mono font-extrabold uppercase px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                              {user.providerData?.[0]?.providerId === 'password' ? 'Email/Password' : 'Google Auth'}
+                            </span>
+                          </div>
+                          <span className="text-[9px] font-mono font-medium text-slate-500 leading-none">
+                            {user.email} • UID: {user.uid.slice(0, 8)}...
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleGoogleLogout}
+                        className="p-1 px-2.5 bg-red-50 hover:bg-red-100 text-red-600 rounded text-[9px] font-black uppercase transition-all tracking-wider cursor-pointer border border-red-100"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                    <div className="text-[9px] font-mono text-slate-500 border-t border-slate-200/70 pt-1.5 flex flex-wrap gap-x-3 gap-y-1">
+                      <span>✓ Firestore Relational DB: Connected</span>
+                      <span>✓ Firebase Storage Backups: clients_data.json & transactions_and_ledgers.json</span>
+                    </div>
                   </div>
                 )}
               </div>

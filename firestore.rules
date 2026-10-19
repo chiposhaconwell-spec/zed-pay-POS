@@ -1,162 +1,317 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     // 1. Global default deny safety net
     match /{document=**} {
       allow read, write: if false;
     }
-    
-    // Primitives & Hardened Shared Helpers
+
+    // 2. Hardened Global Primitives
     function isSignedIn() {
       return request.auth != null;
     }
-    
-    function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+
+    function isAdmin() {
+      return isSignedIn() &&
+        request.auth.token.email == 'chiposhaconwell@gmail.com' &&
+        request.auth.token.email_verified == true;
     }
-    
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
-    
+
     function existing() {
       return resource.data;
     }
-    
-    // Relational synchronize parent business validator
+
+    // Master Gate: Relational check against parent Business document
     function isBusinessOwner(businessId) {
-      return isSignedIn() && get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid;
+      return isSignedIn() && (
+        get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid ||
+        isAdmin()
+      );
     }
 
-    // Helper validation for Business entity of custom multi-tenant workspaces
+    // 3. Entity Validation Blueprints (Anti-Update-Gap)
+
     function isValidBusiness(data) {
-      return data.id is string && data.id.size() <= 128 &&
-             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
-             data.owner is string && data.owner.size() > 0 && data.owner.size() <= 200 &&
-             data.email is string && data.email.size() > 0 && data.email.size() <= 200 &&
-             data.ownerUid is string && data.ownerUid == request.auth.uid &&
-             data.keys().hasAll(['id', 'name', 'owner', 'email', 'ownerUid', 'createdAt']) &&
-             data.keys().size() == 6;
+      return data.keys().hasAll(['id', 'name', 'owner', 'email', 'ownerUid', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'name', 'owner', 'email', 'ownerUid', 'createdAt', 'updatedAt']) &&
+             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
+             data.owner is string && data.owner.size() >= 1 && data.owner.size() <= 200 &&
+             data.email is string && data.email.size() >= 1 && data.email.size() <= 200 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
     }
 
-    // Helper validation for individual store branches
     function isValidStore(data) {
-      return data.id is string && data.id.size() <= 128 &&
-             data.business_id is string && data.business_id.size() <= 128 &&
-             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
              data.location is string && data.location.size() <= 200 &&
              data.allow_discounts is int &&
              data.allow_refunds is int &&
              data.allow_laybys is int &&
-             data.require_manager_discount is int &&
-             data.keys().hasAll(['id', 'business_id', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
-             data.keys().size() == 8;
+             data.require_manager_discount is int;
     }
 
-    // Helper validation for catalog products
     function isValidProduct(data) {
-      return data.id is int &&
-             data.name is string && data.name.size() > 0 && data.name.size() <= 250 &&
+      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
+             data.id is int &&
+             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 250 &&
              data.sku is string && data.sku.size() <= 100 &&
              data.category is string && data.category.size() <= 100 &&
              data.price is number && data.price >= 0.0 &&
              data.cost is number && data.cost >= 0.0 &&
              data.stock is int &&
-             data.imageUrl is string && data.imageUrl.size() <= 300000 && // accommodate rich image URLs
-             data.business_id is string && data.business_id.size() <= 128 &&
+             data.imageUrl is string && data.imageUrl.size() <= 300000 &&
              (!('is_service' in data) || data.is_service is int) &&
              (!('batch_number' in data) || (data.batch_number is string && data.batch_number.size() <= 100)) &&
-             (!('expiry_date' in data) || (data.expiry_date is string && data.expiry_date.size() <= 100)) &&
-             data.keys().hasAll(['id', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'business_id']) &&
-             data.keys().hasOnly(['id', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'business_id', 'is_service', 'batch_number', 'expiry_date']);
+             (!('expiry_date' in data) || (data.expiry_date is string && data.expiry_date.size() <= 100));
     }
 
-    // Helper validation for Customer CRM records
     function isValidCustomer(data) {
-      return data.id is int &&
-             data.name is string && data.name.size() > 0 && data.name.size() <= 200 &&
+      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
+             data.id is int &&
+             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
              data.phone is string && data.phone.size() <= 50 &&
              data.email is string && data.email.size() <= 200 &&
              data.loyalPoints is int && data.loyalPoints >= 0 &&
              data.tpin is string && data.tpin.size() <= 100 &&
              data.zra_connected is int &&
-             data.tax_band is string && data.tax_band.size() <= 100 &&
-             data.business_id is string && data.business_id.size() <= 128 &&
-             data.keys().hasAll(['id', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band', 'business_id']) &&
-             data.keys().size() == 9;
+             data.tax_band is string && data.tax_band.size() <= 100;
     }
 
-    // Helper validation for historical completed orders
     function isValidOrder(data) {
-      return data.id is string && data.id.size() <= 128 &&
+      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'customerId', 'orderDate', 'subtotal', 'tax', 'discount', 'total', 'paymentMethod', 'status', 'store_id', 'performed_by']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'customerId', 'orderDate', 'subtotal', 'tax', 'discount', 'total', 'paymentMethod', 'status', 'store_id', 'performed_by']) &&
+             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
              (data.customerId is int || data.customerId == null) &&
-             data.orderDate is string && data.orderDate.size() <= 100 &&
+             data.orderDate is string && data.orderDate.size() >= 1 && data.orderDate.size() <= 100 &&
              data.subtotal is number && data.subtotal >= 0.0 &&
              data.tax is number && data.tax >= 0.0 &&
              data.discount is number && data.discount >= 0.0 &&
              data.total is number && data.total >= 0.0 &&
-             data.paymentMethod is string && data.paymentMethod.size() <= 50 &&
-             data.status is string && data.status.size() <= 50 &&
-             data.store_id is string && data.store_id.size() <= 128 &&
-             data.performed_by is string && data.performed_by.size() <= 100 &&
-             data.keys().hasAll(['id', 'customerId', 'orderDate', 'subtotal', 'tax', 'discount', 'total', 'paymentMethod', 'status', 'store_id', 'performed_by']) &&
-             data.keys().size() == 11;
+             data.paymentMethod is string && data.paymentMethod.size() >= 1 && data.paymentMethod.size() <= 50 &&
+             data.status is string && data.status.size() >= 1 && data.status.size() <= 50 &&
+             data.store_id is string && data.store_id.size() >= 1 && data.store_id.size() <= 128 &&
+             data.performed_by is string && data.performed_by.size() >= 1 && data.performed_by.size() <= 100;
     }
 
-    // Primary matching boundary for Businesses
+    function isValidOrderItem(data) {
+      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'orderId', 'productId', 'quantity', 'unitPrice']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'orderId', 'productId', 'quantity', 'unitPrice']) &&
+             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
+             data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 128 &&
+             data.productId is int &&
+             data.quantity is int && data.quantity >= 1 &&
+             data.unitPrice is number && data.unitPrice >= 0.0;
+    }
+
+    function isValidLedgerBackup(data) {
+      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'ledger_type', 'record_count', 'records', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'ledger_type', 'record_count', 'records', 'updatedAt']) &&
+             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
+             data.ownerUid == request.auth.uid &&
+             data.ledger_type is string && data.ledger_type.size() >= 1 && data.ledger_type.size() <= 100 &&
+             data.record_count is int && data.record_count >= 0 &&
+             data.records is list && data.records.size() <= 500 &&
+             (data.records.size() == 0 || data.records[0] is map) &&
+             data.updatedAt is timestamp;
+    }
+
+    // 4. Collection & Relational Subcollection Match Rules
+
     match /businesses/{businessId} {
-      allow get: if isSignedIn() && existing().ownerUid == request.auth.uid;
-      allow create: if isSignedIn() && isValidId(businessId) && isValidBusiness(incoming()) && incoming().createdAt == request.time;
-      allow update: if isSignedIn() && isValidId(businessId) && isValidBusiness(incoming()) && 
-                       incoming().ownerUid == existing().ownerUid && 
+      allow get: if isSignedIn() && isValidId(businessId) && (resource == null || existing().ownerUid == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() &&
+                       isValidId(businessId) &&
+                       isValidBusiness(incoming()) &&
+                       incoming().id == businessId &&
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time;
+      allow update: if isSignedIn() &&
+                       isValidId(businessId) &&
+                       isValidBusiness(incoming()) &&
+                       (existing().ownerUid == request.auth.uid || isAdmin()) &&
+                       incoming().id == existing().id &&
+                       incoming().ownerUid == existing().ownerUid &&
                        incoming().createdAt == existing().createdAt &&
-                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'owner', 'email']);
-      allow delete: if false; // Locked to maintain consistent historical bookkeeping context
+                       incoming().updatedAt == request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'owner', 'email', 'updatedAt']);
+      allow delete: if false;
 
-      // Nested Store routes
+      // Subcollection: Store Branches
       match /stores/{storeId} {
-        allow get: if isBusinessOwner(businessId);
-        allow list: if isBusinessOwner(businessId);
-        allow create: if isBusinessOwner(businessId) && isValidId(storeId) && isValidStore(incoming());
-        allow update: if isBusinessOwner(businessId) && isValidId(storeId) && isValidStore(incoming()) &&
-                         incoming().business_id == existing().business_id &&
+        allow get: if isSignedIn() && isValidId(businessId) && isValidId(storeId) && isBusinessOwner(businessId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(storeId) &&
+                         isValidStore(incoming()) &&
+                         incoming().id == storeId &&
+                         incoming().business_id == businessId &&
+                         isBusinessOwner(businessId);
+        allow update: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(storeId) &&
+                         isValidStore(incoming()) &&
                          incoming().id == existing().id &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']);
-        allow delete: if isBusinessOwner(businessId);
+                         incoming().business_id == existing().business_id &&
+                         incoming().ownerUid == existing().ownerUid &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+                         isBusinessOwner(businessId);
+        allow delete: if isSignedIn() && isValidId(businessId) && isValidId(storeId) && isBusinessOwner(businessId);
       }
 
-      // Nested Product catalog routes
+      // Subcollection: Product Catalog & Batches
       match /products/{productId} {
-        allow get: if isBusinessOwner(businessId);
-        allow list: if isBusinessOwner(businessId);
-        allow create: if isBusinessOwner(businessId) && isValidId(productId) && isValidProduct(incoming());
-        allow update: if isBusinessOwner(businessId) && isValidId(productId) && isValidProduct(incoming()) &&
-                         incoming().business_id == existing().business_id &&
+        allow get: if isSignedIn() && isValidId(businessId) && isValidId(productId) && isBusinessOwner(businessId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(productId) &&
+                         isValidProduct(incoming()) &&
+                         incoming().business_id == businessId &&
+                         isBusinessOwner(businessId);
+        allow update: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(productId) &&
+                         isValidProduct(incoming()) &&
                          incoming().id == existing().id &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']);
-        allow delete: if isBusinessOwner(businessId);
+                         incoming().business_id == existing().business_id &&
+                         incoming().ownerUid == existing().ownerUid &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
+                         isBusinessOwner(businessId);
+        allow delete: if isSignedIn() && isValidId(businessId) && isValidId(productId) && isBusinessOwner(businessId);
       }
 
-      // Nested Customer CRM accounts database
+      // Subcollection: Client CRM Data
       match /customers/{customerId} {
-        allow get: if isBusinessOwner(businessId);
-        allow list: if isBusinessOwner(businessId);
-        allow create: if isBusinessOwner(businessId) && isValidId(customerId) && isValidCustomer(incoming());
-        allow update: if isBusinessOwner(businessId) && isValidId(customerId) && isValidCustomer(incoming()) &&
-                         incoming().business_id == existing().business_id &&
+        allow get: if isSignedIn() && isValidId(businessId) && isValidId(customerId) && isBusinessOwner(businessId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(customerId) &&
+                         isValidCustomer(incoming()) &&
+                         incoming().business_id == businessId &&
+                         isBusinessOwner(businessId);
+        allow update: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(customerId) &&
+                         isValidCustomer(incoming()) &&
                          incoming().id == existing().id &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']);
-        allow delete: if isBusinessOwner(businessId);
+                         incoming().business_id == existing().business_id &&
+                         incoming().ownerUid == existing().ownerUid &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
+                         isBusinessOwner(businessId);
+        allow delete: if isSignedIn() && isValidId(businessId) && isValidId(customerId) && isBusinessOwner(businessId);
       }
 
-      // Nested order logs audits
+      // Subcollection: POS Sales & Refund Orders (Transactions)
       match /orders/{orderId} {
-        allow get: if isBusinessOwner(businessId);
-        allow list: if isBusinessOwner(businessId);
-        allow create: if isBusinessOwner(businessId) && isValidId(orderId) && isValidOrder(incoming());
-        allow update: if false; // Immutable invoices path locks historical logs
-        allow delete: if false; // Invoice deletion disabled
+        allow get: if isSignedIn() && isValidId(businessId) && isValidId(orderId) && isBusinessOwner(businessId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(orderId) &&
+                         isValidOrder(incoming()) &&
+                         incoming().id == orderId &&
+                         incoming().business_id == businessId &&
+                         isBusinessOwner(businessId);
+        allow update: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(orderId) &&
+                         isValidOrder(incoming()) &&
+                         incoming().id == existing().id &&
+                         incoming().business_id == existing().business_id &&
+                         incoming().ownerUid == existing().ownerUid &&
+                         incoming().orderDate == existing().orderDate &&
+                         incoming().store_id == existing().store_id &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentMethod', 'total', 'subtotal', 'tax', 'discount', 'customerId', 'performed_by']) &&
+                         isBusinessOwner(businessId);
+        allow delete: if false;
+      }
+
+      // Subcollection: Order Line Items (Relational link between Orders and Products)
+      match /order_items/{itemId} {
+        allow get: if isSignedIn() && isValidId(businessId) && isValidId(itemId) && isBusinessOwner(businessId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(itemId) &&
+                         isValidOrderItem(incoming()) &&
+                         incoming().id == itemId &&
+                         incoming().business_id == businessId &&
+                         isBusinessOwner(businessId);
+        allow update: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(itemId) &&
+                         isValidOrderItem(incoming()) &&
+                         incoming().id == existing().id &&
+                         incoming().business_id == existing().business_id &&
+                         incoming().ownerUid == existing().ownerUid &&
+                         incoming().orderId == existing().orderId &&
+                         incoming().productId == existing().productId &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['quantity', 'unitPrice']) &&
+                         isBusinessOwner(businessId);
+        allow delete: if isSignedIn() && isValidId(businessId) && isValidId(itemId) && isBusinessOwner(businessId);
+      }
+
+      // Subcollection: Double-Entry Accounting & Client Relational Ledger Backups
+      match /ledgers/{ledgerId} {
+        allow get: if isSignedIn() && isValidId(businessId) && isValidId(ledgerId) && isBusinessOwner(businessId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow create: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(ledgerId) &&
+                         isValidLedgerBackup(incoming()) &&
+                         incoming().id == ledgerId &&
+                         incoming().business_id == businessId &&
+                         incoming().updatedAt == request.time &&
+                         isBusinessOwner(businessId);
+        allow update: if isSignedIn() &&
+                         isValidId(businessId) &&
+                         isValidId(ledgerId) &&
+                         isValidLedgerBackup(incoming()) &&
+                         incoming().id == existing().id &&
+                         incoming().business_id == existing().business_id &&
+                         incoming().ownerUid == existing().ownerUid &&
+                         incoming().ledger_type == existing().ledger_type &&
+                         incoming().updatedAt == request.time &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['record_count', 'records', 'updatedAt']) &&
+                         isBusinessOwner(businessId);
+        allow delete: if isSignedIn() && isValidId(businessId) && isValidId(ledgerId) && isBusinessOwner(businessId);
       }
     }
   }

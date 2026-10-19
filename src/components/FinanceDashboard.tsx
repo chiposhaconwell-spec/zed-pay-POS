@@ -52,7 +52,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   // Sub-navigation tab state
   const [subTab, setSubTab] = useState<'statements' | 'payment_methods' | 'receipt_refund' | 'cash_flow' | 'double_entry' | 'expenses' | 'procurement' | 'transfers' | 'assets_equity'>('statements');
   const [expenseSubView, setExpenseSubView] = useState<'all' | 'operating' | 'purchase_orders'>('all');
-  const [statementStoreFilter, setStatementStoreFilter] = useState<string>('all');
+  const [statementStoreFilter, setStatementStoreFilter] = useState<string>(() => activeStore || 'all');
 
   // DB tables for Expenses, Transfers and Transit Procurement
   const [expensesList, setExpensesList] = useState<any[]>([]);
@@ -136,15 +136,27 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   const [newEquityName, setNewEquityName] = useState('');
   const [newEquityValue, setNewEquityValue] = useState('');
 
+  useEffect(() => {
+    if (activeStore) {
+      setStatementStoreFilter(activeStore);
+      setExpenseStoreId(activeStore);
+      setTransitStoreId(activeStore);
+      loadFinanceData(activeStore);
+    }
+  }, [activeStore]);
+
   // Load finance tables on mount or store change
   const loadFinanceData = (targetStoreFilter: string = statementStoreFilter) => {
     // Ensure all double-entry accounting systems are synchronized
     syncAllAccountingSystems('Finance Dashboard Load');
 
-    // 1. Load Operating Expenses
+    // 1. Load Operating Expenses (filtered by targetStoreFilter when not 'all')
     const expRes = runSql('SELECT * FROM expenses ORDER BY expense_date DESC', 'Finance: Fetch operating expenses');
     if (expRes.success && Array.isArray(expRes.data)) {
-      setExpensesList(expRes.data);
+      const filteredExp = (targetStoreFilter && targetStoreFilter !== 'all')
+        ? expRes.data.filter((ex: any) => String(ex.store_id || '').toLowerCase() === targetStoreFilter.toLowerCase())
+        : expRes.data;
+      setExpensesList(filteredExp);
     }
 
     // 2. Load Transfers

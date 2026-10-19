@@ -44,18 +44,19 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
   const [quotations, setQuotations] = useState<Quotation[]>([]);
   const [selectedQuote, setSelectedQuote] = useState<Quotation | null>(null);
   
-  // Create Form State
-  const [companyName, setCompanyName] = useState('SME Retailers Ltd');
-  const [companyTPIN, setCompanyTPIN] = useState('1003449910');
-  const [companyAddress, setCompanyAddress] = useState('Plot 45, Independence Avenue, Lusaka');
-  const [logoText, setLogoText] = useState('咖啡'); // custom text logo
+  // Create Form State (populated from business setup & billing address, no pre-seeded demo values)
+  const fullBillingAddress = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
+  const [companyName, setCompanyName] = useState(settings.storeName || '');
+  const [companyTPIN, setCompanyTPIN] = useState(settings.tpin || '');
+  const [companyAddress, setCompanyAddress] = useState(fullBillingAddress || '');
+  const [logoText, setLogoText] = useState((settings.storeName || 'POS').slice(0, 3).toUpperCase());
   
-  // The 5 Core Banking Fields requested
-  const [bankName, setBankName] = useState('Zambia National Commercial Bank (Zanaco)');
-  const [bankAccountName, setBankAccountName] = useState('SME Retailers Ltd');
-  const [bankAccountNumber, setBankAccountNumber] = useState('1020088991102');
-  const [bankBranchName, setBankBranchName] = useState('Lusaka Commercial Branch');
-  const [bankSortCode, setBankSortCode] = useState('01-02-03');
+  // The 5 Core Banking Fields (configured by business, blank by default)
+  const [bankName, setBankName] = useState('');
+  const [bankAccountName, setBankAccountName] = useState(settings.storeName || '');
+  const [bankAccountNumber, setBankAccountNumber] = useState('');
+  const [bankBranchName, setBankBranchName] = useState('');
+  const [bankSortCode, setBankSortCode] = useState('');
 
   // Client Info
   const [cName, setCName] = useState('');
