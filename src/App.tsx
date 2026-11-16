@@ -12,9 +12,11 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 
 // Database & Firebase Cloud API
-import { initializeDatabase, SeedTemplate, runSql, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer } from './db';
+import { initializeDatabase, SeedTemplate, runSql, getCentralBranches, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getAllSelectableAccounts, syncAllAccountingSystems } from './db';
 import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud } from './firebase';
 import { StoreSettings, ActiveTab } from './types';
+import { FiscalService } from './zra/fiscalService';
+import { getZraConfig, saveZraConfig } from './zra/zraConfig';
 
 // Custom sub-components
 import AndroidShell from './components/AndroidShell';
@@ -50,7 +52,7 @@ const DEFAULT_SETTINGS: StoreSettings = {
   termsAndConditions: '',
   printerName: '',
   printerInterface: '',
-  printerStatus: 'Disconnected',
+  printerStatus: 'Not Linked',
 };
 
 export default function App() {
@@ -84,7 +86,7 @@ export default function App() {
   const [businesses, setBusinesses] = useState<any[]>([]);
   const [stores, setStores] = useState<any[]>([]);
   const [staffMembers, setStaffMembers] = useState<any[]>([]);
-  const [settingsInitialSubTab, setSettingsInitialSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'printer' | 'database'>('general');
+  const [settingsInitialSubTab, setSettingsInitialSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'printer' | 'database'>('general');
   const [newBizName, setNewBizName] = useState('');
   const [newBizOwner, setNewBizOwner] = useState('');
   const [newBizEmail, setNewBizEmail] = useState('');
@@ -118,7 +120,7 @@ export default function App() {
   const [isHeaderSyncing, setIsHeaderSyncing] = useState(false);
   const [lastHeaderSyncMsg, setLastHeaderSyncMsg] = useState<string | null>(null);
 
-  const openUnifiedSettings = (subTab: 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'printer' | 'database' = 'general') => {
+  const openUnifiedSettings = (subTab: 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'printer' | 'database' = 'general') => {
     loadBusinessData();
     setSettingsInitialSubTab(subTab);
     setShowNavDrawer(false);
@@ -132,6 +134,7 @@ export default function App() {
   const [showExpenseModal, setShowExpenseModal] = useState(false);
   const [expenseAmount, setExpenseAmount] = useState('');
   const [expenseCategory, setExpenseCategory] = useState('Store Operations');
+  const [expenseAccountId, setExpenseAccountId] = useState('acc_cash');
   const [expenseNotes, setExpenseNotes] = useState('');
   const [expenseStoreId, setExpenseStoreId] = useState('');
 
@@ -209,15 +212,24 @@ export default function App() {
     // 1. Provision memory SQL tables in blank mode (no preseeded stock, batches, or login accounts)
     initializeDatabase('blank');
 
-    // 2. Recover merchant preference details
+    // 2. Recover merchant preference details & sync ZRA config
     const localConf = localStorage.getItem('android_pos_settings');
     if (localConf) {
       try {
-        setSettings(JSON.parse(localConf));
+        const parsedConf = JSON.parse(localConf);
+        if (parsedConf?.zraConfig) {
+          saveZraConfig(parsedConf.zraConfig);
+        } else {
+          parsedConf.zraConfig = getZraConfig();
+        }
+        setSettings(parsedConf);
       } catch (err) {
         console.warn('Failed restoring settings, falling back to default config details.', err);
       }
     }
+
+    // Start ZRA VSDC background offline queue auto-sync
+    FiscalService.startAutoSync();
 
     // 3. Load initial CRM customers
     fetchCustomersList();
@@ -355,37 +367,21 @@ export default function App() {
       setIsAuthenticatedSession(false);
     }
 
-    // 2. Fetch stores of the activeBusiness (strictly 0 preseeded fallback stores)
-    if (currentBiz && currentBiz.id) {
-      const sResult = runSql(`SELECT * FROM stores WHERE business_id = '${currentBiz.id}'`, 'App: Query branch outlets for active business');
-      const allStoresRes = (!sResult.data || sResult.data.length === 0)
-        ? runSql(`SELECT * FROM stores`, 'App: Query all branch outlets')
-        : sResult;
-      if (allStoresRes.success && Array.isArray(allStoresRes.data) && allStoresRes.data.length > 0) {
-        const allStores = allStoresRes.data;
-        setStores(allStores);
-        // Filter by accessibleStoreIds if logged in as non-owner with restricted branches
-        const permittedStores = (userRole !== 'owner' && accessibleStoreIds.length > 0)
-          ? allStores.filter((s: any) => accessibleStoreIds.includes(s.id))
-          : allStores;
-        const listToUse = permittedStores.length > 0 ? permittedStores : allStores;
-        const exists = listToUse.find((s: any) => s.id === activeStore);
-        if (!exists) {
-          const nextStore = listToUse[0].id;
-          setActiveStore(nextStore);
-          localStorage.setItem('active_store_branch', nextStore);
-        }
-      } else {
-        setStores([]);
-        setActiveStore('');
+    // 2. Fetch stores from the single central branches database (strictly 0 pre-created branches)
+    const allStores = getCentralBranches(currentBiz?.id || undefined);
+    setStores(allStores);
+    if (currentBiz && currentBiz.id && allStores.length > 0) {
+      const permittedStores = (userRole !== 'owner' && accessibleStoreIds.length > 0)
+        ? allStores.filter((s: any) => accessibleStoreIds.includes(s.id))
+        : allStores;
+      const listToUse = permittedStores.length > 0 ? permittedStores : allStores;
+      const exists = listToUse.find((s: any) => s.id === activeStore);
+      if (!exists) {
+        const nextStore = listToUse[0].id;
+        setActiveStore(nextStore);
+        localStorage.setItem('active_store_branch', nextStore);
       }
     } else {
-      const sAll = runSql(`SELECT * FROM stores`, 'App: Query branch outlets for login');
-      if (sAll.success && Array.isArray(sAll.data)) {
-        setStores(sAll.data);
-      } else {
-        setStores([]);
-      }
       setActiveStore('');
     }
   };
@@ -421,7 +417,7 @@ export default function App() {
         let fbSuccess = false;
         if (auth.currentUser) {
           try {
-            const fbRes = await backupToCloud(targetBizId);
+            const fbRes = await backupToCloud(targetBizId, { silentIfNotOwner: true });
             fbSuccess = fbRes.success;
           } catch (fbErr) {
             console.warn('Header Firebase backup notice:', fbErr);
@@ -513,11 +509,13 @@ export default function App() {
     // 3. Provision primary store outlet ONLY if the admin specified a branch name during setup (no pre-seeded branch)
     if (hasInitialStore && storeId) {
       runSql(`
-        INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
+        INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
           '${storeId}',
           '${bizId}',
           '${rawStoreName.replace(/'/g, "''")}',
           '${rawLocation.replace(/'/g, "''")}',
+          '${newBizBillingPhone.trim().replace(/'/g, "''")}',
+          '${(newBizBillingEmail.trim() || newBizEmail.trim()).replace(/'/g, "''")}',
           1, 1, 1, 0
         )
       `, `Registration: Provision initial store outlet [${rawStoreName}]`);
@@ -723,10 +721,7 @@ export default function App() {
         }
       }
 
-      const sRes = runSql(`SELECT * FROM stores WHERE business_id = '${matchedBiz.id}'`, 'Cloud Login: Load stores');
-      const allStores = (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0)
-        ? sRes.data
-        : (runSql(`SELECT * FROM stores`, 'Cloud Login: Load all stores').data || []);
+      const allStores = getCentralBranches(matchedBiz.id);
 
       // Check branch authorization if user picked a branch on the login form
       if (syncLoginBranch && userAllowedBranches.length > 0 && !userAllowedBranches.includes(syncLoginBranch)) {
@@ -789,9 +784,9 @@ export default function App() {
         setActiveStore('');
       }
 
-      // Ensure Firebase Firestore + Storage mirror is up to date after sign-in
-      if (auth.currentUser) {
-        backupToCloud(matchedBiz.id).catch(() => {});
+      // Ensure Firebase Firestore + Storage mirror is up to date after Owner sign-in
+      if (auth.currentUser && resolvedRole === 'owner' && !matchedStaff) {
+        backupToCloud(matchedBiz.id, { silentIfNotOwner: true }).catch(() => {});
       }
 
       localStorage.setItem('logged_in_user_email', targetEmail);
@@ -878,9 +873,6 @@ export default function App() {
                   <h1 className="text-base sm:text-lg font-black tracking-tight text-white uppercase font-sans">
                     Enterprise POS & Cloud Accounting
                   </h1>
-                  <p className="text-[11px] text-slate-400 font-medium mt-0.5">
-                    100% Blank Slate — No pre-seeded details, branches, or stock. First account automatically becomes Admin.
-                  </p>
                 </div>
               </div>
 
@@ -915,16 +907,6 @@ export default function App() {
             <div className="p-5 sm:p-6 overflow-y-auto max-h-[76vh]">
               {authScreenMode === 'login' ? (
                 <div className="flex flex-col gap-5">
-                  <div className="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-800/50 flex items-start gap-3">
-                    <Lock size={16} className="text-emerald-400 shrink-0 mt-0.5" />
-                    <div className="text-xs text-slate-300 leading-relaxed">
-                      <span className="font-bold text-emerald-300 uppercase tracking-wide block mb-0.5">
-                        Sign In to Your Business or Staff Account
-                      </span>
-                      Enter your Admin or Staff email and password to authenticate with Firebase & synchronize your business setup, stores, stock, batches, and accounting ledgers from Cloud SQL & Firebase Storage.
-                    </div>
-                  </div>
-
                   <form onSubmit={handleSyncExistingAccount} className="flex flex-col gap-4">
                     <div>
                       <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
@@ -954,26 +936,25 @@ export default function App() {
                       />
                     </div>
 
-                    <div>
-                      <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
-                        Choose Branch to Log Into (Or Select After Sign-In)
-                      </label>
-                      <select
-                        value={syncLoginBranch}
-                        onChange={(e) => setSyncLoginBranch(e.target.value)}
-                        className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-bold text-xs focus:border-emerald-500 focus:outline-hidden cursor-pointer uppercase"
-                      >
-                        <option value="">— Choose Branch After Verification ({stores.length} Configured) —</option>
-                        {stores.map((st: any) => (
-                          <option key={st.id} value={st.id}>
-                            📍 {st.name} {st.location ? `(${st.location})` : ''}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="text-[10px] text-slate-500 block mt-1">
-                        Each branch keeps separate stock, sales, laybys, expenses &amp; End-of-Day (EOD) totals.
-                      </span>
-                    </div>
+                    {stores.length > 0 && (
+                      <div>
+                        <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                          Select Branch
+                        </label>
+                        <select
+                          value={syncLoginBranch}
+                          onChange={(e) => setSyncLoginBranch(e.target.value)}
+                          className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-bold text-xs focus:border-emerald-500 focus:outline-hidden cursor-pointer uppercase"
+                        >
+                          <option value="">— Select Branch ({stores.length} Available) —</option>
+                          {stores.map((st: any) => (
+                            <option key={st.id} value={st.id}>
+                              📍 {st.name} {st.location ? `(${st.location})` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
 
                     <button
                       type="submit"
@@ -981,33 +962,12 @@ export default function App() {
                       className="mt-1 py-3 px-5 bg-emerald-600 hover:bg-emerald-500 text-white font-black uppercase rounded-xl text-xs tracking-wider cursor-pointer shadow-lg flex items-center justify-center gap-2 transition-all"
                     >
                       <RefreshCw size={15} className={isHeaderSyncing ? 'animate-spin' : ''} />
-                      <span>{isHeaderSyncing ? 'Authenticating & Synchronizing...' : 'Log In & Choose Branch'}</span>
+                      <span>{isHeaderSyncing ? 'Authenticating...' : 'Log In'}</span>
                     </button>
                   </form>
-
-                  {/* If local workspaces already exist on this device, allow quick selection after login or switching to Create Account */}
-                  <div className="pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
-                    <span>Setting up a new business for the first time?</span>
-                    <button
-                      type="button"
-                      onClick={() => setAuthScreenMode('register')}
-                      className="text-indigo-400 hover:text-indigo-300 font-extrabold uppercase tracking-wider cursor-pointer"
-                    >
-                      Create Admin Account →
-                    </button>
-                  </div>
                 </div>
               ) : (
                 <form onSubmit={handleRegisterBusiness} className="flex flex-col gap-4">
-                  <div className="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-800/60 flex items-start gap-3">
-                    <ShieldCheck size={17} className="text-indigo-400 shrink-0 mt-0.5" />
-                    <div className="text-[11px] text-slate-300 leading-relaxed">
-                      <span className="font-extrabold text-indigo-300 uppercase tracking-wide block mb-0.5">
-                        First Account Automatically Becomes the Admin Account
-                      </span>
-                      Everything starts blank with zero pre-seeded stock, batches, or branches. As Admin, you can configure your business setup, billing address, create stores/branches, add users, and add stock.
-                    </div>
-                  </div>
 
                   {/* Section 1: Admin Account Credentials */}
                   <div className="p-3.5 rounded-xl bg-slate-950/80 border border-slate-800/90 flex flex-col gap-3">
@@ -1201,7 +1161,7 @@ export default function App() {
         </div>
       ) : (
       /* Main Container without congested permanent sidebar dock */
-      <div className="flex-1 flex flex-col overflow-hidden relative h-full">
+      <div className="flex-1 min-h-0 flex flex-col overflow-hidden relative h-full">
         
         {/* Top Header Bar with 3-Lines Hamburger Menu Button on Upper Corner */}
         <div className="bg-slate-900 border-b border-slate-800 px-2 py-1.5 sm:px-3 sm:py-2 flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 text-slate-300 shadow-md z-20 shrink-0">
@@ -1324,8 +1284,8 @@ export default function App() {
         </div>
 
         {/* Dynamic Display Area (Defaults to clean Sale Register view) */}
-        <div className="flex-1 flex overflow-hidden relative min-w-0 w-full">
-          <div className="flex-1 flex flex-col overflow-hidden bg-slate-50 relative z-0 min-w-0 w-full">
+        <div className="flex-1 min-h-0 flex overflow-hidden relative min-w-0 w-full">
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-slate-50 relative z-0 min-w-0 w-full">
               <AnimatePresence mode="wait">
                 {activeTab === 'billing' && (
                   <motion.div
@@ -1334,7 +1294,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden min-w-0 w-full"
+                    className="flex-1 min-h-0 flex flex-col overflow-hidden min-w-0 w-full"
                   >
                     <BillingTerminal
                       settings={settings}
@@ -1378,7 +1338,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden min-w-0 w-full"
+                    className="flex-1 min-h-0 flex flex-col overflow-hidden min-w-0 w-full"
                   >
                     <InventoryManager 
                       settings={settings} 
@@ -1413,9 +1373,9 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden"
+                    className="flex-1 min-h-0 flex flex-col overflow-hidden min-w-0 w-full"
                   >
-                    <QuotationsCreator settings={settings} />
+                    <QuotationsCreator settings={settings} activeStore={activeStore} />
                   </motion.div>
                 )}
                 {activeTab === 'loans' && (
@@ -1425,7 +1385,7 @@ export default function App() {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 10 }}
                     transition={{ duration: 0.15 }}
-                    className="flex-1 flex flex-col overflow-hidden"
+                    className="flex-1 min-h-0 flex flex-col overflow-hidden"
                   >
                     <LoanDashboard settings={settings} userRole={userRole} activeStore={activeStore} />
                   </motion.div>
@@ -1805,7 +1765,7 @@ export default function App() {
                   </span>
                 </button>
 
-                {/* Documents & Quotes (word 'Receipts' removed as requested) */}
+                {/* Quote, Invoice & Delivery Note */}
                 <button
                   onClick={() => {
                     setShowNavDrawer(false);
@@ -1817,7 +1777,7 @@ export default function App() {
                     <div className="p-1.5 rounded-lg bg-purple-600 text-white shadow-xs group-hover:scale-105 transition-transform">
                       <FileText size={16} />
                     </div>
-                    <span>Documents & Invoices</span>
+                    <span>Quote, Invoice &amp; Delivery Note</span>
                   </div>
                 </button>
 
@@ -2244,17 +2204,19 @@ export default function App() {
                 const targetBranch = expenseStoreId || activeStore || (accessibleStores[0]?.id ?? '');
                 const nowIso = new Date().toISOString();
                 const expId = `EXP-${Date.now()}`;
+                const allAccounts = getAllSelectableAccounts();
+                const matchedAcc = allAccounts.find(a => a.accountId === expenseAccountId);
+                const chosenMethodLabel = matchedAcc?.label || 'Cash';
 
                 runSql(`
-                  INSERT INTO expenses (id, category, payment_method, account_id, amount, description, ref_number, reference_no, expense_date, store_id, performed_by, created_by, created_at)
+                  INSERT INTO expenses (id, category, payment_method, account_id, amount, description, ref_number, expense_date, store_id, performed_by, created_by, created_at)
                   VALUES (
                     '${expId}',
                     '${expenseCategory.replace(/'/g, "''")}',
-                    'Cash',
-                    'acc_cash',
+                    '${chosenMethodLabel.replace(/'/g, "''")}',
+                    '${expenseAccountId}',
                     ${amt},
                     '${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
-                    '${expId}',
                     '${expId}',
                     '${nowIso.split('T')[0]}',
                     '${targetBranch.replace(/'/g, "''")}',
@@ -2271,15 +2233,17 @@ export default function App() {
                     '${expId}',
                     '[Branch: ${targetBranch}] ${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
                     'Operating Expenses',
-                    'Cash Drawer',
+                    '${chosenMethodLabel.replace(/'/g, "''")}',
                     ${amt},
                     '${settings.currency}'
                   )
                 `, 'Record expense journal entry');
 
-                logEmployeeAudit('EXPENSES', 'Added Operating Expense', `Category: ${expenseCategory}, Notes: ${expenseNotes || 'Store Expense'}`, amt, targetBranch, userRole);
+                logEmployeeAudit('EXPENSES', 'Added Operating Expense', `Category: ${expenseCategory}, Account: ${chosenMethodLabel}, Notes: ${expenseNotes || 'Store Expense'}`, amt, targetBranch, userRole);
+                syncAllAccountingSystems(`Expense #${expId}`);
+                persistTablesToStorage();
 
-                alert(`Operating expense of ${settings.currency}${amt.toFixed(2)} recorded for branch [${targetBranch.toUpperCase()}] and linked to branch EOD totals!`);
+                alert(`Operating expense of ${settings.currency}${amt.toFixed(2)} recorded for branch [${targetBranch.toUpperCase()}] from ${chosenMethodLabel} and synced with EOD & Double-Entry Ledgers!`);
                 setExpenseAmount('');
                 setExpenseNotes('');
                 setShowExpenseModal(false);
@@ -2313,6 +2277,19 @@ export default function App() {
                   <option value="Rent & Property">Rent & Property Fees</option>
                   <option value="Staff Refreshments">Staff Refreshments & Meals</option>
                   <option value="Miscellaneous">Miscellaneous Expense</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-[10px] uppercase font-bold text-slate-400 block pb-1">Payment Account</label>
+                <select
+                  value={expenseAccountId}
+                  onChange={(e) => setExpenseAccountId(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg p-2 text-slate-100 font-bold focus:outline-hidden"
+                >
+                  {getAllSelectableAccounts().map(acc => (
+                    <option key={acc.accountId} value={acc.accountId}>{acc.label}</option>
+                  ))}
                 </select>
               </div>
 

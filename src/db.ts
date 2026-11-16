@@ -1,5 +1,5 @@
 import alasql from 'alasql';
-import { Product, Customer, Order, OrderItem, SqlLogEntry, StoreSettings } from './types';
+import { Product, Customer, Order, OrderItem, SqlLogEntry, StoreSettings, CustomPaymentMethod } from './types';
 import { 
   initSqliteStorage, 
   registerPendingSync, 
@@ -145,8 +145,48 @@ function translatePostgresToAlaSql(stmt: string): string {
   // Remove trailing commas left by stripped columns
   cleaned = cleaned.replace(/,\s*\)/g, ')');
   cleaned = cleaned.replace(/\(\s*,/g, '(');
-  
-  return cleaned.trim();
+
+  // Escape AlaSQL reserved keywords used as column/alias identifiers (outside string literals/backticks)
+  const reservedIdentifiers = new Set(['total', 'value']);
+  let escaped = '';
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === "'" && !inDouble && !inBacktick) {
+      inSingle = !inSingle;
+      escaped += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle && !inBacktick) {
+      inDouble = !inDouble;
+      escaped += ch;
+      continue;
+    }
+    if (ch === '`' && !inSingle && !inDouble) {
+      inBacktick = !inBacktick;
+      escaped += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble && !inBacktick && /[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < cleaned.length && /[A-Za-z0-9_]/.test(cleaned[j])) {
+        j++;
+      }
+      const word = cleaned.slice(i, j);
+      if (reservedIdentifiers.has(word.toLowerCase())) {
+        escaped += '`' + word + '`';
+      } else {
+        escaped += word;
+      }
+      i = j - 1;
+      continue;
+    }
+    escaped += ch;
+  }
+
+  return escaped.trim();
 }
 
 // Custom SQL Query Runner with logging and PostgreSQL emulation
@@ -415,10 +455,10 @@ export function seedHistoricalOrders() {
 
   historicalOrders.forEach((o, idx) => {
     const custVal = o.custId === null ? 'NULL' : o.custId;
-    const store_id = idx % 3 === 0 ? 'lusaka' : idx % 3 === 1 ? 'kitwe' : 'ndola';
+    const store_id = '';
     runSql(
       `INSERT INTO orders VALUES ('${o.id}', ${custVal}, '${o.date}', ${o.sub}, ${o.tax}, ${o.dis}, ${o.tot}, '${o.pay}', 'Completed', '${store_id}', 'owner')`,
-      `Seed Data: Record historical invoice ${o.id} for branch ${store_id.toUpperCase()}`
+      `Seed Data: Record historical invoice ${o.id}`
     );
 
     o.items.forEach((item, itemIdx) => {
@@ -437,7 +477,7 @@ export function seedHistoricalOrders() {
     let channelName = 'CASH';
 
     if (o.pay === 'Mobile Wallet') {
-      clearingAcc = Math.random() > 0.5 ? 'mtn-clearing-account-uuid' : 'airtel-clearing-account-uuid';
+      clearingAcc = idx % 2 === 0 ? 'mtn-clearing-account-uuid' : 'airtel-clearing-account-uuid';
       channelName = clearingAcc === 'mtn-clearing-account-uuid' ? 'MTN_MOMO' : 'AIRTEL_MONEY';
     } else if (o.pay === 'Credit Card') {
       clearingAcc = 'airtel-clearing-account-uuid';
@@ -464,20 +504,73 @@ export function seedHistoricalOrders() {
   persistTablesToStorage();
 }
 
+export function toLocalDateKey(rawDate?: any): string {
+  if (rawDate === null || rawDate === undefined || rawDate === '') {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  }
+  const str = String(rawDate).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+  const d = new Date(typeof rawDate === 'number' ? rawDate : str);
+  if (!isNaN(d.getTime())) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  const match = str.match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : '';
+}
+
 export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
   if (!tablesData || typeof tablesData !== 'object') return;
+  const dedupeTables = new Set([
+    'businesses',
+    'stores',
+    'staff',
+    'products',
+    'customers',
+    'orders',
+    'order_items',
+    'laybys',
+    'cash_ups',
+    'accounts',
+    'double_entry_journal',
+    'receipt_refund_ledger',
+    'cash_flow_ledger',
+    'payment_method_ledger',
+    'financial_statements_ledger',
+    'payment_methods',
+    'audit_logs',
+    'quotations',
+    'zra_invoices',
+    'zra_sync_queue',
+  ]);
   for (const [table, rows] of Object.entries(tablesData)) {
     if (!Array.isArray(rows)) continue;
     try {
       if (!alasql.tables || !alasql.tables[table]) continue;
+      const tableObj = alasql.tables[table] as any;
+      const tableCols: any[] = Array.isArray(tableObj.columns) ? tableObj.columns : [];
+      const validColSet = tableCols.length > 0 ? new Set(tableCols.map((c: any) => c.columnid)) : null;
+      let cleanRows = rows;
+      if (dedupeTables.has(table)) {
+        const seen = new Set<string>();
+        cleanRows = rows.filter((r: any) => {
+          if (!r || typeof r !== 'object') return false;
+          if (r.id === undefined || r.id === null || r.id === '') return true;
+          const k = String(r.id);
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+      }
       alasql(`DELETE FROM ${table}`);
-      for (const row of rows) {
+      for (const row of cleanRows) {
         if (!row || typeof row !== 'object') continue;
-        const keys = Object.keys(row);
+        const keys = Object.keys(row).filter(k => !validColSet || validColSet.has(k));
         if (keys.length === 0) continue;
         const placeholders = keys.map(() => '?').join(', ');
+        const quotedKeys = keys.map(k => '`' + k + '`').join(', ');
         const values = keys.map(k => row[k]);
-        alasql(`INSERT INTO ${table} (${keys.join(', ')}) VALUES (${placeholders})`, values);
+        alasql(`INSERT INTO ${table} (${quotedKeys}) VALUES (${placeholders})`, values);
       }
     } catch (err) {
       console.warn(`Failed rehydrating table ${table}:`, err);
@@ -506,6 +599,21 @@ function isLegacyPreseededSnapshot(recovered: Record<string, any[]>): boolean {
 
 function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<string, any[]> {
   const cleaned: Record<string, any[]> = { ...recovered };
+  const legacyStoreIds = new Set(['lusaka', 'kitwe', 'ndola', 'store_main']);
+  const legacyLaybyIds = new Set(['layby-1004', 'LBY-8082']);
+  const legacyInstallmentIds = new Set(['inst-001', 'inst-002', 'inst-54859']);
+  const legacyTxIds = new Set([
+    'tx-999', 'tx-1000',
+    'ledger_TXN-8801', 'ledger_TXN-8802', 'ledger_TXN-8803',
+    'ledger_TXN-8798', 'ledger_TXN-8799', 'ledger_TXN-8800',
+    'ledger_TXN-8795', 'ledger_TXN-8796', 'ledger_TXN-8797',
+    'TX_AUDIT_1792321282567_rn0mx'
+  ]);
+  const legacyOrderIds = new Set([
+    'TXN-8801', 'TXN-8802', 'TXN-8803', 'TXN-8798', 'TXN-8799', 'TXN-8800', 'TXN-8795', 'TXN-8796', 'TXN-8797'
+  ]);
+  const legacyLoanIds = new Set(['LOAN-001', 'LOAN-002']);
+
   if (Array.isArray(cleaned['businesses'])) {
     cleaned['businesses'] = cleaned['businesses'].filter(
       (b: any) => b?.id !== 'default_biz' && b?.email !== 'owner@pos.zm'
@@ -513,7 +621,19 @@ function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<stri
   }
   if (Array.isArray(cleaned['stores'])) {
     cleaned['stores'] = cleaned['stores'].filter(
-      (s: any) => s?.business_id !== 'default_biz' && !(['lusaka', 'kitwe', 'ndola'].includes(String(s?.id || '')) && !s?.business_id)
+      (s: any) =>
+        s?.business_id !== 'default_biz' &&
+        !legacyStoreIds.has(String(s?.id || '').toLowerCase())
+    );
+  }
+  const activeOrderIds = new Set(
+    (Array.isArray(cleaned['orders']) ? cleaned['orders'] : [])
+      .filter((o: any) => !legacyOrderIds.has(String(o?.id || '')))
+      .map((o: any) => String(o?.id || ''))
+  );
+  if (Array.isArray(cleaned['store_products'])) {
+    cleaned['store_products'] = cleaned['store_products'].filter(
+      (sp: any) => !legacyStoreIds.has(String(sp?.store_id || '').toLowerCase())
     );
   }
   if (Array.isArray(cleaned['products'])) {
@@ -531,6 +651,127 @@ function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<stri
     cleaned['staff'] = cleaned['staff'].filter(
       (st: any) => st?.business_id !== 'default_biz' && !['staff-101', 'staff-102', 'staff-103'].includes(String(st?.id || ''))
     );
+  }
+  if (Array.isArray(cleaned['orders'])) {
+    cleaned['orders'] = cleaned['orders'].filter(
+      (o: any) => !legacyOrderIds.has(String(o?.id || ''))
+    );
+  }
+  if (Array.isArray(cleaned['order_items'])) {
+    cleaned['order_items'] = cleaned['order_items'].filter(
+      (oi: any) => !legacyOrderIds.has(String(oi?.orderId || ''))
+    );
+  }
+  if (Array.isArray(cleaned['laybys'])) {
+    cleaned['laybys'] = cleaned['laybys'].filter(
+      (l: any) =>
+        !legacyLaybyIds.has(String(l?.id || '')) &&
+        !['Jane Carter', 'Marcus Brody'].includes(String(l?.customer_name || ''))
+    );
+  }
+  if (Array.isArray(cleaned['layby_installments'])) {
+    cleaned['layby_installments'] = cleaned['layby_installments'].filter(
+      (inst: any) =>
+        !legacyLaybyIds.has(String(inst?.layby_id || '')) &&
+        !legacyInstallmentIds.has(String(inst?.id || '')) &&
+        String(inst?.received_by || '') !== 'Alice Mwansa'
+    );
+  }
+  if (Array.isArray(cleaned['loans'])) {
+    cleaned['loans'] = cleaned['loans'].filter(
+      (l: any) => !legacyLoanIds.has(String(l?.id || '')) && String(l?.merchant_id || '') !== 'default_biz'
+    );
+  }
+  if (Array.isArray(cleaned['loan_amortization_schedule'])) {
+    cleaned['loan_amortization_schedule'] = cleaned['loan_amortization_schedule'].filter(
+      (a: any) => !legacyLoanIds.has(String(a?.loan_id || '')) && !String(a?.id || '').startsWith('AMORT-1-')
+    );
+  }
+  if (Array.isArray(cleaned['automated_deduction_logs'])) {
+    cleaned['automated_deduction_logs'] = cleaned['automated_deduction_logs'].filter(
+      (d: any) => !legacyLoanIds.has(String(d?.loan_id || '')) && !['DED-001', 'DED-002'].includes(String(d?.id || ''))
+    );
+  }
+  if (Array.isArray(cleaned['quotations'])) {
+    cleaned['quotations'] = cleaned['quotations'].filter(
+      (q: any) => String(q?.id || '') !== 'QT-1025'
+    );
+  }
+  if (Array.isArray(cleaned['double_entry_journal'])) {
+    cleaned['double_entry_journal'] = cleaned['double_entry_journal'].filter(
+      (j: any) =>
+        !legacyLaybyIds.has(String(j?.reference || '')) &&
+        !legacyOrderIds.has(String(j?.reference || '')) &&
+        String(j?.reference || '') !== 'OPEN-INV-01' &&
+        String(j?.id || '') !== 'JRN_LBY_INST_inst-54859' &&
+        String(j?.id || '') !== 'JRN_OPENING_INVENTORY_CAPITAL'
+    );
+  }
+  if (Array.isArray(cleaned['ledger_entries'])) {
+    cleaned['ledger_entries'] = cleaned['ledger_entries'].filter(
+      (le: any) =>
+        !['le-1', 'le-2', 'le-3', 'le-4', 'le-5', 'le-6'].includes(String(le?.id || '')) &&
+        !legacyTxIds.has(String(le?.transaction_id || '')) &&
+        !String(le?.id || '').includes('OPENING_INVENTORY_CAPITAL') &&
+        !String(le?.id || '').includes('inst-54859')
+    );
+  }
+  if (Array.isArray(cleaned['receipt_refund_ledger'])) {
+    cleaned['receipt_refund_ledger'] = cleaned['receipt_refund_ledger'].filter(
+      (r: any) =>
+        !legacyLaybyIds.has(String(r?.order_id || '')) &&
+        !legacyOrderIds.has(String(r?.order_id || '')) &&
+        !legacyStoreIds.has(String(r?.store_id || '').toLowerCase()) &&
+        String(r?.id || '') !== 'RCPT_LBY_inst-54859'
+    );
+  }
+  if (Array.isArray(cleaned['cash_flow_ledger'])) {
+    cleaned['cash_flow_ledger'] = cleaned['cash_flow_ledger'].filter(
+      (c: any) =>
+        !legacyLaybyIds.has(String(c?.reference_id || '')) &&
+        !legacyOrderIds.has(String(c?.reference_id || '')) &&
+        !legacyStoreIds.has(String(c?.store_id || '').toLowerCase()) &&
+        String(c?.id || '') !== 'CF_LBY_inst-54859'
+    );
+  }
+  if (Array.isArray(cleaned['payment_method_ledger'])) {
+    cleaned['payment_method_ledger'] = cleaned['payment_method_ledger'].filter(
+      (p: any) => !legacyStoreIds.has(String(p?.store_id || '').toLowerCase())
+    );
+  }
+  if (Array.isArray(cleaned['financial_statements_ledger'])) {
+    cleaned['financial_statements_ledger'] = cleaned['financial_statements_ledger'].filter(
+      (f: any) => !legacyStoreIds.has(String(f?.store_id || '').toLowerCase())
+    );
+  }
+  if (Array.isArray(cleaned['cash_ups'])) {
+    cleaned['cash_ups'] = cleaned['cash_ups'].filter(
+      (c: any) => !legacyStoreIds.has(String(c?.store_id || '').toLowerCase())
+    );
+  }
+  if (Array.isArray(cleaned['audit_logs'])) {
+    cleaned['audit_logs'] = cleaned['audit_logs'].filter(
+      (a: any) =>
+        String(a?.id || '') !== 'AUDIT_1792321282567_rn0mx' &&
+        !String(a?.details || '').includes('LBY-8082') &&
+        !legacyStoreIds.has(String(a?.store_id || '').toLowerCase())
+    );
+  }
+  if (Array.isArray(cleaned['transactions'])) {
+    cleaned['transactions'] = cleaned['transactions'].filter((tx: any) => {
+      const id = String(tx?.id || '');
+      const provRef = String(tx?.provider_reference || '');
+      const terminal = String(tx?.pos_terminal_id || '').toLowerCase();
+      if (legacyTxIds.has(id)) return false;
+      if (String(tx?.narration || '').includes('LBY-8082')) return false;
+      if (terminal.includes('pos-lusaka') || terminal.includes('pos-ndola') || terminal.includes('pos-kitwe')) {
+        return false;
+      }
+      if (id.startsWith('tx_txn-') && provRef && !activeOrderIds.has(provRef)) {
+        return false;
+      }
+      return true;
+    });
   }
   return cleaned;
 }
@@ -589,6 +830,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     runSql('DROP TABLE IF EXISTS cash_flow_ledger', 'Clean database: Drops old cash_flow_ledger');
     runSql('DROP TABLE IF EXISTS payment_method_ledger', 'Clean database: Drops old payment_method_ledger');
     runSql('DROP TABLE IF EXISTS financial_statements_ledger', 'Clean database: Drops old financial_statements_ledger');
+    runSql('DROP TABLE IF EXISTS payment_methods', 'Clean database: Drops old payment_methods');
 
     // Create Business Identity container (with billing address, tax & admin role metadata)
     runSql(`
@@ -603,10 +845,13 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         billing_city STRING,
         billing_country STRING,
         phone STRING,
+        billing_phone STRING,
+        billing_email STRING,
         tpin STRING,
         currency STRING,
         tax_rate NUMERIC,
-        role STRING
+        role STRING,
+        admin_role STRING
       )
     `, 'Multi-Business Schema: Create BUSINESSES table');
 
@@ -617,6 +862,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         business_id STRING,
         name STRING,
         location STRING,
+        phone STRING,
+        email STRING,
         allow_discounts INT,
         allow_refunds INT,
         allow_laybys INT,
@@ -661,7 +908,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         business_id STRING,
         is_service INT DEFAULT 0,
         batch_number STRING,
-        expiry_date STRING
+        expiry_date STRING,
+        item_cls_cd STRING,
+        tax_ty_cd STRING
       )
     `, 'Durable Schema: Create PRODUCTS table');
 
@@ -689,6 +938,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         discount NUMERIC,
         total NUMERIC,
         paymentMethod STRING,
+        split_cash NUMERIC,
+        split_momo NUMERIC,
         status STRING,
         store_id STRING,
         performed_by STRING
@@ -794,6 +1045,11 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
   runSql(`
     CREATE TABLE staff (
       id STRING PRIMARY KEY,
+      name STRING,
+      role STRING,
+      hourly_rate NUMERIC,
+      pin STRING,
+      store_id STRING,
       first_name STRING,
       surname STRING,
       contact STRING,
@@ -867,7 +1123,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       bank_account STRING,
       bank_branch STRING,
       status STRING,
-      created_at STRING
+      created_at STRING,
+      updated_at STRING,
+      extra_json STRING
     )
   `, 'Durable Schema: Create QUOTATIONS template table');
 
@@ -1101,6 +1359,53 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
   `, 'Durable Schema: Create PAYMENT_METHOD_LEDGER table');
 
   runSql(`
+    CREATE TABLE payment_methods (
+      id STRING PRIMARY KEY,
+      name STRING,
+      category STRING,
+      account_id STRING,
+      is_active INT,
+      created_by STRING,
+      created_at STRING
+    )
+  `, 'Durable Schema: Create PAYMENT_METHODS custom payment channels table');
+
+  runSql(`
+    CREATE TABLE zra_invoices (
+      id STRING PRIMARY KEY,
+      order_id STRING,
+      status STRING,
+      tpin STRING,
+      bhf_id STRING,
+      sdc_id STRING,
+      mrc_no STRING,
+      rcpt_no INT,
+      cis_invc_no STRING,
+      intrl_data STRING,
+      rcpt_sign STRING,
+      qr_code_url STRING,
+      vsdc_date STRING,
+      payload_json STRING,
+      record_json STRING,
+      created_at STRING,
+      updated_at STRING
+    )
+  `, 'Durable Schema: Create ZRA_INVOICES fiscal audit table');
+
+  runSql(`
+    CREATE TABLE zra_sync_queue (
+      id STRING PRIMARY KEY,
+      order_id STRING,
+      endpoint STRING,
+      payload_json STRING,
+      sale_json STRING,
+      retry_count INT,
+      last_error STRING,
+      created_at STRING
+    )
+  `, 'Durable Schema: Create ZRA_SYNC_QUEUE offline retry table');
+
+  runSql(`
     CREATE TABLE financial_statements_ledger (
       id STRING PRIMARY KEY,
       store_id STRING,
@@ -1255,12 +1560,21 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
 function seedChartOfAccountsOnly() {
   const accountsToSeed = [
     { id: 'acc_cash', name: 'Cash Account (Counter Drawer)', type: 'ASSET', cur: 'ZMW' },
-    { id: 'acc_momo', name: 'Mobile Wallet Account (MTN/Airtel/Zamtel)', type: 'ASSET', cur: 'ZMW' },
-    { id: 'acc_bank', name: 'Commercial Bank Account', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_airtel', name: 'Airtel Money Account', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_mtn', name: 'MTN Mobile Money Account', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_momo', name: 'Mobile Wallet Account (General)', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_bank', name: 'Commercial Bank & Card Settlement Account', type: 'ASSET', cur: 'ZMW' },
     { id: 'acc_transit', name: 'Goods in Transit Asset', type: 'ASSET', cur: 'ZMW' },
-    { id: 'acc_inventory', name: 'Store Merchandise Inventory', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_inventory', name: 'Store Merchandise Inventory Asset', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_fixed_assets', name: 'Fixed Equipment & Property Assets', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_vat_payable', name: 'VAT / Tax Output Payable (ZRA)', type: 'LIABILITY', cur: 'ZMW' },
+    { id: 'acc_layby_deposits', name: 'Customer Layby Unearned Deposits', type: 'LIABILITY', cur: 'ZMW' },
+    { id: 'acc_loans_payable', name: 'Working Capital Loans Payable', type: 'LIABILITY', cur: 'ZMW' },
     { id: 'acc_sales_revenue', name: 'Gross Sales Revenue', type: 'REVENUE', cur: 'ZMW' },
+    { id: 'acc_sales_returns', name: 'Sales Returns, Refunds & Allowances', type: 'EXPENSE', cur: 'ZMW' },
+    { id: 'acc_sales_discounts', name: 'Sales Discounts Allowed', type: 'EXPENSE', cur: 'ZMW' },
     { id: 'acc_retained_earnings', name: 'Owner Equity & Retained Earnings', type: 'EQUITY', cur: 'ZMW' },
+    { id: 'acc_owner_capital', name: 'Owner Paid-In Capital Equity', type: 'EQUITY', cur: 'ZMW' },
     { id: 'acc_cost_of_goods', name: 'Cost of Goods Sold (COGS)', type: 'EXPENSE', cur: 'ZMW' },
     { id: 'acc_exp_rent', name: 'Rent & Premises Expense', type: 'EXPENSE', cur: 'ZMW' },
     { id: 'acc_exp_utilities', name: 'Utilities Expense (Power/Water/Internet)', type: 'EXPENSE', cur: 'ZMW' },
@@ -1350,15 +1664,7 @@ function seedTemplateData(template: SeedTemplate) {
     )
   `, 'Seed Data: Insert default business profile');
 
-  runSql(`
-    INSERT INTO stores VALUES ('lusaka', 'default_biz', 'Lusaka Main Office', 'Lusaka', 1, 1, 1, 0, 'weekly')
-  `, 'Seed Data: Insert store Lusaka');
-  runSql(`
-    INSERT INTO stores VALUES ('kitwe', 'default_biz', 'Kitwe Regional Yard', 'Kitwe', 1, 1, 1, 0, 'monthly')
-  `, 'Seed Data: Insert store Kitwe');
-  runSql(`
-    INSERT INTO stores VALUES ('ndola', 'default_biz', 'Ndola Branch Station', 'Ndola', 0, 0, 1, 1, 'quarterly')
-  `, 'Seed Data: Insert store Ndola');
+  // Do not create any branch in advance; branches are only created by the user in the central stores table
 
   customersToInsert.forEach(c => {
     runSql(
@@ -1377,7 +1683,9 @@ function seedTemplateData(template: SeedTemplate) {
   // Seed double entry accounts in both ledger sandbox mode and as empty shells in standard shop layouts
   const accountsToSeed = [
     { id: 'acc_cash', name: 'Cash Account (Counter Drawer)', type: 'ASSET', cur: 'ZMW' },
-    { id: 'acc_momo', name: 'Mobile Wallet Account (MTN/Airtel/Zamtel)', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_airtel', name: 'Airtel Money Account', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_mtn', name: 'MTN Mobile Money Account', type: 'ASSET', cur: 'ZMW' },
+    { id: 'acc_momo', name: 'Mobile Wallet Account (General)', type: 'ASSET', cur: 'ZMW' },
     { id: 'acc_bank', name: 'Commercial Bank Account', type: 'ASSET', cur: 'ZMW' },
     { id: 'acc_transit', name: 'Goods in Transit Asset', type: 'ASSET', cur: 'ZMW' },
     { id: 'acc_inventory', name: 'Store Merchandise Inventory', type: 'ASSET', cur: 'ZMW' },
@@ -1412,231 +1720,7 @@ function seedTemplateData(template: SeedTemplate) {
     );
   });
 
-  // Seed sample initial transactions if in full ledger database template mode
-  if (template === 'ledger') {
-    // Inject initial transaction balancing ledger
-    runSql(
-      `INSERT INTO transactions VALUES ('tx-999', 'unique-uuid-from-pos-12345', 'POS-LUSAKA-01', 'MTN_MOMO', 'MTN-REF-88771', 1000.0000, 10.0000, 'SUCCESS', 'Payment via MTN MoMo at Counter 1', '2026-06-07T11:30:00Z', '2026-06-07T11:30:00Z', 'owner')`,
-      `Seed Double Entry: Initial MTN MoMo Transaction`
-    );
-    runSql(
-      `INSERT INTO ledger_entries VALUES ('le-1', 'tx-999', 'mtn-clearing-account-uuid', 'DEBIT', 1000.0000)`,
-      `Seed Ledger: Debit MTN Cash Asset Account`
-    );
-    runSql(
-      `INSERT INTO ledger_entries VALUES ('le-2', 'tx-999', 'merchant-wallet-account-uuid', 'CREDIT', 990.0000)`,
-      `Seed Ledger: Credit Merchant Settled Wallets`
-    );
-    runSql(
-      `INSERT INTO ledger_entries VALUES ('le-3', 'tx-999', 'platform-revenue-account-uuid', 'CREDIT', 10.0000)`,
-      `Seed Ledger: Credit Platform Fees Revenues`
-    );
-
-    // Another sample entry for Airtel Kwacha MoMo check
-    runSql(
-      `INSERT INTO transactions VALUES ('tx-1000', 'unique-uuid-from-pos-zambia-airtel', 'POS-LUSAKA-02', 'AIRTEL_MONEY', 'AIRTEL-REF-33422', 450.0000, 4.5000, 'SUCCESS', 'Airtel MoMo checkout ticket', '2026-06-07T12:15:00Z', '2026-06-07T12:15:00Z', 'owner')`,
-      `Seed Double Entry: Airtel MoMo transaction`
-    );
-    runSql(
-      `INSERT INTO ledger_entries VALUES ('le-4', 'tx-1000', 'airtel-clearing-account-uuid', 'DEBIT', 450.00) `,
-      `Seed Ledger: Debit Airtel Money`
-    );
-    runSql(
-      `INSERT INTO ledger_entries VALUES ('le-5', 'tx-1000', 'merchant-wallet-account-uuid', 'CREDIT', 445.50) `,
-      `Seed Ledger: Credit Merchant Wallet`
-    );
-    runSql(
-      `INSERT INTO ledger_entries VALUES ('le-6', 'tx-1000', 'platform-revenue-account-uuid', 'CREDIT', 4.50) `,
-      `Seed Ledger: Credit Processing Fee Account`
-    );
-  }
-
-  // Seed general POS invoice orders
-  seedHistoricalOrders();
-
-  // ==========================================
-  // SEED EXTRA SME RETAIL TABLES
-  // ==========================================
-  
-  // Seed store_products for multiple branches: 'lusaka', 'kitwe', 'ndola'
-  const branches = ['lusaka', 'kitwe', 'ndola'];
-  productsToInsert.forEach((p) => {
-    branches.forEach((bCode) => {
-      const multiplierPrice = bCode === 'lusaka' ? 1.0 : bCode === 'kitwe' ? 0.95 : 1.08;
-      const baseStock = bCode === 'lusaka' ? 80 : bCode === 'kitwe' ? 45 : 30;
-      const targetPrice = parseFloat((p.price * multiplierPrice).toFixed(2));
-      const targetStock = Math.round(baseStock + (p.id * 5));
-      runSql(
-        `INSERT INTO store_products VALUES ('sp_${p.id}_${bCode}', ${p.id}, '${bCode}', ${targetStock}, ${targetPrice})`,
-        `Seed Stock: Product #${p.id} stock/price in branch ${bCode}`
-      );
-    });
-  });
-
-  // Seed default layby contract and initial payments
-  runSql(`
-    INSERT INTO laybys VALUES (
-      'layby-1004',
-      101,
-      'Jane Carter',
-      '+1 (555) 012-4466',
-      'jane.carter@outlook.com',
-      300.00,
-      100.00,
-      150.00,
-      150.00,
-      'PENDING',
-      '[{"id":6,"name":"Almond Butter Croissant","quantity":10,"unitPrice":4.75},{"id":8,"name":"Gourmet Club Sandwich","quantity":24,"unitPrice":10.50}]',
-      '2026-06-05T09:00:00Z',
-      'lusaka'
-    )
-  `, 'Seed Laybys: Jane Carter item contract');
-
-  runSql(`
-    INSERT INTO layby_installments VALUES (
-      'inst-001',
-      'layby-1004',
-      100.00,
-      'Cash',
-      'Alice Mwansa',
-      '2026-06-05T09:05:00Z'
-    )
-  `, 'Seed Installments: Record first downpayment');
-
-  runSql(`
-    INSERT INTO layby_installments VALUES (
-      'inst-002',
-      'layby-1004',
-      50.00,
-      'Airtel Money',
-      'Alice Mwansa',
-      '2026-06-06T14:30:00Z'
-    )
-  `, 'Seed Installments: Record installment payment #2');
-
-  // Seed sample ready quotations
-  runSql(`
-    INSERT INTO quotations VALUES (
-      'QT-1025',
-      'Daka Construction Ltd',
-      '+260 977 123456',
-      'info@dakaconstruct.zm',
-      '[{"name":"Double Espresso Shot","quantity":100,"unitPrice":3.50},{"name":"Classic Cappuccino","quantity":150,"unitPrice":4.50},{"name":"Gourmet Club Sandwich","quantity":50,"unitPrice":10.50}]',
-      1550.00,
-      232.50,
-      82.50,
-      1700.00,
-      'Zambia National Commercial Bank (Zanaco)',
-      '1020088991102',
-      'Lusaka Commercial Branch',
-      'QUOTATION',
-      '2026-06-07T08:50:00Z'
-    )
-  `, 'Seed Quotes: Daka corporate coffee catering');
-
-  // Seed Loans, schedules and simulated background logs
-  runSql(`
-    INSERT INTO loans VALUES (
-      'LOAN-001',
-      'default_biz',
-      'acc_operating',
-      10000.00,
-      1200.00,
-      11200.00,
-      10.00,
-      'ACTIVE',
-      '2026-06-01T10:00:00Z',
-      '2026-09-01T10:00:00Z',
-      '2026-06-01T10:00:00Z',
-      '2026-06-01T10:00:00Z'
-    )
-  `, 'Seed: Active loan for SME financing');
-
-  runSql(`
-    INSERT INTO loans VALUES (
-      'LOAN-002',
-      'default_biz',
-      'acc_operating',
-      25000.00,
-      3000.00,
-      28000.00,
-      15.00,
-      'PENDING_REVIEW',
-      NULL,
-      '2026-12-07T12:00:00Z',
-      '2026-06-07T14:00:00Z',
-      '2026-06-07T14:00:00Z'
-    )
-  `, 'Seed: Pending loan extension file');
-
-  runSql(`
-    INSERT INTO loan_amortization_schedule VALUES (
-      'AMORT-1-1',
-      'LOAN-001',
-      1,
-      3333.33,
-      400.00,
-      3733.33,
-      3733.33,
-      1,
-      '2026-07-01T10:00:00Z',
-      '2026-06-05T15:30:00Z'
-    )
-  `, 'Seed Milestone 1: Settled');
-
-  runSql(`
-    INSERT INTO loan_amortization_schedule VALUES (
-      'AMORT-1-2',
-      'LOAN-001',
-      2,
-      3333.33,
-      400.00,
-      3733.33,
-      1200.00,
-      0,
-      '2026-08-01T10:00:00Z',
-      NULL
-    )
-  `, 'Seed Milestone 2: Partially Paid');
-
-  runSql(`
-    INSERT INTO loan_amortization_schedule VALUES (
-      'AMORT-1-3',
-      'LOAN-001',
-      3,
-      3333.34,
-      400.00,
-      3733.34,
-      0.00,
-      0,
-      '2026-09-01T10:00:00Z',
-      NULL
-    )
-  `, 'Seed Milestone 3: Unpaid');
-
-  runSql(`
-    INSERT INTO automated_deduction_logs VALUES (
-      'DED-001',
-      'LOAN-001',
-      'TXN-QS-774122',
-      150.00,
-      'SUCCESS',
-      NULL,
-      '2026-06-02T16:45:00Z'
-    )
-  `, 'Seed Sweep: Recorded $150 repayment slice');
-
-  runSql(`
-    INSERT INTO automated_deduction_logs VALUES (
-      'DED-002',
-      'LOAN-001',
-      'TXN-QS-903120',
-      210.00,
-      'SUCCESS',
-      NULL,
-      '2026-06-04T11:15:00Z'
-    )
-  `, 'Seed Sweep: Recorded $210 split deduction on order checkout');
+  // Double-entry journal, ledger_entries, transactions, loans, and schedules always start with zero pre-seeded amounts.
 
   // Seed staff members so user accounts and staff management are ready out of the box
   runSql(`
@@ -1762,6 +1846,53 @@ export function upsertCustomerSync(data: CustomerSyncData): any {
 }
 
 // ==========================================
+// ==========================================
+// CENTRAL BRANCHES DATABASE ACCESSOR (SINGLE SOURCE OF TRUTH)
+// ==========================================
+export function getCentralBranches(businessId?: string): Array<{
+  id: string;
+  business_id?: string;
+  name: string;
+  location?: string;
+  phone?: string;
+  email?: string;
+  allow_discounts?: number;
+  allow_refunds?: number;
+  allow_laybys?: number;
+  require_manager_discount?: number;
+  stocktake_frequency?: string;
+}> {
+  try {
+    let targetBizId = businessId;
+    if (!targetBizId && typeof localStorage !== 'undefined') {
+      try {
+        const savedBiz = localStorage.getItem('active_business_profile');
+        if (savedBiz) {
+          const parsed = JSON.parse(savedBiz);
+          if (parsed && parsed.id) targetBizId = parsed.id;
+        }
+      } catch {}
+    }
+    const allRes = runSql('SELECT * FROM stores', 'Central Branches DB: Fetch all configured branches', true);
+    const rawStores = (allRes.success && Array.isArray(allRes.data)) ? allRes.data : [];
+    const seenStoreIds = new Set<string>();
+    const allStores = rawStores.filter((s: any) => {
+      const id = String(s?.id || '');
+      if (!id || seenStoreIds.has(id)) return false;
+      seenStoreIds.add(id);
+      return true;
+    });
+    if (targetBizId) {
+      const bizStores = allStores.filter((s: any) => s.business_id === targetBizId);
+      if (bizStores.length > 0) return bizStores;
+    }
+    return allStores;
+  } catch {
+    return [];
+  }
+}
+
+// ==========================================
 // CENTRALIZED EMPLOYEE AUDIT TRAIL LOGGING
 // ==========================================
 export function logEmployeeAudit(
@@ -1776,7 +1907,8 @@ export function logEmployeeAudit(
     const id = `AUDIT_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const nowStr = new Date().toISOString();
     const user = performedBy || localStorage.getItem('logged_in_user_name') || localStorage.getItem('logged_in_user_email') || 'Staff Operator';
-    const store = storeId || localStorage.getItem('pos_active_store') || 'lusaka';
+    const centralFirst = getCentralBranches()[0]?.id || '';
+    const store = storeId || localStorage.getItem('active_store_branch') || localStorage.getItem('pos_active_store') || centralFirst;
     const cleanAction = (action || '').replace(/'/g, "''");
     const cleanDetails = (details || '').replace(/'/g, "''");
     const cleanUser = (user || '').replace(/'/g, "''");
@@ -1812,31 +1944,335 @@ export function logEmployeeAudit(
 // ============================================================================
 let isAccountingSyncRunning = false;
 
+function readSettingsCustomPaymentMethods(): CustomPaymentMethod[] {
+  try {
+    if (typeof localStorage === 'undefined') return [];
+    const raw = localStorage.getItem('android_pos_settings');
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.customPaymentMethods) ? parsed.customPaymentMethods : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeSettingsCustomPaymentMethods(methods: CustomPaymentMethod[]) {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const raw = localStorage.getItem('android_pos_settings');
+    const parsed = raw ? JSON.parse(raw) : {};
+    parsed.customPaymentMethods = methods;
+    localStorage.setItem('android_pos_settings', JSON.stringify(parsed));
+  } catch {}
+}
+
+export function getCustomPaymentMethods(includeInactive: boolean = false): CustomPaymentMethod[] {
+  const mergedMap = new Map<string, CustomPaymentMethod>();
+  if (alasql?.tables?.payment_methods) {
+    try {
+      const rows = alasql('SELECT * FROM payment_methods') as any[];
+      if (Array.isArray(rows)) {
+        rows.forEach((r: any) => {
+          if (!r || !r.name) return;
+          const id = String(r.id || `pm_${String(r.name).toLowerCase().replace(/[^a-z0-9]+/g, '_')}`);
+          mergedMap.set(id, {
+            id,
+            name: String(r.name),
+            category: (r.category || 'Other') as CustomPaymentMethod['category'],
+            accountId: String(r.account_id || `acc_pm_${String(r.name).toLowerCase().replace(/[^a-z0-9]+/g, '_')}`),
+            isActive: Number(r.is_active ?? 1) === 1,
+            createdAt: String(r.created_at || ''),
+            createdBy: r.created_by ? String(r.created_by) : undefined,
+          });
+        });
+      }
+    } catch {}
+  }
+
+  for (const sm of readSettingsCustomPaymentMethods()) {
+    if (!sm || !sm.name) continue;
+    if (!mergedMap.has(sm.id)) {
+      mergedMap.set(sm.id, sm);
+    }
+  }
+
+  const all = Array.from(mergedMap.values());
+  return includeInactive ? all : all.filter(m => m.isActive);
+}
+
+export function saveCustomPaymentMethod(
+  name: string,
+  category: CustomPaymentMethod['category'],
+  createdBy: string = 'Admin'
+): { success: boolean; method?: CustomPaymentMethod; error?: string } {
+  const cleanName = name.trim();
+  if (!cleanName) {
+    return { success: false, error: 'Payment method name is required.' };
+  }
+
+  const builtInLower = new Set([
+    'cash',
+    'airtel',
+    'airtel money',
+    'mtn',
+    'mtn money',
+    'mtn mobile money',
+    'credit card',
+    'credit card / bank',
+    'bank / card',
+    'split',
+    'mobile wallet',
+  ]);
+  if (builtInLower.has(cleanName.toLowerCase())) {
+    return { success: false, error: `"${cleanName}" is already a built-in payment channel.` };
+  }
+
+  const existing = getCustomPaymentMethods(true);
+  if (existing.some(m => m.name.toLowerCase() === cleanName.toLowerCase())) {
+    return { success: false, error: `Payment method "${cleanName}" already exists.` };
+  }
+
+  const slug = cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'custom';
+  let accountId = `acc_pm_${slug}`;
+  if (existing.some(m => m.accountId === accountId)) {
+    accountId = `acc_pm_${slug}_${Date.now().toString().slice(-4)}`;
+  }
+  const id = `pm_${slug}_${Math.floor(100 + Math.random() * 900)}`;
+  const nowIso = new Date().toISOString();
+
+  const newMethod: CustomPaymentMethod = {
+    id,
+    name: cleanName,
+    category,
+    accountId,
+    isActive: true,
+    createdAt: nowIso,
+    createdBy,
+  };
+
+  runSql(
+    `CREATE TABLE IF NOT EXISTS payment_methods (
+      id STRING PRIMARY KEY, name STRING, category STRING, account_id STRING,
+      is_active INT, created_by STRING, created_at STRING
+    )`,
+    'Ensure payment_methods table',
+    true
+  );
+
+  runSql(
+    `INSERT INTO payment_methods (id, name, category, account_id, is_active, created_by, created_at)
+     VALUES ('${id}', '${cleanName.replace(/'/g, "''")}', '${category.replace(/'/g, "''")}', '${accountId}', 1, '${createdBy.replace(/'/g, "''")}', '${nowIso}')`,
+    `Admin: Create custom payment method [${cleanName}]`
+  );
+
+  const accRes = runSql(`SELECT id FROM accounts WHERE id = '${accountId}'`, 'Check custom payment account', true);
+  if (!accRes.success || !Array.isArray(accRes.data) || accRes.data.length === 0) {
+    runSql(
+      `INSERT INTO accounts VALUES ('${accountId}', '${cleanName.replace(/'/g, "''")} (${category})', 'ASSET', 'ZMW', 'default_biz', '${nowIso}', '${nowIso}')`,
+      `Chart of Accounts: Register [${cleanName}]`,
+      true
+    );
+  }
+
+  writeSettingsCustomPaymentMethods([...existing, newMethod]);
+  syncAllAccountingSystems(`Created Payment Method: ${cleanName}`);
+  persistTablesToStorage();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('pos_data_updated'));
+  }
+  return { success: true, method: newMethod };
+}
+
+export function toggleCustomPaymentMethod(id: string, isActive: boolean): CustomPaymentMethod[] {
+  runSql(
+    `UPDATE payment_methods SET is_active = ${isActive ? 1 : 0} WHERE id = '${id.replace(/'/g, "''")}'`,
+    `Admin: Toggle custom payment method ${id}`
+  );
+  const updated = getCustomPaymentMethods(true).map(m => (m.id === id ? { ...m, isActive } : m));
+  writeSettingsCustomPaymentMethods(updated);
+  syncAllAccountingSystems('Payment Method Toggled');
+  persistTablesToStorage();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('pos_data_updated'));
+  }
+  return updated;
+}
+
+export function deleteCustomPaymentMethod(id: string): CustomPaymentMethod[] {
+  runSql(
+    `DELETE FROM payment_methods WHERE id = '${id.replace(/'/g, "''")}'`,
+    `Admin: Remove custom payment method ${id}`
+  );
+  const updated = getCustomPaymentMethods(true).filter(m => m.id !== id);
+  writeSettingsCustomPaymentMethods(updated);
+  syncAllAccountingSystems('Payment Method Removed');
+  persistTablesToStorage();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('pos_data_updated'));
+  }
+  return updated;
+}
+
+export function getMobileMoneyOptions(): Array<{
+  name: string;
+  accountId: string;
+  clearingAccountId: string;
+  channel: string;
+  isCustom: boolean;
+}> {
+  const builtIn = [
+    {
+      name: 'Airtel Money',
+      accountId: 'acc_airtel',
+      clearingAccountId: 'airtel-clearing-account-uuid',
+      channel: 'AIRTEL_MONEY',
+      isCustom: false,
+    },
+    {
+      name: 'MTN Mobile Money',
+      accountId: 'acc_mtn',
+      clearingAccountId: 'mtn-clearing-account-uuid',
+      channel: 'MTN_MOMO',
+      isCustom: false,
+    },
+  ];
+  const customMomo = getCustomPaymentMethods(false)
+    .filter(m => m.category === 'Mobile Money')
+    .map(m => ({
+      name: m.name,
+      accountId: m.accountId,
+      clearingAccountId: 'mtn-clearing-account-uuid',
+      channel: `CUSTOM_${m.name.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`,
+      isCustom: true,
+    }));
+  return [...builtIn, ...customMomo];
+}
+
+export function getAllSelectableAccounts(): Array<{
+  accountId: string;
+  label: string;
+  category: string;
+  isCustom: boolean;
+}> {
+  const base = [
+    { accountId: 'acc_cash', label: 'Cash Drawer Account', category: 'Cash', isCustom: false },
+    { accountId: 'acc_airtel', label: 'Airtel Money Account', category: 'Mobile Money', isCustom: false },
+    { accountId: 'acc_mtn', label: 'MTN Mobile Money Account', category: 'Mobile Money', isCustom: false },
+    { accountId: 'acc_bank', label: 'Commercial Bank Account', category: 'Bank / Card', isCustom: false },
+  ];
+  const custom = getCustomPaymentMethods(false).map(m => ({
+    accountId: m.accountId,
+    label: `${m.name} (${m.category})`,
+    category: m.category,
+    isCustom: true,
+  }));
+  return [...base, ...custom];
+}
+
 export function resolvePaymentMethodBucket(rawMethod: any): {
-  bucket: 'Cash' | 'MTN Mobile Money' | 'Airtel Money' | 'Zamtel Kwacha' | 'Mobile Wallet' | 'Credit Card / Bank' | 'Split';
+  bucket: string;
+  accountId: string;
+  clearingAccountId: string;
+  category: 'Cash' | 'Mobile Money' | 'Bank / Card' | 'Split' | 'Other';
+} {
+  const raw = String(rawMethod || 'Cash').trim();
+  const m = raw.toLowerCase();
+
+  if (m === 'split' || m.includes('split')) {
+    return { bucket: 'Split', accountId: 'acc_cash', clearingAccountId: 'cash-clearing-account-uuid', category: 'Split' };
+  }
+
+  // Match Admin-created custom payment methods first (active or historical)
+  const customMethods = getCustomPaymentMethods(true);
+  const customMatch = customMethods.find(
+    cm => cm.name.toLowerCase() === m || cm.accountId.toLowerCase() === m
+  );
+  if (customMatch) {
+    const clr =
+      customMatch.category === 'Cash'
+        ? 'cash-clearing-account-uuid'
+        : customMatch.category === 'Bank / Card'
+          ? 'airtel-clearing-account-uuid'
+          : 'mtn-clearing-account-uuid';
+    return {
+      bucket: customMatch.name,
+      accountId: customMatch.accountId,
+      clearingAccountId: clr,
+      category: customMatch.category,
+    };
+  }
+
+  if (m.includes('mtn') || m === 'acc_mtn') {
+    return { bucket: 'MTN Mobile Money', accountId: 'acc_mtn', clearingAccountId: 'mtn-clearing-account-uuid', category: 'Mobile Money' };
+  }
+  if (m.includes('airtel') || m === 'acc_airtel') {
+    return { bucket: 'Airtel Money', accountId: 'acc_airtel', clearingAccountId: 'airtel-clearing-account-uuid', category: 'Mobile Money' };
+  }
+  if (m.includes('mobile') || m.includes('momo') || m.includes('wallet') || m === 'acc_momo') {
+    return { bucket: 'Mobile Wallet', accountId: 'acc_momo', clearingAccountId: 'mtn-clearing-account-uuid', category: 'Mobile Money' };
+  }
+  if (m.includes('card') || m.includes('credit') || m.includes('visa') || m.includes('bank') || m.includes('pos') || m.includes('transfer') || m.includes('cheque') || m === 'acc_bank') {
+    return { bucket: 'Credit Card / Bank', accountId: 'acc_bank', clearingAccountId: 'airtel-clearing-account-uuid', category: 'Bank / Card' };
+  }
+  if (m === 'cash' || m === 'acc_cash' || !m) {
+    return { bucket: 'Cash', accountId: 'acc_cash', clearingAccountId: 'cash-clearing-account-uuid', category: 'Cash' };
+  }
+
+  // Preserve custom string from historical/adhoc method names
+  return { bucket: raw, accountId: 'acc_bank', clearingAccountId: 'airtel-clearing-account-uuid', category: 'Other' };
+}
+
+export function resolveSplitMobileProvider(
+  rawMethod: any,
+  txEntries?: Array<{ account_id?: string; type?: string }>
+): {
+  bucket: string;
   accountId: string;
   clearingAccountId: string;
 } {
-  const m = String(rawMethod || 'Cash').trim().toLowerCase();
-  if (m === 'split' || m.includes('split')) {
-    return { bucket: 'Split', accountId: 'acc_cash', clearingAccountId: 'cash-clearing-account-uuid' };
+  const raw = String(rawMethod || '');
+  const plusIdx = raw.indexOf('+');
+  if (plusIdx !== -1) {
+    const providerRaw = raw.slice(plusIdx + 1).replace(/\)+$/, '').trim();
+    if (providerRaw && !providerRaw.toLowerCase().includes('split')) {
+      const resolved = resolvePaymentMethodBucket(providerRaw);
+      if (resolved.bucket !== 'Cash' && resolved.bucket !== 'Split') {
+        return {
+          bucket: resolved.bucket,
+          accountId: resolved.accountId,
+          clearingAccountId: resolved.clearingAccountId,
+        };
+      }
+    }
+  }
+
+  const m = raw.toLowerCase();
+  if (m.includes('airtel')) {
+    return { bucket: 'Airtel Money', accountId: 'acc_airtel', clearingAccountId: 'airtel-clearing-account-uuid' };
   }
   if (m.includes('mtn')) {
-    return { bucket: 'MTN Mobile Money', accountId: 'acc_momo', clearingAccountId: 'mtn-clearing-account-uuid' };
+    return { bucket: 'MTN Mobile Money', accountId: 'acc_mtn', clearingAccountId: 'mtn-clearing-account-uuid' };
   }
-  if (m.includes('airtel')) {
-    return { bucket: 'Airtel Money', accountId: 'acc_momo', clearingAccountId: 'airtel-clearing-account-uuid' };
+
+  if (Array.isArray(txEntries)) {
+    const debits = txEntries.filter(le => le.type === 'DEBIT');
+    for (const le of debits) {
+      if (le.account_id === 'acc_airtel' || le.account_id === 'airtel-clearing-account-uuid') {
+        return { bucket: 'Airtel Money', accountId: 'acc_airtel', clearingAccountId: 'airtel-clearing-account-uuid' };
+      }
+      if (le.account_id === 'acc_mtn' || le.account_id === 'mtn-clearing-account-uuid') {
+        return { bucket: 'MTN Mobile Money', accountId: 'acc_mtn', clearingAccountId: 'mtn-clearing-account-uuid' };
+      }
+      if (String(le.account_id || '').startsWith('acc_pm_')) {
+        const cm = getCustomPaymentMethods(true).find(c => c.accountId === le.account_id);
+        if (cm) {
+          return { bucket: cm.name, accountId: cm.accountId, clearingAccountId: 'mtn-clearing-account-uuid' };
+        }
+      }
+    }
   }
-  if (m.includes('zamtel')) {
-    return { bucket: 'Zamtel Kwacha', accountId: 'acc_momo', clearingAccountId: 'mtn-clearing-account-uuid' };
-  }
-  if (m.includes('mobile') || m.includes('momo') || m.includes('wallet')) {
-    return { bucket: 'Mobile Wallet', accountId: 'acc_momo', clearingAccountId: 'mtn-clearing-account-uuid' };
-  }
-  if (m.includes('card') || m.includes('credit') || m.includes('visa') || m.includes('bank') || m.includes('pos') || m.includes('transfer') || m.includes('cheque')) {
-    return { bucket: 'Credit Card / Bank', accountId: 'acc_bank', clearingAccountId: 'airtel-clearing-account-uuid' };
-  }
-  return { bucket: 'Cash', accountId: 'acc_cash', clearingAccountId: 'cash-clearing-account-uuid' };
+
+  return { bucket: 'Airtel Money', accountId: 'acc_airtel', clearingAccountId: 'airtel-clearing-account-uuid' };
 }
 
 export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS Sale Accounting Sync') {
@@ -1845,7 +2281,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
 
   try {
     const nowIso = new Date().toISOString();
-    const todayDate = nowIso.split('T')[0];
+    const todayDate = toLocalDateKey();
 
     // 0. Ensure all required tables exist (in case recovered from older schema)
     const ensureTables = [
@@ -1882,19 +2318,43 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       `CREATE TABLE IF NOT EXISTS double_entry_journal (
         id STRING PRIMARY KEY, date STRING, reference STRING, description STRING,
         account_debit STRING, account_credit STRING, amount NUMERIC, currency STRING
+      )`,
+      `CREATE TABLE IF NOT EXISTS payment_methods (
+        id STRING PRIMARY KEY, name STRING, category STRING, account_id STRING,
+        is_active INT, created_by STRING, created_at STRING
       )`
     ];
     for (const ddl of ensureTables) {
       runSql(ddl, 'Ensure accounting table', true);
     }
 
+    // Sync any custom payment methods from settings into payment_methods table
+    const settingsCustom = readSettingsCustomPaymentMethods();
+    const existingPmRes = runSql('SELECT id FROM payment_methods', 'Check payment_methods', true);
+    const existingPmIds = new Set(
+      existingPmRes.success && Array.isArray(existingPmRes.data)
+        ? existingPmRes.data.map((r: any) => String(r.id))
+        : []
+    );
+    for (const cm of settingsCustom) {
+      if (cm && cm.id && !existingPmIds.has(cm.id)) {
+        runSql(
+          `INSERT INTO payment_methods (id, name, category, account_id, is_active, created_by, created_at)
+           VALUES ('${cm.id.replace(/'/g, "''")}', '${cm.name.replace(/'/g, "''")}', '${cm.category.replace(/'/g, "''")}', '${cm.accountId.replace(/'/g, "''")}', ${cm.isActive ? 1 : 0}, '${(cm.createdBy || 'Admin').replace(/'/g, "''")}', '${cm.createdAt || nowIso}')`,
+          `Sync custom payment method [${cm.name}]`,
+          true
+        );
+      }
+    }
+
+    const allCustomMethods = getCustomPaymentMethods(true);
+
     // 1. Ensure Complete Chart of Accounts in `accounts`
     const requiredAccounts = [
       { id: 'acc_cash', name: 'Cash Account (Counter Drawer)', type: 'ASSET', cur: 'ZMW' },
-      { id: 'acc_momo', name: 'Mobile Wallet Account (MTN/Airtel/Zamtel)', type: 'ASSET', cur: 'ZMW' },
-      { id: 'acc_mtn', name: 'MTN Mobile Money Account', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_airtel', name: 'Airtel Money Account', type: 'ASSET', cur: 'ZMW' },
-      { id: 'acc_zamtel', name: 'Zamtel Kwacha Account', type: 'ASSET', cur: 'ZMW' },
+      { id: 'acc_mtn', name: 'MTN Mobile Money Account', type: 'ASSET', cur: 'ZMW' },
+      { id: 'acc_momo', name: 'Mobile Wallet Account (General)', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_bank', name: 'Commercial Bank & Card Settlement Account', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_inventory', name: 'Store Merchandise Inventory Asset', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_transit', name: 'Goods in Transit Asset', type: 'ASSET', cur: 'ZMW' },
@@ -1922,7 +2382,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       { id: 'airtel-clearing-account-uuid', name: 'Airtel Money Clearing Asset', type: 'ASSET', cur: 'ZMW' },
       { id: 'merchant-wallet-account-uuid', name: 'Merchant Settlement Wallet', type: 'LIABILITY', cur: 'ZMW' },
       { id: 'platform-revenue-account-uuid', name: 'Mobile Money Processor Fees', type: 'EXPENSE', cur: 'ZMW' },
-      { id: 'cash-clearing-account-uuid', name: 'Counter Cash Tender Registry', type: 'ASSET', cur: 'ZMW' }
+      { id: 'cash-clearing-account-uuid', name: 'Counter Cash Tender Registry', type: 'ASSET', cur: 'ZMW' },
+      ...allCustomMethods.map(cm => ({
+        id: cm.accountId,
+        name: `${cm.name} (${cm.category})`,
+        type: 'ASSET',
+        cur: 'ZMW',
+      })),
     ];
 
     const existingAccRes = runSql('SELECT id FROM accounts', 'Accounting Sync: Check accounts', true);
@@ -1939,6 +2405,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           `Accounting Sync: Ensure account ${acc.id}`,
           true
         );
+        existingAccIds.add(acc.id);
       }
     }
 
@@ -1996,22 +2463,98 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     const laybyMap = new Map<string, any>();
     laybys.forEach(l => laybyMap.set(String(l.id), l));
 
-    // Helper to resolve split payment breakdown for an order from ledger_entries if available
-    const getSplitAmountsForOrder = (ordId: string, totalAmt: number): { cashPart: number; momoPart: number } => {
+    // Helper to resolve split payment breakdown for an order (persisted columns first, then ledger_entries, then 50/50 fallback)
+    const getSplitAmountsForOrder = (
+      ord: any,
+      totalAmt: number
+    ): {
+      cashPart: number;
+      momoPart: number;
+      txId?: string;
+      momoBucket: string;
+      momoAccountId: string;
+      momoClearingId: string;
+    } => {
+      const ordId = String(ord?.id || '');
       const matchingTx = existingTransactions.find(t => String(t.provider_reference || '').includes(ordId));
+      const txEntries = matchingTx
+        ? existingLedgerEntries.filter(le => le.transaction_id === matchingTx.id)
+        : [];
+      const splitProvider = resolveSplitMobileProvider(ord?.paymentMethod, txEntries);
+
+      const storedCash = Number(ord?.split_cash);
+      const storedMomo = Number(ord?.split_momo);
+      if (ord && (ord.split_cash !== null && ord.split_cash !== undefined || ord.split_momo !== null && ord.split_momo !== undefined)) {
+        const c = isNaN(storedCash) ? 0 : storedCash;
+        const m = isNaN(storedMomo) ? 0 : storedMomo;
+        if (c + m > 0) {
+          return {
+            cashPart: c,
+            momoPart: m,
+            txId: matchingTx?.id,
+            momoBucket: splitProvider.bucket,
+            momoAccountId: splitProvider.accountId,
+            momoClearingId: splitProvider.clearingAccountId,
+          };
+        }
+      }
       if (matchingTx) {
-        const entries = existingLedgerEntries.filter(le => le.transaction_id === matchingTx.id && le.type === 'DEBIT');
+        const entries = txEntries.filter(le => le.type === 'DEBIT');
         let cashPart = 0;
         let momoPart = 0;
         entries.forEach(le => {
-          if (le.account_id === 'acc_cash') cashPart += Number(le.amount || 0);
-          if (le.account_id === 'acc_momo') momoPart += Number(le.amount || 0);
+          if (le.account_id === 'acc_cash' || le.account_id === 'cash-clearing-account-uuid') cashPart += Number(le.amount || 0);
+          if (
+            le.account_id === 'acc_momo' ||
+            le.account_id === 'acc_mtn' ||
+            le.account_id === 'acc_airtel' ||
+            String(le.account_id || '').startsWith('acc_pm_') ||
+            le.account_id === 'mtn-clearing-account-uuid' ||
+            le.account_id === 'airtel-clearing-account-uuid'
+          ) {
+            momoPart += Number(le.amount || 0);
+          }
         });
+        const accCash = entries.filter(le => le.account_id === 'acc_cash').reduce((s, le) => s + Number(le.amount || 0), 0);
+        const accMomo = entries
+          .filter(
+            le =>
+              le.account_id === 'acc_momo' ||
+              le.account_id === 'acc_mtn' ||
+              le.account_id === 'acc_airtel' ||
+              String(le.account_id || '').startsWith('acc_pm_')
+          )
+          .reduce((s, le) => s + Number(le.amount || 0), 0);
+        if (accCash + accMomo > 0) {
+          return {
+            cashPart: accCash,
+            momoPart: accMomo,
+            txId: matchingTx.id,
+            momoBucket: splitProvider.bucket,
+            momoAccountId: splitProvider.accountId,
+            momoClearingId: splitProvider.clearingAccountId,
+          };
+        }
         if (cashPart + momoPart > 0) {
-          return { cashPart, momoPart };
+          return {
+            cashPart,
+            momoPart,
+            txId: matchingTx.id,
+            momoBucket: splitProvider.bucket,
+            momoAccountId: splitProvider.accountId,
+            momoClearingId: splitProvider.clearingAccountId,
+          };
         }
       }
-      return { cashPart: parseFloat((totalAmt / 2).toFixed(2)), momoPart: parseFloat((totalAmt - parseFloat((totalAmt / 2).toFixed(2))).toFixed(2)) };
+      const half = parseFloat((totalAmt / 2).toFixed(2));
+      return {
+        cashPart: half,
+        momoPart: parseFloat((totalAmt - half).toFixed(2)),
+        txId: matchingTx?.id,
+        momoBucket: splitProvider.bucket,
+        momoAccountId: splitProvider.accountId,
+        momoClearingId: splitProvider.clearingAccountId,
+      };
     };
 
     // 3. Rebuild authoritative accounting ledgers:
@@ -2075,31 +2618,44 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       });
     };
 
-    // Dynamically collect all store IDs from stores table and active records
+    // Dynamically collect all store IDs from stores table and active records (ignoring deleted legacy demo store IDs)
+    const legacyIgnoredStores = new Set(['lusaka', 'kitwe', 'ndola', 'store_main']);
     const dbStoresRes = runSql('SELECT id FROM stores', 'Accounting Sync: Stores', true);
     const dynamicStoreSet = new Set<string>();
     if (dbStoresRes.success && Array.isArray(dbStoresRes.data)) {
       dbStoresRes.data.forEach((s: any) => {
-        if (s.id) dynamicStoreSet.add(String(s.id).toLowerCase().trim());
+        const sId = String(s.id || '').toLowerCase().trim();
+        if (sId && !legacyIgnoredStores.has(sId)) dynamicStoreSet.add(sId);
       });
     }
-    orders.forEach(o => { if (o.store_id) dynamicStoreSet.add(String(o.store_id).toLowerCase().trim()); });
-    expenses.forEach(e => { if (e.store_id) dynamicStoreSet.add(String(e.store_id).toLowerCase().trim()); });
-    laybys.forEach(l => { if (l.store_id) dynamicStoreSet.add(String(l.store_id).toLowerCase().trim()); });
-    storeProducts.forEach(sp => { if (sp.store_id) dynamicStoreSet.add(String(sp.store_id).toLowerCase().trim()); });
+    const addIfActiveStore = (rawStore: any) => {
+      const sId = String(rawStore || '').toLowerCase().trim();
+      if (sId && !legacyIgnoredStores.has(sId)) dynamicStoreSet.add(sId);
+    };
+    orders.forEach(o => addIfActiveStore(o.store_id));
+    expenses.forEach(e => addIfActiveStore(e.store_id));
+    laybys.forEach(l => addIfActiveStore(l.store_id));
+    storeProducts.forEach(sp => addIfActiveStore(sp.store_id));
 
     const individualStores = Array.from(dynamicStoreSet);
     const storesList = [...individualStores, 'all'];
     const defaultFallbackStore = individualStores[0] || 'main';
-    const methodNames = [
+    const customMethodNames = allCustomMethods.map(cm => cm.name);
+    const methodNamesSet = new Set<string>([
       'Cash',
-      'MTN Mobile Money',
       'Airtel Money',
-      'Zamtel Kwacha',
-      'Mobile Wallet',
+      'MTN Mobile Money',
       'Credit Card / Bank',
-      'Split'
-    ];
+      'Split',
+      ...customMethodNames,
+    ]);
+    // Include legacy 'Mobile Wallet' bucket only if historical transactions exist for it
+    const hasLegacyMobileWallet = orders.some(o => resolvePaymentMethodBucket(o.paymentMethod).bucket === 'Mobile Wallet') ||
+      laybyInstallments.some(i => resolvePaymentMethodBucket(i.payment_method).bucket === 'Mobile Wallet');
+    if (hasLegacyMobileWallet) {
+      methodNamesSet.add('Mobile Wallet');
+    }
+    const methodNames = Array.from(methodNamesSet);
 
     interface MethodStat {
       payment_method: string;
@@ -2168,7 +2724,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     orders.forEach((ord, idx) => {
       const ordId = String(ord.id || `ORD-${idx}`);
       const dateStr = ord.orderDate || nowIso;
-      const storeId = (ord.store_id || 'lusaka').toLowerCase().trim();
+      const storeId = (ord.store_id || defaultFallbackStore).toLowerCase().trim();
       const statusLower = String(ord.status || 'Completed').toLowerCase().trim();
       const isRefunded = statusLower === 'refunded';
       const isCancelled = statusLower === 'cancelled' || statusLower === 'voided' || statusLower === 'deleted';
@@ -2233,50 +2789,102 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           total
         );
       } else if (resolved.bucket === 'Split') {
-        const { cashPart, momoPart } = getSplitAmountsForOrder(ordId, total);
+        const { cashPart, momoPart, txId, momoBucket, momoAccountId, momoClearingId } = getSplitAmountsForOrder(ord, total);
+        const splitSum = cashPart + momoPart;
+        const cashShareRatio = splitSum > 0 ? cashPart / splitSum : 0.5;
+        const cashVat = parseFloat((tax * cashShareRatio).toFixed(2));
+        const momoVat = parseFloat((tax - cashVat).toFixed(2));
+        const cashNetRev = Math.max(0, cashPart - cashVat);
+        const momoNetRev = Math.max(0, momoPart - momoVat);
         if (cashPart > 0) {
-          addJournalPair(
-            `SALE_SPLITCASH_${ordId}`,
-            dateStr,
-            ordId,
-            `POS Split Sale (Cash Portion) #${ordId} (${custName})`,
-            'acc_cash',
-            'acc_sales_revenue',
-            cashPart
-          );
+          if (cashNetRev > 0) {
+            addJournalPair(
+              `SALE_SPLITCASH_${ordId}`,
+              dateStr,
+              ordId,
+              `POS Split Sale (Cash Portion) #${ordId} (${custName})`,
+              'acc_cash',
+              'acc_sales_revenue',
+              cashNetRev,
+              txId
+            );
+          }
+          if (cashVat > 0) {
+            addJournalPair(
+              `SALE_SPLITCASH_VAT_${ordId}`,
+              dateStr,
+              ordId,
+              `POS Split VAT (Cash Portion) #${ordId} (${custName})`,
+              'acc_cash',
+              'acc_vat_payable',
+              cashVat,
+              txId
+            );
+          }
           rebuiltLedgerEntries.push({
             id: `le_clr_cash_${ordId}`,
-            transaction_id: `tx_${ordId}`,
+            transaction_id: txId || `tx_${ordId}`,
             account_id: 'cash-clearing-account-uuid',
             type: 'DEBIT',
+            amount: cashPart,
+            created_at: dateStr
+          });
+          rebuiltLedgerEntries.push({
+            id: `le_merch_cash_${ordId}`,
+            transaction_id: txId || `tx_${ordId}`,
+            account_id: 'merchant-wallet-account-uuid',
+            type: 'CREDIT',
             amount: cashPart,
             created_at: dateStr
           });
           addMethodStat(storeId, 'Cash', 'gross_receipts', cashPart, true);
         }
         if (momoPart > 0) {
-          addJournalPair(
-            `SALE_SPLITMOMO_${ordId}`,
-            dateStr,
-            ordId,
-            `POS Split Sale (Mobile Money Portion) #${ordId} (${custName})`,
-            'acc_momo',
-            'acc_sales_revenue',
-            momoPart
-          );
+          if (momoNetRev > 0) {
+            addJournalPair(
+              `SALE_SPLITMOMO_${ordId}`,
+              dateStr,
+              ordId,
+              `POS Split Sale (${momoBucket} Portion) #${ordId} (${custName})`,
+              momoAccountId,
+              'acc_sales_revenue',
+              momoNetRev,
+              txId
+            );
+          }
+          if (momoVat > 0) {
+            addJournalPair(
+              `SALE_SPLITMOMO_VAT_${ordId}`,
+              dateStr,
+              ordId,
+              `POS Split VAT (${momoBucket} Portion) #${ordId} (${custName})`,
+              momoAccountId,
+              'acc_vat_payable',
+              momoVat,
+              txId
+            );
+          }
           rebuiltLedgerEntries.push({
             id: `le_clr_momo_${ordId}`,
-            transaction_id: `tx_${ordId}`,
-            account_id: 'mtn-clearing-account-uuid',
+            transaction_id: txId || `tx_${ordId}`,
+            account_id: momoClearingId,
             type: 'DEBIT',
             amount: momoPart,
             created_at: dateStr
           });
-          addMethodStat(storeId, 'Mobile Wallet', 'gross_receipts', momoPart, true);
+          rebuiltLedgerEntries.push({
+            id: `le_merch_momo_${ordId}`,
+            transaction_id: txId || `tx_${ordId}`,
+            account_id: 'merchant-wallet-account-uuid',
+            type: 'CREDIT',
+            amount: momoPart,
+            created_at: dateStr
+          });
+          addMethodStat(storeId, momoBucket, 'gross_receipts', momoPart, true);
         }
         addMethodStat(storeId, 'Split', 'gross_receipts', total, true);
       } else {
-        // Standard or Quick Sale via Cash, Mobile Wallet, MTN, Airtel, Zamtel, or Bank/Card
+        // Standard or Quick Sale via Cash, Airtel Money, MTN Mobile Money, Custom Method, or Bank/Card
         if (netSalesExTax > 0) {
           addJournalPair(
             `SALE_REV_${ordId}`,
@@ -2379,7 +2987,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         });
 
         if (resolved.bucket === 'Split') {
-          const { cashPart, momoPart } = getSplitAmountsForOrder(ordId, total);
+          const { cashPart, momoPart, momoBucket, momoAccountId, momoClearingId } = getSplitAmountsForOrder(ord, total);
           if (cashPart > 0) {
             addJournalPair(
               `RFND_SPLITCASH_${ordId}`,
@@ -2398,6 +3006,14 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
               amount: cashPart,
               created_at: dateStr
             });
+            rebuiltLedgerEntries.push({
+              id: `le_rfnd_merch_cash_${ordId}`,
+              transaction_id: `tx_rfnd_${ordId}`,
+              account_id: 'merchant-wallet-account-uuid',
+              type: 'DEBIT',
+              amount: cashPart,
+              created_at: dateStr
+            });
             addMethodStat(storeId, 'Cash', 'refunds_out', cashPart, false);
           }
           if (momoPart > 0) {
@@ -2405,20 +3021,28 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
               `RFND_SPLITMOMO_${ordId}`,
               dateStr,
               ordId,
-              `Refund Reversal (Mobile Portion) for Order #${ordId}`,
+              `Refund Reversal (${momoBucket} Portion) for Order #${ordId}`,
               'acc_sales_returns',
-              'acc_momo',
+              momoAccountId,
               momoPart
             );
             rebuiltLedgerEntries.push({
               id: `le_rfnd_clr_momo_${ordId}`,
               transaction_id: `tx_rfnd_${ordId}`,
-              account_id: 'mtn-clearing-account-uuid',
+              account_id: momoClearingId,
               type: 'CREDIT',
               amount: momoPart,
               created_at: dateStr
             });
-            addMethodStat(storeId, 'Mobile Wallet', 'refunds_out', momoPart, false);
+            rebuiltLedgerEntries.push({
+              id: `le_rfnd_merch_momo_${ordId}`,
+              transaction_id: `tx_rfnd_${ordId}`,
+              account_id: 'merchant-wallet-account-uuid',
+              type: 'DEBIT',
+              amount: momoPart,
+              created_at: dateStr
+            });
+            addMethodStat(storeId, momoBucket, 'refunds_out', momoPart, false);
           }
           addMethodStat(storeId, 'Split', 'refunds_out', total, false);
         } else {
@@ -2502,7 +3126,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const instId = String(inst.id || `INST-${idx}`);
       const laybyId = String(inst.layby_id || '');
       const parentLayby = laybyMap.get(laybyId);
-      const storeId = (parentLayby?.store_id || 'lusaka').toLowerCase().trim();
+      const storeId = (parentLayby?.store_id || defaultFallbackStore).toLowerCase().trim();
       const custName = parentLayby?.customer_name || 'Layby Customer';
       const amt = Number(inst.amount || 0);
       if (amt <= 0) return;
@@ -2528,6 +3152,14 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         transaction_id: `tx_lby_${instId}`,
         account_id: resolved.clearingAccountId,
         type: 'DEBIT',
+        amount: amt,
+        created_at: dateStr
+      });
+      rebuiltLedgerEntries.push({
+        id: `le_merch_lby_${instId}`,
+        transaction_id: `tx_lby_${instId}`,
+        account_id: 'merchant-wallet-account-uuid',
+        type: 'CREDIT',
         amount: amt,
         created_at: dateStr
       });
@@ -2582,7 +3214,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const expId = String(exp.id || `EXP-${idx}`);
       const amt = Number(exp.amount || 0);
       if (amt <= 0) return;
-      const storeId = (exp.store_id || 'lusaka').toLowerCase().trim();
+      const storeId = (exp.store_id || defaultFallbackStore).toLowerCase().trim();
       const dateStr = exp.expense_date || exp.created_at || nowIso;
       const accId = exp.account_id || 'acc_cash';
       const cat = String(exp.category || 'Miscellaneous Overhead');
@@ -2608,7 +3240,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         amt
       );
 
-      const methodBucket = accId === 'acc_momo' ? 'Mobile Wallet' : accId === 'acc_bank' ? 'Credit Card / Bank' : 'Cash';
+      const methodBucket = resolvePaymentMethodBucket(accId).bucket;
       addMethodStat(storeId, methodBucket, 'expenses_out', amt, false);
 
       cashFlowRows.push({
@@ -2647,12 +3279,12 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         amt
       );
 
-      addMethodStat('lusaka', 'Cash', 'expenses_out', amt, false);
+      addMethodStat(defaultFallbackStore, 'Cash', 'expenses_out', amt, false);
 
       cashFlowRows.push({
         id: `CF_PAY_${attId}`,
         date: dateStr,
-        store_id: 'lusaka',
+        store_id: defaultFallbackStore,
         activity_type: 'OPERATING',
         category: 'Staff Payroll & Wages',
         direction: 'OUTFLOW',
@@ -2687,10 +3319,10 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         amt
       );
 
-      const srcBucket = srcAcc === 'acc_momo' ? 'Mobile Wallet' : srcAcc === 'acc_bank' ? 'Credit Card / Bank' : 'Cash';
-      const dstBucket = dstAcc === 'acc_momo' ? 'Mobile Wallet' : dstAcc === 'acc_bank' ? 'Credit Card / Bank' : 'Cash';
-      addMethodStat('lusaka', srcBucket, 'transfers_out', amt, false);
-      addMethodStat('lusaka', dstBucket, 'transfers_in', amt, false);
+      const srcBucket = resolvePaymentMethodBucket(srcAcc).bucket;
+      const dstBucket = resolvePaymentMethodBucket(dstAcc).bucket;
+      addMethodStat(defaultFallbackStore, srcBucket, 'transfers_out', amt, false);
+      addMethodStat(defaultFallbackStore, dstBucket, 'transfers_in', amt, false);
     });
 
     // F. Process Goods in Transit & Purchase Orders (Procurement)
@@ -2698,11 +3330,18 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const poId = String(po.id || `PO-${idx}`);
       const amt = Number(po.grand_landed_total || 0);
       if (amt <= 0) return;
-      const storeId = (po.store_id || 'lusaka').toLowerCase().trim();
+      const storeId = (po.store_id || defaultFallbackStore).toLowerCase().trim();
       const dateStr = po.created_at || nowIso;
       const payMethod = String(po.payment_method || 'BANK_TRANSFER');
-      const payAcc = payMethod === 'CASH' ? 'acc_cash' : payMethod === 'MOBILE_MONEY' ? 'acc_momo' : 'acc_bank';
-      const methodBucket = payAcc === 'acc_cash' ? 'Cash' : payAcc === 'acc_momo' ? 'Mobile Wallet' : 'Credit Card / Bank';
+      const resolvedPo = po.payment_account
+        ? resolvePaymentMethodBucket(po.payment_account)
+        : payMethod === 'CASH'
+          ? resolvePaymentMethodBucket('Cash')
+          : payMethod === 'MOBILE_MONEY'
+            ? resolvePaymentMethodBucket('Mobile Wallet')
+            : resolvePaymentMethodBucket(payMethod);
+      const payAcc = resolvedPo.accountId;
+      const methodBucket = resolvedPo.bucket;
 
       const targetAssetAcc = po.status === 'RECEIVED' ? 'acc_inventory' : 'acc_transit';
       addJournalPair(
@@ -2770,7 +3409,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       cashFlowRows.push({
         id: `CF_EQ_${eqId}`,
         date: nowIso,
-        store_id: 'lusaka',
+        store_id: defaultFallbackStore,
         activity_type: 'FINANCING',
         category: 'Owner Capital Injection',
         direction: 'INFLOW',
@@ -2788,7 +3427,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
 
     // H. Process Inventory Stock Valuation & Retained Earnings Alignment
     let totalPhysicalInventoryValue = 0;
-    const invValueByStore: Record<string, number> = { lusaka: 0, kitwe: 0, ndola: 0 };
+    const invValueByStore: Record<string, number> = {};
     if (storeProducts.length > 0) {
       storeProducts.forEach(sp => {
         const prod = productMap.get(Number(sp.product_id));
@@ -2796,7 +3435,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           const unitCost = Number(prod.cost || Number(sp.price || prod.price || 0) * 0.7);
           const stockQty = Math.max(0, Number(sp.stock || 0));
           const val = unitCost * stockQty;
-          const st = String(sp.store_id || 'lusaka').toLowerCase();
+          const st = String(sp.store_id || defaultFallbackStore).toLowerCase();
           invValueByStore[st] = (invValueByStore[st] || 0) + val;
           totalPhysicalInventoryValue += val;
         }
@@ -2805,28 +3444,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       products.forEach(p => {
         if (p.is_service !== 1) {
           const val = Number(p.cost || Number(p.price || 0) * 0.7) * Math.max(0, Number(p.stock || 0));
-          invValueByStore['lusaka'] += val;
+          invValueByStore[defaultFallbackStore] = (invValueByStore[defaultFallbackStore] || 0) + val;
           totalPhysicalInventoryValue += val;
         }
       });
     }
 
-    // Post Opening Inventory Stock Capitalization so `acc_inventory` in `view_account_balances` matches current physical warehouse cost valuation
-    const currentInvLedgerNet = rebuiltLedgerEntries
-      .filter(le => le.account_id === 'acc_inventory')
-      .reduce((acc, le) => acc + (le.type === 'DEBIT' ? le.amount : -le.amount), 0);
-    const neededInitialInventory = totalPhysicalInventoryValue - currentInvLedgerNet;
-    if (neededInitialInventory > 0) {
-      addJournalPair(
-        'OPENING_INVENTORY_CAPITAL',
-        '2026-01-01T00:00:00Z',
-        'OPEN-INV-01',
-        'Opening Warehouse Merchandise Inventory Valuation Capitalization',
-        'acc_inventory',
-        'acc_retained_earnings',
-        neededInitialInventory
-      );
-    }
+    // No synthetic opening inventory capitalization journal entry is posted; double-entry journal strictly reflects real recorded transactions.
 
     // 4. Bulk insert rebuilt rows into AlaSQL tables
     if (alasql.tables.double_entry_journal) {
@@ -2889,7 +3513,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     const netLoansPayable = Math.max(0, totalLoansRepayable - totalLoansSwept);
 
     for (const st of storesList) {
-      const matchStore = (rowStore: any) => st === 'all' || String(rowStore || 'lusaka').toLowerCase().trim() === st;
+      const matchStore = (rowStore: any) => st === 'all' || String(rowStore || defaultFallbackStore).toLowerCase().trim() === st;
 
       // Orders for this store
       const stOrders = orders.filter(o => {
@@ -2931,7 +3555,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const stExpenses = expenses
         .filter(e => matchStore(e.store_id))
         .reduce((s, e) => s + Number(e.amount || 0), 0);
-      const stPayroll = (st === 'all' || st === 'lusaka')
+      const stPayroll = (st === 'all' || st === defaultFallbackStore)
         ? paidAttendance.reduce((s, a) => s + Number(a.gross_payment || 0), 0)
         : 0;
 
@@ -2943,31 +3567,41 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         return found ? Number(found.net_balance || 0) : 0;
       };
 
-      const cashDrawerBal = getMethodNet('Cash');
+      const customCashBal = allCustomMethods
+        .filter(cm => cm.category === 'Cash')
+        .reduce((sum, cm) => sum + getMethodNet(cm.name), 0);
+      const customMomoBal = allCustomMethods
+        .filter(cm => cm.category === 'Mobile Money')
+        .reduce((sum, cm) => sum + getMethodNet(cm.name), 0);
+      const customBankOtherBal = allCustomMethods
+        .filter(cm => cm.category === 'Bank / Card' || cm.category === 'Other')
+        .reduce((sum, cm) => sum + getMethodNet(cm.name), 0);
+
+      const cashDrawerBal = getMethodNet('Cash') + customCashBal;
       const momoBal =
         getMethodNet('MTN Mobile Money') +
         getMethodNet('Airtel Money') +
-        getMethodNet('Zamtel Kwacha') +
-        getMethodNet('Mobile Wallet');
-      const bankCardBal = getMethodNet('Credit Card / Bank');
+        getMethodNet('Mobile Wallet') +
+        customMomoBal;
+      const bankCardBal = getMethodNet('Credit Card / Bank') + customBankOtherBal;
       const totalCashEquiv = cashDrawerBal + momoBal + bankCardBal;
 
       const stInvVal = st === 'all' ? totalPhysicalInventoryValue : (invValueByStore[st] || 0);
       const stTransitVal = transitPos
         .filter(p => matchStore(p.store_id) && p.status !== 'RECEIVED')
         .reduce((s, p) => s + Number(p.grand_landed_total || 0), 0);
-      const stFixedAssets = st === 'all' || st === 'lusaka' ? totalFixedAssetsVal : 0;
+      const stFixedAssets = st === 'all' || st === defaultFallbackStore ? totalFixedAssetsVal : 0;
       const totalAssets = totalCashEquiv + stInvVal + stTransitVal + stFixedAssets;
 
       // Liabilities
       const stLaybyLiability = laybys
         .filter(l => matchStore(l.store_id) && l.status !== 'COMPLETED')
         .reduce((s, l) => s + Number(l.amount_paid || 0), 0);
-      const stLoansLiability = st === 'all' || st === 'lusaka' ? netLoansPayable : 0;
+      const stLoansLiability = st === 'all' || st === defaultFallbackStore ? netLoansPayable : 0;
       const totalLiabilities = vatCollected + stLaybyLiability + stLoansLiability;
 
       // Equity (Assets - Liabilities = Total Equity, decomposed into Owner Capital + Retained Earnings)
-      const stOwnerCapital = st === 'all' || st === 'lusaka' ? totalOwnerCapitalVal : 0;
+      const stOwnerCapital = st === 'all' || st === defaultFallbackStore ? totalOwnerCapitalVal : 0;
       const totalEquity = totalAssets - totalLiabilities;
       const retainedEarnings = totalEquity - stOwnerCapital;
 
@@ -3029,11 +3663,14 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     if (individualStores.length > 0 || orders.length > 0 || expenses.length > 0) {
       for (const st of storesList) {
         const matchStore = (rowStore: any) => st === 'all' || String(rowStore || defaultFallbackStore).toLowerCase().trim() === st;
-        const isToday = (dVal: any) => String(dVal || '').includes(todayDate);
+        const isToday = (dVal: any) => toLocalDateKey(dVal) === todayDate;
 
         let eodCashSales = 0;
         let eodCardSales = 0;
         let eodMomoSales = 0;
+        let eodAirtelSales = 0;
+        let eodMtnSales = 0;
+        let eodCustomMomoSales = 0;
         let eodRefundsCash = 0;
         let eodRefundsCard = 0;
         let eodRefundsMomo = 0;
@@ -3049,23 +3686,30 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           const resolved = resolvePaymentMethodBucket(rawPay);
 
           if (resolved.bucket === 'Split') {
-            const { cashPart, momoPart } = getSplitAmountsForOrder(String(o.id), tot);
+            const { cashPart, momoPart, momoBucket } = getSplitAmountsForOrder(o, tot);
+            eodCashSales += cashPart;
+            eodMomoSales += momoPart;
+            const sign = isRef ? -1 : 1;
+            if (momoBucket === 'Airtel Money') eodAirtelSales += sign * momoPart;
+            else if (momoBucket === 'MTN Mobile Money') eodMtnSales += sign * momoPart;
+            else eodCustomMomoSales += sign * momoPart;
             if (isRef) {
               eodRefundsCash += cashPart;
               eodRefundsMomo += momoPart;
-            } else {
-              eodCashSales += cashPart;
-              eodMomoSales += momoPart;
             }
-          } else if (resolved.bucket === 'Cash') {
+          } else if (resolved.category === 'Cash') {
+            eodCashSales += tot;
             if (isRef) eodRefundsCash += tot;
-            else eodCashSales += tot;
-          } else if (resolved.bucket === 'Credit Card / Bank') {
+          } else if (resolved.category === 'Bank / Card' || resolved.category === 'Other') {
+            eodCardSales += tot;
             if (isRef) eodRefundsCard += tot;
-            else eodCardSales += tot;
           } else {
+            eodMomoSales += tot;
+            const sign = isRef ? -1 : 1;
+            if (resolved.bucket === 'Airtel Money') eodAirtelSales += sign * tot;
+            else if (resolved.bucket === 'MTN Mobile Money') eodMtnSales += sign * tot;
+            else eodCustomMomoSales += sign * tot;
             if (isRef) eodRefundsMomo += tot;
-            else eodMomoSales += tot;
           }
         });
 
@@ -3075,9 +3719,14 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           if (!matchStore(pLayby?.store_id)) return;
           const amt = Number(inst.amount || 0);
           const resolved = resolvePaymentMethodBucket(inst.payment_method);
-          if (resolved.bucket === 'Cash') eodCashSales += amt;
-          else if (resolved.bucket === 'Credit Card / Bank') eodCardSales += amt;
-          else eodMomoSales += amt;
+          if (resolved.category === 'Cash') eodCashSales += amt;
+          else if (resolved.category === 'Bank / Card' || resolved.category === 'Other') eodCardSales += amt;
+          else {
+            eodMomoSales += amt;
+            if (resolved.bucket === 'Airtel Money') eodAirtelSales += amt;
+            else if (resolved.bucket === 'MTN Mobile Money') eodMtnSales += amt;
+            else eodCustomMomoSales += amt;
+          }
         });
 
         let eodCashExpenses = 0;
@@ -3088,9 +3737,20 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           }
         });
 
-        const openingFloat = typeof localStorage !== 'undefined'
-          ? parseFloat(localStorage.getItem('shift_opening_cash_' + (st === 'all' ? defaultFallbackStore : st)) || localStorage.getItem('shift_opening_cash_global') || '0') || 0
-          : 0;
+        let openingFloat = 0;
+        if (typeof localStorage !== 'undefined') {
+          if (st === 'all') {
+            const sumAllBranches = individualStores.reduce((sum, bId) => {
+              const val = parseFloat(localStorage.getItem('shift_opening_cash_' + bId) || '0');
+              return sum + (isNaN(val) ? 0 : val);
+            }, 0);
+            openingFloat = individualStores.length > 0 && sumAllBranches > 0
+              ? sumAllBranches
+              : (parseFloat(localStorage.getItem('shift_opening_cash_global') || '0') || 0);
+          } else {
+            openingFloat = parseFloat(localStorage.getItem('shift_opening_cash_' + st) || localStorage.getItem('shift_opening_cash_global') || '0') || 0;
+          }
+        }
 
         const netExpectedCash = parseFloat((openingFloat + eodCashSales - eodRefundsCash - eodCashExpenses).toFixed(2));
         const netExpectedCard = parseFloat((eodCardSales - eodRefundsCard).toFixed(2));
@@ -3111,7 +3771,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
             ${netExpectedMomo},
             ${netExpectedMomo},
             0.00,
-            'Auto-synced EOD | Cash Sales: ${eodCashSales.toFixed(2)} | Refunds: ${(eodRefundsCash + eodRefundsCard + eodRefundsMomo).toFixed(2)} | Cash Out: ${eodCashExpenses.toFixed(2)}',
+            'Auto-synced EOD | Cash Sales: ${eodCashSales.toFixed(2)} | Airtel: ${eodAirtelSales.toFixed(2)} | MTN: ${eodMtnSales.toFixed(2)}${eodCustomMomoSales > 0 ? ` | Custom MoMo: ${eodCustomMomoSales.toFixed(2)}` : ''} | Refunds: ${(eodRefundsCash + eodRefundsCard + eodRefundsMomo).toFixed(2)} | Cash Out: ${eodCashExpenses.toFixed(2)}',
             '${nowIso}'
           )`,
           `EOD Sync: Auto-update live EOD cash-up for ${st}`,
@@ -3130,12 +3790,24 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
 // ============================================================================
 // CLOUD SQL SERVER SYNCHRONIZATION API CLIENT
 // ============================================================================
+let activeCloudPushPromise: Promise<{
+  success: boolean;
+  businessId?: string;
+  updatedAt?: string;
+  details: string;
+}> | null = null;
+
 export async function pushDatabaseToServer(explicitBusinessId?: string): Promise<{
   success: boolean;
   businessId?: string;
   updatedAt?: string;
   details: string;
 }> {
+  if (activeCloudPushPromise) {
+    return activeCloudPushPromise;
+  }
+
+  activeCloudPushPromise = (async () => {
   try {
     syncAllAccountingSystems('Pre-Cloud Push Sync');
     const tables = extractAllTablesSnapshot();
@@ -3214,7 +3886,12 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
       success: false,
       details: err?.message || 'Failed to push database state to Cloud SQL server.',
     };
+  } finally {
+    activeCloudPushPromise = null;
   }
+  })();
+
+  return activeCloudPushPromise;
 }
 
 export async function pullDatabaseFromServer(businessId?: string, email?: string): Promise<{
@@ -3247,7 +3924,8 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
       };
     }
 
-    rehydrateAlasqlFromRecords(data.tables);
+    const cleanedTables = scrubLegacyPreseededRows(data.tables);
+    rehydrateAlasqlFromRecords(cleanedTables);
     syncAllAccountingSystems('Cloud SQL Pull Rehydration');
     persistTablesToStorage(true);
 
@@ -3255,7 +3933,7 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
       localStorage.setItem('android_pos_settings', JSON.stringify(data.settings));
     }
 
-    const bizRows = Array.isArray(data.tables.businesses) ? data.tables.businesses : [];
+    const bizRows = Array.isArray(cleanedTables.businesses) ? cleanedTables.businesses : [];
     const targetBiz =
       bizRows.find((b: any) => b.id === data.businessId) ||
       (email ? bizRows.find((b: any) => String(b.email || '').toLowerCase() === email.toLowerCase()) : null) ||
@@ -3276,9 +3954,9 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
       window.dispatchEvent(new CustomEvent('pos_sync_status_changed', { detail: { syncedAt: data.updatedAt, status: 'synced' } }));
     }
 
-    const prodCount = (data.tables.products || []).length;
-    const storeCount = (data.tables.stores || []).length;
-    const orderCount = (data.tables.orders || []).length;
+    const prodCount = (cleanedTables.products || []).length;
+    const storeCount = (cleanedTables.stores || []).length;
+    const orderCount = (cleanedTables.orders || []).length;
 
     return {
       success: true,

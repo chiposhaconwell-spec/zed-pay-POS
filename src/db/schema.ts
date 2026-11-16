@@ -27,6 +27,8 @@ export const stores = pgTable('stores', {
   businessId: text('business_id'),
   name: text('name').notNull(),
   location: text('location'),
+  phone: text('phone'),
+  email: text('email'),
   allowDiscounts: integer('allow_discounts').default(1),
   allowRefunds: integer('allow_refunds').default(1),
   allowLaybys: integer('allow_laybys').default(1),

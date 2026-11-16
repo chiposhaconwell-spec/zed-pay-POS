@@ -1,3 +1,5 @@
+import type { ZraConfig } from './zra/zraConfig';
+
 export interface Product {
   id: number;
   name: string;
@@ -10,6 +12,8 @@ export interface Product {
   is_service?: number; // 0 or 1
   batch_number?: string;
   expiry_date?: string;
+  item_cls_cd?: string;
+  tax_ty_cd?: string;
 }
 
 export interface Customer {
@@ -54,6 +58,16 @@ export interface SqlLogEntry {
   executionTimeMs: number;
 }
 
+export interface CustomPaymentMethod {
+  id: string;
+  name: string;
+  category: 'Mobile Money' | 'Bank / Card' | 'Cash' | 'Other';
+  accountId: string;
+  isActive: boolean;
+  createdAt: string;
+  createdBy?: string;
+}
+
 export interface StoreSettings {
   storeName: string;
   currency: string;
@@ -73,6 +87,8 @@ export interface StoreSettings {
   printerName?: string;
   printerInterface?: string;
   printerStatus?: 'Linked' | 'Not Linked';
+  customPaymentMethods?: CustomPaymentMethod[];
+  zraConfig?: ZraConfig;
 }
 
 export type ActiveTab = 'billing' | 'inventory' | 'analytics' | 'customers' | 'settings' | 'console' | 'laybys' | 'attendance' | 'quotes' | 'loans' | 'finance' | 'workspace' | 'audit';

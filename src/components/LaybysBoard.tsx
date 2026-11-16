@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { jsPDF } from 'jspdf';
-import { exportAndSharePdf, safeSystemPrint } from '../androidUtils';
-import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems } from '../db';
+import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
+import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, getCentralBranches, getCustomPaymentMethods, resolvePaymentMethodBucket } from '../db';
 import { 
   Users, 
   Search, 
@@ -21,10 +21,13 @@ import {
   Eye, 
   AlertTriangle,
   Camera,
-  Activity
+  Activity,
+  Send,
+  Share2,
+  Download
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { StoreSettings } from '../types';
+import { StoreSettings, CustomPaymentMethod } from '../types';
 import { DEFAULT_COMPANY_LOGO } from '../App';
 
 interface LaybysBoardProps {
@@ -78,14 +81,51 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
   const [itemSearchQuery, setItemSearchQuery] = useState('');
   
   // Add payment states
+  const [initialPayMethod, setInitialPayMethod] = useState('Cash');
   const [paymentAmount, setPaymentAmount] = useState('');
   const [payMethod, setPayMethod] = useState('Cash');
-  const [cashierName, setCashierName] = useState('Alice Mwansa');
+  const [customPaymentMethods, setCustomPaymentMethods] = useState<CustomPaymentMethod[]>(() => getCustomPaymentMethods(false));
+  const [cashierName, setCashierName] = useState(
+    () => (typeof localStorage !== 'undefined' && (localStorage.getItem('logged_in_user_name') || localStorage.getItem('quick_salesperson_name'))) || 'Cashier'
+  );
   const [successMsg, setSuccessMsg] = useState('');
+
+  useEffect(() => {
+    const syncCustomMethods = () => setCustomPaymentMethods(getCustomPaymentMethods(false));
+    syncCustomMethods();
+    window.addEventListener('pos_data_updated', syncCustomMethods);
+    window.addEventListener('local_db_restored', syncCustomMethods);
+    return () => {
+      window.removeEventListener('pos_data_updated', syncCustomMethods);
+      window.removeEventListener('local_db_restored', syncCustomMethods);
+    };
+  }, []);
 
   // Installment receipt state variables
   const [activeInstReceipt, setActiveInstReceipt] = useState<any | null>(null);
   const [whatsappPhone, setWhatsappPhone] = useState<string>('');
+  const [whatsappSending, setWhatsappSending] = useState(false);
+  const [whatsappError, setWhatsappError] = useState<string | null>(null);
+  const [whatsappResult, setWhatsappResult] = useState<WhatsAppPdfDispatchResult | null>(null);
+  const [lastCompiledLaybyPdf, setLastCompiledLaybyPdf] = useState<{ doc: jsPDF; filename: string; caption: string } | null>(null);
+
+  useEffect(() => {
+    setWhatsappError(null);
+    setWhatsappResult(null);
+    setLastCompiledLaybyPdf(null);
+  }, [activeInstReceipt?.installmentId]);
+
+  const getBranchReceiptInfo = (storeId?: string) => {
+    const targetId = (storeId || activeStore || '').toLowerCase().trim();
+    const branches = getCentralBranches();
+    const matched = branches.find((b: any) => String(b.id || '').toLowerCase().trim() === targetId) || branches[0];
+    return {
+      name: matched?.name || (targetId ? targetId.toUpperCase() : ''),
+      location: matched?.location || '',
+      phone: matched?.phone || '',
+      email: matched?.email || ''
+    };
+  };
 
   const compileInstallmentReceipt = (layby: Layby, allInsts: Installment[], targetInst: Installment) => {
     // Sort all installments chronologically to trace progressive balance
@@ -105,6 +145,7 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
     return {
       installmentId: targetInst.id,
       laybyId: layby.id,
+      storeId: layby.store_id || activeStore,
       customerName: layby.customer_name,
       customerPhone: layby.customer_phone,
       amountPaidThisTime: targetInst.amount,
@@ -119,48 +160,65 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
     };
   };
 
-  const handleWhatsAppSend = (phone: string, receiptData: any) => {
-    if (!phone) {
-      alert('Please enter a valid WhatsApp phone number.');
+  const handleWhatsAppSend = async (phone: string, receiptData: any) => {
+    setWhatsappError(null);
+    setWhatsappResult(null);
+
+    if (!phone.trim()) {
+      setWhatsappError('Please enter a valid WhatsApp phone number.');
       return;
     }
-    const cleanPhone = phone.replace(/[^\d+]/g, '');
-    const headerDecor = "============================";
-    let msg = `*${settings.storeName.toUpperCase()} LAYBY RECEIPT*\n`;
-    msg += `*Receipt ID:* ${receiptData.installmentId}\n`;
-    msg += `*Layby Contract ID:* ${receiptData.laybyId}\n`;
-    msg += `*Date:* ${new Date(receiptData.createdAt).toLocaleDateString()}\n`;
-    msg += `${headerDecor}\n`;
-    msg += `*Customer:* ${receiptData.customerName}\n`;
-    msg += `*Phone:* ${receiptData.customerPhone}\n`;
-    msg += `${headerDecor}\n`;
-    msg += `*Reserved Items:*\n`;
-    receiptData.items.forEach((item: any) => {
-      msg += `• ${item.name} x${item.quantity} (${settings.currency}${item.unitPrice.toFixed(2)} ea)\n`;
-    });
-    msg += `${headerDecor}\n`;
-    msg += `*TOTAL CONTRACT:* ${settings.currency}${receiptData.totalContractAmount.toFixed(2)}\n`;
-    msg += `*PAID THIS TIME:* ${settings.currency}${receiptData.amountPaidThisTime.toFixed(2)}\n`;
-    msg += `*PAID SO FAR:* ${settings.currency}${receiptData.totalAmountPaidSoFar.toFixed(2)}\n`;
-    msg += `*PREVIOUS BALANCE:* ${settings.currency}${receiptData.previousBalance.toFixed(2)}\n`;
-    msg += `*NEW BALANCE DUE: ${settings.currency}${receiptData.newBalance.toFixed(2)}*\n`;
-    msg += `${headerDecor}\n`;
-    msg += `*Payment Mode:* ${receiptData.paymentMethod.toUpperCase()}\n`;
-    msg += `*Received By:* ${receiptData.receivedBy}\n`;
-    if (settings.receiptFooter) {
-      msg += `\n_${settings.receiptFooter}_`;
+    if (!receiptData) {
+      setWhatsappError('No receipt selected to send.');
+      return;
     }
-    
-    const url = `https://api.whatsapp.com/send?phone=${cleanPhone}&text=${encodeURIComponent(msg)}`;
-    window.open(url, '_blank');
+
+    const compiled = generateInstPdfReceipt(receiptData, true);
+    if (!compiled) {
+      setWhatsappError('Failed to compile layby installment PDF receipt.');
+      return;
+    }
+
+    const balanceText = receiptData.newBalance <= 0.01
+      ? 'FULLY SETTLED'
+      : `${settings.currency}${Number(receiptData.newBalance || 0).toFixed(2)} due`;
+    const caption = `Layby Receipt #${receiptData.installmentId} (Contract ${receiptData.laybyId}) • Paid: ${settings.currency}${Number(receiptData.amountPaidThisTime || 0).toFixed(2)} • Balance: ${balanceText}`;
+
+    setLastCompiledLaybyPdf({ doc: compiled.doc, filename: compiled.filename, caption });
+    setWhatsappSending(true);
+    try {
+      const result = await dispatchPdfToWhatsApp({
+        phone,
+        filename: compiled.filename,
+        doc: compiled.doc,
+        storeName: settings.storeName,
+        caption,
+      });
+      if (!result.success) {
+        setWhatsappError(result.error || 'Could not dispatch PDF receipt to WhatsApp.');
+        return;
+      }
+      setWhatsappResult(result);
+    } catch (err: any) {
+      setWhatsappError(err?.message || 'Unexpected error preparing layby PDF receipt for WhatsApp.');
+    } finally {
+      setWhatsappSending(false);
+    }
   };
 
-  const generateInstPdfReceipt = (receiptData: any) => {
+  const generateInstPdfReceipt = (
+    receiptData: any,
+    skipAutoExport: boolean = false
+  ): { doc: jsPDF; filename: string } | null => {
     try {
       const logoToUse = settings.logoUrl || DEFAULT_COMPANY_LOGO;
+      const branchInfo = getBranchReceiptInfo(receiptData.storeId);
       // Dynamically expand physical ticket size
-      let ticketHeight = 160;
+      let ticketHeight = 165;
       if (logoToUse) ticketHeight += 20;
+      if (branchInfo.name) ticketHeight += 5;
+      if (branchInfo.location) ticketHeight += 5;
+      if (branchInfo.phone || branchInfo.email) ticketHeight += 8;
       if (settings.termsAndConditions) {
         ticketHeight += Math.ceil(settings.termsAndConditions.length / 45) * 4 + 10;
       }
@@ -186,13 +244,34 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
         }
       }
 
-      // Title
+      // Overall Company Name
       doc.setFont('times', 'bold');
       doc.setFontSize(13);
       doc.text(settings.storeName.toUpperCase(), 40, headingOffset, { align: 'center' });
       headingOffset += 5;
 
+      // Transacting Branch Name & Contact Details
+      doc.setFontSize(8.5);
+      if (branchInfo.name) {
+        doc.setFont('times', 'bold');
+        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 40, headingOffset, { align: 'center' });
+        headingOffset += 4;
+      }
       doc.setFont('times', 'normal');
+      doc.setFontSize(7.5);
+      if (branchInfo.location) {
+        doc.text(branchInfo.location, 40, headingOffset, { align: 'center' });
+        headingOffset += 3.8;
+      }
+      if (branchInfo.phone) {
+        doc.text(`Tel: ${branchInfo.phone}`, 40, headingOffset, { align: 'center' });
+        headingOffset += 3.8;
+      }
+      if (branchInfo.email) {
+        doc.text(`Email: ${branchInfo.email}`, 40, headingOffset, { align: 'center' });
+        headingOffset += 3.8;
+      }
+
       doc.setFontSize(8);
       if (settings.receiptHeader) {
         doc.text(settings.receiptHeader, 40, headingOffset, { align: 'center' });
@@ -304,9 +383,14 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
         doc.text(settings.receiptFooter, 40, headingOffset, { align: 'center' });
       }
 
-      exportAndSharePdf(`Layby_Receipt_${receiptData.installmentId}.pdf`, doc);
+      const pdfFilename = `Layby_Receipt_${receiptData.installmentId}.pdf`;
+      if (!skipAutoExport) {
+        exportAndSharePdf(pdfFilename, doc);
+      }
+      return { doc, filename: pdfFilename };
     } catch (err: any) {
-      alert('Error generating PDF receipt: ' + err.message);
+      console.error('Error generating layby PDF receipt:', err);
+      return null;
     }
   };
 
@@ -355,6 +439,13 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
 
   useEffect(() => {
     loadData();
+    const handleRefresh = () => loadData();
+    window.addEventListener('local_db_restored', handleRefresh);
+    window.addEventListener('pos_data_updated', handleRefresh);
+    return () => {
+      window.removeEventListener('local_db_restored', handleRefresh);
+      window.removeEventListener('pos_data_updated', handleRefresh);
+    };
   }, [selectedLayby?.id, activeStore]);
 
   const filteredLaybys = laybys.filter(l => 
@@ -466,12 +557,12 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       const activeCashier = localStorage.getItem('logged_in_user_name') || cashierName || 'Cashier';
       logEmployeeAudit('LAYBY', 'Created Layby Contract', `Contract #${laybyId} for ${clientName}, Total: K${total.toFixed(2)}, Deposit: K${depositNum.toFixed(2)}`, depositNum, targetBranch, activeCashier);
 
-      // Record initial installment
+      // Record initial installment using chosen deposit payment method
       const installmentId = 'inst-' + Math.floor(10000 + Math.random() * 90000);
       runSql(`
         INSERT INTO layby_installments (id, layby_id, amount, payment_method, received_by, created_at)
-        VALUES ('${installmentId}', '${laybyId}', ${depositNum.toFixed(2)}, 'Cash', '${activeCashier.replace(/'/g, "''")}', '${dateStr}')
-      `, `Layby: Log initial security deposit +K${depositNum}`);
+        VALUES ('${installmentId}', '${laybyId}', ${depositNum.toFixed(2)}, '${initialPayMethod.replace(/'/g, "''")}', '${activeCashier.replace(/'/g, "''")}', '${dateStr}')
+      `, `Layby: Log initial security deposit +K${depositNum} via ${initialPayMethod}`);
 
       // Decrement physical warehouse stock instantly to reserve items in the selected branch
       selectedItems.forEach((x) => {
@@ -480,16 +571,21 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       });
 
       // Clear layout
+      const chosenDepositMethod = initialPayMethod;
       setClientName('');
       setClientPhone('');
       setClientEmail('');
       setSelectedItems([]);
       setCustomDeposit('');
+      setInitialPayMethod('Cash');
       setItemSearchQuery('');
       setShowCreateModal(false);
       syncAllAccountingSystems(`Layby Created #${laybyId}`);
       loadData();
       try {
+        window.dispatchEvent(new CustomEvent('pos_sale_completed', {
+          detail: { orderId: laybyId, totalAmount: depositNum, paymentMethod: chosenDepositMethod, store_id: targetBranch, type: 'LAYBY_DEPOSIT' }
+        }));
         window.dispatchEvent(new Event('pos_data_updated'));
       } catch (e) {}
       persistTablesToStorage();
@@ -525,7 +621,7 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
     const instRes = runSql(addInstSql, `Layby: Collect partial payment +K${payNum.toFixed(2)} on invoice ${selectedLayby.id}`);
 
     if (instRes.success) {
-      logEmployeeAudit('LAYBY', 'Recorded Layby Payment', `Layby #${selectedLayby.id}, Payment K${payNum.toFixed(2)} via ${payMethod}, Customer: ${selectedLayby.customer_name}`, payNum, selectedLayby.store_id || 'lusaka', cashierName);
+      logEmployeeAudit('LAYBY', 'Recorded Layby Payment', `Layby #${selectedLayby.id}, Payment K${payNum.toFixed(2)} via ${payMethod}, Customer: ${selectedLayby.customer_name}`, payNum, selectedLayby.store_id || activeStore || '', cashierName);
       const newPaid = selectedLayby.amount_paid + payNum;
       const newDue = selectedLayby.total_amount - newPaid;
       const isCompleted = newDue <= 0.01;
@@ -542,7 +638,7 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
         const orderId = selectedLayby.id;
         const checkOrder = runSql(`SELECT id FROM orders WHERE id = '${orderId}'`);
         if (!checkOrder.success || !checkOrder.data || checkOrder.data.length === 0) {
-          const storeId = selectedLayby.store_id || 'lusaka';
+          const storeId = selectedLayby.store_id || activeStore || '';
           runSql(`
             INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by)
             VALUES (
@@ -597,19 +693,23 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
 
       // Double-entry record for the incoming payment asset
       const txId = `tx_layby_pay_${Math.floor(100 + Math.random() * 900)}`;
-      let clearingAccountId = 'cash-clearing-account-uuid';
+      const resolvedPay = resolvePaymentMethodBucket(payMethod);
+      const clearingAccountId = resolvedPay.clearingAccountId;
       let channel = 'CASH';
       if (payMethod === 'MTN Mobile Money') {
-        clearingAccountId = 'mtn-clearing-account-uuid';
         channel = 'MTN_MOMO';
       } else if (payMethod === 'Airtel Money') {
-        clearingAccountId = 'airtel-clearing-account-uuid';
         channel = 'AIRTEL_MONEY';
+      } else if (payMethod === 'Credit Card') {
+        channel = 'CARD_VISA';
+      } else if (payMethod !== 'Cash') {
+        channel = `CUSTOM_${payMethod.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
       }
 
+      const storeTerminalCode = (selectedLayby.store_id || activeStore || 'MAIN').toUpperCase();
       runSql(`
         INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at)
-        VALUES ('${txId}', 'idemp-${txId}', 'POS-LUSAKA-01', '${channel}', 'POS-LAYBY-REF-${selectedLayby.id}', ${payNum.toFixed(4)}, 0.00, 'SUCCESS', 'Layby installment client payment ${selectedLayby.id}', '${dateStr}')
+        VALUES ('${txId}', 'idemp-${txId}', 'POS-${storeTerminalCode}-01', '${channel}', 'POS-LAYBY-REF-${selectedLayby.id}', ${payNum.toFixed(4)}, 0.00, 'SUCCESS', 'Layby installment client payment ${selectedLayby.id}', '${dateStr}')
       `, 'Double Entry: Record layby installment');
 
       runSql(`
@@ -629,6 +729,7 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       const newReceipt = {
         installmentId: instId,
         laybyId: selectedLayby.id,
+        storeId: selectedLayby.store_id || activeStore,
         customerName: selectedLayby.customer_name,
         customerPhone: selectedLayby.customer_phone,
         amountPaidThisTime: payNum,
@@ -647,6 +748,9 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       syncAllAccountingSystems(`Layby Installment #${instId}`);
       loadData();
       try {
+        window.dispatchEvent(new CustomEvent('pos_sale_completed', {
+          detail: { orderId: selectedLayby.id, totalAmount: payNum, paymentMethod: payMethod, store_id: selectedLayby.store_id || activeStore, type: 'LAYBY_PAYMENT' }
+        }));
         window.dispatchEvent(new Event('pos_data_updated'));
       } catch (e) {}
       persistTablesToStorage();
@@ -932,7 +1036,7 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
                       />
                     </div>
 
-                    <div className="w-[140px] flex flex-col gap-1.5">
+                    <div className="w-[170px] flex flex-col gap-1.5">
                       <label className="text-[10px] text-slate-400 font-extrabold uppercase">Option Channel</label>
                       <select
                         value={payMethod}
@@ -940,8 +1044,12 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
                         className="px-3 py-1.5 text-xs font-bold bg-slate-50 border border-slate-200 rounded-lg w-full text-slate-800"
                       >
                         <option value="Cash">Cash Counter</option>
-                        <option value="MTN Mobile Money">MTN Kwacha MoMo</option>
-                        <option value="Airtel Money">Airtel Kwacha MoMo</option>
+                        <option value="Airtel Money">Airtel Money</option>
+                        <option value="MTN Mobile Money">MTN Mobile Money</option>
+                        <option value="Credit Card">Credit Card / Bank</option>
+                        {customPaymentMethods.map(cm => (
+                          <option key={cm.id} value={cm.name}>{cm.name}</option>
+                        ))}
                       </select>
                     </div>
 
@@ -1235,15 +1343,33 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
                     <p className="text-lg font-mono font-extrabold text-emerald-400">{settings.currency}{calculateGrandTotal().toFixed(2)}</p>
                   </div>
 
-                  <div className="flex flex-col gap-1 w-full sm:w-[180px]">
-                    <label className="text-[9px] text-slate-350 font-sans uppercase">Security Downpayment ({settings.currency})</label>
-                    <input
-                      type="number"
-                      value={customDeposit}
-                      onChange={(e) => setCustomDeposit(e.target.value)}
-                      placeholder={`Min: ${(calculateGrandTotal() * 0.2).toFixed(2)}`}
-                      className="px-2 py-1 text-xs bg-slate-800 text-white rounded-md border border-slate-700 font-bold focus:outline-hidden text-center"
-                    />
+                  <div className="flex flex-col sm:flex-row gap-2.5 w-full sm:w-auto">
+                    <div className="flex flex-col gap-1 w-full sm:w-[170px]">
+                      <label className="text-[9px] text-slate-350 font-sans uppercase">Security Downpayment ({settings.currency})</label>
+                      <input
+                        type="number"
+                        value={customDeposit}
+                        onChange={(e) => setCustomDeposit(e.target.value)}
+                        placeholder={`Min: ${(calculateGrandTotal() * 0.2).toFixed(2)}`}
+                        className="px-2 py-1.5 text-xs bg-slate-800 text-white rounded-md border border-slate-700 font-bold focus:outline-hidden text-center"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1 w-full sm:w-[170px]">
+                      <label className="text-[9px] text-slate-350 font-sans uppercase">Deposit Channel</label>
+                      <select
+                        value={initialPayMethod}
+                        onChange={(e) => setInitialPayMethod(e.target.value)}
+                        className="px-2 py-1.5 text-xs bg-slate-800 text-white rounded-md border border-slate-700 font-bold focus:outline-hidden cursor-pointer"
+                      >
+                        <option value="Cash">Cash Counter</option>
+                        <option value="Airtel Money">Airtel Money</option>
+                        <option value="MTN Mobile Money">MTN Mobile Money</option>
+                        <option value="Credit Card">Credit Card / Bank</option>
+                        {customPaymentMethods.map(cm => (
+                          <option key={cm.id} value={cm.name}>{cm.name}</option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
                 </div>
 
@@ -1301,10 +1427,28 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
                 {/* Simulated Paper Invoice Ticket */}
                 <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 flex flex-col gap-2.5 font-sans shadow-sm">
                   <div className="text-center border-b border-slate-200 pb-1.5 flex flex-col items-center gap-0.5">
-                    {settings.logoUrl && (
-                      <img src={settings.logoUrl} alt="Store logo" className="max-h-10 object-contain mb-1" referrerPolicy="no-referrer" />
+                    {(settings.logoUrl || DEFAULT_COMPANY_LOGO) && (
+                      <img src={settings.logoUrl || DEFAULT_COMPANY_LOGO} alt="Company Logo" className="max-h-10 object-contain mb-1" referrerPolicy="no-referrer" />
                     )}
                     <h5 className="font-extrabold text-[12px] text-slate-800 uppercase tracking-tight">{settings.storeName}</h5>
+                    {(() => {
+                      const bInfo = getBranchReceiptInfo(activeInstReceipt.storeId);
+                      return (
+                        <>
+                          {bInfo.name && (
+                            <span className="text-[9px] font-bold text-indigo-800 uppercase">Branch: {bInfo.name}</span>
+                          )}
+                          {bInfo.location && (
+                            <span className="text-[8.5px] text-slate-600">{bInfo.location}</span>
+                          )}
+                          {(bInfo.phone || bInfo.email) && (
+                            <span className="text-[8px] text-slate-500 font-mono">
+                              {[bInfo.phone ? `Tel: ${bInfo.phone}` : '', bInfo.email].filter(Boolean).join(' | ')}
+                            </span>
+                          )}
+                        </>
+                      );
+                    })()}
                     {settings.tpin && (
                       <span className="text-[8px] font-bold text-slate-500 font-mono tracking-wider">TPIN: {settings.tpin}</span>
                     )}
@@ -1388,25 +1532,74 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
                 {/* WhatsApp Share Form */}
                 <div className="bg-indigo-50 border border-indigo-150 rounded-xl p-2.5 flex flex-col gap-1.5">
                   <div className="flex items-center gap-1.5 select-none text-[9px] text-indigo-800 font-extrabold uppercase">
-                    <span>📱 Share Dispatch Receipt via WhatsApp</span>
+                    <span>📱 Send PDF Receipt via WhatsApp</span>
                   </div>
                   
                   <div className="flex gap-2">
                     <input
                       type="tel"
                       value={whatsappPhone}
-                      onChange={(e) => setWhatsappPhone(e.target.value)}
-                      placeholder="e.g. 260977XXXXXX"
+                      onChange={(e) => { setWhatsappPhone(e.target.value); setWhatsappError(null); }}
+                      placeholder="e.g. +260977XXXXXX"
                       className="flex-1 bg-white border border-slate-200 rounded-lg px-2 py-1 text-xs text-slate-800 font-semibold focus:outline-indigo-500 font-mono"
                     />
                     <button
                       type="button"
+                      disabled={whatsappSending}
                       onClick={() => handleWhatsAppSend(whatsappPhone, activeInstReceipt)}
-                      className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[10px] font-black cursor-pointer transition-colors shadow-3xs uppercase"
+                      className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-[10px] font-black cursor-pointer transition-colors shadow-3xs uppercase inline-flex items-center gap-1"
                     >
-                      Send WhatsApp
+                      <Send size={10} />
+                      {whatsappSending ? 'Preparing...' : 'Send PDF'}
                     </button>
                   </div>
+
+                  {whatsappError && (
+                    <p className="text-[10px] font-bold text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1">
+                      {whatsappError}
+                    </p>
+                  )}
+
+                  {whatsappResult && whatsappResult.success && (
+                    <div className="bg-white border border-emerald-200 rounded-lg p-2 flex flex-col gap-1.5 text-[10px]">
+                      <span className="font-bold text-emerald-800">
+                        {whatsappResult.mode === 'cloud_api'
+                          ? `✓ PDF (${whatsappResult.filename}) sent directly to +${whatsappResult.phone} on WhatsApp.`
+                          : `✓ PDF Receipt (${whatsappResult.filename}) ready for +${whatsappResult.phone}.`}
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {whatsappResult.whatsappUrl && (
+                          <a
+                            href={whatsappResult.whatsappUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-black uppercase inline-flex items-center gap-1"
+                          >
+                            <Send size={9} /> Open Customer WhatsApp
+                          </a>
+                        )}
+                        {whatsappResult.canShareFile && lastCompiledLaybyPdf && (
+                          <button
+                            type="button"
+                            onClick={() => sharePdfFileDirectly(lastCompiledLaybyPdf.filename, lastCompiledLaybyPdf.doc, lastCompiledLaybyPdf.caption)}
+                            className="px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-black uppercase cursor-pointer inline-flex items-center gap-1"
+                          >
+                            <Share2 size={9} /> Share PDF File
+                          </button>
+                        )}
+                        {whatsappResult.pdfUrl && (
+                          <a
+                            href={whatsappResult.pdfUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold inline-flex items-center gap-1"
+                          >
+                            <Download size={9} /> View PDF
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Action buttons */}

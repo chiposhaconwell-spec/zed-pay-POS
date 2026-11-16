@@ -16,12 +16,15 @@ export const createPool = () => {
       password: process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
       max: 10,
-      connectionTimeoutMillis: 15000,
+      idleTimeoutMillis: 5000,
+      connectionTimeoutMillis: 20000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 5000,
     });
 
     // Prevent unhandled pool-level errors from crashing the application
     global._postgresPool.on('error', (err) => {
-      console.error('Unexpected error on idle SQL pool client:', err);
+      console.warn('[CloudSQL Pool] Idle client disconnected and removed from pool:', err?.message || err);
     });
   }
   return global._postgresPool;

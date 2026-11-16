@@ -47,7 +47,10 @@ export const ALL_TABLE_NAMES = [
   'receipt_refund_ledger',
   'cash_flow_ledger',
   'payment_method_ledger',
-  'financial_statements_ledger'
+  'financial_statements_ledger',
+  'payment_methods',
+  'zra_invoices',
+  'zra_sync_queue'
 ];
 
 /**
@@ -87,7 +90,9 @@ CREATE TABLE IF NOT EXISTS products (
   business_id TEXT,
   is_service INTEGER DEFAULT 0,
   batch_number TEXT,
-  expiry_date TEXT
+  expiry_date TEXT,
+  item_cls_cd TEXT,
+  tax_ty_cd TEXT
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -111,6 +116,8 @@ CREATE TABLE IF NOT EXISTS orders (
   discount REAL,
   total REAL,
   paymentMethod TEXT,
+  split_cash REAL,
+  split_momo REAL,
   status TEXT,
   store_id TEXT,
   performed_by TEXT
@@ -263,7 +270,9 @@ CREATE TABLE IF NOT EXISTS quotations (
   bank_account TEXT,
   bank_branch TEXT,
   status TEXT,
-  created_at TEXT
+  created_at TEXT,
+  updated_at TEXT,
+  extra_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS loans (
@@ -519,6 +528,47 @@ CREATE TABLE IF NOT EXISTS financial_statements_ledger (
   net_cash_flow REAL,
   updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS payment_methods (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  category TEXT,
+  account_id TEXT,
+  is_active INTEGER,
+  created_by TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS zra_invoices (
+  id TEXT PRIMARY KEY,
+  order_id TEXT,
+  status TEXT,
+  tpin TEXT,
+  bhf_id TEXT,
+  sdc_id TEXT,
+  mrc_no TEXT,
+  rcpt_no INTEGER,
+  cis_invc_no TEXT,
+  intrl_data TEXT,
+  rcpt_sign TEXT,
+  qr_code_url TEXT,
+  vsdc_date TEXT,
+  payload_json TEXT,
+  record_json TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS zra_sync_queue (
+  id TEXT PRIMARY KEY,
+  order_id TEXT,
+  endpoint TEXT,
+  payload_json TEXT,
+  sale_json TEXT,
+  retry_count INTEGER,
+  last_error TEXT,
+  created_at TEXT
+);
 `;
 
 /**
@@ -555,6 +605,10 @@ export async function initSqliteStorage(): Promise<boolean> {
 
       // Create schema
       await dbConnection.execute(SQLITE_SCHEMA);
+      try { await dbConnection.execute('ALTER TABLE quotations ADD COLUMN updated_at TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE quotations ADD COLUMN extra_json TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE products ADD COLUMN item_cls_cd TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE products ADD COLUMN tax_ty_cd TEXT;'); } catch {}
       console.log('[SqliteStorage] SQLite schema verified');
       isSqliteReady = true;
     }

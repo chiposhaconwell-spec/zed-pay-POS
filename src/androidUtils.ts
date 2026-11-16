@@ -179,3 +179,141 @@ export function safeSystemPrint(): void {
     console.warn('[AndroidUtils] System print not supported in this WebView environment:', err);
   }
 }
+
+export interface WhatsAppPdfDispatchResult {
+  success: boolean;
+  mode: 'cloud_api' | 'native_file_share' | 'link_and_download';
+  phone: string;
+  filename: string;
+  pdfUrl?: string;
+  whatsappUrl?: string;
+  error?: string;
+  canShareFile: boolean;
+}
+
+/**
+ * Triggers native mobile / Web Share sheet with the actual PDF File attachment
+ * so the user can attach the compiled PDF directly in WhatsApp on phones/tablets.
+ */
+export async function sharePdfFileDirectly(filename: string, doc: jsPDF, caption?: string): Promise<boolean> {
+  const safeFilename = filename.endsWith('.pdf') ? filename : `${filename}.pdf`;
+  try {
+    if (Capacitor.isNativePlatform()) {
+      return await exportAndSharePdf(safeFilename, doc);
+    }
+    const blob = doc.output('blob');
+    const file = new File([blob], safeFilename, { type: 'application/pdf' });
+    if (typeof navigator !== 'undefined' && typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })) {
+      await navigator.share({
+        title: safeFilename,
+        text: caption || `Official PDF Receipt (${safeFilename})`,
+        files: [file],
+      });
+      return true;
+    }
+  } catch (err) {
+    console.warn('[AndroidUtils] Direct file share declined or unavailable:', err);
+  }
+  return false;
+}
+
+/**
+ * Compiles the receipt PDF, uploads it to the server so it has a real downloadable PDF URL
+ * (and delivers directly as a PDF document attachment if WhatsApp Cloud API is configured),
+ * and opens the customer's WhatsApp number with the direct PDF link & local PDF file ready.
+ */
+export async function dispatchPdfToWhatsApp(params: {
+  phone: string;
+  filename: string;
+  doc: jsPDF;
+  storeName: string;
+  caption: string;
+}): Promise<WhatsAppPdfDispatchResult> {
+  const cleanPhone = String(params.phone || '').replace(/[^\d+]/g, '');
+  const digitsOnly = cleanPhone.replace(/\D/g, '');
+  const safeFilename = params.filename.endsWith('.pdf') ? params.filename : `${params.filename}.pdf`;
+
+  if (!digitsOnly || digitsOnly.length < 7) {
+    return {
+      success: false,
+      mode: 'link_and_download',
+      phone: cleanPhone,
+      filename: safeFilename,
+      error: 'Please enter a valid WhatsApp phone number (with country code, e.g. +26097...).',
+      canShareFile: false,
+    };
+  }
+
+  let canShareFile = Capacitor.isNativePlatform();
+  try {
+    const testBlob = params.doc.output('blob');
+    const testFile = new File([testBlob], safeFilename, { type: 'application/pdf' });
+    if (!canShareFile && typeof navigator !== 'undefined' && typeof navigator.canShare === 'function') {
+      canShareFile = navigator.canShare({ files: [testFile] });
+    }
+  } catch {}
+
+  const dataUri = params.doc.output('datauristring');
+  const pdfBase64 = dataUri.includes(',') ? dataUri.split(',')[1] : dataUri;
+
+  let pdfUrl = '';
+  let sentDirectly = false;
+
+  try {
+    const resp = await fetch('/api/whatsapp/send-pdf', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        phone: digitsOnly,
+        filename: safeFilename,
+        pdfBase64,
+        caption: params.caption,
+      }),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      sentDirectly = Boolean(data?.sentDirectly);
+      pdfUrl = data?.pdfUrl || '';
+    }
+  } catch (err) {
+    console.warn('[WhatsApp PDF] Server dispatch check failed, falling back to local file + WhatsApp chat:', err);
+  }
+
+  if (sentDirectly) {
+    return {
+      success: true,
+      mode: 'cloud_api',
+      phone: digitsOnly,
+      filename: safeFilename,
+      pdfUrl,
+      canShareFile,
+    };
+  }
+
+  // On native Android/mobile share-capable devices, try sharing the actual PDF file;
+  // on desktop browsers, save the PDF locally and open wa.me directly to the customer's number with the direct PDF URL.
+  const msgLines = [
+    `Hello! Here is your official PDF receipt from *${params.storeName.toUpperCase()}*:`,
+    params.caption,
+    pdfUrl ? `📄 *Download Receipt PDF:*\n${pdfUrl}` : `📎 _PDF File: ${safeFilename}_`,
+  ].filter(Boolean);
+
+  const whatsappUrl = `https://wa.me/${digitsOnly}?text=${encodeURIComponent(msgLines.join('\n\n'))}`;
+
+  // Trigger local PDF download on desktop web so the actual PDF file is immediately saved too
+  if (!Capacitor.isNativePlatform()) {
+    try {
+      params.doc.save(safeFilename);
+    } catch {}
+  }
+
+  return {
+    success: true,
+    mode: 'link_and_download',
+    phone: digitsOnly,
+    filename: safeFilename,
+    pdfUrl,
+    whatsappUrl,
+    canShareFile,
+  };
+}

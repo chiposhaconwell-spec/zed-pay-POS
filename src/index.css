@@ -97,3 +97,11 @@ body {
   transform: scale(0.97);
   opacity: 0.9;
 }
+
+input, textarea {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+

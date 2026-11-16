@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts';
-import { runSql } from '../db';
+import { runSql, getCentralBranches } from '../db';
 import { StoreSettings } from '../types';
 import { TrendingUp, Award, Wallet, Activity, Code, Play, Download, FileText } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -24,8 +24,16 @@ interface MetricState {
 
 export default function SmeDashboard({ settings, setActiveTab, setTerminalCode, userRole = 'owner', activeStore = '' }: SmeDashboardProps) {
   const [selectedStoreFilter, setSelectedStoreFilter] = useState<string>(() => activeStore || 'all');
+  const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
 
   useEffect(() => {
+    const centralBranches = getCentralBranches();
+    setStoresList(
+      centralBranches.map((s) => ({
+        id: String(s.id),
+        name: String(s.name || s.id),
+      }))
+    );
     if (activeStore) {
       setSelectedStoreFilter(activeStore);
       calculateAnalytics(activeStore);
@@ -50,17 +58,21 @@ export default function SmeDashboard({ settings, setActiveTab, setTerminalCode, 
   const [showSqlFor, setShowSqlFor] = useState<'metrics' | 'trend' | 'payments' | 'leaderboard' | 'double_entry' | 'customer_crm' | null>(null);
 
   const getFilteredQueries = (storeId: string) => {
+    const storeFilterRaw = storeId === 'all' ? '' : `AND LOWER(store_id) = '${storeId.toLowerCase()}'`;
+    const storeFilterAlias = storeId === 'all' ? '' : `AND LOWER(o.store_id) = '${storeId.toLowerCase()}'`;
+    const completedCond = `LOWER(TRIM(status)) IN ('completed', 'success', 'paid', 'active', 'quicksale')`;
+    const completedCondAlias = `LOWER(TRIM(o.status)) IN ('completed', 'success', 'paid', 'active', 'quicksale')`;
     return {
       metrics: `
 -- Aggregate top-level financial metrics from invoices and products for branch ${storeId.toUpperCase()}
 SELECT 
-  (SELECT SUM(total) FROM orders WHERE status = 'Completed' ${storeId === 'all' ? '' : `AND store_id = '${storeId}'`}) AS total_revenue,
-  (SELECT COUNT(*) FROM orders WHERE 1=1 ${storeId === 'all' ? '' : `AND store_id = '${storeId}'`}) AS transaction_count,
-  (SELECT SUM(oi.quantity * (oi.unitPrice - p.cost)) 
+  COALESCE((SELECT SUM(total) FROM orders WHERE ${completedCond} ${storeFilterRaw}), 0) AS total_revenue,
+  COALESCE((SELECT COUNT(*) FROM orders WHERE ${completedCond} ${storeFilterRaw}), 0) AS transaction_count,
+  COALESCE((SELECT SUM(oi.quantity * (oi.unitPrice - COALESCE(p.cost, oi.unitPrice * 0.7))) 
    FROM order_items oi 
-   JOIN products p ON oi.productId = p.id
+   LEFT JOIN products p ON oi.productId = p.id
    JOIN orders o ON oi.orderId = o.id
-   WHERE o.status = 'Completed' ${storeId === 'all' ? '' : `AND o.store_id = '${storeId}'`}) AS total_profit;
+   WHERE ${completedCondAlias} ${storeFilterAlias}), 0) - COALESCE((SELECT SUM(discount) FROM orders WHERE ${completedCond} ${storeFilterRaw}), 0) AS total_profit;
       `,
       trend: `
 -- Rollup sales transactions by daily date calendar buckets for branch ${storeId.toUpperCase()}
@@ -68,7 +80,7 @@ SELECT
   SUBSTR(orderDate, 1, 10) AS date,
   SUM(total) AS revenue
 FROM orders
-WHERE 1=1 ${storeId === 'all' ? '' : `AND store_id = '${storeId}'`}
+WHERE ${completedCond} ${storeFilterRaw}
 GROUP BY SUBSTR(orderDate, 1, 10)
 ORDER BY date ASC;
       `,
@@ -78,7 +90,7 @@ SELECT
   paymentMethod AS name,
   SUM(total) AS value
 FROM orders
-WHERE 1=1 ${storeId === 'all' ? '' : `AND store_id = '${storeId}'`}
+WHERE ${completedCond} ${storeFilterRaw}
 GROUP BY paymentMethod;
       `,
       leaderboard: `
@@ -89,7 +101,7 @@ SELECT
 FROM order_items oi
 JOIN products p ON oi.productId = p.id
 JOIN orders o ON oi.orderId = o.id
-WHERE 1=1 ${storeId === 'all' ? '' : `AND o.store_id = '${storeId}'`}
+WHERE ${completedCondAlias} ${storeFilterAlias}
 GROUP BY p.name
 ORDER BY value DESC
 LIMIT 5;
@@ -631,10 +643,10 @@ FROM view_account_balances;
                 onChange={(e) => setSelectedStoreFilter(e.target.value)}
                 className="bg-slate-50 border border-slate-200 rounded-lg p-1.5 px-2 text-[10.5px] font-bold text-slate-705 focus:outline-hidden cursor-pointer"
               >
-                <option value="all">🌐 All Stores Combined</option>
-                <option value="lusaka">🇿🇲 Lusaka Retail Store</option>
-                <option value="kitwe">🇿🇲 Kitwe Branch Warehouse</option>
-                <option value="ndola">🇿🇲 Ndola Trading Post</option>
+                <option value="all">🌐 All Branches Combined</option>
+                {storesList.map((s) => (
+                  <option key={s.id} value={s.id}>📍 {s.name}</option>
+                ))}
               </select>
             </div>
           )}

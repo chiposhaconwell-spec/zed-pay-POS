@@ -6,7 +6,8 @@ import {
   Archive
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { runSql } from '../db';
+import { runSql, syncAllAccountingSystems, persistTablesToStorage, getCustomPaymentMethods, resolvePaymentMethodBucket } from '../db';
+import { CustomPaymentMethod } from '../types';
 import { auth, googleSignIn, googleSignOut, getAccessToken } from '../firebase';
 import { User as FirebaseUser } from 'firebase/auth';
 
@@ -113,9 +114,21 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
   const [selectedTaskForFinancials, setSelectedTaskForFinancials] = useState<GoogleTask | null>(null);
   const [financialsServices, setFinancialsServices] = useState<any[]>([]);
   const [selectedServiceId, setSelectedServiceId] = useState<string>('');
-  const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'Mobile Wallet' | 'Credit Card'>('Cash');
+  const [paymentMethod, setPaymentMethod] = useState<string>('Cash');
+  const [customMethods, setCustomMethods] = useState<CustomPaymentMethod[]>(() => getCustomPaymentMethods(false));
   const [customerList, setCustomerList] = useState<any[]>([]);
   const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
+
+  useEffect(() => {
+    const syncCustomMethods = () => setCustomMethods(getCustomPaymentMethods(false));
+    syncCustomMethods();
+    window.addEventListener('pos_data_updated', syncCustomMethods);
+    window.addEventListener('local_db_restored', syncCustomMethods);
+    return () => {
+      window.removeEventListener('pos_data_updated', syncCustomMethods);
+      window.removeEventListener('local_db_restored', syncCustomMethods);
+    };
+  }, []);
 
   // Dialog and Notification feedback
   const [feedbackMsg, setFeedbackMsg] = useState<{ status: 'success' | 'info' | 'error', text: string } | null>(null);
@@ -434,8 +447,8 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
     }
 
     const orderId = 'ord_task_' + Math.floor(100000 + Math.random() * 900000);
-    const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    const customerIdVal = selectedCustomerId ? `'${selectedCustomerId}'` : 'NULL';
+    const dateStr = new Date().toISOString();
+    const customerIdVal = selectedCustomerId ? Number(selectedCustomerId) : 'NULL';
 
     const subtotal = serviceObj.price;
     const taxAmount = subtotal * 0.16; // 16% standard VAT
@@ -484,15 +497,18 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
     const feeAmount = parseFloat((totalAmount * calculatedFeeRate).toFixed(4));
     const netSettlement = totalAmount - feeAmount;
 
-    let clearingAccountId = 'cash-clearing-account-uuid';
+    const resolvedPay = resolvePaymentMethodBucket(paymentMethod);
+    const clearingAccountId = resolvedPay.clearingAccountId;
     let channel = 'CASH';
 
-    if (paymentMethod === 'Mobile Wallet') {
-      clearingAccountId = Math.random() > 0.5 ? 'mtn-clearing-account-uuid' : 'airtel-clearing-account-uuid';
-      channel = clearingAccountId === 'mtn-clearing-account-uuid' ? 'MTN_MOMO' : 'AIRTEL_MONEY';
+    if (paymentMethod === 'Airtel Money') {
+      channel = 'AIRTEL_MONEY';
+    } else if (paymentMethod === 'MTN Mobile Money') {
+      channel = 'MTN_MOMO';
     } else if (paymentMethod === 'Credit Card') {
-      clearingAccountId = 'airtel-clearing-account-uuid';
       channel = 'CARD_VISA';
+    } else if (paymentMethod !== 'Cash') {
+      channel = `CUSTOM_${paymentMethod.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
     }
 
     runSql(`
@@ -516,6 +532,15 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
         VALUES ('le_${txId}_cre_fee', '${txId}', 'zra-tax-payment-escrow-uuid', 'CREDIT', ${feeAmount.toFixed(4)}, '${dateStr}')
       `, 'Double Entry: Credit Escrow');
     }
+
+    syncAllAccountingSystems(`Workspace Task Sale #${orderId}`);
+    persistTablesToStorage();
+    try {
+      window.dispatchEvent(new CustomEvent('pos_sale_completed', {
+        detail: { orderId, totalAmount, paymentMethod, store_id: activeStore }
+      }));
+      window.dispatchEvent(new Event('pos_data_updated'));
+    } catch {}
 
     setShowFinancialsModal(false);
     setSelectedTaskForFinancials(null);
@@ -1883,13 +1908,13 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
                 {/* Choose Payment Method */}
                 <div className="flex flex-col gap-1">
                   <label className="text-[10px] uppercase font-mono font-bold text-slate-400">Payment Channel</label>
-                  <div className="grid grid-cols-3 gap-2 mt-1">
-                    {(['Cash', 'Mobile Wallet', 'Credit Card'] as const).map(method => (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-1">
+                    {['Cash', 'Airtel Money', 'MTN Mobile Money', 'Credit Card', ...customMethods.map(m => m.name)].map(method => (
                       <button
                         key={method}
                         type="button"
                         onClick={() => setPaymentMethod(method)}
-                        className={`py-2 px-1 text-[10px] font-bold rounded-lg border text-center transition-all cursor-pointer ${
+                        className={`py-2 px-1.5 text-[10px] font-bold rounded-lg border text-center transition-all cursor-pointer ${
                           paymentMethod === method
                             ? 'bg-amber-600 border-amber-650 text-white shadow-xs'
                             : 'bg-slate-50 border-slate-200 hover:border-slate-300 text-slate-600'

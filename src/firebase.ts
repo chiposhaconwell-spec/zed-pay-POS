@@ -29,7 +29,7 @@ import {
   getBytes,
 } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json';
-import { runSql, persistTablesToStorage, syncAllAccountingSystems } from './db';
+import { runSql, persistTablesToStorage, syncAllAccountingSystems, rehydrateAlasqlFromRecords } from './db';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(
@@ -410,6 +410,7 @@ export async function backupClientsAndTransactionsToStorage(
         customers: payload.customers,
         orders: payload.orders,
         order_items: payload.orderItems,
+        quotations: payload.quotations,
         ledgers: payload.ledgers,
       },
       null,
@@ -433,12 +434,73 @@ export async function backupClientsAndTransactionsToStorage(
   }
 }
 
+export function isCurrentUserAuthorizedBusinessOwner(businessId: string): boolean {
+  if (!auth.currentUser) return false;
+  const currentEmail = (auth.currentUser.email || '').trim().toLowerCase();
+  const isVerifiedBootstrapAdmin =
+    Boolean(auth.currentUser.emailVerified) && currentEmail === 'chiposhaconwell@gmail.com';
+
+  // 1. Check active POS session role (staff/sales/manager must not overwrite owner Firestore doc)
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const savedRole = (localStorage.getItem('logged_in_user_role') || '').trim().toLowerCase();
+      if (savedRole && savedRole !== 'owner' && !isVerifiedBootstrapAdmin) {
+        return false;
+      }
+      const sessionRaw = localStorage.getItem('pos_authenticated_session');
+      if (sessionRaw && sessionRaw.startsWith('{')) {
+        const session = JSON.parse(sessionRaw);
+        if (session?.role && session.role !== 'owner' && !isVerifiedBootstrapAdmin) {
+          return false;
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Check against local business owner email and staff roster
+  const cleanBizId = String(businessId || '').replace(/'/g, "''");
+  const bizRes = cleanBizId
+    ? runSql(`SELECT * FROM businesses WHERE id = '${cleanBizId}'`, 'Cloud Sync: Verify owner profile', true)
+    : { success: false, data: [] };
+  const bizRow =
+    bizRes.success && Array.isArray(bizRes.data) && bizRes.data.length > 0 ? bizRes.data[0] : null;
+
+  if (bizRow?.email) {
+    const bizOwnerEmail = String(bizRow.email).trim().toLowerCase();
+    if (bizOwnerEmail && currentEmail && currentEmail !== bizOwnerEmail && !isVerifiedBootstrapAdmin) {
+      return false;
+    }
+  } else {
+    const staffRes = runSql(`SELECT email FROM staff`, 'Cloud Sync: Check staff role', true);
+    const staffRows = staffRes.success && Array.isArray(staffRes.data) ? staffRes.data : [];
+    const matchesStaff = staffRows.some(
+      (st: any) => st?.email && String(st.email).trim().toLowerCase() === currentEmail
+    );
+    if (matchesStaff && !isVerifiedBootstrapAdmin) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // ============================================================================
 // CLOUD BACKUP (AlaSQL Local -> Firestore Relational + Firebase Storage)
 // ============================================================================
-export async function backupToCloud(businessId: string): Promise<{ success: boolean; details: string }> {
+export async function backupToCloud(
+  businessId: string,
+  options?: { silentIfNotOwner?: boolean }
+): Promise<{ success: boolean; details: string }> {
   if (!auth.currentUser) {
     throw new Error('You must be signed in (Email/Password or Google) to sync with Firebase Cloud.');
+  }
+
+  if (!isCurrentUserAuthorizedBusinessOwner(businessId)) {
+    const msg = 'Firestore owner backup skipped for staff/non-owner session (all data synced via Cloud SQL).';
+    if (options?.silentIfNotOwner) {
+      return { success: false, details: msg };
+    }
+    throw new Error(msg);
   }
 
   // Ensure all double-entry accounting ledgers are up to date before backing up
@@ -664,6 +726,9 @@ export async function backupToCloud(businessId: string): Promise<{ success: bool
     'expenses',
     'staff',
     'store_products',
+    'payment_methods',
+    'zra_invoices',
+    'zra_sync_queue',
   ];
 
   const ledgerMapForStorage: Record<string, any[]> = {};
@@ -966,27 +1031,44 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
     handleFirestoreError(err, OperationType.LIST, orderItemsPath);
   }
 
-  // 7. Pull Accounting & Client Relational Ledgers
+  // 7. Pull Accounting & Client Relational Ledgers (including quotations)
   const ledgersPath = `businesses/${targetBizId}/ledgers`;
   try {
     const lSnap = await getDocs(
       query(collection(db, 'businesses', targetBizId, 'ledgers'), where('ownerUid', '==', currentUid))
     );
     if (!lSnap.empty) {
+      const restoredLedgers: Record<string, any[]> = {};
       lSnap.forEach((docSnap) => {
         const d = docSnap.data();
         const tableName = String(d.ledger_type || docSnap.id);
         const rows = Array.isArray(d.records) ? d.records : [];
         if (rows.length > 0) {
+          restoredLedgers[tableName] = rows;
           totalLedgersRestored++;
         }
       });
+      if (Object.keys(restoredLedgers).length > 0) {
+        rehydrateAlasqlFromRecords(restoredLedgers);
+      }
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, ledgersPath);
   }
 
-  // 8. Also check Firebase Cloud Storage archive if additional records exist
+  // 8. Also check Firebase Cloud Storage archive for full untruncated quotations & settings
+  try {
+    const clientsRef = storageRef(storage, `backups/${targetBizId}/clients_data.json`);
+    const cBytes = await getBytes(clientsRef);
+    const cText = new TextDecoder().decode(cBytes);
+    const cParsed = JSON.parse(cText);
+    if (cParsed?.clients && Array.isArray(cParsed.clients.quotations) && cParsed.clients.quotations.length > 0) {
+      rehydrateAlasqlFromRecords({ quotations: cParsed.clients.quotations });
+    }
+  } catch {
+    // Clients archive optional
+  }
+
   try {
     const fullRef = storageRef(storage, `backups/${targetBizId}/full_workspace_backup.json`);
     const bytes = await getBytes(fullRef);
@@ -994,6 +1076,9 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
     const parsed = JSON.parse(text);
     if (parsed && parsed.settings && typeof localStorage !== 'undefined') {
       localStorage.setItem('android_pos_settings', JSON.stringify(parsed.settings));
+    }
+    if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
+      rehydrateAlasqlFromRecords({ quotations: parsed.quotations });
     }
   } catch {
     // Storage archive optional on restore if Firestore succeeded
@@ -1041,8 +1126,8 @@ export function triggerAutoFirebaseBackup(businessId?: string) {
           targetBizId = bRes.data[0].id;
         }
       }
-      if (targetBizId && targetBizId !== 'default_biz') {
-        await backupToCloud(targetBizId);
+      if (targetBizId && targetBizId !== 'default_biz' && isCurrentUserAuthorizedBusinessOwner(targetBizId)) {
+        await backupToCloud(targetBizId, { silentIfNotOwner: true });
       }
     } catch (err) {
       console.warn('Auto Firebase background backup notice:', err);

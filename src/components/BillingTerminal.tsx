@@ -40,20 +40,24 @@ import {
   AlertTriangle,
   Zap
 } from 'lucide-react';
-import { runSql, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer } from '../db';
-import { Product, Customer, StoreSettings } from '../types';
+import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider } from '../db';
+import { Product, Customer, StoreSettings, CustomPaymentMethod } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { jsPDF } from 'jspdf';
-import { exportAndSharePdf, safeSystemPrint } from '../androidUtils';
+import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
 import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud } from '../firebase';
+import { FiscalService, ZraFiscalReceiptData } from '../zra/fiscalService';
+import { getZraConfig, subscribeZraConfig, ZraConfig } from '../zra/zraConfig';
 
 const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
 interface BillingTerminalProps {
   settings: StoreSettings;
-  activeStore: string; // 'lusaka' | 'kitwe' | 'ndola'
+  activeStore: string;
   userRole: string; // 'owner' | 'manager' | 'sales'
+  accessibleStores?: Array<{ id: string; name: string; location?: string }>;
+  onLogout?: () => void;
   onCartCheckedOut: () => void;
   initialAction?: 'camera' | 'cashup' | 'refunds' | 'history' | null;
   onClearInitialAction?: () => void;
@@ -76,6 +80,8 @@ interface OfflineOrder {
   discountAmount: number;
   totalAmount: number;
   paymentMethod: string;
+  splitCash?: number;
+  splitMobile?: number;
   activeStore: string;
   salesperson?: string;
   type: 'standard' | 'quicksale';
@@ -114,7 +120,11 @@ export default function BillingTerminal({
   // Checkout & Payment Modals
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [checkoutStep, setCheckoutStep] = useState<'customer' | 'payment' | 'success'>('customer');
-  const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'Credit Card' | 'Mobile Wallet' | 'Split'>('Cash');
+  const [paymentMethod, setPaymentMethod] = useState<string>('Cash');
+  const [splitMobileProvider, setSplitMobileProvider] = useState<string>('Airtel Money');
+  const [mobileMoneyOptions, setMobileMoneyOptions] = useState(() => getMobileMoneyOptions());
+  const [customPaymentMethods, setCustomPaymentMethods] = useState<CustomPaymentMethod[]>(() => getCustomPaymentMethods(false));
+  const [allCustomMethods, setAllCustomMethods] = useState<CustomPaymentMethod[]>(() => getCustomPaymentMethods(true));
   const [receivedCash, setReceivedCash] = useState<string>('');
   const [splitCashAmount, setSplitCashAmount] = useState<string>('');
   const [splitMobileAmount, setSplitMobileAmount] = useState<string>('');
@@ -130,7 +140,7 @@ export default function BillingTerminal({
   const [quickSearchQuery, setQuickSearchQuery] = useState('');
   const [quickSelectedProduct, setQuickSelectedProduct] = useState<Product | null>(null);
   const [quickSaleQty, setQuickSaleQty] = useState<string>('1');
-  const [quickPaymentMethod, setQuickPaymentMethod] = useState<'Cash' | 'Credit Card' | 'Mobile Wallet'>('Cash');
+  const [quickPaymentMethod, setQuickPaymentMethod] = useState<string>('Cash');
 
   // Invoice History and Refund state management
   const [showInvoiceHistoryModal, setShowInvoiceHistoryModal] = useState(false);
@@ -165,6 +175,18 @@ export default function BillingTerminal({
     }
   });
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [zraConfigState, setZraConfigState] = useState<ZraConfig>(() => getZraConfig());
+  const [zraQueueCount, setZraQueueCount] = useState<number>(() => FiscalService.getOfflineQueue().length);
+
+  useEffect(() => {
+    const unsubZra = subscribeZraConfig((cfg) => setZraConfigState(cfg));
+    const onQueueUpdate = () => setZraQueueCount(FiscalService.getOfflineQueue().length);
+    window.addEventListener('zra_queue_updated', onQueueUpdate);
+    return () => {
+      unsubZra();
+      window.removeEventListener('zra_queue_updated', onQueueUpdate);
+    };
+  }, []);
 
   // Synchronize queued transactions
   const syncOfflineQueue = async () => {
@@ -218,13 +240,14 @@ export default function BillingTerminal({
               `;
               runSql(itemInsertSql, `Sync: Post quick sales transaction lines`);
 
-              // Decrement branch specific stock if not a service
+              // Decrement branch specific stock and baseline catalog stock if not a service
               if (item.product.is_service !== 1) {
                 runSql(`
                   UPDATE store_products 
                   SET stock = stock - ${item.quantity} 
                   WHERE product_id = ${item.product.id} AND store_id = '${trx.activeStore}'
                 `, `Sync: Decrement quicksale stock unit from ${trx.activeStore.toUpperCase()}`);
+                runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id}`, 'Sync: Decrement quicksale baseline stock');
               }
             });
 
@@ -240,8 +263,11 @@ export default function BillingTerminal({
         } else {
           // Sync standard checkout
           const customerIdVal = trx.customerId ? trx.customerId : 'NULL';
+          const isSplit = String(trx.paymentMethod || '').toLowerCase().startsWith('split');
+          const splitCashStored = isSplit ? Number(trx.splitCash ?? (trx.totalAmount / 2)) : 0;
+          const splitMobileStored = isSplit ? Number(trx.splitMobile ?? Math.max(0, trx.totalAmount - splitCashStored)) : 0;
           const orderInsertSql = `
-            INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
+            INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo) VALUES (
               '${trx.orderId}', 
               ${customerIdVal}, 
               '${trx.dateStr}', 
@@ -252,7 +278,9 @@ export default function BillingTerminal({
               '${trx.paymentMethod}', 
               'Completed',
               '${trx.activeStore}',
-              '${(trx.salesperson || 'Default Cashier').replace(/'/g, "''")}'
+              '${(trx.salesperson || 'Default Cashier').replace(/'/g, "''")}',
+              ${splitCashStored.toFixed(2)},
+              ${splitMobileStored.toFixed(2)}
             )
           `;
           const resOrder = runSql(orderInsertSql, `Sync: Post standard order ${trx.orderId}`);
@@ -306,31 +334,59 @@ export default function BillingTerminal({
             const feeAmount = parseFloat((trx.totalAmount * calculatedFeeRate).toFixed(4));
             const netSettlement = trx.totalAmount - feeAmount;
 
-            let clearingAccountId = 'cash-clearing-account-uuid';
-            let channel = 'CASH';
+            if (isSplit) {
+              const momoResolved = resolveSplitMobileProvider(trx.paymentMethod);
+              const splitFee = parseFloat((splitMobileStored * 0.015).toFixed(4));
+              const splitNet = trx.totalAmount - splitFee;
+              runSql(`
+                INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
+                VALUES ('${txId}', '${idempotencyKey}', 'POS-${trx.activeStore.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${splitFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${trx.activeStore.toUpperCase()} order Split Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}')
+              `, 'Double Entry: Journal base transaction entry (Offline Split)');
+              if (splitCashStored > 0) {
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_deb_cash', '${txId}', 'cash-clearing-account-uuid', 'DEBIT', ${splitCashStored.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Debit Cash Clearing');
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_cash_asset', '${txId}', 'acc_cash', 'DEBIT', ${splitCashStored.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Debit Cash Account');
+              }
+              if (splitMobileStored > 0) {
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_deb_momo', '${txId}', '${momoResolved.clearingAccountId}', 'DEBIT', ${splitMobileStored.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Debit Mobile Clearing');
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_momo_asset', '${txId}', '${momoResolved.accountId}', 'DEBIT', ${splitMobileStored.toFixed(4)}, '${trx.dateStr}')`, `Double Entry: Debit ${momoResolved.bucket} Account`);
+              }
+              runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${splitNet.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Credit Merchant Wallet');
+              runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Credit Sales Revenue');
+            } else {
+              const resolvedOff = resolvePaymentMethodBucket(trx.paymentMethod);
+              const clearingAccountId = resolvedOff.clearingAccountId;
+              const targetAccountId = resolvedOff.accountId;
+              let channel = 'CASH';
+              if (targetAccountId === 'acc_airtel') channel = 'AIRTEL_MONEY';
+              else if (targetAccountId === 'acc_mtn') channel = 'MTN_MOMO';
+              else if (targetAccountId === 'acc_bank') channel = 'CARD_VISA';
+              else if (targetAccountId.startsWith('acc_pm_')) channel = `CUSTOM_${resolvedOff.bucket.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
 
-            if (trx.paymentMethod === 'Mobile Wallet') {
-              clearingAccountId = Math.random() > 0.5 ? 'mtn-clearing-account-uuid' : 'airtel-clearing-account-uuid';
-              channel = clearingAccountId === 'mtn-clearing-account-uuid' ? 'MTN_MOMO' : 'AIRTEL_MONEY';
-            } else if (trx.paymentMethod === 'Credit Card') {
-              clearingAccountId = 'airtel-clearing-account-uuid';
-              channel = 'CARD_VISA';
+              runSql(`
+                INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
+                VALUES ('${txId}', '${idempotencyKey}', 'POS-${trx.activeStore.toUpperCase()}-01', '${channel}', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'POS Branch ${trx.activeStore.toUpperCase()} order Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}')
+              `, 'Double Entry: Journal base transaction entry');
+
+              runSql(`
+                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
+                VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
+              `, 'Double Entry: Debit Clearing Asset account');
+
+              runSql(`
+                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
+                VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
+              `, `Double Entry: Debit ${targetAccountId} Account`);
+
+              runSql(`
+                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
+                VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${trx.dateStr}')
+              `, 'Double Entry: Credit Merchant Wallet');
+
+              runSql(`
+                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
+                VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
+              `, 'Double Entry: Credit Gross Sales Revenue');
             }
-
-            runSql(`
-              INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-              VALUES ('${txId}', '${idempotencyKey}', 'POS-${trx.activeStore.toUpperCase()}-01', '${channel}', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'POS Branch ${trx.activeStore.toUpperCase()} order Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}')
-            `, 'Double Entry: Journal base transaction entry');
-
-            runSql(`
-              INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-              VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
-            `, 'Double Entry: Debit Clearing Asset account');
-
-            runSql(`
-              INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-              VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${trx.dateStr}')
-            `, 'Double Entry: Credit Merchant Wallet');
 
             if (trx.customerId) {
               const awardPts = Math.floor(trx.totalAmount * settings.loyaltyRatio);
@@ -364,6 +420,29 @@ export default function BillingTerminal({
               console.error('Offline credit sweep failed:', sweepErr);
             }
 
+            // Submit offline-synced order to ZRA VSDC if ZRA is enabled
+            try {
+              await FiscalService.submitInvoice({
+                orderId: trx.orderId,
+                salesDateIso: trx.dateStr,
+                items: (trx.items || []).map((it) => ({
+                  productId: it.product.id,
+                  itemNm: it.product.name,
+                  itemCd: it.product.sku,
+                  itemClsCd: it.product.item_cls_cd,
+                  taxTyCd: it.product.tax_ty_cd,
+                  qty: it.quantity,
+                  prc: it.product.price,
+                  isService: it.product.is_service === 1,
+                })),
+                totalAmount: trx.totalAmount,
+                discountAmount: trx.discountAmount,
+                paymentMethod: trx.paymentMethod,
+                cashierName: trx.salesperson || 'Cashier',
+                currencyTyCd: settings.currency,
+              });
+            } catch {}
+
             successCount++;
           }
         }
@@ -382,8 +461,10 @@ export default function BillingTerminal({
     onCartCheckedOut();
     syncAllAccountingSystems('Offline Queue Reconnect Sync');
     refreshDbData();
-    handleTriggerCashUp();
+    loadInvoices(historyStoreFilter || activeStore || 'all');
+    handleTriggerCashUp(undefined, undefined, undefined, false, true);
     try {
+      window.dispatchEvent(new CustomEvent('pos_sale_completed', { detail: { syncedCount: successCount, type: 'OFFLINE_SYNC' } }));
       window.dispatchEvent(new Event('pos_data_updated'));
       window.dispatchEvent(new Event('storage'));
     } catch (evErr) {
@@ -409,6 +490,7 @@ export default function BillingTerminal({
       setIsDeviceOnline(true);
       setTimeout(() => {
         syncOfflineQueue().catch(console.error);
+        FiscalService.processOfflineQueue().catch(console.error);
       }, 300);
     };
     const handleOffline = () => {
@@ -486,9 +568,20 @@ export default function BillingTerminal({
   const [btEscPosHex, setBtEscPosHex] = useState<string>('');
   const [btEscPosText, setBtEscPosText] = useState<string>('');
 
-  // WhatsApp share state
+  // WhatsApp PDF dispatch state
   const [whatsappPhone, setWhatsappPhone] = useState('');
   const [whatsappSuccess, setWhatsappSuccess] = useState(false);
+  const [whatsappSending, setWhatsappSending] = useState(false);
+  const [whatsappError, setWhatsappError] = useState<string | null>(null);
+  const [whatsappResult, setWhatsappResult] = useState<WhatsAppPdfDispatchResult | null>(null);
+  const [lastCompiledReceiptPdf, setLastCompiledReceiptPdf] = useState<{ doc: jsPDF; filename: string; caption: string } | null>(null);
+
+  useEffect(() => {
+    setWhatsappSuccess(false);
+    setWhatsappError(null);
+    setWhatsappResult(null);
+    setLastCompiledReceiptPdf(null);
+  }, [activeReceipt?.id]);
 
   // Cash-up report state
   const [showCashUpModal, setShowCashUpModal] = useState(false);
@@ -514,17 +607,17 @@ export default function BillingTerminal({
   const [loginStores, setLoginStores] = useState<any[]>([]);
 
   const loadDynamicLoginStores = () => {
-    const res = runSql("SELECT * FROM stores", 'Fetch stores for login selection');
-    if (res.success && Array.isArray(res.data) && res.data.length > 0) {
+    const centralStores = getCentralBranches();
+    if (centralStores.length > 0) {
       let accessibleIds: string[] = [];
       try {
         const savedAcc = localStorage.getItem('logged_in_accessible_branches');
         if (savedAcc) accessibleIds = JSON.parse(savedAcc);
       } catch {}
       const filteredStores = (userRole !== 'owner' && accessibleIds.length > 0)
-        ? res.data.filter((s: any) => accessibleIds.includes(s.id))
-        : res.data;
-      const finalStores = filteredStores.length > 0 ? filteredStores : res.data;
+        ? centralStores.filter((s: any) => accessibleIds.includes(s.id))
+        : centralStores;
+      const finalStores = filteredStores.length > 0 ? filteredStores : centralStores;
       setLoginStores(finalStores);
       if (!selectedLoginStore || !finalStores.some((s: any) => s.id === selectedLoginStore)) {
         setSelectedLoginStore(finalStores[0].id);
@@ -571,14 +664,17 @@ export default function BillingTerminal({
   const [salesCashSum, setSalesCashSum] = useState<number>(0);
   const [salesAirtelSum, setSalesAirtelSum] = useState<number>(0);
   const [salesMtnSum, setSalesMtnSum] = useState<number>(0);
-  const [salesZamtelSum, setSalesZamtelSum] = useState<number>(0);
   const [salesOtherMomoSum, setSalesOtherMomoSum] = useState<number>(0);
   const [salesCardSum, setSalesCardSum] = useState<number>(0);
   const [salesOtherSum, setSalesOtherSum] = useState<number>(0);
+  const [salesCustomSums, setSalesCustomSums] = useState<Record<string, number>>({});
 
   const [laybyCashSum, setLaybyCashSum] = useState<number>(0);
+  const [laybyAirtelSum, setLaybyAirtelSum] = useState<number>(0);
+  const [laybyMtnSum, setLaybyMtnSum] = useState<number>(0);
   const [laybyMomoSum, setLaybyMomoSum] = useState<number>(0);
   const [laybyCardSum, setLaybyCardSum] = useState<number>(0);
+  const [laybyCustomSums, setLaybyCustomSums] = useState<Record<string, number>>({});
   const [cashExpensesSum, setCashExpensesSum] = useState<number>(0);
 
   // Supervisor verification
@@ -589,7 +685,10 @@ export default function BillingTerminal({
 
   const [cashCounted, setCashCounted] = useState<string>('');
   const [cardCounted, setCardCounted] = useState<string>('');
+  const [airtelCounted, setAirtelCounted] = useState<string>('');
+  const [mtnCounted, setMtnCounted] = useState<string>('');
   const [momoCounted, setMomoCounted] = useState<string>('');
+  const [customMethodCounted, setCustomMethodCounted] = useState<Record<string, string>>({});
   const [cashUpNotes, setCashUpNotes] = useState<string>('');
   const [isCashUpPosted, setIsCashUpPosted] = useState<boolean>(false);
   const [reconciliationHistory, setReconciliationHistory] = useState<any[]>([]);
@@ -627,9 +726,13 @@ export default function BillingTerminal({
       return found ? parseFloat(found.sum_tot || 0) : 0;
     }
     if (method === 'Cash') return (cashUpSummary.salesCash || 0) + (cashUpSummary.laybyCash || 0);
-    if (method === 'Mobile Wallet') return (cashUpSummary.salesMomo || 0) + (cashUpSummary.laybyMomo || 0);
+    if (method === 'Airtel Money') return (cashUpSummary.salesAirtel || 0) + (cashUpSummary.laybyAirtel || 0);
+    if (method === 'MTN Mobile Money') return (cashUpSummary.salesMtn || 0) + (cashUpSummary.laybyMtn || 0);
+    if (method === 'Mobile Wallet') return (cashUpSummary.salesMomo ?? ((cashUpSummary.salesAirtel || 0) + (cashUpSummary.salesMtn || 0) + (cashUpSummary.salesOtherMomo || 0))) + (cashUpSummary.laybyMomo || 0);
     if (method === 'Credit Card') return (cashUpSummary.salesCard || 0) + (cashUpSummary.laybyCard || 0);
-    return 0;
+    const customSale = cashUpSummary.salesCustom?.[method] || 0;
+    const customLayby = cashUpSummary.laybyCustom?.[method] || 0;
+    return customSale + customLayby;
   };
 
   const getTxCountByMethod = (method: string) => {
@@ -642,6 +745,23 @@ export default function BillingTerminal({
       return cashUpSummary.todayTxList.filter((tx: any) => tx.method.includes(method)).length;
     }
     return 0;
+  };
+
+  // Resolve transacting branch name & contact details from the central branches database
+  const getBranchReceiptDetails = (storeId?: string) => {
+    const targetId = String(storeId || activeStore || '').trim();
+    const branches = getCentralBranches();
+    const matched =
+      branches.find((b: any) => String(b.id || '').toLowerCase() === targetId.toLowerCase()) ||
+      branches.find((b: any) => String(b.name || '').toLowerCase() === targetId.toLowerCase()) ||
+      null;
+    return {
+      id: matched?.id || targetId || 'MAIN',
+      name: matched?.name || (targetId ? targetId.toUpperCase() : 'MAIN BRANCH'),
+      location: matched?.location || '',
+      phone: matched?.phone || '',
+      email: matched?.email || ''
+    };
   };
 
   // Sync state with SQL database (strictly separated by activeStore)
@@ -668,8 +788,11 @@ export default function BillingTerminal({
       setCustomers(custResult.data);
     }
 
-    // Keep invoice history list in sync automatically on all refreshes
-    loadInvoices(activeStore || historyStoreFilter);
+    // Keep payment channels & invoice history list in sync automatically on all refreshes
+    setMobileMoneyOptions(getMobileMoneyOptions());
+    setCustomPaymentMethods(getCustomPaymentMethods(false));
+    setAllCustomMethods(getCustomPaymentMethods(true));
+    loadInvoices(historyStoreFilter || activeStore || 'all');
   };
 
   const loadInvoices = (overrideStoreFilter?: string) => {
@@ -739,7 +862,7 @@ export default function BillingTerminal({
               ? `Layby (Finished - Paid K${Number(l.total_amount || 0).toFixed(2)})`
               : `Layby (Active - Paid K${Number(l.amount_paid || 0).toFixed(2)}, K${Number(l.balance_due || 0).toFixed(2)} Due)`,
             status: isFinished ? 'Completed' : 'Layby (Credit)',
-            store_id: l.store_id || 'lusaka',
+            store_id: l.store_id || activeStore || '',
             performed_by: 'Cashier / Layby',
             isLayby: true,
             laybyPaid: Number(l.amount_paid || 0),
@@ -800,18 +923,68 @@ export default function BillingTerminal({
     `, 'Invoice History: Load order items');
     const items = (itemRes.success && Array.isArray(itemRes.data)) ? itemRes.data : [];
 
-    // Construct customer object
+    // Resolve customer details from customers table if linked
     const custName = inv.customer_name || 'Walk-In Customer';
+    let custPhone = 'N/A';
+    let custTpin = 'N/A';
+    let custEmail = 'N/A';
+    if (inv.customerId) {
+      const cRes = runSql(`SELECT * FROM customers WHERE id = ${inv.customerId}`, 'Reprint: Lookup customer contact', true);
+      if (cRes.success && Array.isArray(cRes.data) && cRes.data.length > 0) {
+        custPhone = cRes.data[0].phone || 'N/A';
+        custTpin = cRes.data[0].tpin || 'N/A';
+        custEmail = cRes.data[0].email || 'N/A';
+      }
+    }
     const customerObj = {
       id: inv.customerId || '',
       name: custName,
-      phone: 'N/A',
-      tpin: 'N/A',
-      address: 'N/A'
+      phone: custPhone,
+      tpin: custTpin,
+      address: custEmail
     };
+
+    // Resolve split breakdown if Split payment
+    let splitBreakdown: { cash: number; mobile: number } | null = null;
+    if (String(inv.paymentMethod || '').toLowerCase().startsWith('split')) {
+      const sc = Number(inv.split_cash || 0);
+      const sm = Number(inv.split_momo || 0);
+      if (sc > 0 || sm > 0) {
+        splitBreakdown = { cash: sc, mobile: sm };
+      } else {
+        const legRes = runSql(`
+          SELECT le.account_id, le.amount
+          FROM ledger_entries le
+          JOIN transactions t ON le.transaction_id = t.id
+          WHERE t.provider_reference = 'POS-REF-${inv.id}' AND le.type = 'DEBIT'
+        `, 'Reprint: Lookup split breakdown', true);
+        if (legRes.success && Array.isArray(legRes.data) && legRes.data.length > 0) {
+          let lCash = 0;
+          let lMomo = 0;
+          const seenAccounts = new Set<string>();
+          legRes.data.forEach((le: any) => {
+            const acc = String(le.account_id || '');
+            if (seenAccounts.has(acc)) return;
+            seenAccounts.add(acc);
+            if (acc === 'cash-clearing-account-uuid') lCash += Number(le.amount || 0);
+            else if (acc === 'mtn-clearing-account-uuid' || acc === 'airtel-clearing-account-uuid') lMomo += Number(le.amount || 0);
+          });
+          if (lCash === 0 && lMomo === 0) {
+            legRes.data.forEach((le: any) => {
+              if (le.account_id === 'acc_cash') lCash += Number(le.amount || 0);
+              if (le.account_id === 'acc_momo') lMomo += Number(le.amount || 0);
+            });
+          }
+          if (lCash > 0 || lMomo > 0) splitBreakdown = { cash: lCash, mobile: lMomo };
+        }
+      }
+    }
+
+    const savedZraRecord = FiscalService.getFiscalRecordByOrderId(inv.id);
 
     const receiptToPrint = {
       id: inv.id,
+      store_id: inv.store_id || activeStore,
       date: new Date(inv.orderDate).toLocaleString(),
       paymentMethod: inv.paymentMethod,
       subtotal: Number(inv.subtotal || 0),
@@ -821,7 +994,7 @@ export default function BillingTerminal({
       total: Number(inv.total || 0),
       cashReceived: Number(inv.total || 0),
       change: 0,
-      splitBreakdown: null,
+      splitBreakdown,
       customer: customerObj,
       items: items.map((it: any) => ({
         product: {
@@ -833,7 +1006,8 @@ export default function BillingTerminal({
         quantity: it.quantity
       })),
       performed_by: inv.performed_by || 'Unknown Cashier',
-      zra: null
+      fiscalStatus: savedZraRecord ? savedZraRecord.status : 'LOCAL_ONLY',
+      zra: savedZraRecord
     };
 
     setActiveReceipt(receiptToPrint);
@@ -861,6 +1035,7 @@ export default function BillingTerminal({
       WHERE oi.orderId = '${inv.id}'
     `, 'Refund: Fetch order lines for stock restore');
 
+    const refundStore = inv.store_id || activeStore;
     if (itemRes.success && Array.isArray(itemRes.data)) {
       itemRes.data.forEach((item: any) => {
         if (item.is_service !== 1) {
@@ -868,8 +1043,8 @@ export default function BillingTerminal({
           runSql(`
             UPDATE store_products 
             SET stock = stock + ${item.quantity} 
-            WHERE product_id = ${item.productId} AND store_id = '${activeStore}'
-          `, `Refund: Restore ${item.quantity} units to branch ${activeStore}`);
+            WHERE product_id = ${item.productId} AND store_id = '${refundStore}'
+          `, `Refund: Restore ${item.quantity} units to branch ${refundStore}`);
 
           // Increment global stock fallback
           runSql(`
@@ -882,20 +1057,20 @@ export default function BillingTerminal({
     }
 
     // 3. Log a refund audit event & synchronize all double-entry accounting tables immediately
-    logEmployeeAudit('SALES', 'Processed Refund', `Refunded Order #${inv.id}, Supervisor Approved: ${supervisorName}`, Number(inv.total || 0), activeStore);
+    logEmployeeAudit('SALES', 'Processed Refund', `Refunded Order #${inv.id}, Supervisor Approved: ${supervisorName}`, Number(inv.total || 0), refundStore);
     syncAllAccountingSystems(`POS Refund #${inv.id}`);
 
     alert(`✓ Refund Processed Successfully!\n\nOrder Ref: ${inv.id}\nValue: ${settings.currency}${Number(inv.total || 0).toFixed(2)}\nSupervisor Approved: ${supervisorName}\n\nInventory levels and all Double-Entry Accounting Ledgers (EOD, Cash Flow, Payment Methods, P&L, Balance Sheet & Refund Ledger) have been updated!`);
 
     // 4. Reload data and notify all accounting views
-    loadInvoices();
+    loadInvoices(historyStoreFilter || activeStore || 'all');
     const updatedInv = { ...inv, status: 'Refunded' };
     setSelectedInvoice(updatedInv);
     refreshDbData();
-    handleTriggerCashUp();
+    handleTriggerCashUp(undefined, undefined, undefined, false, true);
     try {
       window.dispatchEvent(new CustomEvent('pos_sale_completed', {
-        detail: { orderId: inv.id, totalAmount: -Number(inv.total || 0), paymentMethod: inv.paymentMethod, store_id: activeStore, type: 'REFUND' }
+        detail: { orderId: inv.id, totalAmount: -Number(inv.total || 0), paymentMethod: inv.paymentMethod, store_id: refundStore, type: 'REFUND' }
       }));
       window.dispatchEvent(new Event('pos_data_updated'));
       window.dispatchEvent(new Event('storage'));
@@ -911,6 +1086,22 @@ export default function BillingTerminal({
   useEffect(() => {
     refreshDbData();
   }, [activeReceipt, activeStore]); // reload catalog on changes
+
+  useEffect(() => {
+    const handleCrossModuleSync = () => {
+      refreshDbData();
+      loadInvoices(historyStoreFilter || activeStore || 'all');
+      handleTriggerCashUp(undefined, undefined, undefined, false, true);
+    };
+    window.addEventListener('pos_data_updated', handleCrossModuleSync);
+    window.addEventListener('pos_sale_completed', handleCrossModuleSync);
+    window.addEventListener('local_db_restored', handleCrossModuleSync);
+    return () => {
+      window.removeEventListener('pos_data_updated', handleCrossModuleSync);
+      window.removeEventListener('pos_sale_completed', handleCrossModuleSync);
+      window.removeEventListener('local_db_restored', handleCrossModuleSync);
+    };
+  }, [activeStore, historyStoreFilter, cashUpDate, cashUpStore, cashUpCashier]);
 
   useEffect(() => {
     if (showInvoiceHistoryModal) {
@@ -1018,7 +1209,9 @@ export default function BillingTerminal({
     // Initialize: ESC @
     addBytes([0x1B, 0x40], 'Initialize Printer');
 
-    // Store Name: Center, Bold, Double Size
+    const branchInfo = getBranchReceiptDetails(receipt.store_id);
+
+    // Company Name: Center, Bold, Double Size
     addBytes([0x1B, 0x61, 0x01], 'Align Center');
     addBytes([0x1B, 0x45, 0x01], 'Bold ON');
     addBytes([0x1D, 0x21, 0x11], 'Double Width & Height ON');
@@ -1027,6 +1220,12 @@ export default function BillingTerminal({
     // Reset sizes
     addBytes([0x1D, 0x21, 0x00], 'Double Size OFF');
     addBytes([0x1B, 0x45, 0x00], 'Bold OFF');
+
+    // Transacting Branch Name & Contact Details
+    addText(`BRANCH: ${branchInfo.name.toUpperCase()}`, ['center']);
+    if (branchInfo.location) addText(branchInfo.location, ['center']);
+    if (branchInfo.phone) addText(`TEL: ${branchInfo.phone}`, ['center']);
+    if (branchInfo.email) addText(`EMAIL: ${branchInfo.email}`, ['center']);
 
     if (settings.receiptHeader) {
       addText(settings.receiptHeader, ['center']);
@@ -1212,11 +1411,16 @@ export default function BillingTerminal({
     }
   };
 
-  // Generate highly styled real PDF receipt for download
-  const generatePdfReceipt = (receipt: any, selectedSize: '58mm' | '80mm' = '58mm') => {
+  // Generate highly styled real PDF receipt for download or WhatsApp PDF delivery
+  const generatePdfReceipt = (
+    receipt: any,
+    selectedSize: '58mm' | '80mm' = '58mm',
+    skipAutoExport: boolean = false
+  ): { doc: jsPDF; filename: string } | null => {
     try {
       const is58 = selectedSize === '58mm';
       const pageWidth = is58 ? 58 : 80;
+      const branchInfo = getBranchReceiptDetails(receipt.store_id);
 
       // Calculate exact text layout metrics in advance to prevent clipping
       const dummyDoc = new jsPDF();
@@ -1236,8 +1440,11 @@ export default function BillingTerminal({
       }
 
       // Dynamic ticket height computation
-      let ticketHeight = 75; // starting baseline
-      if (settings.logoUrl) ticketHeight += 18;
+      let ticketHeight = 82; // starting baseline including branch name
+      if (settings.logoUrl || DEFAULT_COMPANY_LOGO) ticketHeight += 18;
+      if (branchInfo.location) ticketHeight += 5;
+      if (branchInfo.phone) ticketHeight += 5;
+      if (branchInfo.email) ticketHeight += 5;
       if (settings.receiptHeader) ticketHeight += 6;
       if (settings.tpin) ticketHeight += 5;
       if (receipt.customer) ticketHeight += 5;
@@ -1247,11 +1454,17 @@ export default function BillingTerminal({
       if (receipt.discount > 0) ticketHeight += 4;
       
       ticketHeight += 12; // Payment details
-      if (receipt.paymentMethod === 'Cash' || receipt.paymentMethod === 'Split') {
+      if (receipt.paymentMethod === 'Cash' || String(receipt.paymentMethod || '').toLowerCase().startsWith('split')) {
         ticketHeight += 10;
       }
       
-      if (receipt.zra) ticketHeight += 55;
+      if (receipt.zra && receipt.zra.status === 'FISCALIZED') {
+        ticketHeight += 76;
+      } else if (receipt.zra && receipt.zra.status === 'QUEUED_OFFLINE') {
+        ticketHeight += 28;
+      } else if (receipt.fiscalStatus === 'LOCAL_ONLY') {
+        ticketHeight += 12;
+      }
       ticketHeight += termsHeight;
       if (settings.receiptFooter) ticketHeight += 5;
       ticketHeight += 22; // Barcode graphic height
@@ -1276,7 +1489,7 @@ export default function BillingTerminal({
       const rightMargin = is58 ? 55 : 76;
       const midPoint = is58 ? 29 : 40;
 
-      // Draw Company Logo picture if provided or default
+      // Draw Overall Company Logo if provided or default
       const logoToUse = settings.logoUrl || DEFAULT_COMPANY_LOGO;
       if (logoToUse) {
         try {
@@ -1290,11 +1503,32 @@ export default function BillingTerminal({
         }
       }
 
-      // Title (Store name)
+      // Overall Company Name
       doc.setFont('times', 'bold');
       doc.setFontSize(is58 ? 10.5 : 12.5);
       doc.text(settings.storeName.toUpperCase(), midPoint, headingOffset, { align: 'center' });
       headingOffset += 4.5;
+
+      // Transacting Branch Name & Contact Details
+      doc.setFont('times', 'bold');
+      doc.setFontSize(is58 ? 7.5 : 8.5);
+      doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, midPoint, headingOffset, { align: 'center' });
+      headingOffset += 4;
+
+      doc.setFont('times', 'normal');
+      doc.setFontSize(is58 ? 6.5 : 7.5);
+      if (branchInfo.location) {
+        doc.text(branchInfo.location, midPoint, headingOffset, { align: 'center' });
+        headingOffset += 3.8;
+      }
+      if (branchInfo.phone) {
+        doc.text(`Tel: ${branchInfo.phone}`, midPoint, headingOffset, { align: 'center' });
+        headingOffset += 3.8;
+      }
+      if (branchInfo.email) {
+        doc.text(`Email: ${branchInfo.email}`, midPoint, headingOffset, { align: 'center' });
+        headingOffset += 3.8;
+      }
 
       // Subtitle Badge
       doc.setFont('times', 'bold');
@@ -1340,9 +1574,9 @@ export default function BillingTerminal({
       headingOffset += 4;
 
       doc.setFont('times', 'bold');
-      doc.text('BRANCH HUB:', leftMargin, headingOffset);
+      doc.text('BRANCH:', leftMargin, headingOffset);
       doc.setFont('times', 'normal');
-      doc.text(`${activeStore.toUpperCase()}`, rightMargin, headingOffset, { align: 'right' });
+      doc.text(`${branchInfo.name.toUpperCase()}`, rightMargin, headingOffset, { align: 'right' });
       headingOffset += 4;
 
       const repName = receipt.performed_by || localStorage.getItem('logged_in_user_name') || 'Default Cashier';
@@ -1433,7 +1667,7 @@ export default function BillingTerminal({
         headingOffset += 4;
         doc.text(`Return Change: ${settings.currency}${receipt.change.toFixed(2)}`, leftMargin, headingOffset);
         headingOffset += 5;
-      } else if (receipt.paymentMethod === 'Split' && receipt.splitBreakdown) {
+      } else if (String(receipt.paymentMethod || '').toLowerCase().startsWith('split') && receipt.splitBreakdown) {
         doc.text(`Cash Portion: ${settings.currency}${receipt.splitBreakdown.cash.toFixed(2)}`, leftMargin, headingOffset);
         headingOffset += 4;
         doc.text(`Mobile Portion: ${settings.currency}${receipt.splitBreakdown.mobile.toFixed(2)}`, leftMargin, headingOffset);
@@ -1442,46 +1676,97 @@ export default function BillingTerminal({
         headingOffset += 5;
       }
 
-      // Add ZRA Smart Invoice Fiscal Stamps & Verifiers if active
-      if (receipt.zra) {
+      // Add ZRA Smart Invoice SDC Information & Verifiable QR Code
+      if (receipt.zra && receipt.zra.status === 'FISCALIZED') {
+        const z: ZraFiscalReceiptData = receipt.zra;
+        const textMaxW = is58 ? 50 : 70;
         doc.setLineWidth(0.15);
         doc.line(leftMargin, headingOffset, rightMargin, headingOffset);
         headingOffset += 4;
-        
+
         doc.setFont('times', 'bold');
         doc.setFontSize(is58 ? 6.5 : 7.5);
-        doc.text('--- ZRA FISCAL SMART INVOICE ---', midPoint, headingOffset, { align: 'center' });
-        headingOffset += 4.5;
-        
-        doc.setFont('times', 'normal');
-        doc.setFontSize(is58 ? 6 : 7);
-        doc.text(`SME TPIN: ${settings.tpin || '1001234567'}`, leftMargin, headingOffset);
-        doc.text(`CUSTOMER TPIN: ${receipt.zra.tpin}`, midPoint, headingOffset);
-        headingOffset += 3.5;
-        
-        doc.text(`TAX CLASSIFICATION: ${receipt.zra.taxBand}`, leftMargin, headingOffset);
-        headingOffset += 3.5;
-        
-        doc.setFont('times', 'bold');
-        doc.text(`ZRA FISCAL FSD CODE:`, leftMargin, headingOffset);
-        headingOffset += 3.5;
+        doc.text('SDC INFORMATION', midPoint, headingOffset, { align: 'center' });
+        headingOffset += 4;
+
         doc.setFont('times', 'normal');
         doc.setFontSize(is58 ? 5.5 : 6.5);
-        doc.text(`${receipt.zra.fiscalCode}`, leftMargin, headingOffset);
-        headingOffset += 4.5;
+        doc.text(`Date/Time: ${z.vsdcRcptPbctDate || receipt.date}`, leftMargin, headingOffset);
+        headingOffset += 3.3;
+        doc.text(`TPIN: ${z.tpin}  BHF: ${z.bhfId}`, leftMargin, headingOffset);
+        headingOffset += 3.3;
+        doc.text(`SDC ID: ${z.sdcId}`, leftMargin, headingOffset);
+        headingOffset += 3.3;
+        if (z.mrcNo) {
+          doc.text(`MRC NO: ${z.mrcNo}`, leftMargin, headingOffset);
+          headingOffset += 3.3;
+        }
+        doc.text(`INVOICE NO: ${z.cisInvcNo} (RCPT #${z.rcptNo})`, leftMargin, headingOffset);
+        headingOffset += 3.5;
 
-        // Custom ASCII-style Mock QR / barcode for receipt authentication scans
-        const qrSizeX = is58 ? 20 : 28;
-        const qrSizeY = 12;
-        const qrX = midPoint - (qrSizeX / 2);
-        doc.rect(qrX, headingOffset, qrSizeX, qrSizeY);
+        if (z.formattedIntrlData) {
+          doc.setFont('times', 'bold');
+          doc.text('INTERNAL DATA:', leftMargin, headingOffset);
+          headingOffset += 3;
+          doc.setFont('times', 'normal');
+          const intrlLines = doc.splitTextToSize(z.formattedIntrlData, textMaxW);
+          intrlLines.forEach((ln: string) => {
+            doc.text(ln, leftMargin, headingOffset);
+            headingOffset += 3;
+          });
+        }
+
+        if (z.formattedRcptSign) {
+          doc.setFont('times', 'bold');
+          doc.text('SIGNATURE:', leftMargin, headingOffset);
+          headingOffset += 3;
+          doc.setFont('times', 'normal');
+          const signLines = doc.splitTextToSize(z.formattedRcptSign, textMaxW);
+          signLines.forEach((ln: string) => {
+            doc.text(ln, leftMargin, headingOffset);
+            headingOffset += 3;
+          });
+        }
+
+        headingOffset += 1;
+        const qrSize = is58 ? 22 : 26;
+        const qrX = midPoint - (qrSize / 2);
+        if (z.qrDataUrl) {
+          try {
+            doc.addImage(z.qrDataUrl, 'PNG', qrX, headingOffset, qrSize, qrSize);
+            headingOffset += qrSize + 3;
+          } catch {
+            doc.rect(qrX, headingOffset, qrSize, 10);
+            doc.text('ZRA QR VERIFIED', midPoint, headingOffset + 6, { align: 'center' });
+            headingOffset += 13;
+          }
+        }
         doc.setFont('times', 'bold');
-        doc.setFontSize(is58 ? 5 : 6);
-        doc.text('[ ZRA VERIFIED SECURE ]', midPoint, headingOffset + 4, { align: 'center' });
+        doc.setFontSize(is58 ? 5.5 : 6.5);
+        doc.text('Powered by ZRA Smart Invoice', midPoint, headingOffset, { align: 'center' });
+        headingOffset += 4;
+      } else if (receipt.zra && receipt.zra.status === 'QUEUED_OFFLINE') {
+        doc.setLineWidth(0.15);
+        doc.line(leftMargin, headingOffset, rightMargin, headingOffset);
+        headingOffset += 4;
+        doc.setFont('times', 'bold');
+        doc.setFontSize(is58 ? 6 : 7);
+        doc.text('ZRA SMART INVOICE: QUEUED OFFLINE', midPoint, headingOffset, { align: 'center' });
+        headingOffset += 3.5;
         doc.setFont('times', 'normal');
-        doc.setFontSize(is58 ? 4 : 5);
-        doc.text('MOCK QR SCAN PREVIEW', midPoint, headingOffset + 8, { align: 'center' });
-        headingOffset += 16;
+        doc.setFontSize(is58 ? 5.5 : 6.2);
+        doc.text(`TPIN: ${receipt.zra.tpin} | INV: ${receipt.zra.cisInvcNo}`, midPoint, headingOffset, { align: 'center' });
+        headingOffset += 3.5;
+        doc.text('Will fiscalize automatically on reconnect', midPoint, headingOffset, { align: 'center' });
+        headingOffset += 4.5;
+      } else if (receipt.fiscalStatus === 'LOCAL_ONLY') {
+        doc.setLineWidth(0.1);
+        doc.line(leftMargin, headingOffset, rightMargin, headingOffset);
+        headingOffset += 4;
+        doc.setFont('times', 'normal');
+        doc.setFontSize(is58 ? 5.5 : 6.2);
+        doc.text('FISCAL STATUS: LOCAL_ONLY (ZRA OFF)', midPoint, headingOffset, { align: 'center' });
+        headingOffset += 4;
       }
 
       // Render Divider for Footer info
@@ -1536,10 +1821,15 @@ export default function BillingTerminal({
       doc.setFontSize(is58 ? 5.5 : 6.5);
       doc.text(`*${receipt.id}*`, midPoint, headingOffset, { align: 'center' });
 
-      // Trigger automatic receipt PDF file generation and device share/download
-      exportAndSharePdf(`receipt-${selectedSize}-${receipt.id}.pdf`, doc);
+      const pdfFilename = `receipt-${selectedSize}-${receipt.id}.pdf`;
+      // Trigger automatic receipt PDF file generation and device share/download unless caller handles delivery
+      if (!skipAutoExport) {
+        exportAndSharePdf(pdfFilename, doc);
+      }
+      return { doc, filename: pdfFilename };
     } catch (err) {
       console.error('jsPDF generation error:', err);
+      return null;
     }
   };
 
@@ -1682,18 +1972,19 @@ export default function BillingTerminal({
       return;
     }
     
+    const branchInfo = getBranchReceiptDetails(activeReceipt.store_id);
     let text = `===============================\n`;
     text += `   ${settings.storeName.toUpperCase()}\n`;
+    text += `   BRANCH: ${branchInfo.name.toUpperCase()}\n`;
+    if (branchInfo.location) text += `   ${branchInfo.location}\n`;
+    if (branchInfo.phone) text += `   TEL: ${branchInfo.phone}\n`;
+    if (branchInfo.email) text += `   EMAIL: ${branchInfo.email}\n`;
     if (settings.receiptHeader) text += `   ${settings.receiptHeader}\n`;
-    if (settings.billingAddress || settings.billingCity) {
-      text += `   ${[settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ')}\n`;
-    }
-    if (settings.billingPhone) text += `   TEL: ${settings.billingPhone}\n`;
     if (settings.tpin) text += `   TPIN: ${settings.tpin}\n`;
     text += `===============================\n`;
     text += `TICKET REF: ${activeReceipt.id}\n`;
     text += `DATE: ${activeReceipt.date}\n`;
-    text += `BRANCH: ${activeStore.toUpperCase()}\n`;
+    text += `BRANCH: ${branchInfo.name.toUpperCase()}\n`;
     if (activeReceipt.customer) {
       text += `CUSTOMER: ${activeReceipt.customer.name}\n`;
     }
@@ -1731,83 +2022,55 @@ export default function BillingTerminal({
     });
   };
 
-  // Perform WhatsApp Receipt PDF dispatch sharing
-  const handleWhatsAppSend = (e?: React.FormEvent | React.MouseEvent) => {
+  // Perform direct WhatsApp Receipt PDF dispatch
+  const handleWhatsAppSend = async (e?: React.FormEvent | React.MouseEvent) => {
     if (e && typeof e.preventDefault === 'function') {
       e.preventDefault();
     }
-    if (!whatsappPhone) {
-      alert('Please fill in a valid WhatsApp mobile number!');
+    setWhatsappError(null);
+    setWhatsappSuccess(false);
+    setWhatsappResult(null);
+
+    if (!whatsappPhone.trim()) {
+      setWhatsappError('Please enter the customer WhatsApp mobile number.');
       return;
     }
     if (!activeReceipt) {
-      alert('No active ticket available to share.');
+      setWhatsappError('No active receipt available to send.');
       return;
     }
 
-    // Step 1: Automatically generate and download the high-quality PDF Receipt
-    generatePdfReceipt(activeReceipt);
-
-    // Step 2: Build beautifully formatted WhatsApp text representation mirroring the PDF
-    const cleanPhone = whatsappPhone.replace(/[^\d+]/g, ''); // keep only numbers & optional '+'
-    const headerDecor = '━━━━━━━━━━━━━━━━━━━━━━━━━';
-    
-    let msg = `🧾 *RECEIPT FROM ${settings.storeName.toUpperCase()}* 🧾\n`;
-    msg += `_${settings.receiptHeader || 'Official Purchase Invoice'}_\n`;
-    msg += `${headerDecor}\n`;
-    msg += `*Ticket ID:* ${activeReceipt.id}\n`;
-    msg += `*Date:* ${activeReceipt.date}\n`;
-    msg += `*Store:* ${activeStore.toUpperCase()} branch\n`;
-    if (activeReceipt.customer) {
-      msg += `*Customer:* ${activeReceipt.customer.name}\n`;
+    const compiled = generatePdfReceipt(
+      activeReceipt,
+      previewPaperSize === '80mm' ? '80mm' : '58mm',
+      true
+    );
+    if (!compiled) {
+      setWhatsappError('Failed to compile receipt PDF.');
+      return;
     }
-    msg += `${headerDecor}\n\n`;
 
-    msg += `🛒 *PURCHASED ITEMS:*\n`;
-    activeReceipt.items.forEach((item: any) => {
-      msg += `• *${item.product.name}* (x${item.quantity})\n`;
-      msg += `  ${settings.currency}${item.product.price.toFixed(2)} ea ➔ *${settings.currency}${(item.product.price * item.quantity).toFixed(2)}*\n`;
-    });
-    msg += `\n${headerDecor}\n`;
-    msg += `*Subtotal:* ${settings.currency}${activeReceipt.subtotal.toFixed(2)}\n`;
-    if (activeReceipt.discount > 0) {
-      msg += `*Discount Applied:* -${settings.currency}${activeReceipt.discount.toFixed(2)}\n`;
-    }
-    msg += `*Tax (${settings.taxRate}%):* ${settings.currency}${activeReceipt.tax.toFixed(2)}\n`;
-    msg += `*GRAND TOTAL: ${settings.currency}${activeReceipt.total.toFixed(2)}*\n`;
-    msg += `${headerDecor}\n`;
-    msg += `*Payment Mode:* ${activeReceipt.paymentMethod.toUpperCase()}\n`;
-    if (activeReceipt.paymentMethod === 'Cash') {
-      msg += `*Tendered:* ${settings.currency}${activeReceipt.cashReceived.toFixed(2)}\n`;
-      msg += `*Change Back:* ${settings.currency}${activeReceipt.change.toFixed(2)}\n`;
-    } else if (activeReceipt.paymentMethod === 'Split' && activeReceipt.splitBreakdown) {
-      msg += `*Cash Portion Tended:* ${settings.currency}${activeReceipt.splitBreakdown.cash.toFixed(2)}\n`;
-      msg += `*Mobile Money Paid:* ${settings.currency}${activeReceipt.splitBreakdown.mobile.toFixed(2)}\n`;
-      if (activeReceipt.change > 0) {
-        msg += `*Cash Change Returned:* ${settings.currency}${activeReceipt.change.toFixed(2)}\n`;
+    const caption = `Invoice #${activeReceipt.id} • Total: ${settings.currency}${Number(activeReceipt.total || 0).toFixed(2)} • ${activeReceipt.date}`;
+    setLastCompiledReceiptPdf({ doc: compiled.doc, filename: compiled.filename, caption });
+    setWhatsappSending(true);
+    try {
+      const result = await dispatchPdfToWhatsApp({
+        phone: whatsappPhone,
+        filename: compiled.filename,
+        doc: compiled.doc,
+        storeName: settings.storeName,
+        caption,
+      });
+      if (!result.success) {
+        setWhatsappError(result.error || 'Could not dispatch PDF receipt to WhatsApp.');
+        return;
       }
-    }
-    msg += `${headerDecor}\n`;
-    if (settings.receiptFooter) {
-      msg += `_${settings.receiptFooter}_\n`;
-    }
-    msg += `*Thank you for your business!*\n\n`;
-    msg += `📁 _Your official high-resolution PDF copy has been successfully compiled and downloaded to your downloads folder._`;
-
-    // Step 3: Trigger external link smoothly
-    const url = `https://api.whatsapp.com/send?phone=${cleanPhone}&text=${encodeURIComponent(msg)}`;
-    
-    // We update state for success visual feedback
-    setWhatsappSuccess(true);
-    
-    // Attempt window.open with a standard fallback link alert to guarantee user has a clickable action sheet if browser pop-up is strict!
-    const newWindow = window.open(url, '_blank');
-    if (!newWindow || newWindow.closed || typeof newWindow.closed === 'undefined') {
-      // Return a quick alert with double action fallback trigger
-      const confirmOpen = window.confirm(`PDF receipt generated & downloaded! \n\nPop-up block warning: Please click 'OK' to redirect to WhatsApp Chat for ${cleanPhone} directly.`);
-      if (confirmOpen) {
-        window.location.href = url;
-      }
+      setWhatsappResult(result);
+      setWhatsappSuccess(true);
+    } catch (err: any) {
+      setWhatsappError(err?.message || 'Unexpected error preparing PDF receipt for WhatsApp.');
+    } finally {
+      setWhatsappSending(false);
     }
   };
 
@@ -1816,7 +2079,8 @@ export default function BillingTerminal({
     overrideDate?: string,
     overrideStore?: string,
     overrideCashier?: string,
-    shouldOpenModal: boolean = false
+    shouldOpenModal: boolean = false,
+    silentRefresh: boolean = false
   ) => {
     const targetDate = overrideDate !== undefined ? overrideDate : cashUpDate;
     const rawTargetStore = overrideStore !== undefined ? overrideStore : (cashUpStore || activeStore || 'all');
@@ -1829,27 +2093,13 @@ export default function BillingTerminal({
       if (savedAcc) accessibleIds = JSON.parse(savedAcc);
     } catch {}
 
-    // Helper to check if a date string/timestamp matches the target YYYY-MM-DD
+    // Consistent local YYYY-MM-DD date matching
     const isTargetDate = (rawDate: any) => {
-      if (!rawDate) return false;
-      const dateStr = String(rawDate).trim();
-      if (!dateStr) return false;
-
-      // Direct match if string contains target date YYYY-MM-DD
-      if (dateStr.includes(targetDate)) return true;
-
-      // Parse timestamp or ISO string
-      const d = new Date(typeof rawDate === 'number' ? rawDate : dateStr);
-      if (!isNaN(d.getTime())) {
-        const yyyy = d.getFullYear();
-        const mm = String(d.getMonth() + 1).padStart(2, '0');
-        const dd = String(d.getDate()).padStart(2, '0');
-        return `${yyyy}-${mm}-${dd}` === targetDate;
-      }
-      return false;
+      const key = toLocalDateKey(rawDate);
+      return Boolean(key) && key === targetDate;
     };
 
-    // Helper for store matching (strictly separates each branch and respects account accessible branches)
+    // Strict branch isolation & account access enforcement
     const isTargetStore = (storeId: any) => {
       const ordStoreLower = String(storeId || '').toLowerCase().trim();
       if (userRole !== 'owner' && accessibleIds.length > 0 && ordStoreLower) {
@@ -1861,7 +2111,7 @@ export default function BillingTerminal({
       return ordStoreLower === tStoreLower;
     };
 
-    // Helper for cashier matching
+    // Cashier matching
     const isTargetCashier = (perfBy: any) => {
       if (targetCashier === 'all' || !targetCashier) return true;
       const tCashierLower = targetCashier.toLowerCase().trim();
@@ -1870,52 +2120,109 @@ export default function BillingTerminal({
       return perfLower.includes(tCashierLower) || tCashierLower.includes(perfLower);
     };
 
-    // 1. Fetch completed orders from SQLite database
-    const ordersRes = runSql(`
-      SELECT o.*, c.name AS customer_name 
-      FROM orders o
-      LEFT JOIN customers c ON o.customerId = c.id
-      WHERE LOWER(TRIM(o.status)) NOT IN ('cancelled', 'voided', 'refunded', 'deleted')
-      AND (
-        LOWER(TRIM(o.status)) IN ('completed', 'success', 'paid', 'active', 'quicksale')
-        OR o.status IS NULL 
-        OR o.status = ''
-      )
-      ORDER BY o.orderDate DESC
-    `, 'EOD Cash Up: Query database completed sales');
+    // Direct queries without fragile AlaSQL JOINs on NULL customerId or nonexistent columns
+    const allOrdersRes = runSql('SELECT * FROM orders ORDER BY orderDate DESC', 'EOD Cash Up: Query orders table', true);
+    const custRes = runSql('SELECT id, name FROM customers', 'EOD Cash Up: Load customer names', true);
+    const custMap = new Map<string, string>();
+    if (custRes.success && Array.isArray(custRes.data)) {
+      custRes.data.forEach((c: any) => {
+        if (c && c.id != null) custMap.set(String(c.id), c.name || 'Walk-in Customer');
+      });
+    }
 
-    // 2. Fetch layby installments
-    const laybyPaymentsRes = runSql(`
-      SELECT li.*, l.customer_name
-      FROM layby_installments li
-      LEFT JOIN laybys l ON li.layby_id = l.id
-      ORDER BY li.created_at DESC
-    `, 'EOD Cash Up: Query layby payments');
+    const laybyInstRes = runSql('SELECT * FROM layby_installments ORDER BY created_at DESC', 'EOD Cash Up: Query layby payments', true);
+    const laybyAllRes = runSql('SELECT id, store_id, customer_name FROM laybys', 'EOD Cash Up: Load layby branch map', true);
+    const laybyMap = new Map<string, any>();
+    if (laybyAllRes.success && Array.isArray(laybyAllRes.data)) {
+      laybyAllRes.data.forEach((l: any) => {
+        if (l && l.id) laybyMap.set(String(l.id), l);
+      });
+    }
 
-    // 3. Fetch recorded cash expenses / cash out
-    const expensesRes = runSql(`
-      SELECT * FROM expenses 
-      WHERE (LOWER(account_id) = 'acc_cash' OR LOWER(source_account_id) = 'acc_cash')
-      ORDER BY created_at DESC
-    `, 'EOD Cash Up: Query cash out expenses');
+    const expensesRes = runSql('SELECT * FROM expenses ORDER BY created_at DESC', 'EOD Cash Up: Query expenses', true);
+    const txAllRes = runSql('SELECT id, provider_reference FROM transactions', 'EOD Cash Up: Load transaction refs', true);
+    const leAllRes = runSql('SELECT transaction_id, account_id, type, amount FROM ledger_entries', 'EOD Cash Up: Load ledger entries', true);
+
+    const resolveSplitForOrder = (ord: any, tot: number): { splitCash: number; splitMomo: number } => {
+      const explicitCash = Number(ord.split_cash || 0);
+      const explicitMomo = Number(ord.split_momo || 0);
+      if (explicitCash > 0 || explicitMomo > 0) {
+        return { splitCash: explicitCash, splitMomo: explicitMomo };
+      }
+      if (txAllRes.success && Array.isArray(txAllRes.data) && leAllRes.success && Array.isArray(leAllRes.data)) {
+        const ref = `POS-REF-${ord.id}`;
+        const matchingTxIds = new Set(
+          txAllRes.data.filter((t: any) => t.provider_reference === ref).map((t: any) => String(t.id))
+        );
+        if (matchingTxIds.size > 0) {
+          let cashCleared = 0;
+          let momoCleared = 0;
+          let cashAcc = 0;
+          let momoAcc = 0;
+          leAllRes.data.forEach((le: any) => {
+            if (!matchingTxIds.has(String(le.transaction_id)) || le.type !== 'DEBIT') return;
+            const amt = Number(le.amount || 0);
+            if (le.account_id === 'cash-clearing-account-uuid') cashCleared += amt;
+            else if (le.account_id === 'mtn-clearing-account-uuid' || le.account_id === 'airtel-clearing-account-uuid') momoCleared += amt;
+            else if (le.account_id === 'acc_cash') cashAcc += amt;
+            else if (le.account_id === 'acc_momo') momoAcc += amt;
+          });
+          if (cashCleared > 0 || momoCleared > 0) return { splitCash: cashCleared, splitMomo: momoCleared };
+          if (cashAcc > 0 || momoAcc > 0) return { splitCash: cashAcc, splitMomo: momoAcc };
+        }
+      }
+      return { splitCash: tot / 2, splitMomo: tot / 2 };
+    };
 
     let sCash = 0;
     let sAirtel = 0;
     let sMtn = 0;
-    let sZamtel = 0;
     let sOtherMomo = 0;
     let sCard = 0;
     let sOther = 0;
+    const sCustom: Record<string, number> = {};
+
+    let rCash = 0;
+    let rAirtel = 0;
+    let rMtn = 0;
+    let rOtherMomo = 0;
+    let rCard = 0;
+    let rOther = 0;
+    const rCustom: Record<string, number> = {};
+
+    const customListAll = getCustomPaymentMethods(true);
+    setAllCustomMethods(customListAll);
+    setCustomPaymentMethods(customListAll.filter(c => c.isActive));
+    setMobileMoneyOptions(getMobileMoneyOptions());
+    customListAll.forEach(cm => {
+      sCustom[cm.name] = 0;
+      rCustom[cm.name] = 0;
+    });
+
+    const getTxEntriesForOrder = (ordId: any) => {
+      if (!txAllRes.success || !Array.isArray(txAllRes.data) || !leAllRes.success || !Array.isArray(leAllRes.data)) {
+        return [];
+      }
+      const ref = `POS-REF-${ordId}`;
+      const txIds = new Set(txAllRes.data.filter((t: any) => t.provider_reference === ref).map((t: any) => String(t.id)));
+      return leAllRes.data.filter((le: any) => txIds.has(String(le.transaction_id)));
+    };
+
+    let completedCount = 0;
+    let refundCount = 0;
 
     const txList: any[] = [];
     const processedTxIds = new Set<string>();
 
-    // Process orders from SQLite database
-    if (ordersRes.success && Array.isArray(ordersRes.data)) {
-      ordersRes.data.forEach((ord: any) => {
+    // 1. Process orders from database (both completed and refunded)
+    if (allOrdersRes.success && Array.isArray(allOrdersRes.data)) {
+      allOrdersRes.data.forEach((ord: any) => {
         if (!isTargetDate(ord.orderDate)) return;
         if (!isTargetStore(ord.store_id)) return;
         if (!isTargetCashier(ord.performed_by)) return;
+
+        const statusLower = String(ord.status || 'Completed').trim().toLowerCase();
+        if (['cancelled', 'voided', 'deleted'].includes(statusLower)) return;
 
         const method = String(ord.paymentMethod || 'Cash').trim();
         const methodLower = method.toLowerCase();
@@ -1926,92 +2233,118 @@ export default function BillingTerminal({
         if (ordId) processedTxIds.add(ordId);
 
         const tot = parseFloat(ord.total || 0);
+        const custName = ord.customerId != null && custMap.has(String(ord.customerId))
+          ? custMap.get(String(ord.customerId))!
+          : 'Walk-in Customer';
+        const cashierName = ord.performed_by || 'Cashier';
+        const matchedCustom = customListAll.find(cm => cm.name.toLowerCase() === methodLower);
 
-        if (methodLower === 'cash') {
+        if (statusLower === 'refunded') {
+          refundCount++;
+          if (methodLower === 'split' || methodLower.includes('split')) {
+            const { splitCash, splitMomo } = resolveSplitForOrder(ord, tot);
+            const provider = resolveSplitMobileProvider(method, getTxEntriesForOrder(ord.id));
+            sCash += splitCash;
+            rCash += splitCash;
+            if (provider.accountId === 'acc_airtel') {
+              sAirtel += splitMomo;
+              rAirtel += splitMomo;
+            } else if (provider.accountId === 'acc_mtn') {
+              sMtn += splitMomo;
+              rMtn += splitMomo;
+            } else if (sCustom[provider.bucket] !== undefined) {
+              sCustom[provider.bucket] += splitMomo;
+              rCustom[provider.bucket] += splitMomo;
+            } else {
+              sOtherMomo += splitMomo;
+              rOtherMomo += splitMomo;
+            }
+          } else if (matchedCustom) {
+            sCustom[matchedCustom.name] = (sCustom[matchedCustom.name] || 0) + tot;
+            rCustom[matchedCustom.name] = (rCustom[matchedCustom.name] || 0) + tot;
+          } else if (methodLower.includes('airtel')) {
+            sAirtel += tot;
+            rAirtel += tot;
+          } else if (methodLower.includes('mtn')) {
+            sMtn += tot;
+            rMtn += tot;
+          } else if (methodLower.includes('mobile') || methodLower.includes('momo') || methodLower.includes('wallet')) {
+            sOtherMomo += tot;
+            rOtherMomo += tot;
+          } else if (methodLower.includes('card') || methodLower.includes('credit') || methodLower.includes('bank') || methodLower.includes('pos') || methodLower.includes('transfer')) {
+            sCard += tot;
+            rCard += tot;
+          } else if (methodLower === 'cash' || !methodLower) {
+            sCash += tot;
+            rCash += tot;
+          } else {
+            sOther += tot;
+            rOther += tot;
+          }
+          txList.push({
+            id: `${ord.id} (REFUND)`,
+            type: 'Refunded Credit Note',
+            method: `${method} (Reversed)`,
+            amount: -tot,
+            time: ord.orderDate,
+            customer: custName,
+            cashier: cashierName
+          });
+          return;
+        }
+
+        const isCompleted = !statusLower || ['completed', 'success', 'paid', 'active', 'quicksale'].includes(statusLower);
+        if (!isCompleted) return;
+        completedCount++;
+
+        if (methodLower === 'split' || methodLower.includes('split')) {
+          const { splitCash, splitMomo } = resolveSplitForOrder(ord, tot);
+          const provider = resolveSplitMobileProvider(method, getTxEntriesForOrder(ord.id));
+          sCash += splitCash;
+          if (provider.accountId === 'acc_airtel') {
+            sAirtel += splitMomo;
+          } else if (provider.accountId === 'acc_mtn') {
+            sMtn += splitMomo;
+          } else if (sCustom[provider.bucket] !== undefined) {
+            sCustom[provider.bucket] += splitMomo;
+          } else {
+            sOtherMomo += splitMomo;
+          }
+          txList.push({
+            id: ord.id,
+            type: 'Completed Sale (Split)',
+            method: `Split (Cash: ${splitCash.toFixed(2)}, ${provider.bucket}: ${splitMomo.toFixed(2)})`,
+            amount: tot,
+            time: ord.orderDate,
+            customer: custName,
+            cashier: cashierName
+          });
+        } else if (matchedCustom) {
+          sCustom[matchedCustom.name] = (sCustom[matchedCustom.name] || 0) + tot;
+          txList.push({ id: ord.id, type: 'Completed Sale', method: matchedCustom.name, amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
+        } else if (methodLower === 'cash') {
           sCash += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Cash', amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
+          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Cash', amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
         } else if (methodLower.includes('airtel')) {
           sAirtel += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Airtel Money', amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
+          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Airtel Money', amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
         } else if (methodLower.includes('mtn')) {
           sMtn += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: 'MTN Money', amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
-        } else if (methodLower.includes('zamtel')) {
-          sZamtel += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Zamtel Money', amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
+          txList.push({ id: ord.id, type: 'Completed Sale', method: 'MTN Mobile Money', amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
         } else if (methodLower.includes('mobile') || methodLower.includes('momo') || methodLower.includes('wallet')) {
           sOtherMomo += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Mobile Wallet', amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
+          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Mobile Money', amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
         } else if (methodLower.includes('card') || methodLower.includes('credit') || methodLower.includes('bank') || methodLower.includes('pos') || methodLower.includes('transfer')) {
           sCard += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Bank / Card', amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
-        } else if (methodLower === 'split') {
-          const legRes = runSql(`
-            SELECT le.account_id, le.amount 
-            FROM ledger_entries le
-            JOIN transactions t ON le.transaction_id = t.id
-            WHERE t.provider_reference = 'POS-REF-${ord.id}' AND le.type = 'DEBIT'
-          `, 'EOD Split: Fetch split ledger entries');
-
-          let splitCash = 0;
-          let splitMomo = 0;
-          if (legRes.success && Array.isArray(legRes.data) && legRes.data.length > 0) {
-            legRes.data.forEach((le: any) => {
-              if (le.account_id === 'cash-clearing-account-uuid' || le.account_id === 'acc_cash') {
-                splitCash += parseFloat(le.amount || 0);
-              } else if (le.account_id === 'acc_momo' || le.account_id.includes('clearing')) {
-                splitMomo += parseFloat(le.amount || 0);
-              }
-            });
-          } else {
-            splitCash = tot / 2;
-            splitMomo = tot / 2;
-          }
-          sCash += splitCash;
-          sOtherMomo += splitMomo;
-          txList.push({ 
-            id: ord.id, 
-            type: 'Completed Sale (Split)', 
-            method: `Split (Cash: ${splitCash.toFixed(2)}, Mobile: ${splitMomo.toFixed(2)})`, 
-            amount: tot, 
-            time: ord.orderDate, 
-            customer: ord.customer_name || 'Walk-in Customer',
-            cashier: ord.performed_by || 'Cashier'
-          });
+          txList.push({ id: ord.id, type: 'Completed Sale', method: 'Bank / Card', amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
         } else {
           sOther += tot;
-          txList.push({ id: ord.id, type: 'Completed Sale', method: method, amount: tot, time: ord.orderDate, customer: ord.customer_name || 'Walk-in Customer', cashier: ord.performed_by || 'Cashier' });
+          txList.push({ id: ord.id, type: 'Completed Sale', method, amount: tot, time: ord.orderDate, customer: custName, cashier: cashierName });
         }
       });
     }
 
-    // Also include Refunded orders in todayTxList for full EOD audit transparency
-    const refundedRes = runSql(`
-      SELECT o.*, c.name AS customer_name 
-      FROM orders o
-      LEFT JOIN customers c ON o.customerId = c.id
-      WHERE LOWER(TRIM(o.status)) = 'refunded'
-      ORDER BY o.orderDate DESC
-    `, 'EOD Cash Up: Query database refunded orders');
-    if (refundedRes.success && Array.isArray(refundedRes.data)) {
-      refundedRes.data.forEach((rOrd: any) => {
-        if (!isTargetDate(rOrd.orderDate)) return;
-        if (!isTargetStore(rOrd.store_id)) return;
-        if (!isTargetCashier(rOrd.performed_by)) return;
-        const rTot = parseFloat(rOrd.total || 0);
-        txList.push({
-          id: `${rOrd.id} (REFUND)`,
-          type: 'Refunded Credit Note',
-          method: `${rOrd.paymentMethod || 'Cash'} (Reversed)`,
-          amount: -rTot,
-          time: rOrd.orderDate,
-          customer: rOrd.customer_name || 'Walk-in Customer',
-          cashier: rOrd.performed_by || 'Cashier'
-        });
-      });
-    }
-
-    // 4. Also include unsynced offline queue sales for that target date & store & cashier
+    // 2. Also include unsynced offline queue sales for that target date & store & cashier
     let savedQueue: OfflineOrder[] = [];
     try {
       const qData = localStorage.getItem('pos_offline_queue');
@@ -2025,68 +2358,111 @@ export default function BillingTerminal({
         if (processedTxIds.has(offOrd.orderId)) return;
         if (!isTargetDate(offOrd.dateStr)) return;
         if (!isTargetStore(offOrd.activeStore)) return;
+        if (!isTargetCashier(offOrd.salesperson)) return;
 
         processedTxIds.add(offOrd.orderId);
+        completedCount++;
         const method = String(offOrd.paymentMethod || 'Cash').trim();
         const methodLower = method.toLowerCase();
         const tot = parseFloat(offOrd.totalAmount as any || 0);
+        const matchedCustom = customListAll.find(cm => cm.name.toLowerCase() === methodLower);
 
-        if (methodLower === 'cash') {
+        if (methodLower === 'split' || methodLower.includes('split')) {
+          const splitCash = Number(offOrd.splitCash ?? tot / 2);
+          const splitMomo = Number(offOrd.splitMobile ?? Math.max(0, tot - splitCash));
+          const provider = resolveSplitMobileProvider(method);
+          sCash += splitCash;
+          if (provider.accountId === 'acc_airtel') sAirtel += splitMomo;
+          else if (provider.accountId === 'acc_mtn') sMtn += splitMomo;
+          else if (sCustom[provider.bucket] !== undefined) sCustom[provider.bucket] += splitMomo;
+          else sOtherMomo += splitMomo;
+          txList.push({
+            id: offOrd.orderId,
+            type: 'Completed Sale (Offline Split)',
+            method: `Split (Cash: ${splitCash.toFixed(2)}, ${provider.bucket}: ${splitMomo.toFixed(2)})`,
+            amount: tot,
+            time: offOrd.dateStr,
+            customer: 'Walk-in Customer',
+            cashier: offOrd.salesperson || 'Cashier'
+          });
+        } else if (matchedCustom) {
+          sCustom[matchedCustom.name] = (sCustom[matchedCustom.name] || 0) + tot;
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: matchedCustom.name, amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
+        } else if (methodLower === 'cash') {
           sCash += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Cash', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Cash', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
         } else if (methodLower.includes('airtel')) {
           sAirtel += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Airtel Money', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Airtel Money', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
         } else if (methodLower.includes('mtn')) {
           sMtn += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'MTN Money', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
-        } else if (methodLower.includes('zamtel')) {
-          sZamtel += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Zamtel Money', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'MTN Mobile Money', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
         } else if (methodLower.includes('mobile') || methodLower.includes('momo') || methodLower.includes('wallet')) {
           sOtherMomo += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Mobile Wallet', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Mobile Money', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
         } else if (methodLower.includes('card') || methodLower.includes('credit') || methodLower.includes('bank') || methodLower.includes('pos') || methodLower.includes('transfer')) {
           sCard += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Bank / Card', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: 'Bank / Card', amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
         } else {
           sOther += tot;
-          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method: method, amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: 'Cashier' });
+          txList.push({ id: offOrd.orderId, type: 'Completed Sale (Offline)', method, amount: tot, time: offOrd.dateStr, customer: 'Walk-in Customer', cashier: offOrd.salesperson || 'Cashier' });
         }
       });
     }
 
-    // 5. Layby cash payments
+    // 3. Layby cash/mobile/card/custom payments scoped to branch
     let lCash = 0;
+    let lAirtel = 0;
+    let lMtn = 0;
     let lMomo = 0;
     let lCard = 0;
+    const lCustom: Record<string, number> = {};
+    customListAll.forEach(cm => {
+      lCustom[cm.name] = 0;
+    });
 
-    if (laybyPaymentsRes.success && Array.isArray(laybyPaymentsRes.data)) {
-      laybyPaymentsRes.data.forEach((inst: any) => {
+    if (laybyInstRes.success && Array.isArray(laybyInstRes.data)) {
+      laybyInstRes.data.forEach((inst: any) => {
         if (!isTargetDate(inst.created_at)) return;
+        const parentLayby = laybyMap.get(String(inst.layby_id || ''));
+        if (!isTargetStore(parentLayby?.store_id)) return;
         if (!isTargetCashier(inst.received_by)) return;
 
-        const m = String(inst.payment_method || 'Cash').trim();
-        const mLower = m.toLowerCase();
         const amt = parseFloat(inst.amount || 0);
+        const custName = parentLayby?.customer_name || 'Layby Customer';
+        const resolved = resolvePaymentMethodBucket(inst.payment_method);
 
-        if (mLower === 'cash') {
+        if (resolved.accountId === 'acc_cash') {
           lCash += amt;
-          txList.push({ id: inst.id, type: 'Layby Cash Payment', method: 'Cash', amount: amt, time: inst.created_at, customer: inst.customer_name || 'Layby Customer', cashier: inst.received_by || 'Cashier' });
-        } else if (mLower.includes('mobile') || mLower.includes('momo') || mLower.includes('wallet') || mLower.includes('airtel') || mLower.includes('zamtel')) {
+          txList.push({ id: inst.id, type: 'Layby Cash Payment', method: 'Cash', amount: amt, time: inst.created_at, customer: custName, cashier: inst.received_by || 'Cashier' });
+        } else if (resolved.accountId === 'acc_airtel') {
+          lAirtel += amt;
           lMomo += amt;
-          txList.push({ id: inst.id, type: 'Layby Mobile Payment', method: 'Mobile Wallet', amount: amt, time: inst.created_at, customer: inst.customer_name || 'Layby Customer', cashier: inst.received_by || 'Cashier' });
+          txList.push({ id: inst.id, type: 'Layby Mobile Payment', method: 'Airtel Money', amount: amt, time: inst.created_at, customer: custName, cashier: inst.received_by || 'Cashier' });
+        } else if (resolved.accountId === 'acc_mtn') {
+          lMtn += amt;
+          lMomo += amt;
+          txList.push({ id: inst.id, type: 'Layby Mobile Payment', method: 'MTN Mobile Money', amount: amt, time: inst.created_at, customer: custName, cashier: inst.received_by || 'Cashier' });
+        } else if (resolved.accountId.startsWith('acc_pm_')) {
+          lCustom[resolved.bucket] = (lCustom[resolved.bucket] || 0) + amt;
+          if (resolved.category === 'Mobile Money') lMomo += amt;
+          txList.push({ id: inst.id, type: 'Layby Custom Payment', method: resolved.bucket, amount: amt, time: inst.created_at, customer: custName, cashier: inst.received_by || 'Cashier' });
+        } else if (resolved.accountId === 'acc_momo') {
+          lMomo += amt;
+          txList.push({ id: inst.id, type: 'Layby Mobile Payment', method: resolved.bucket, amount: amt, time: inst.created_at, customer: custName, cashier: inst.received_by || 'Cashier' });
         } else {
           lCard += amt;
-          txList.push({ id: inst.id, type: 'Layby Bank/Card Payment', method: 'Bank / Card', amount: amt, time: inst.created_at, customer: inst.customer_name || 'Layby Customer', cashier: inst.received_by || 'Cashier' });
+          txList.push({ id: inst.id, type: 'Layby Bank/Card Payment', method: 'Bank / Card', amount: amt, time: inst.created_at, customer: custName, cashier: inst.received_by || 'Cashier' });
         }
       });
     }
 
-    // 6. Cash out / Expenses
+    // 4. Cash out / Expenses paid from Cash Drawer (acc_cash)
     let cExp = 0;
     if (expensesRes.success && Array.isArray(expensesRes.data)) {
       expensesRes.data.forEach((ex: any) => {
+        const acct = String(ex.account_id || ex.source_account_id || 'acc_cash').toLowerCase().trim();
+        if (acct !== 'acc_cash') return;
         if (!isTargetDate(ex.expense_date || ex.created_at)) return;
         if (!isTargetStore(ex.store_id)) return;
         if (!isTargetCashier(ex.performed_by)) return;
@@ -2095,81 +2471,123 @@ export default function BillingTerminal({
       });
     }
 
-    setSalesCashSum(sCash);
-    setSalesAirtelSum(sAirtel);
-    setSalesMtnSum(sMtn);
-    setSalesZamtelSum(sZamtel);
-    setSalesOtherMomoSum(sOtherMomo);
-    setSalesCardSum(sCard);
-    setSalesOtherSum(sOther);
+    // Net sales per payment channel (after subtracting refunds)
+    const netCash = sCash - rCash;
+    const netAirtel = sAirtel - rAirtel;
+    const netMtn = sMtn - rMtn;
+    const netOtherMomo = sOtherMomo - rOtherMomo;
+    const netCard = sCard - rCard;
+    const netOther = sOther - rOther;
+    const netCustom: Record<string, number> = {};
+    let netCustomTotal = 0;
+    let netCustomMomoTotal = 0;
+    Object.keys(sCustom).forEach(name => {
+      const val = (sCustom[name] || 0) - (rCustom[name] || 0);
+      netCustom[name] = val;
+      netCustomTotal += val;
+      const meta = customListAll.find(c => c.name === name);
+      if (meta?.category === 'Mobile Money') {
+        netCustomMomoTotal += val;
+      }
+    });
+    const netMomoTotal = netAirtel + netMtn + netOtherMomo + netCustomMomoTotal;
+
+    setSalesCashSum(netCash);
+    setSalesAirtelSum(netAirtel);
+    setSalesMtnSum(netMtn);
+    setSalesOtherMomoSum(netOtherMomo);
+    setSalesCardSum(netCard);
+    setSalesOtherSum(netOther);
+    setSalesCustomSums(netCustom);
 
     setLaybyCashSum(lCash);
+    setLaybyAirtelSum(lAirtel);
+    setLaybyMtnSum(lMtn);
     setLaybyMomoSum(lMomo);
     setLaybyCardSum(lCard);
+    setLaybyCustomSums(lCustom);
     setCashExpensesSum(cExp);
 
-    const totalSales = sCash + sAirtel + sMtn + sZamtel + sOtherMomo + sCard + sOther;
-    const openFloat = targetStore !== 'all' && targetStore
-      ? (parseFloat(localStorage.getItem('shift_opening_cash_' + targetStore) || openingCash || '0') || 0)
-      : (parseFloat(openingCash) || 0);
-    const expectedCashInDrawer = openFloat + sCash + lCash - cExp;
+    const totalSales = netCash + netAirtel + netMtn + netOtherMomo + netCard + netOther + netCustomTotal;
+    let openFloat = 0;
+    if (targetStore !== 'all' && targetStore) {
+      openFloat = parseFloat(localStorage.getItem('shift_opening_cash_' + targetStore) || openingCash || '0') || 0;
+    } else {
+      const branchesToSum = (accessibleIds.length > 0 ? loginStores.filter((st: any) => accessibleIds.some(id => id.toLowerCase() === String(st.id).toLowerCase())) : loginStores);
+      const summedFloat = branchesToSum.reduce((acc: number, st: any) => {
+        return acc + (parseFloat(localStorage.getItem('shift_opening_cash_' + st.id) || '0') || 0);
+      }, 0);
+      openFloat = summedFloat > 0 ? summedFloat : (parseFloat(openingCash) || parseFloat(localStorage.getItem('shift_opening_cash_global') || '0') || 0);
+    }
+    const expectedCashInDrawer = openFloat + netCash + lCash - cExp;
 
     setCashUpSummary({
       date: targetDate,
       store: targetStore,
       cashier: targetCashier,
       totalSales: totalSales,
-      totalTxCount: txList.length,
-      salesCash: sCash,
-      salesAirtel: sAirtel,
-      salesMtn: sMtn,
-      salesZamtel: sZamtel,
-      salesOtherMomo: sOtherMomo,
-      salesCard: sCard,
-      salesOther: sOther,
+      totalTxCount: completedCount,
+      completedCount,
+      refundCount,
+      salesCash: netCash,
+      salesAirtel: netAirtel,
+      salesMtn: netMtn,
+      salesOtherMomo: netOtherMomo,
+      salesMomo: netMomoTotal,
+      salesCard: netCard,
+      salesOther: netOther,
+      salesCustom: netCustom,
       laybyCash: lCash,
+      laybyAirtel: lAirtel,
+      laybyMtn: lMtn,
       laybyMomo: lMomo,
       laybyCard: lCard,
+      laybyCustom: lCustom,
       cashExpenses: cExp,
       openingCash: openFloat,
       expectedCash: expectedCashInDrawer,
       todayTxList: txList,
     });
 
-    // Reset inputs
-    setCashCounted('');
-    setCardCounted('');
-    setMomoCounted('');
-    setCashUpNotes('');
-    setIsCashUpPosted(false);
-    setIsSupervisorApproved(false);
-    setSupervisorNameInput('');
-    setSupervisorPasswordInput('');
+    if (!silentRefresh) {
+      // Reset inputs only on explicit open/filter change
+      setCashCounted('');
+      setCardCounted('');
+      setAirtelCounted('');
+      setMtnCounted('');
+      setMomoCounted('');
+      setCustomMethodCounted({});
+      setCashUpNotes('');
+      setIsCashUpPosted(false);
+      setIsSupervisorApproved(false);
+      setSupervisorNameInput('');
+      setSupervisorPasswordInput('');
 
-    // Fetch registered supervisors/staff from database
-    const staffRes = runSql('SELECT * FROM staff', 'EOD Cashup: Load supervisors list');
-    if (staffRes.success && Array.isArray(staffRes.data)) {
-      setSupervisors(staffRes.data);
-      if (staffRes.data.length > 0) {
-        setSupervisorNameInput(`${staffRes.data[0].first_name} ${staffRes.data[0].surname}`);
+      // Fetch registered supervisors/staff from database
+      const staffRes = runSql('SELECT * FROM staff', 'EOD Cashup: Load supervisors list');
+      if (staffRes.success && Array.isArray(staffRes.data)) {
+        setSupervisors(staffRes.data);
+        if (staffRes.data.length > 0) {
+          setSupervisorNameInput(`${staffRes.data[0].first_name} ${staffRes.data[0].surname}`);
+        }
+      } else {
+        setSupervisors([]);
       }
-    } else {
-      setSupervisors([]);
-    }
 
-    setCashUpActiveTab('reconcile');
-    setShowDenomHelper(false);
-    setDenominations({
-      '100': 0,
-      '50': 0,
-      '20': 0,
-      '10': 0,
-      '5': 0,
-      '2': 0,
-      '1': 0,
-      '0.50': 0,
-      '0.10': 0,
-    });
+      setCashUpActiveTab('reconcile');
+      setShowDenomHelper(false);
+      setDenominations({
+        '100': 0,
+        '50': 0,
+        '20': 0,
+        '10': 0,
+        '5': 0,
+        '2': 0,
+        '1': 0,
+        '0.50': 0,
+        '0.10': 0,
+      });
+    }
 
     loadReconciliationHistory();
     if (shouldOpenModal) {
@@ -2203,9 +2621,34 @@ export default function BillingTerminal({
     const actualCash = parseFloat(cashCounted) || 0;
     const cashDiff = actualCash - expectedCash;
 
+    const expectedAirtel = salesAirtelSum + laybyAirtelSum;
+    const expectedMtn = salesMtnSum + laybyMtnSum;
+    const customMomoExpected = allCustomMethods
+      .filter(cm => cm.category === 'Mobile Money')
+      .reduce((sum, cm) => sum + (salesCustomSums[cm.name] || 0) + (laybyCustomSums[cm.name] || 0), 0);
+    const expectedMomoTotal = expectedAirtel + expectedMtn + salesOtherMomoSum + customMomoExpected;
+
+    const actualAirtel = parseFloat(airtelCounted) || 0;
+    const actualMtn = parseFloat(mtnCounted) || 0;
+    const customMomoActual = allCustomMethods
+      .filter(cm => cm.category === 'Mobile Money')
+      .reduce((sum, cm) => sum + (parseFloat(customMethodCounted[cm.name] || '') || 0), 0);
+    const actualMomoTotal = (airtelCounted !== '' || mtnCounted !== '' || customMomoActual > 0)
+      ? (actualAirtel + actualMtn + customMomoActual)
+      : (parseFloat(momoCounted) || 0);
+
+    const customNotes = allCustomMethods
+      .map(cm => {
+        const expVal = (salesCustomSums[cm.name] || 0) + (laybyCustomSums[cm.name] || 0);
+        const actVal = parseFloat(customMethodCounted[cm.name] || '') || 0;
+        return expVal !== 0 || actVal !== 0 ? `${cm.name}: Exp ${settings.currency}${expVal.toFixed(2)} / Counted ${settings.currency}${actVal.toFixed(2)}` : '';
+      })
+      .filter(Boolean)
+      .join(', ');
+
     const cashUpId = 'CSH-' + Math.random().toString(36).substr(2, 9).toUpperCase();
     const timestamp = new Date().toISOString();
-    const fullNotes = `Date: ${cashUpDate} | Store: ${cashUpStore} | Cashier: ${cashUpCashier} | Approved by Supervisor: ${supervisorNameInput.trim()} | Notes: ${cashUpNotes}`;
+    const fullNotes = `Date: ${cashUpDate} | Store: ${cashUpStore} | Cashier: ${cashUpCashier} | Approved by Supervisor: ${supervisorNameInput.trim()} | Airtel Exp/Counted: ${settings.currency}${expectedAirtel.toFixed(2)}/${settings.currency}${actualAirtel.toFixed(2)} | MTN Exp/Counted: ${settings.currency}${expectedMtn.toFixed(2)}/${settings.currency}${actualMtn.toFixed(2)}${customNotes ? ` | Custom: ${customNotes}` : ''} | Notes: ${cashUpNotes}`;
 
     const insertSql = `
       INSERT INTO cash_ups VALUES (
@@ -2217,8 +2660,8 @@ export default function BillingTerminal({
         ${actualCash},
         ${salesCardSum + laybyCardSum},
         ${parseFloat(cardCounted) || 0},
-        ${salesAirtelSum + salesMtnSum + salesZamtelSum + salesOtherMomoSum + laybyMomoSum},
-        ${parseFloat(momoCounted) || 0},
+        ${expectedMomoTotal},
+        ${actualMomoTotal},
         ${cashDiff},
         '${fullNotes.replace(/'/g, "''")}',
         '${timestamp}'
@@ -2232,7 +2675,7 @@ export default function BillingTerminal({
       setIsSupervisorApproved(false);
       setSupervisorNameInput('');
       setSupervisorPasswordInput('');
-      alert(`✓ Daily Cash-Up Reconciled & Logged!\n\nID: ${cashUpId}\nDate: ${cashUpDate}\nExpected Cash: ${settings.currency}${expectedCash.toFixed(2)}\nActual Cash: ${settings.currency}${actualCash.toFixed(2)}\nDifference: ${settings.currency}${cashDiff.toFixed(2)}\nStatus: ${Math.abs(cashDiff) < 0.01 ? 'EXACT' : cashDiff < 0 ? 'SHORT' : 'OVER'}`);
+      alert(`✓ Daily Cash-Up Reconciled & Logged!\n\nID: ${cashUpId}\nDate: ${cashUpDate}\nExpected Cash: ${settings.currency}${expectedCash.toFixed(2)}\nActual Cash: ${settings.currency}${actualCash.toFixed(2)}\nAirtel Money: ${settings.currency}${actualAirtel.toFixed(2)} (Exp: ${settings.currency}${expectedAirtel.toFixed(2)})\nMTN Mobile Money: ${settings.currency}${actualMtn.toFixed(2)} (Exp: ${settings.currency}${expectedMtn.toFixed(2)})\nDifference: ${settings.currency}${cashDiff.toFixed(2)}\nStatus: ${Math.abs(cashDiff) < 0.01 ? 'EXACT' : cashDiff < 0 ? 'SHORT' : 'OVER'}`);
       setShowCashUpModal(false);
     } else {
       alert(`Error posting cash-up report: ${res.error}`);
@@ -2364,7 +2807,7 @@ export default function BillingTerminal({
     setShowPaymentModal(true);
   };
 
-  const handleExecuteQuickSale = (e: React.FormEvent) => {
+  const handleExecuteQuickSale = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isShiftActive) {
       alert('🔒 Gated Action: Please open your active shift first by declaring the opening register drawer cash balance!');
@@ -2423,62 +2866,98 @@ export default function BillingTerminal({
 
       // Generate & Download POS Thermal receipt in offline mode
       try {
-        const doc = new jsPDF({ format: [80, 150] });
+        const branchInfo = getBranchReceiptDetails(activeStore);
+        const doc = new jsPDF({ format: [80, 165] });
+        let qsY = 8;
+        const logoToUse = settings.logoUrl || DEFAULT_COMPANY_LOGO;
+        if (logoToUse) {
+          try {
+            doc.addImage(logoToUse, 'PNG', 33, qsY, 14, 14);
+            qsY += 17;
+          } catch {}
+        }
         
         doc.setFont('times', 'bold');
         doc.setFontSize(10);
-        doc.text(settings.storeName.toUpperCase(), 40, 10, { align: 'center' });
+        doc.text(settings.storeName.toUpperCase(), 40, qsY, { align: 'center' });
+        qsY += 4;
+        doc.setFontSize(7.5);
+        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 40, qsY, { align: 'center' });
+        qsY += 3.5;
         doc.setFont('times', 'normal');
         doc.setFontSize(6);
-        doc.text('LUSAKA / KITWE / NDOLA ENTERPRISE RETAIL HUB', 40, 14, { align: 'center' });
+        if (branchInfo.location) {
+          doc.text(branchInfo.location, 40, qsY, { align: 'center' });
+          qsY += 3.2;
+        }
+        if (branchInfo.phone) {
+          doc.text(`Tel: ${branchInfo.phone}`, 40, qsY, { align: 'center' });
+          qsY += 3.2;
+        }
+        if (branchInfo.email) {
+          doc.text(`Email: ${branchInfo.email}`, 40, qsY, { align: 'center' });
+          qsY += 3.2;
+        }
         
         doc.setLineWidth(0.1);
-        doc.line(4, 16, 76, 16);
+        doc.line(4, qsY, 76, qsY);
+        qsY += 4;
         
         doc.setFont('times', 'bold');
         doc.setFontSize(7);
-        doc.text('SALESPERSON QUICK RECEIPT (OFFLINE)', 40, 20, { align: 'center' });
+        doc.text('SALESPERSON QUICK RECEIPT (OFFLINE)', 40, qsY, { align: 'center' });
+        qsY += 5;
         
         doc.setFont('times', 'normal');
         doc.setFontSize(6);
-        doc.text(`TICKET NO: ${orderId}`, 4, 25);
-        doc.text(`BRANCH: ${activeStore.toUpperCase()}`, 4, 29);
-        doc.text(`DATE/TIME: ${new Date(dateStr).toLocaleString()}`, 4, 33);
-        doc.text(`SALESPERSON: ${salesperson.toUpperCase()}`, 4, 37);
-        doc.text(`PAYMENT: ${quickPaymentMethod}`, 4, 41);
+        doc.text(`TICKET NO: ${orderId}`, 4, qsY); qsY += 4;
+        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 4, qsY); qsY += 4;
+        doc.text(`DATE/TIME: ${new Date(dateStr).toLocaleString()}`, 4, qsY); qsY += 4;
+        doc.text(`SALESPERSON: ${salesperson.toUpperCase()}`, 4, qsY); qsY += 4;
+        doc.text(`PAYMENT: ${quickPaymentMethod}`, 4, qsY); qsY += 2;
         
-        doc.line(4, 43, 76, 43);
+        doc.line(4, qsY, 76, qsY);
+        qsY += 5;
         
         doc.setFont('helvetica', 'bold');
-        doc.text('ITEM DESCRIPTION', 4, 48);
-        doc.text('QTY', 52, 48, { align: 'right' });
-        doc.text('TOTAL', 76, 48, { align: 'right' });
+        doc.text('ITEM DESCRIPTION', 4, qsY);
+        doc.text('QTY', 52, qsY, { align: 'right' });
+        doc.text('TOTAL', 76, qsY, { align: 'right' });
+        qsY += 5;
         
         doc.setFont('helvetica', 'normal');
         const itemName = quickSelectedProduct.name.length > 25 ? quickSelectedProduct.name.substring(0, 22) + '...' : quickSelectedProduct.name;
-        doc.text(`${itemName} (${quickSelectedProduct.sku})`, 4, 53);
-        doc.text(`${qty}x ${settings.currency}${quickSelectedProduct.price.toFixed(2)}`, 4, 57);
-        doc.text(`${qty}`, 52, 57, { align: 'right' });
-        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, 57, { align: 'right' });
+        doc.text(`${itemName} (${quickSelectedProduct.sku})`, 4, qsY);
+        qsY += 4;
+        doc.text(`${qty}x ${settings.currency}${quickSelectedProduct.price.toFixed(2)}`, 4, qsY);
+        doc.text(`${qty}`, 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 4;
         
-        doc.line(4, 61, 76, 61);
+        doc.line(4, qsY, 76, qsY);
+        qsY += 5;
         
-        doc.text('Subtotal:', 52, 66, { align: 'right' });
-        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, 66, { align: 'right' });
+        doc.text('Subtotal:', 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 4;
         
-        doc.text(`Zambia Standard VAT (${activeTaxRate}%):`, 52, 70, { align: 'right' });
-        doc.text(`${settings.currency}${taxAmountQS.toFixed(2)}`, 76, 70, { align: 'right' });
+        doc.text(`VAT (${activeTaxRate}%):`, 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${taxAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 5;
         
         doc.setFont('helvetica', 'bold');
-        doc.text('GRAND TOTAL AMOUNT:', 52, 75, { align: 'right' });
-        doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, 75, { align: 'right' });
+        doc.text('GRAND TOTAL AMOUNT:', 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 8;
         
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(5);
-        doc.text('⚠️ ISSUED IN HIGH-AVAILABILITY OFFLINE RESERVE', 40, 83, { align: 'center' });
-        doc.text(settings.receiptFooter, 40, 86, { align: 'center' });
+        doc.text('⚠️ ISSUED IN HIGH-AVAILABILITY OFFLINE RESERVE', 40, qsY, { align: 'center' });
+        qsY += 3;
+        doc.text(settings.receiptFooter, 40, qsY, { align: 'center' });
         
-        exportAndSharePdf(`CHIPOSHA_QUICK_SALE_OFFLINE_${orderId}.pdf`, doc);
+        const safePrefix = (settings.storeName || 'POS').replace(/[^A-Za-z0-9]+/g, '_');
+        exportAndSharePdf(`${safePrefix}_QUICK_SALE_OFFLINE_${orderId}.pdf`, doc);
       } catch (pdfErr) {
         console.error('Failed generating quick sale offline PDF:', pdfErr);
       }
@@ -2510,7 +2989,6 @@ export default function BillingTerminal({
       )
     `;
     const resOrder = runSql(orderInsertSql, `Quick Sale: Logging cashier order header metadata`);
-    loadInvoices();
 
     logEmployeeAudit('SALES', 'Completed Quick Sale', `Invoice #${orderId}, Item: ${quickSelectedProduct.name} x${qty}, Payment: ${quickPaymentMethod}`, totalAmountQS, activeStore, salesperson);
 
@@ -2547,18 +3025,18 @@ export default function BillingTerminal({
       const feeAmount = parseFloat((totalAmountQS * feeRate).toFixed(4));
       const netSettlement = totalAmountQS - feeAmount;
 
-      let clearingAccountId = 'cash-clearing-account-uuid';
-      let targetAccountId = 'acc_cash';
+      const resolvedQuick = resolvePaymentMethodBucket(quickPaymentMethod);
+      const clearingAccountId = resolvedQuick.clearingAccountId;
+      const targetAccountId = resolvedQuick.accountId;
       let channel = 'CASH';
-
-      if (quickPaymentMethod === 'Mobile Wallet') {
-        clearingAccountId = 'mtn-clearing-account-uuid';
+      if (targetAccountId === 'acc_airtel') {
+        channel = 'AIRTEL_MONEY';
+      } else if (targetAccountId === 'acc_mtn') {
         channel = 'MTN_MOMO';
-        targetAccountId = 'acc_momo';
-      } else if (quickPaymentMethod === 'Credit Card') {
-        clearingAccountId = 'airtel-clearing-account-uuid';
+      } else if (targetAccountId === 'acc_bank') {
         channel = 'CARD_VISA';
-        targetAccountId = 'acc_bank';
+      } else if (targetAccountId.startsWith('acc_pm_')) {
+        channel = `CUSTOM_${resolvedQuick.bucket.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
       }
 
       runSql(`
@@ -2601,68 +3079,160 @@ export default function BillingTerminal({
         `, 'Quick Sale: Credit Inventory Asset Valuation');
       }
 
-      // 5. Generate & Download PDF instantly
+      // 5. Submit Quick Sale to ZRA Smart Invoice FiscalService
+      const qsZraResult = await FiscalService.submitInvoice({
+        orderId,
+        salesDateIso: dateStr,
+        items: [{
+          productId: quickSelectedProduct.id,
+          itemNm: quickSelectedProduct.name,
+          itemCd: quickSelectedProduct.sku,
+          itemClsCd: quickSelectedProduct.item_cls_cd,
+          taxTyCd: quickSelectedProduct.tax_ty_cd,
+          qty,
+          prc: quickSelectedProduct.price,
+          isService: quickSelectedProduct.is_service === 1,
+        }],
+        totalAmount: totalAmountQS,
+        paymentMethod: quickPaymentMethod,
+        cashierName: salesperson,
+        currencyTyCd: settings.currency,
+      });
+
+      // 6. Generate & Download PDF instantly (with ZRA SDC Info + QR if fiscalized)
       try {
-        const doc = new jsPDF({ format: [80, 150] }); // 80mm roll size format for point-of-sale thermal receipts
+        const branchInfo = getBranchReceiptDetails(activeStore);
+        const hasFiscalBlock = qsZraResult.zraData && qsZraResult.zraData.status === 'FISCALIZED';
+        const doc = new jsPDF({ format: [80, hasFiscalBlock ? 225 : 175] }); // 80mm roll size format for point-of-sale thermal receipts
+        let qsY = 8;
+        const logoToUse = settings.logoUrl || DEFAULT_COMPANY_LOGO;
+        if (logoToUse) {
+          try {
+            doc.addImage(logoToUse, 'PNG', 33, qsY, 14, 14);
+            qsY += 17;
+          } catch {}
+        }
         
         doc.setFont('times', 'bold');
         doc.setFontSize(10);
-        doc.text(settings.storeName.toUpperCase(), 40, 10, { align: 'center' });
+        doc.text(settings.storeName.toUpperCase(), 40, qsY, { align: 'center' });
+        qsY += 4;
+        doc.setFontSize(7.5);
+        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 40, qsY, { align: 'center' });
+        qsY += 3.5;
         doc.setFont('times', 'normal');
         doc.setFontSize(6);
-        doc.text('LUSAKA / KITWE / NDOLA ENTERPRISE RETAIL HUB', 40, 14, { align: 'center' });
+        if (branchInfo.location) {
+          doc.text(branchInfo.location, 40, qsY, { align: 'center' });
+          qsY += 3.2;
+        }
+        if (branchInfo.phone) {
+          doc.text(`Tel: ${branchInfo.phone}`, 40, qsY, { align: 'center' });
+          qsY += 3.2;
+        }
+        if (branchInfo.email) {
+          doc.text(`Email: ${branchInfo.email}`, 40, qsY, { align: 'center' });
+          qsY += 3.2;
+        }
         
         doc.setLineWidth(0.1);
-        doc.line(4, 16, 76, 16);
+        doc.line(4, qsY, 76, qsY);
+        qsY += 4;
         
         doc.setFont('times', 'bold');
         doc.setFontSize(7);
-        doc.text('SALESPERSON QUICK RECEIPT', 40, 20, { align: 'center' });
+        doc.text('SALESPERSON QUICK RECEIPT', 40, qsY, { align: 'center' });
+        qsY += 5;
         
         // Metadata fields
         doc.setFont('times', 'normal');
         doc.setFontSize(6);
-        doc.text(`TICKET NO: ${orderId}`, 4, 25);
-        doc.text(`BRANCH: ${activeStore.toUpperCase()}`, 4, 29);
-        doc.text(`DATE/TIME: ${new Date(dateStr).toLocaleString()}`, 4, 33);
-        doc.text(`SALESPERSON: ${salesperson.toUpperCase()}`, 4, 37);
-        doc.text(`PAYMENT: ${quickPaymentMethod}`, 4, 41);
+        doc.text(`TICKET NO: ${orderId}`, 4, qsY); qsY += 4;
+        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 4, qsY); qsY += 4;
+        doc.text(`DATE/TIME: ${new Date(dateStr).toLocaleString()}`, 4, qsY); qsY += 4;
+        doc.text(`SALESPERSON: ${salesperson.toUpperCase()}`, 4, qsY); qsY += 4;
+        doc.text(`PAYMENT: ${quickPaymentMethod}`, 4, qsY); qsY += 2;
         
-        doc.line(4, 43, 76, 43);
+        doc.line(4, qsY, 76, qsY);
+        qsY += 5;
         
         // Item detail layout
         doc.setFont('helvetica', 'bold');
-        doc.text('ITEM DESCRIPTION', 4, 48);
-        doc.text('QTY', 52, 48, { align: 'right' });
-        doc.text('TOTAL', 76, 48, { align: 'right' });
+        doc.text('ITEM DESCRIPTION', 4, qsY);
+        doc.text('QTY', 52, qsY, { align: 'right' });
+        doc.text('TOTAL', 76, qsY, { align: 'right' });
+        qsY += 5;
         
         doc.setFont('helvetica', 'normal');
-        // Let's wrap name
         const itemName = quickSelectedProduct.name.length > 25 ? quickSelectedProduct.name.substring(0, 22) + '...' : quickSelectedProduct.name;
-        doc.text(`${itemName} (${quickSelectedProduct.sku})`, 4, 53);
-        doc.text(`${qty}x ${settings.currency}${quickSelectedProduct.price.toFixed(2)}`, 4, 57);
-        doc.text(`${qty}`, 52, 57, { align: 'right' });
-        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, 57, { align: 'right' });
+        doc.text(`${itemName} (${quickSelectedProduct.sku})`, 4, qsY);
+        qsY += 4;
+        doc.text(`${qty}x ${settings.currency}${quickSelectedProduct.price.toFixed(2)}`, 4, qsY);
+        doc.text(`${qty}`, 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 4;
         
-        doc.line(4, 61, 76, 61);
+        doc.line(4, qsY, 76, qsY);
+        qsY += 5;
         
         // Math blocks
-        doc.text('Subtotal:', 52, 66, { align: 'right' });
-        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, 66, { align: 'right' });
+        doc.text('Subtotal:', 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 4;
         
-        doc.text(`Zambia Standard VAT (${activeTaxRate}%):`, 52, 70, { align: 'right' });
-        doc.text(`${settings.currency}${taxAmountQS.toFixed(2)}`, 76, 70, { align: 'right' });
+        doc.text(`VAT (${activeTaxRate}%):`, 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${taxAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 5;
         
         doc.setFont('helvetica', 'bold');
-        doc.text('GRAND TOTAL AMOUNT:', 52, 75, { align: 'right' });
-        doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, 75, { align: 'right' });
-        
+        doc.text('GRAND TOTAL AMOUNT:', 52, qsY, { align: 'right' });
+        doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
+        qsY += 6;
+
+        if (qsZraResult.zraData && qsZraResult.zraData.status === 'FISCALIZED') {
+          const z = qsZraResult.zraData;
+          doc.line(4, qsY, 76, qsY);
+          qsY += 4;
+          doc.setFont('times', 'bold');
+          doc.setFontSize(6.5);
+          doc.text('SDC INFORMATION', 40, qsY, { align: 'center' });
+          qsY += 3.5;
+          doc.setFont('times', 'normal');
+          doc.setFontSize(5.8);
+          doc.text(`SDC ID: ${z.sdcId} | TPIN: ${z.tpin}`, 4, qsY); qsY += 3.2;
+          doc.text(`INVOICE: ${z.cisInvcNo} (RCPT #${z.rcptNo})`, 4, qsY); qsY += 3.2;
+          if (z.formattedRcptSign) {
+            doc.text(`SIGN: ${z.formattedRcptSign.slice(0, 32)}`, 4, qsY); qsY += 3.5;
+          }
+          if (z.qrDataUrl) {
+            try {
+              doc.addImage(z.qrDataUrl, 'PNG', 28, qsY, 24, 24);
+              qsY += 27;
+            } catch {}
+          }
+          doc.setFont('times', 'bold');
+          doc.text('Powered by ZRA Smart Invoice', 40, qsY, { align: 'center' });
+          qsY += 4;
+        } else {
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(5);
+          doc.text(
+            qsZraResult.fiscalStatus === 'QUEUED_OFFLINE'
+              ? 'ZRA SMART INVOICE: QUEUED FOR OFFLINE SYNC'
+              : 'FISCAL STATUS: LOCAL_ONLY',
+            40,
+            qsY,
+            { align: 'center' }
+          );
+          qsY += 4;
+        }
+
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(5);
-        doc.text('Double-Entry Pos System Checked', 40, 83, { align: 'center' });
-        doc.text(settings.receiptFooter, 40, 86, { align: 'center' });
+        doc.text(settings.receiptFooter, 40, qsY, { align: 'center' });
         
-        exportAndSharePdf(`CHIPOSHA_QUICK_SALE_${orderId}.pdf`, doc);
+        const safePrefix = (settings.storeName || 'POS').replace(/[^A-Za-z0-9]+/g, '_');
+        exportAndSharePdf(`${safePrefix}_QUICK_SALE_${orderId}.pdf`, doc);
       } catch (pdfErr) {
         console.error('Failed generating quick sale PDF:', pdfErr);
       }
@@ -2706,7 +3276,7 @@ export default function BillingTerminal({
     }
   };
 
-  const handleCompletePayment = () => {
+  const handleCompletePayment = async () => {
     const orderId = 'TXN-' + Math.floor(1000 + Math.random() * 9000);
     const dateStr = new Date().toISOString();
 
@@ -2744,20 +3314,31 @@ export default function BillingTerminal({
       address: customerAddress.trim() || 'N/A',
     };
 
+    const isSplitMethod = paymentMethod === 'Split';
+    const finalPaymentMethod = isSplitMethod ? `Split (Cash + ${splitMobileProvider})` : paymentMethod;
+
     // If offline, store standard parameters in offlineQueue
     if (!isDeviceOnline) {
+      const splitCashValOffline = isSplitMethod ? (parseFloat(splitCashAmount) || 0) : 0;
+      const splitMobileValOffline = isSplitMethod ? (parseFloat(splitMobileAmount) || 0) : 0;
+      const splitChangeOffline = isSplitMethod ? Math.max(0, (splitCashValOffline + splitMobileValOffline) - totalAmount) : 0;
+      const actualCashKeptOffline = isSplitMethod ? Math.max(0, splitCashValOffline - splitChangeOffline) : 0;
+      const cashierNameOffline = localStorage.getItem('logged_in_user_name') || 'Default Cashier';
+
       const newOfflineStd: OfflineOrder = {
         orderId,
-        customerId: selectedCustomer ? selectedCustomer.id : null,
+        customerId: selectedCustomer ? String(selectedCustomer.id) : null,
         items: [...cart],
         dateStr,
         subtotal,
         taxAmount,
         discountAmount,
         totalAmount,
-        paymentMethod,
+        paymentMethod: finalPaymentMethod,
+        splitCash: isSplitMethod ? actualCashKeptOffline : 0,
+        splitMobile: isSplitMethod ? splitMobileValOffline : 0,
         activeStore,
-        salesperson: localStorage.getItem('logged_in_user_name') || 'Default Cashier',
+        salesperson: cashierNameOffline,
         type: 'standard'
       };
 
@@ -2767,8 +3348,10 @@ export default function BillingTerminal({
 
       setActiveReceipt({
         id: orderId,
+        store_id: activeStore,
+        performed_by: cashierNameOffline,
         date: new Date(dateStr).toLocaleString(),
-        paymentMethod,
+        paymentMethod: finalPaymentMethod,
         subtotal,
         tax: taxAmount,
         taxRate: settings.taxRate,
@@ -2776,15 +3359,14 @@ export default function BillingTerminal({
         total: totalAmount,
         cashReceived: paymentMethod === 'Cash' 
           ? (parseFloat(receivedCash) || 0) 
-          : (paymentMethod === 'Split' ? (parseFloat(splitCashAmount) || 0) : totalAmount),
+          : (isSplitMethod ? (parseFloat(splitCashAmount) || 0) : totalAmount),
         change: paymentMethod === 'Cash' 
           ? Math.max(0, (parseFloat(receivedCash) || 0) - totalAmount) 
-          : (paymentMethod === 'Split'
-            ? Math.max(0, ((parseFloat(splitCashAmount) || 0) + (parseFloat(splitMobileAmount) || 0)) - totalAmount)
-            : 0),
-        splitBreakdown: paymentMethod === 'Split' ? {
-          cash: parseFloat(splitCashAmount) || 0,
-          mobile: parseFloat(splitMobileAmount) || 0
+          : splitChangeOffline,
+        splitBreakdown: isSplitMethod ? {
+          cash: splitCashValOffline,
+          mobile: splitMobileValOffline,
+          provider: splitMobileProvider
         } : null,
         customer: receiptCustomer,
         items: [...cart],
@@ -2803,15 +3385,21 @@ export default function BillingTerminal({
       setShowPaymentModal(false);
       onCartCheckedOut();
       refreshDbData();
-      loadInvoices();
-      handleTriggerCashUp();
+      loadInvoices(historyStoreFilter || activeStore || 'all');
+      handleTriggerCashUp(undefined, undefined, undefined, false, true);
       persistTablesToStorage();
       return;
     }
 
-    // 1. Insert order details to Orders SQL Database with store identifier
+    const activeCashierName = localStorage.getItem('logged_in_user_name') || 'Default Cashier';
+    const splitCashInput = isSplitMethod ? (parseFloat(splitCashAmount) || 0) : 0;
+    const splitMobileInput = isSplitMethod ? (parseFloat(splitMobileAmount) || 0) : 0;
+    const splitChangeAmt = isSplitMethod ? Math.max(0, (splitCashInput + splitMobileInput) - totalAmount) : 0;
+    const splitCashKept = isSplitMethod ? Math.max(0, splitCashInput - splitChangeAmt) : 0;
+
+    // 1. Insert order details to Orders SQL Database with store identifier and split breakdown
     const orderInsertSql = `
-      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
+      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo) VALUES (
         '${orderId}', 
         ${customerIdVal}, 
         '${dateStr}', 
@@ -2819,16 +3407,17 @@ export default function BillingTerminal({
         ${taxAmount.toFixed(2)}, 
         ${discountAmount.toFixed(2)}, 
         ${totalAmount.toFixed(2)}, 
-        '${paymentMethod}', 
+        '${finalPaymentMethod.replace(/'/g, "''")}', 
         'Completed',
         '${activeStore}',
-        '${(localStorage.getItem('logged_in_user_name') || 'Default Cashier').replace(/'/g, "''")}'
+        '${activeCashierName.replace(/'/g, "''")}',
+        ${splitCashKept.toFixed(2)},
+        ${splitMobileInput.toFixed(2)}
       )
     `;
     runSql(orderInsertSql, `Billing: Post order ticket details to SQLite for store ${activeStore.toUpperCase()}`);
-    loadInvoices();
 
-    logEmployeeAudit('SALES', 'Completed POS Cart Sale', `Invoice #${orderId}, Items: ${cart.length}, Customer: ${selectedCustomer ? selectedCustomer.name : 'Walk-in'}, Payment: ${paymentMethod}`, totalAmount, activeStore);
+    logEmployeeAudit('SALES', 'Completed POS Cart Sale', `Invoice #${orderId}, Items: ${cart.length}, Customer: ${selectedCustomer ? selectedCustomer.name : 'Walk-in'}, Payment: ${finalPaymentMethod}`, totalAmount, activeStore);
 
     // 2. Insert items and decrement branch specific stock layers!
     cart.forEach((item, index) => {
@@ -2877,7 +3466,7 @@ export default function BillingTerminal({
     const txId = `tx_${orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
     const idempotencyKey = `idemp_${txId}`;
 
-    if (paymentMethod === 'Split') {
+    if (isSplitMethod) {
       const splitCashVal = parseFloat(splitCashAmount) || 0;
       const splitMobileVal = parseFloat(splitMobileAmount) || 0;
       const totalSplitPaid = splitCashVal + splitMobileVal;
@@ -2885,10 +3474,11 @@ export default function BillingTerminal({
       const actualCashKept = Math.max(0, splitCashVal - changeAmt);
       const calculatedMobileFee = parseFloat((splitMobileVal * 0.015).toFixed(4));
       const netSettlement = totalAmount - calculatedMobileFee;
+      const momoResolved = resolvePaymentMethodBucket(splitMobileProvider);
 
       runSql(`
         INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStore.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${calculatedMobileFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${activeStore.toUpperCase()} order Split Checkout #${orderId}', '${dateStr}', '${dateStr}', '${(localStorage.getItem('logged_in_user_name') || 'Default Cashier').replace(/'/g, "''")}')
+        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStore.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${calculatedMobileFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${activeStore.toUpperCase()} order Split Checkout #${orderId} (${splitMobileProvider})', '${dateStr}', '${dateStr}', '${(localStorage.getItem('logged_in_user_name') || 'Default Cashier').replace(/'/g, "''")}')
       `, 'Double Entry: Journal base transaction entry for split');
 
       if (actualCashKept > 0) {
@@ -2904,16 +3494,15 @@ export default function BillingTerminal({
       }
 
       if (splitMobileVal > 0) {
-        const clearingAccountId = Math.random() > 0.5 ? 'mtn-clearing-account-uuid' : 'airtel-clearing-account-uuid';
         runSql(`
           INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_deb_momo', '${txId}', '${clearingAccountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}')
-        `, 'Double Entry: Debit Mobile Money Clearing Asset account (Split)');
+          VALUES ('le_${txId}_deb_momo', '${txId}', '${momoResolved.clearingAccountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}')
+        `, `Double Entry: Debit ${momoResolved.bucket} Clearing Asset account (Split)`);
 
         runSql(`
           INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_momo_asset', '${txId}', 'acc_momo', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}')
-        `, 'Double Entry: Debit Mobile Wallet Account (Split)');
+          VALUES ('le_${txId}_momo_asset', '${txId}', '${momoResolved.accountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}')
+        `, `Double Entry: Debit ${momoResolved.bucket} Account (Split)`);
       }
 
       runSql(`
@@ -2927,22 +3516,22 @@ export default function BillingTerminal({
       `, 'Double Entry: Credit Gross Sales Revenue');
 
     } else {
+      const resolvedPay = resolvePaymentMethodBucket(paymentMethod);
       const calculatedFeeRate = paymentMethod === 'Cash' ? 0.0 : 0.015;
       const feeAmount = parseFloat((totalAmount * calculatedFeeRate).toFixed(4));
       const netSettlement = totalAmount - feeAmount;
 
-      let clearingAccountId = 'cash-clearing-account-uuid';
-      let targetAccountId = 'acc_cash';
+      const clearingAccountId = resolvedPay.clearingAccountId;
+      const targetAccountId = resolvedPay.accountId;
       let channel = 'CASH';
-
-      if (paymentMethod === 'Mobile Wallet') {
-        clearingAccountId = Math.random() > 0.5 ? 'mtn-clearing-account-uuid' : 'airtel-clearing-account-uuid';
-        channel = clearingAccountId === 'mtn-clearing-account-uuid' ? 'MTN_MOMO' : 'AIRTEL_MONEY';
-        targetAccountId = 'acc_momo';
-      } else if (paymentMethod === 'Credit Card') {
-        clearingAccountId = 'airtel-clearing-account-uuid';
+      if (targetAccountId === 'acc_airtel') {
+        channel = 'AIRTEL_MONEY';
+      } else if (targetAccountId === 'acc_mtn') {
+        channel = 'MTN_MOMO';
+      } else if (targetAccountId === 'acc_bank') {
         channel = 'CARD_VISA';
-        targetAccountId = 'acc_bank';
+      } else if (targetAccountId.startsWith('acc_pm_')) {
+        channel = `CUSTOM_${resolvedPay.bucket.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
       }
 
       runSql(`
@@ -3029,36 +3618,59 @@ export default function BillingTerminal({
       alert(`✓ Order ${orderId} Checkout Successful!${sweepMessage}`);
     }
 
-    // Capture receipt details with ZRA Fiscal parameters
+    // Submit invoice to ZRA Smart Invoice FiscalService (returns LOCAL_ONLY immediately if toggled OFF)
+    const zraResult = await FiscalService.submitInvoice({
+      orderId,
+      salesDateIso: dateStr,
+      items: cart.map((item) => ({
+        productId: item.product.id,
+        itemNm: item.product.name,
+        itemCd: item.product.sku,
+        itemClsCd: item.product.item_cls_cd,
+        taxTyCd: item.product.tax_ty_cd,
+        qty: item.quantity,
+        prc: item.product.price,
+        isService: item.product.is_service === 1,
+      })),
+      totalAmount,
+      discountAmount,
+      paymentMethod: finalPaymentMethod,
+      cashierName: activeCashierName,
+      customerName: receiptCustomer.name,
+      customerTpin: receiptCustomer.tpin,
+      customerPhone: receiptCustomer.phone,
+      currencyTyCd: settings.currency,
+    });
+
+    // Capture receipt details with ZRA Fiscal parameters & transacting branch
     setActiveReceipt({
       id: orderId,
+      store_id: activeStore,
+      performed_by: activeCashierName,
       date: new Date(dateStr).toLocaleString(),
-      paymentMethod,
+      paymentMethod: finalPaymentMethod,
       subtotal,
       tax: taxAmount,
-      taxRate: isZraConnected ? activeTaxRatePercentage : settings.taxRate,
+      taxRate: zraConfigState.enabled ? activeTaxRatePercentage : settings.taxRate,
       discount: discountAmount,
       total: totalAmount,
       cashReceived: paymentMethod === 'Cash' 
         ? (parseFloat(receivedCash) || 0) 
-        : (paymentMethod === 'Split' ? (parseFloat(splitCashAmount) || 0) : totalAmount),
+        : (isSplitMethod ? (parseFloat(splitCashAmount) || 0) : totalAmount),
       change: paymentMethod === 'Cash' 
         ? Math.max(0, (parseFloat(receivedCash) || 0) - totalAmount) 
-        : (paymentMethod === 'Split'
+        : (isSplitMethod
           ? Math.max(0, ((parseFloat(splitCashAmount) || 0) + (parseFloat(splitMobileAmount) || 0)) - totalAmount)
           : 0),
-      splitBreakdown: paymentMethod === 'Split' ? {
+      splitBreakdown: isSplitMethod ? {
         cash: parseFloat(splitCashAmount) || 0,
-        mobile: parseFloat(splitMobileAmount) || 0
+        mobile: parseFloat(splitMobileAmount) || 0,
+        provider: splitMobileProvider
       } : null,
       customer: receiptCustomer,
       items: [...cart],
-      zra: isZraConnected ? {
-        tpin: customerTpin || '1001122334',
-        taxBand: currentTaxBandName,
-        fiscalCode: 'ESD-' + Math.floor(10000000 + Math.random() * 90000000) + '-' + Math.floor(1000 + Math.random() * 9000),
-        qrUrl: `https://www.zra.org.zm/verify?invoice=${orderId}&tpin=${customerTpin}&amount=${totalAmount.toFixed(2)}`
-      } : null
+      fiscalStatus: zraResult.fiscalStatus,
+      zra: zraResult.zraData,
     });
 
     if (receiptCustomer.phone && receiptCustomer.phone !== 'N/A') {
@@ -3087,7 +3699,7 @@ export default function BillingTerminal({
     const activeCashier = localStorage.getItem('logged_in_user_name') || 'Default Cashier';
     try {
       window.dispatchEvent(new CustomEvent('pos_sale_completed', {
-        detail: { orderId, totalAmount, paymentMethod, store_id: activeStore, performed_by: activeCashier }
+        detail: { orderId, totalAmount, paymentMethod: finalPaymentMethod, store_id: activeStore, performed_by: activeCashier }
       }));
       window.dispatchEvent(new Event('pos_data_updated'));
       window.dispatchEvent(new Event('storage'));
@@ -3098,7 +3710,7 @@ export default function BillingTerminal({
   };
 
   return (
-    <div className="flex-1 flex overflow-hidden flex-col bg-slate-50 relative min-w-0 h-full">
+    <div className="flex-1 min-h-0 flex overflow-hidden flex-col bg-slate-50 relative min-w-0 h-full">
       {/* MOBILE NAV TABS */}
       {isShiftActive && (
         <div className="md:hidden flex bg-white border-b border-slate-200 p-2 gap-1.5 shrink-0 select-none">
@@ -3132,19 +3744,19 @@ export default function BillingTerminal({
         </div>
       )}
 
-      <div className="flex-1 flex overflow-hidden flex-col md:flex-row relative min-w-0">
+      <div className="flex-1 min-h-0 flex overflow-hidden flex-col md:flex-row relative min-w-0">
         
         {/* LEFT COLUMN: ACTIVE SALE SHEET */}
-        <div className={`w-full flex-col overflow-hidden border-b md:border-b-0 md:border-r border-slate-200 ${
+        <div className={`w-full flex-col overflow-hidden min-h-0 border-b md:border-b-0 md:border-r border-slate-200 ${
           !isShiftActive 
             ? 'flex-1 h-auto flex' 
             : activeMobileTab === 'catalog' 
-              ? 'flex-1 h-full md:w-[60%] md:flex bg-slate-50' 
-              : 'hidden md:w-[60%] md:flex md:h-auto bg-slate-50'
+              ? 'flex flex-1 min-h-0 h-full md:w-[60%] md:flex bg-slate-50' 
+              : 'hidden md:w-[60%] md:flex md:h-full bg-slate-50'
         }`}>
         
         {/* Connectivity & Offline Sync Status Ribbon */}
-        <div id="offline-network-banner" className={`px-4 py-2 border-b flex flex-wrap items-center justify-between gap-2 text-xs font-bold leading-none transition-all duration-300 select-none ${
+        <div id="offline-network-banner" className={`px-4 py-2 border-b flex flex-wrap items-center justify-between gap-2 text-xs font-bold leading-none transition-all duration-300 select-none shrink-0 ${
           isDeviceOnline 
             ? 'bg-emerald-50 text-emerald-800 border-emerald-100' 
             : 'bg-amber-50 text-amber-900 border-amber-200'
@@ -3170,6 +3782,13 @@ export default function BillingTerminal({
           </div>
 
           <div className="flex items-center gap-2">
+            <span className={`font-mono text-[9px] px-2 py-0.5 rounded-full border select-none font-bold ${
+              zraConfigState.enabled
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                : 'bg-slate-100 border-slate-200 text-slate-600'
+            }`}>
+              {zraConfigState.enabled ? `ZRA VSDC ON${zraQueueCount > 0 ? ` (${zraQueueCount} QUEUED)` : ''}` : 'ZRA: LOCAL_ONLY'}
+            </span>
             {offlineQueue.length > 0 && (
               <span className="bg-amber-200 border border-amber-300 text-amber-950 font-mono text-[9px] px-2 py-0.5 rounded-full select-none">
                 {offlineQueue.length} PENDING SYNC
@@ -3316,16 +3935,16 @@ export default function BillingTerminal({
                   const userFullName = authResult.fullName;
                   const userRoleFound = authResult.roleFound;
 
-                  // Determine store to activate
+                  // Determine store to activate from central branches database
                   let targetStoreId = selectedLoginStore || activeStore;
-                  const currentStoresRes = runSql('SELECT * FROM stores', 'Auth: Check stores');
-                  if (currentStoresRes.success && Array.isArray(currentStoresRes.data) && currentStoresRes.data.length > 0) {
-                    if (!targetStoreId || !currentStoresRes.data.some((s: any) => s.id === targetStoreId)) {
-                      targetStoreId = currentStoresRes.data[0].id;
+                  const centralList = getCentralBranches();
+                  if (centralList.length > 0) {
+                    if (!targetStoreId || !centralList.some((s: any) => s.id === targetStoreId)) {
+                      targetStoreId = centralList[0].id;
                     }
                   }
 
-                  // 3. Open the selected store's shift
+                  // 3. Open the selected store's shift without overwriting other branches' floats
                   localStorage.setItem('pos_shift_active', 'true');
                   if (targetStoreId) {
                     localStorage.setItem('shift_active_' + targetStoreId, 'true');
@@ -3335,7 +3954,9 @@ export default function BillingTerminal({
                     loginStores.forEach(st => {
                       if (st && st.id) {
                         localStorage.setItem('shift_active_' + st.id, 'true');
-                        localStorage.setItem('shift_opening_cash_' + st.id, amt.toFixed(2));
+                        if (!localStorage.getItem('shift_opening_cash_' + st.id)) {
+                          localStorage.setItem('shift_opening_cash_' + st.id, '0.00');
+                        }
                       }
                     });
                   }
@@ -3343,6 +3964,7 @@ export default function BillingTerminal({
                   localStorage.setItem('quick_salesperson_name', userFullName);
                   localStorage.setItem('logged_in_user_email', targetEmail);
                   localStorage.setItem('logged_in_user_name', userFullName);
+                  localStorage.setItem('logged_in_user_role', userRoleFound);
 
                   // 4. Callback props to update main App state dynamically
                   if (targetStoreId) {
@@ -3443,16 +4065,6 @@ export default function BillingTerminal({
                   <span>🚀 Authorize & Open Shift Register</span>
                 </button>
               </form>
-
-              <div className="mt-1 bg-slate-50 border border-slate-200 p-3 rounded-2xl text-[10px] text-slate-600 font-sans text-left flex flex-col gap-1.5">
-                <strong className="text-slate-800 text-[10px] flex items-center gap-1">
-                  <ShieldCheck size={12} className="text-emerald-600 shrink-0" />
-                  <span>CLOUD-SYNCHRONIZED LOGIN</span>
-                </strong>
-                <p className="leading-relaxed text-slate-500">
-                  Sign in with your Business Owner email & password or a Staff account created in Staff Management. Entering an existing cloud account email automatically synchronizes your business data from Cloud SQL.
-                </p>
-              </div>
             </div>
           </div>
         ) : (
@@ -3513,7 +4125,7 @@ export default function BillingTerminal({
         </div>
 
         {/* Dynamic products catalog viewport */}
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-4 scroll-y-touch touch-pan-y overscroll-contain">
           
           {/* CAMERA FEED SCREEN OVERLAY */}
           {isCamerActive && (
@@ -3688,7 +4300,7 @@ export default function BillingTerminal({
 
       {/* RIGHT COLUMN: REVENUE & CALCULATIONS SHEET */}
       {isShiftActive && (
-        <div className={`border-t md:border-t-0 md:border-l border-slate-200 p-4 flex-col overflow-hidden md:h-auto md:max-h-screen md:w-[40%] shrink-0 ${
+        <div className={`border-t md:border-t-0 md:border-l border-slate-200 p-4 flex-col overflow-hidden min-h-0 md:h-full md:w-[40%] shrink-0 ${
           activeMobileTab === 'basket' 
             ? 'flex-1 w-full h-full flex bg-white' 
             : 'hidden md:flex bg-white'
@@ -4152,23 +4764,32 @@ export default function BillingTerminal({
                     <span className="text-[10px] text-slate-400 font-extrabold uppercase">Payment Ledger Method</span>
                     <div className="grid grid-cols-2 gap-2">
                       {[
-                        { label: 'CASH', val: 'Cash', icon: <DollarSign size={12} className="text-indigo-600" /> },
-                        { label: 'CARD', val: 'Credit Card', icon: <CreditCard size={12} className="text-emerald-600" /> },
-                        { label: 'MOBILE MON.', val: 'Mobile Wallet', icon: <Coins size={12} className="text-amber-600" /> },
-                        { label: 'SPLIT (CASH+MOBILE)', val: 'Split', icon: <Layers size={12} className="text-pink-650 animate-bounce" /> },
+                        { label: 'CASH', val: 'Cash', isSelected: paymentMethod === 'Cash', icon: <DollarSign size={12} className="text-indigo-600" /> },
+                        { label: 'CARD', val: 'Credit Card', isSelected: paymentMethod === 'Credit Card', icon: <CreditCard size={12} className="text-emerald-600" /> },
+                        { label: 'MOBILE MONEY', val: 'Airtel Money', isSelected: mobileMoneyOptions.some(m => m.name === paymentMethod), icon: <Coins size={12} className="text-amber-600" /> },
+                        { label: 'SPLIT (CASH+MOBILE)', val: 'Split', isSelected: paymentMethod === 'Split', icon: <Layers size={12} className="text-pink-650 animate-bounce" /> },
                       ].map(x => (
                         <button
                           key={x.val}
                           type="button"
                           onClick={() => {
-                            setPaymentMethod(x.val as any);
+                            if (x.val === 'Airtel Money') {
+                              if (!mobileMoneyOptions.some(m => m.name === paymentMethod)) {
+                                setPaymentMethod(mobileMoneyOptions[0]?.name || 'Airtel Money');
+                              }
+                            } else {
+                              setPaymentMethod(x.val);
+                            }
                             if (x.val === 'Split') {
                               setSplitCashAmount('');
                               setSplitMobileAmount('');
+                              if (!mobileMoneyOptions.some(m => m.name === splitMobileProvider)) {
+                                setSplitMobileProvider(mobileMoneyOptions[0]?.name || 'Airtel Money');
+                              }
                             }
                           }}
                           className={`py-2 px-1.5 rounded-lg border font-black text-[10px] flex flex-col items-center justify-center gap-1 cursor-pointer transition-colors ${
-                            paymentMethod === x.val ? 'bg-indigo-50 text-indigo-700 border-indigo-500 shadow-3xs' : 'bg-slate-50 border-slate-200 text-slate-500'
+                            x.isSelected ? 'bg-indigo-50 text-indigo-700 border-indigo-500 shadow-3xs' : 'bg-slate-50 border-slate-200 text-slate-500'
                           }`}
                         >
                           {x.icon}
@@ -4176,6 +4797,65 @@ export default function BillingTerminal({
                         </button>
                       ))}
                     </div>
+
+                    {mobileMoneyOptions.some(m => m.name === paymentMethod) && (
+                      <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-2.5 flex flex-col gap-1.5">
+                        <span className="text-[9px] font-black uppercase text-amber-800 tracking-wider">
+                          Select Mobile Money Provider
+                        </span>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {mobileMoneyOptions.map(opt => {
+                            const selected = paymentMethod === opt.name;
+                            const isAirtel = opt.name.toLowerCase().includes('airtel');
+                            const isMtn = opt.name.toLowerCase().includes('mtn');
+                            return (
+                              <button
+                                key={opt.name}
+                                type="button"
+                                onClick={() => setPaymentMethod(opt.name)}
+                                className={`py-2 px-2 rounded-lg border text-[10px] font-black transition-all cursor-pointer ${
+                                  selected
+                                    ? isAirtel
+                                      ? 'bg-rose-600 text-white border-rose-700 shadow-xs'
+                                      : isMtn
+                                        ? 'bg-amber-400 text-slate-950 border-amber-500 shadow-xs'
+                                        : 'bg-indigo-600 text-white border-indigo-700 shadow-xs'
+                                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                                }`}
+                              >
+                                {opt.name}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {customPaymentMethods.filter(m => m.category !== 'Mobile Money').length > 0 && (
+                      <div className="bg-slate-50 border border-slate-200 rounded-xl p-2 flex flex-col gap-1.5">
+                        <span className="text-[9px] font-black uppercase text-slate-500 tracking-wider">
+                          Admin Custom Payment Methods
+                        </span>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {customPaymentMethods
+                            .filter(m => m.category !== 'Mobile Money')
+                            .map(cm => (
+                              <button
+                                key={cm.id}
+                                type="button"
+                                onClick={() => setPaymentMethod(cm.name)}
+                                className={`py-1.5 px-2 rounded-lg border text-[10px] font-bold transition-all cursor-pointer ${
+                                  paymentMethod === cm.name
+                                    ? 'bg-indigo-600 text-white border-indigo-700 shadow-xs'
+                                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                                }`}
+                              >
+                                {cm.name}
+                              </button>
+                            ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {paymentMethod === 'Cash' && (
@@ -4229,6 +4909,28 @@ export default function BillingTerminal({
                         <span>Invoice Amount Due:</span>
                         <span className="font-mono text-sm text-amber-400 font-extrabold">{settings.currency}{totalAmount.toFixed(2)}</span>
                       </div>
+
+                      <div className="flex flex-col gap-1 text-left">
+                        <label className="text-[9px] text-amber-300 font-extrabold uppercase tracking-widest block font-sans">
+                          📱 Mobile Money Provider
+                        </label>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {mobileMoneyOptions.map(opt => (
+                            <button
+                              key={opt.name}
+                              type="button"
+                              onClick={() => setSplitMobileProvider(opt.name)}
+                              className={`py-1.5 px-2 rounded-lg border text-[10px] font-black transition-colors cursor-pointer ${
+                                splitMobileProvider === opt.name
+                                  ? 'bg-amber-400 text-slate-950 border-amber-300'
+                                  : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700'
+                              }`}
+                            >
+                              {opt.name}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                       
                       <p className="text-[9px] text-slate-400 leading-normal font-medium tracking-wide">
                         * Input mobile money and cash tendered amounts manually. Cash can exceed the total to calculate returned change.
@@ -4262,7 +4964,7 @@ export default function BillingTerminal({
 
                         <div className="flex flex-col gap-1">
                           <label className="text-[9px] text-slate-300 font-extrabold uppercase tracking-widest block font-sans">
-                            📱 Mobile Portion ({settings.currency})
+                            📱 {splitMobileProvider} ({settings.currency})
                           </label>
                           <input
                             type="number"
@@ -4403,7 +5105,7 @@ export default function BillingTerminal({
                           </div>
                         )}
 
-                        {activeReceipt.paymentMethod === 'Split' && activeReceipt.splitBreakdown && (
+                        {String(activeReceipt.paymentMethod || '').toLowerCase().startsWith('split') && activeReceipt.splitBreakdown && (
                           <div className="flex flex-col gap-1.5 text-[10px] font-mono text-slate-600 bg-slate-100/50 p-2.5 rounded-lg border border-slate-200">
                             <div className="flex justify-between">
                               <span>Cash Portion:</span>
@@ -4428,29 +5130,77 @@ export default function BillingTerminal({
                     {activeReceipt && (
                       <div className="bg-emerald-50/50 border border-emerald-200/50 rounded-2xl p-4 flex flex-col gap-2">
                         <label className="text-[10px] text-emerald-850 font-black uppercase tracking-wider flex items-center gap-1.5 font-sans">
-                          📱 SEND WHATSAPP RECEIPT
+                          📱 SEND WHATSAPP PDF RECEIPT
                         </label>
                         <p className="text-[8.5px] text-slate-500 leading-snug font-medium">
-                          Enter the customer's WhatsApp-registered mobile number to dispatch a PDF copy instantly.
+                          Enter the customer's WhatsApp number to compile and deliver the PDF receipt directly.
                         </p>
                         
                         <div className="flex gap-1.5 mt-1">
                           <input
                             type="tel"
                             value={whatsappPhone}
-                            onChange={(e) => setWhatsappPhone(e.target.value)}
+                            onChange={(e) => { setWhatsappPhone(e.target.value); setWhatsappError(null); }}
                             placeholder="+260 97 XXXXXX"
                             className="flex-1 text-xs px-3 py-1.5 bg-white border border-slate-350 text-slate-800 font-mono font-extrabold rounded-lg focus:outline-hidden focus:border-emerald-500 placeholder-slate-400"
                           />
                           <button
                             type="button"
+                            disabled={whatsappSending}
                             onClick={() => handleWhatsAppSend()}
-                            className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-[10.5px] rounded-lg font-black tracking-wider uppercase flex items-center justify-center gap-1 cursor-pointer transition-all active:scale-98"
+                            className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[10.5px] rounded-lg font-black tracking-wider uppercase flex items-center justify-center gap-1 cursor-pointer transition-all active:scale-98"
                           >
                             <Send size={11} />
-                            SEND
+                            {whatsappSending ? 'PREPARING...' : 'SEND PDF'}
                           </button>
                         </div>
+
+                        {whatsappError && (
+                          <p className="text-[10px] font-bold text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-2.5 py-1.5">
+                            {whatsappError}
+                          </p>
+                        )}
+
+                        {whatsappSuccess && whatsappResult && (
+                          <div className="bg-white border border-emerald-200 rounded-xl p-2.5 flex flex-col gap-1.5 text-[10px]">
+                            <p className="font-bold text-emerald-800">
+                              {whatsappResult.mode === 'cloud_api'
+                                ? `✓ PDF Receipt (${whatsappResult.filename}) sent directly to +${whatsappResult.phone} on WhatsApp.`
+                                : `✓ PDF Receipt (${whatsappResult.filename}) ready for +${whatsappResult.phone}.`}
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {whatsappResult.whatsappUrl && (
+                                <a
+                                  href={whatsappResult.whatsappUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-black uppercase tracking-wide inline-flex items-center gap-1"
+                                >
+                                  <Send size={10} /> Open Customer WhatsApp
+                                </a>
+                              )}
+                              {whatsappResult.canShareFile && lastCompiledReceiptPdf && (
+                                <button
+                                  type="button"
+                                  onClick={() => sharePdfFileDirectly(lastCompiledReceiptPdf.filename, lastCompiledReceiptPdf.doc, lastCompiledReceiptPdf.caption)}
+                                  className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-black uppercase tracking-wide cursor-pointer inline-flex items-center gap-1"
+                                >
+                                  <Share2 size={10} /> Share PDF File
+                                </button>
+                              )}
+                              {whatsappResult.pdfUrl && (
+                                <a
+                                  href={whatsappResult.pdfUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold inline-flex items-center gap-1"
+                                >
+                                  <Download size={10} /> View PDF
+                                </a>
+                              )}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -4491,45 +5241,59 @@ export default function BillingTerminal({
                           <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-600 rounded-t-xs" />
 
                           {/* Header */}
-                          <div className="text-center border-b-2 border-double border-slate-800 pb-2.5 mb-2.5 flex flex-col gap-0.5 text-slate-800">
-                            {(settings.logoUrl || DEFAULT_COMPANY_LOGO) && (
-                              <div className="flex justify-center mb-1">
-                                <img src={settings.logoUrl || DEFAULT_COMPANY_LOGO} alt="Company Logo" className="max-h-10 max-w-[90px] object-contain rounded-xs" referrerPolicy="no-referrer" />
-                              </div>
-                            )}
-                            <span className="font-extrabold text-slate-900 text-xs tracking-wider uppercase block">{settings.storeName}</span>
-                            <span className="font-bold text-[8px] text-slate-700 uppercase tracking-widest block">*** TAX INVOICE & RECEIPT ***</span>
-                            {settings.tpin && (
-                              <span className="text-[8.5px] font-bold text-slate-700 tracking-wider block">TPIN: {settings.tpin}</span>
-                            )}
-                            <span className="text-[8.5px] font-semibold text-slate-600">{settings.receiptHeader}</span>
-                          </div>
+                          {(() => {
+                            const br = getBranchReceiptDetails(activeReceipt.store_id);
+                            return (
+                              <>
+                                <div className="text-center border-b-2 border-double border-slate-800 pb-2.5 mb-2.5 flex flex-col gap-0.5 text-slate-800">
+                                  {(settings.logoUrl || DEFAULT_COMPANY_LOGO) && (
+                                    <div className="flex justify-center mb-1">
+                                      <img src={settings.logoUrl || DEFAULT_COMPANY_LOGO} alt="Company Logo" className="max-h-10 max-w-[90px] object-contain rounded-xs" referrerPolicy="no-referrer" />
+                                    </div>
+                                  )}
+                                  <span className="font-extrabold text-slate-900 text-xs tracking-wider uppercase block">{settings.storeName}</span>
+                                  <span className="font-bold text-[9px] text-indigo-900 uppercase tracking-wide block">Branch: {br.name}</span>
+                                  {br.location && <span className="text-[8px] text-slate-600 block">{br.location}</span>}
+                                  {(br.phone || br.email) && (
+                                    <span className="text-[8px] text-slate-600 block">
+                                      {[br.phone ? `Tel: ${br.phone}` : '', br.email].filter(Boolean).join(' • ')}
+                                    </span>
+                                  )}
+                                  <span className="font-bold text-[8px] text-slate-700 uppercase tracking-widest block mt-0.5">*** TAX INVOICE & RECEIPT ***</span>
+                                  {settings.tpin && (
+                                    <span className="text-[8.5px] font-bold text-slate-700 tracking-wider block">TPIN: {settings.tpin}</span>
+                                  )}
+                                  {settings.receiptHeader && <span className="text-[8.5px] font-semibold text-slate-600">{settings.receiptHeader}</span>}
+                                </div>
 
-                          {/* Metadata Card */}
-                          <div className="flex flex-col gap-0.5 border-b border-dashed border-slate-400 pb-2 mb-2 text-[8.5px]">
-                            <div className="flex justify-between">
-                              <span className="font-bold text-slate-700">INVOICE NO:</span>
-                              <span className="font-bold text-indigo-950">{activeReceipt.id}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="font-bold text-slate-700">DATE / TIME:</span>
-                              <span>{activeReceipt.date}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="font-bold text-slate-700">BRANCH:</span>
-                              <span>{activeStore.toUpperCase()}</span>
-                            </div>
-                            <div className="flex justify-between">
-                              <span className="font-bold text-slate-700">CASHIER:</span>
-                              <span>{(activeReceipt.performed_by || localStorage.getItem('logged_in_user_name') || 'Cashier').toUpperCase()}</span>
-                            </div>
-                            {activeReceipt.customer && (
-                              <div className="flex justify-between">
-                                <span className="font-bold text-slate-700">CUSTOMER:</span>
-                                <span>{activeReceipt.customer.name}</span>
-                              </div>
-                            )}
-                          </div>
+                                {/* Metadata Card */}
+                                <div className="flex flex-col gap-0.5 border-b border-dashed border-slate-400 pb-2 mb-2 text-[8.5px]">
+                                  <div className="flex justify-between">
+                                    <span className="font-bold text-slate-700">INVOICE NO:</span>
+                                    <span className="font-bold text-indigo-950">{activeReceipt.id}</span>
+                                  </div>
+                                  <div className="flex justify-between">
+                                    <span className="font-bold text-slate-700">DATE / TIME:</span>
+                                    <span>{activeReceipt.date}</span>
+                                  </div>
+                                  <div className="flex justify-between">
+                                    <span className="font-bold text-slate-700">BRANCH:</span>
+                                    <span>{br.name.toUpperCase()}</span>
+                                  </div>
+                                  <div className="flex justify-between">
+                                    <span className="font-bold text-slate-700">CASHIER:</span>
+                                    <span>{(activeReceipt.performed_by || localStorage.getItem('logged_in_user_name') || 'Cashier').toUpperCase()}</span>
+                                  </div>
+                                  {activeReceipt.customer && (
+                                    <div className="flex justify-between">
+                                      <span className="font-bold text-slate-700">CUSTOMER:</span>
+                                      <span>{activeReceipt.customer.name}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </>
+                            );
+                          })()}
 
                           {activeReceipt.offlinePending && (
                             <div className="bg-amber-50 rounded-xs border border-amber-300 p-1.5 text-[8px] text-amber-800 text-center uppercase font-sans font-bold tracking-wider mb-2 leading-tight animate-pulse">
@@ -4603,15 +5367,36 @@ export default function BillingTerminal({
                             )}
                           </div>
 
-                          {/* ZRA parameters */}
-                          {activeReceipt.zra && (
+                          {/* ZRA Smart Invoice SDC Information */}
+                          {activeReceipt.zra && activeReceipt.zra.status === 'FISCALIZED' ? (
                             <div className="border border-slate-300 bg-slate-50/80 p-1.5 rounded-xs pb-2 mb-2 text-[7.5px] text-slate-700 flex flex-col gap-0.5">
-                              <span className="font-extrabold uppercase text-slate-900 text-[8px] text-center border-b border-slate-200 pb-0.5 mb-1">✓ ZRA Fiscal Smart Invoice</span>
-                              <p className="flex justify-between"><span>SME TPIN:</span> <span className="font-mono font-bold">{activeReceipt.zra.tpin}</span></p>
-                              <p className="flex justify-between"><span>Classification:</span> <span className="font-mono font-bold">{activeReceipt.zra.taxBand}</span></p>
-                              <p className="font-mono text-[6.5px] text-slate-500 truncate mt-0.5">FSD: {activeReceipt.zra.fiscalCode}</p>
+                              <span className="font-extrabold uppercase text-slate-900 text-[8px] text-center border-b border-slate-200 pb-0.5 mb-1">SDC INFORMATION</span>
+                              <p className="flex justify-between"><span>TPIN / BHF:</span> <span className="font-mono font-bold">{activeReceipt.zra.tpin} / {activeReceipt.zra.bhfId}</span></p>
+                              <p className="flex justify-between"><span>SDC ID:</span> <span className="font-mono font-bold">{activeReceipt.zra.sdcId}</span></p>
+                              <p className="flex justify-between"><span>INVOICE NO:</span> <span className="font-mono font-bold">{activeReceipt.zra.cisInvcNo} (#{activeReceipt.zra.rcptNo})</span></p>
+                              {activeReceipt.zra.formattedIntrlData && (
+                                <p className="font-mono text-[6.5px] text-slate-600 break-all mt-0.5">INTL: {activeReceipt.zra.formattedIntrlData}</p>
+                              )}
+                              {activeReceipt.zra.formattedRcptSign && (
+                                <p className="font-mono text-[6.5px] text-slate-600 break-all">SIGN: {activeReceipt.zra.formattedRcptSign}</p>
+                              )}
+                              {activeReceipt.zra.qrDataUrl && (
+                                <div className="flex flex-col items-center my-1">
+                                  <img src={activeReceipt.zra.qrDataUrl} alt="ZRA Smart Invoice QR" className="w-20 h-20 object-contain border border-slate-200 bg-white p-0.5" />
+                                </div>
+                              )}
+                              <span className="text-center font-bold text-[7px] text-slate-800">Powered by ZRA Smart Invoice</span>
                             </div>
-                          )}
+                          ) : activeReceipt.zra && activeReceipt.zra.status === 'QUEUED_OFFLINE' ? (
+                            <div className="border border-amber-300 bg-amber-50 p-1.5 rounded-xs mb-2 text-[7.5px] text-amber-900 text-center">
+                              <span className="font-extrabold uppercase block">ZRA QUEUED FOR OFFLINE SYNC</span>
+                              <span className="font-mono text-[6.5px]">INV: {activeReceipt.zra.cisInvcNo} • Auto-retries when online</span>
+                            </div>
+                          ) : activeReceipt.fiscalStatus === 'LOCAL_ONLY' ? (
+                            <div className="border border-slate-200 bg-slate-50 p-1 rounded-xs mb-2 text-[7px] text-slate-500 text-center font-mono">
+                              FISCAL STATUS: LOCAL_ONLY (ZRA OFF)
+                            </div>
+                          ) : null}
 
                           {/* Terms */}
                           {settings.termsAndConditions && (
@@ -4701,45 +5486,59 @@ export default function BillingTerminal({
                 <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-indigo-600 via-purple-600 to-indigo-600 rounded-t-xs print:hidden" />
 
                 {/* Header */}
-                <div className="text-center border-b-2 border-double border-slate-800 pb-3 mb-3 flex flex-col gap-0.5 select-none text-slate-800">
-                  {(settings.logoUrl || DEFAULT_COMPANY_LOGO) && (
-                    <div className="flex justify-center mb-1.5">
-                      <img src={settings.logoUrl || DEFAULT_COMPANY_LOGO} alt="Company Logo" className="max-h-12 max-w-[100px] object-contain rounded-xs" referrerPolicy="no-referrer" />
-                    </div>
-                  )}
-                  <span className="font-extrabold text-slate-900 text-sm tracking-wider uppercase block">{settings.storeName}</span>
-                  <span className="font-bold text-[8.5px] text-slate-700 uppercase tracking-widest block">*** OFFICIAL TAX INVOICE & RECEIPT ***</span>
-                  {settings.tpin && (
-                    <span className="text-[9px] font-bold text-slate-700 tracking-wider block">TPIN: {settings.tpin}</span>
-                  )}
-                  <span className="text-[9.5px] font-semibold text-slate-600">{settings.receiptHeader}</span>
-                </div>
+                {(() => {
+                  const br = getBranchReceiptDetails(activeReceipt.store_id);
+                  return (
+                    <>
+                      <div className="text-center border-b-2 border-double border-slate-800 pb-3 mb-3 flex flex-col gap-0.5 select-none text-slate-800">
+                        {(settings.logoUrl || DEFAULT_COMPANY_LOGO) && (
+                          <div className="flex justify-center mb-1.5">
+                            <img src={settings.logoUrl || DEFAULT_COMPANY_LOGO} alt="Company Logo" className="max-h-12 max-w-[100px] object-contain rounded-xs" referrerPolicy="no-referrer" />
+                          </div>
+                        )}
+                        <span className="font-extrabold text-slate-900 text-sm tracking-wider uppercase block">{settings.storeName}</span>
+                        <span className="font-bold text-[10px] text-indigo-900 uppercase tracking-wide block">Branch: {br.name}</span>
+                        {br.location && <span className="text-[8.5px] text-slate-600 block">{br.location}</span>}
+                        {(br.phone || br.email) && (
+                          <span className="text-[8.5px] text-slate-600 block">
+                            {[br.phone ? `Tel: ${br.phone}` : '', br.email].filter(Boolean).join(' • ')}
+                          </span>
+                        )}
+                        <span className="font-bold text-[8.5px] text-slate-700 uppercase tracking-widest block mt-0.5">*** OFFICIAL TAX INVOICE & RECEIPT ***</span>
+                        {settings.tpin && (
+                          <span className="text-[9px] font-bold text-slate-700 tracking-wider block">TPIN: {settings.tpin}</span>
+                        )}
+                        {settings.receiptHeader && <span className="text-[9.5px] font-semibold text-slate-600">{settings.receiptHeader}</span>}
+                      </div>
 
-                {/* Metadata Card */}
-                <div className="flex flex-col gap-1 border-b border-dashed border-slate-400 pb-2.5 mb-2.5 text-[9px]">
-                  <div className="flex justify-between">
-                    <span className="font-bold text-slate-700">INVOICE NO:</span>
-                    <span className="font-bold text-indigo-950 font-mono">{activeReceipt.id}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="font-bold text-slate-700">DATE / TIME:</span>
-                    <span>{activeReceipt.date}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="font-bold text-slate-700">BRANCH HUB:</span>
-                    <span>{activeStore.toUpperCase()}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="font-bold text-slate-700">CASHIER / REP:</span>
-                    <span>{(activeReceipt.performed_by || localStorage.getItem('logged_in_user_name') || 'Cashier').toUpperCase()}</span>
-                  </div>
-                  {activeReceipt.customer && (
-                    <div className="flex justify-between">
-                      <span className="font-bold text-slate-700">CUSTOMER:</span>
-                      <span>{activeReceipt.customer.name}</span>
-                    </div>
-                  )}
-                </div>
+                      {/* Metadata Card */}
+                      <div className="flex flex-col gap-1 border-b border-dashed border-slate-400 pb-2.5 mb-2.5 text-[9px]">
+                        <div className="flex justify-between">
+                          <span className="font-bold text-slate-700">INVOICE NO:</span>
+                          <span className="font-bold text-indigo-950 font-mono">{activeReceipt.id}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="font-bold text-slate-700">DATE / TIME:</span>
+                          <span>{activeReceipt.date}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="font-bold text-slate-700">BRANCH:</span>
+                          <span>{br.name.toUpperCase()}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="font-bold text-slate-700">CASHIER / REP:</span>
+                          <span>{(activeReceipt.performed_by || localStorage.getItem('logged_in_user_name') || 'Cashier').toUpperCase()}</span>
+                        </div>
+                        {activeReceipt.customer && (
+                          <div className="flex justify-between">
+                            <span className="font-bold text-slate-700">CUSTOMER:</span>
+                            <span>{activeReceipt.customer.name}</span>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
 
                 {activeReceipt.offlinePending && (
                   <div className="bg-amber-50 rounded-xs border border-amber-300 p-2 text-[9px] text-amber-800 text-center uppercase font-sans font-bold tracking-wider mb-3 leading-snug animate-pulse select-none">
@@ -4811,7 +5610,7 @@ export default function BillingTerminal({
                       </div>
                     </>
                   )}
-                  {activeReceipt.paymentMethod === 'Split' && activeReceipt.splitBreakdown && (
+                  {String(activeReceipt.paymentMethod || '').toLowerCase().startsWith('split') && activeReceipt.splitBreakdown && (
                     <div className="flex flex-col gap-1 mt-1">
                       <div className="flex justify-between bg-teal-50 text-teal-800 px-1 py-0.5 rounded-xs border border-dashed border-teal-200 text-[8.5px]">
                         <span>✓ Cash Portion:</span>
@@ -4837,15 +5636,39 @@ export default function BillingTerminal({
                   )}
                 </div>
 
-                {/* ZRA Fiscal parameters */}
-                {activeReceipt.zra && (
+                {/* ZRA Smart Invoice SDC Information */}
+                {activeReceipt.zra && activeReceipt.zra.status === 'FISCALIZED' ? (
                   <div className="border border-slate-300 bg-slate-50/80 p-2 rounded-xs pb-2 mb-2.5 text-[8px] text-slate-700 flex flex-col gap-1">
-                    <span className="font-extrabold uppercase text-slate-900 text-[8.5px] text-center border-b border-slate-200 pb-1 mb-0.5">✓ ZRA Fiscal Smart Invoice</span>
-                    <p className="flex justify-between"><span>SME TPIN:</span> <span className="font-mono font-bold text-slate-900">{activeReceipt.zra.tpin}</span></p>
-                    <p className="flex justify-between"><span>Classification:</span> <span className="font-mono font-bold text-slate-900">{activeReceipt.zra.taxBand}</span></p>
-                    <p className="font-mono text-[7px] text-slate-500 truncate mt-0.5">FSD CODE: {activeReceipt.zra.fiscalCode}</p>
+                    <span className="font-extrabold uppercase text-slate-900 text-[8.5px] text-center border-b border-slate-200 pb-1 mb-0.5">SDC INFORMATION</span>
+                    <p className="flex justify-between"><span>TPIN / BHF:</span> <span className="font-mono font-bold text-slate-900">{activeReceipt.zra.tpin} / {activeReceipt.zra.bhfId}</span></p>
+                    <p className="flex justify-between"><span>SDC ID:</span> <span className="font-mono font-bold text-slate-900">{activeReceipt.zra.sdcId}</span></p>
+                    {activeReceipt.zra.mrcNo && (
+                      <p className="flex justify-between"><span>MRC NO:</span> <span className="font-mono font-bold text-slate-900">{activeReceipt.zra.mrcNo}</span></p>
+                    )}
+                    <p className="flex justify-between"><span>INVOICE NO:</span> <span className="font-mono font-bold text-slate-900">{activeReceipt.zra.cisInvcNo} (Rcpt #{activeReceipt.zra.rcptNo})</span></p>
+                    {activeReceipt.zra.formattedIntrlData && (
+                      <p className="font-mono text-[7px] text-slate-600 break-all">INTERNAL DATA: {activeReceipt.zra.formattedIntrlData}</p>
+                    )}
+                    {activeReceipt.zra.formattedRcptSign && (
+                      <p className="font-mono text-[7px] text-slate-600 break-all">SIGNATURE: {activeReceipt.zra.formattedRcptSign}</p>
+                    )}
+                    {activeReceipt.zra.qrDataUrl && (
+                      <div className="flex flex-col items-center my-1.5">
+                        <img src={activeReceipt.zra.qrDataUrl} alt="ZRA Verification QR Code" className="w-24 h-24 object-contain border border-slate-200 bg-white p-1" />
+                      </div>
+                    )}
+                    <span className="text-center font-extrabold text-[7.5px] text-slate-900">Powered by ZRA Smart Invoice</span>
                   </div>
-                )}
+                ) : activeReceipt.zra && activeReceipt.zra.status === 'QUEUED_OFFLINE' ? (
+                  <div className="border border-amber-300 bg-amber-50 p-2 rounded-xs mb-2.5 text-[8px] text-amber-900 text-center">
+                    <span className="font-extrabold uppercase block">ZRA SMART INVOICE: QUEUED OFFLINE</span>
+                    <span className="font-mono text-[7px]">INV: {activeReceipt.zra.cisInvcNo} • Auto-retries when online</span>
+                  </div>
+                ) : activeReceipt.fiscalStatus === 'LOCAL_ONLY' ? (
+                  <div className="border border-slate-200 bg-slate-50 p-1.5 rounded-xs mb-2.5 text-[7.5px] text-slate-500 text-center font-mono">
+                    FISCAL STATUS: LOCAL_ONLY (ZRA OFF)
+                  </div>
+                ) : null}
 
                 {/* Terms & Conditions */}
                 {settings.termsAndConditions && (
@@ -4889,29 +5712,77 @@ export default function BillingTerminal({
                 <div className="mt-4 pt-4 border-t border-dashed border-slate-300 print:hidden font-sans flex flex-col gap-2 bg-slate-50/80 p-3 rounded-lg border border-slate-200 text-left">
                   <div className="flex items-center gap-1.5 text-emerald-600 font-extrabold text-[10px] uppercase tracking-wider">
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    WhatsApp dispatch
+                    WhatsApp PDF dispatch
                   </div>
                   <p className="text-[8.5px] text-slate-500 leading-snug">
-                    Provide the customer's WhatsApp mobile number below to compile and transmit the PDF digital invoice.
+                    Provide the customer's WhatsApp mobile number below to compile and deliver the PDF digital invoice directly.
                   </p>
                   
                   <div className="flex flex-col gap-1.5 mt-1">
                     <input
                       type="tel"
                       value={whatsappPhone}
-                      onChange={(e) => setWhatsappPhone(e.target.value)}
+                      onChange={(e) => { setWhatsappPhone(e.target.value); setWhatsappError(null); }}
                       placeholder="+260 97 XXXXXX"
                       className="w-full text-xs px-2.5 py-1.5 bg-white border border-slate-300 text-slate-800 font-mono font-extrabold rounded focus:outline-hidden focus:border-indigo-500"
                     />
                     <button
                       type="button"
+                      disabled={whatsappSending}
                       onClick={() => handleWhatsAppSend()}
-                      className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] rounded font-black tracking-wider uppercase flex items-center justify-center gap-1 cursor-pointer transition-all active:scale-98"
+                      className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[10px] rounded font-black tracking-wider uppercase flex items-center justify-center gap-1 cursor-pointer transition-all active:scale-98"
                     >
                       <Send size={11} />
-                      Send WhatsApp Dispatch
+                      {whatsappSending ? 'Compiling PDF...' : 'Send PDF to WhatsApp'}
                     </button>
                   </div>
+
+                  {whatsappError && (
+                    <p className="text-[9.5px] font-bold text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1">
+                      {whatsappError}
+                    </p>
+                  )}
+
+                  {whatsappSuccess && whatsappResult && (
+                    <div className="bg-emerald-50 border border-emerald-200 rounded p-2 flex flex-col gap-1.5 text-[9.5px]">
+                      <span className="font-bold text-emerald-800">
+                        {whatsappResult.mode === 'cloud_api'
+                          ? `✓ Sent ${whatsappResult.filename} directly to +${whatsappResult.phone}`
+                          : `✓ PDF Ready (${whatsappResult.filename}) for +${whatsappResult.phone}`}
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {whatsappResult.whatsappUrl && (
+                          <a
+                            href={whatsappResult.whatsappUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-black uppercase inline-flex items-center gap-1"
+                          >
+                            <Send size={9} /> Open WhatsApp
+                          </a>
+                        )}
+                        {whatsappResult.canShareFile && lastCompiledReceiptPdf && (
+                          <button
+                            type="button"
+                            onClick={() => sharePdfFileDirectly(lastCompiledReceiptPdf.filename, lastCompiledReceiptPdf.doc, lastCompiledReceiptPdf.caption)}
+                            className="px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-black uppercase cursor-pointer inline-flex items-center gap-1"
+                          >
+                            <Share2 size={9} /> Share PDF
+                          </button>
+                        )}
+                        {whatsappResult.pdfUrl && (
+                          <a
+                            href={whatsappResult.pdfUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 bg-white border border-slate-200 text-slate-700 rounded font-bold inline-flex items-center gap-1"
+                          >
+                            <Download size={9} /> View PDF
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -4933,28 +5804,76 @@ export default function BillingTerminal({
                   className="bg-slate-950/80 border border-slate-800 p-3 rounded-lg flex flex-col gap-2 shadow-inner text-left"
                 >
                   <label className="text-[10px] text-slate-300 font-black uppercase tracking-wider flex items-center gap-1.5">
-                    📱 SHARE VIA WHATSAPP
+                    📱 SEND PDF VIA WHATSAPP
                   </label>
                   <p className="text-[8.5px] text-slate-450 leading-snug">
-                    Provide the customer's WhatsApp-registered number below to trigger auto-dispatch.
+                    Enter the customer's WhatsApp number to deliver the PDF receipt directly.
                   </p>
                   
                   <div className="flex flex-col gap-1.5 mt-1">
                     <input
                       type="tel"
                       value={whatsappPhone}
-                      onChange={(e) => setWhatsappPhone(e.target.value)}
+                      onChange={(e) => { setWhatsappPhone(e.target.value); setWhatsappError(null); }}
                       placeholder="+260 97 XXXXXX"
                       className="w-full text-xs px-2.5 py-1.5 bg-slate-900 border border-slate-700 text-teal-300 font-mono font-extrabold rounded focus:outline-hidden focus:border-teal-500 text-left placeholder-slate-600"
                     />
                     <button
                       type="submit"
-                      className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-[10.5px] rounded font-black tracking-wider uppercase flex items-center justify-center gap-1.5 cursor-pointer shadow-md transition-all active:scale-98"
+                      disabled={whatsappSending}
+                      className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-[10.5px] rounded font-black tracking-wider uppercase flex items-center justify-center gap-1.5 cursor-pointer shadow-md transition-all active:scale-98"
                     >
                       <Send size={11} />
-                      Send WhatsApp
+                      {whatsappSending ? 'Preparing PDF...' : 'Send PDF WhatsApp'}
                     </button>
                   </div>
+
+                  {whatsappError && (
+                    <p className="text-[9.5px] font-bold text-rose-400 bg-rose-950/50 border border-rose-800 rounded px-2 py-1">
+                      {whatsappError}
+                    </p>
+                  )}
+
+                  {whatsappSuccess && whatsappResult && (
+                    <div className="bg-emerald-950/60 border border-emerald-700/60 rounded p-2 flex flex-col gap-1.5 text-[9.5px]">
+                      <span className="font-bold text-emerald-300">
+                        {whatsappResult.mode === 'cloud_api'
+                          ? `✓ PDF sent directly to +${whatsappResult.phone}`
+                          : `✓ PDF ready for +${whatsappResult.phone}`}
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {whatsappResult.whatsappUrl && (
+                          <a
+                            href={whatsappResult.whatsappUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-black uppercase inline-flex items-center gap-1"
+                          >
+                            <Send size={9} /> Open WhatsApp
+                          </a>
+                        )}
+                        {whatsappResult.canShareFile && lastCompiledReceiptPdf && (
+                          <button
+                            type="button"
+                            onClick={() => sharePdfFileDirectly(lastCompiledReceiptPdf.filename, lastCompiledReceiptPdf.doc, lastCompiledReceiptPdf.caption)}
+                            className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded font-black uppercase cursor-pointer inline-flex items-center gap-1"
+                          >
+                            <Share2 size={9} /> Share PDF
+                          </button>
+                        )}
+                        {whatsappResult.pdfUrl && (
+                          <a
+                            href={whatsappResult.pdfUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded font-bold inline-flex items-center gap-1"
+                          >
+                            <Download size={9} /> View PDF
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </form>
 
                 {/* Print Triggers Section */}
@@ -5336,7 +6255,11 @@ export default function BillingTerminal({
                     <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-800 flex flex-col gap-0.5">
                       <span className="text-[8.5px] font-extrabold uppercase text-slate-400 tracking-wider">Total Sales</span>
                       <span className="text-sm font-black font-mono text-emerald-400">{settings.currency}{(cashUpSummary ? cashUpSummary.totalSales : 0).toFixed(2)}</span>
-                      <span className="text-[8px] text-slate-500 font-mono font-bold">{cashUpSummary ? cashUpSummary.totalTxCount : 0} Completed Sales</span>
+                      <span className="text-[8px] text-slate-500 font-mono font-bold">
+                        {cashUpSummary
+                          ? `${cashUpSummary.completedCount ?? cashUpSummary.totalTxCount} Completed${(cashUpSummary.refundCount || 0) > 0 ? ` • ${cashUpSummary.refundCount} Refunded` : ''}`
+                          : '0 Completed Sales'}
+                      </span>
                     </div>
 
                     {/* Expected Cash */}
@@ -5394,24 +6317,31 @@ export default function BillingTerminal({
                       </div>
                       <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
                         <span className="text-slate-400 font-sans font-bold">📱 Airtel Money</span>
-                        <span className="font-bold text-rose-300">{settings.currency}{salesAirtelSum.toFixed(2)}</span>
+                        <span className="font-bold text-rose-300">{settings.currency}{(salesAirtelSum + laybyAirtelSum).toFixed(2)}</span>
                       </div>
                       <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
                         <span className="text-slate-400 font-sans font-bold">📱 MTN Money</span>
-                        <span className="font-bold text-amber-400">{settings.currency}{salesMtnSum.toFixed(2)}</span>
-                      </div>
-                      <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
-                        <span className="text-slate-400 font-sans font-bold">📱 Zamtel Money</span>
-                        <span className="font-bold text-emerald-300">{settings.currency}{salesZamtelSum.toFixed(2)}</span>
+                        <span className="font-bold text-amber-400">{settings.currency}{(salesMtnSum + laybyMtnSum).toFixed(2)}</span>
                       </div>
                       <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
                         <span className="text-slate-400 font-sans font-bold">💳 Bank / Card</span>
-                        <span className="font-bold text-indigo-300">{settings.currency}{salesCardSum.toFixed(2)}</span>
+                        <span className="font-bold text-indigo-300">{settings.currency}{(salesCardSum + laybyCardSum).toFixed(2)}</span>
                       </div>
-                      <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
-                        <span className="text-slate-400 font-sans font-bold">🔄 Other / Split</span>
-                        <span className="font-bold text-slate-200">{settings.currency}{(salesOtherMomoSum + salesOtherSum).toFixed(2)}</span>
-                      </div>
+                      {allCustomMethods.map(cm => {
+                        const cmTotal = (salesCustomSums[cm.name] || 0) + (laybyCustomSums[cm.name] || 0);
+                        return (
+                          <div key={cm.id} className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
+                            <span className="text-slate-300 font-sans font-bold truncate pr-1">🏷️ {cm.name}</span>
+                            <span className="font-bold text-cyan-300 shrink-0">{settings.currency}{cmTotal.toFixed(2)}</span>
+                          </div>
+                        );
+                      })}
+                      {(salesOtherMomoSum !== 0 || salesOtherSum !== 0) && (
+                        <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center">
+                          <span className="text-slate-400 font-sans font-bold">🔄 Other</span>
+                          <span className="font-bold text-slate-200">{settings.currency}{(salesOtherMomoSum + salesOtherSum).toFixed(2)}</span>
+                        </div>
+                      )}
                       {laybyCashSum > 0 && (
                         <div className="bg-slate-900/80 p-2 rounded-lg border border-slate-800 flex justify-between items-center col-span-2 sm:col-span-1">
                           <span className="text-slate-400 font-sans font-bold">📑 Layby Cash</span>
@@ -5529,23 +6459,83 @@ export default function BillingTerminal({
                         </div>
                       </div>
 
-                      {/* Mobile Money Input */}
-                      <div className="flex flex-col gap-1">
-                        <label className="text-[10px] font-bold text-slate-400 flex items-center gap-1 font-sans">
-                          <Smartphone size={11} className="text-emerald-400" />
-                          <span>3. MOBILE MONEY COUNTED</span>
-                        </label>
-                        <div className="relative">
-                          <span className="absolute left-3 top-2.5 text-xs text-slate-500 font-mono font-bold">{settings.currency}</span>
-                          <input
-                            type="number"
-                            placeholder="0.00"
-                            value={momoCounted}
-                            onChange={(e) => setMomoCounted(e.target.value)}
-                            className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono font-bold focus:outline-hidden focus:border-emerald-505 text-emerald-300 placeholder-slate-600"
-                          />
+                      {/* Airtel Money & MTN Mobile Money Inputs */}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] font-bold text-rose-300 flex items-center justify-between font-sans">
+                            <span className="flex items-center gap-1">
+                              <Smartphone size={11} className="text-rose-400" />
+                              <span>3a. AIRTEL MONEY</span>
+                            </span>
+                            <span className="font-mono text-[9px] text-slate-400">Exp: {settings.currency}{(salesAirtelSum + laybyAirtelSum).toFixed(2)}</span>
+                          </label>
+                          <div className="relative">
+                            <span className="absolute left-3 top-2.5 text-xs text-slate-500 font-mono font-bold">{settings.currency}</span>
+                            <input
+                              type="number"
+                              placeholder="0.00"
+                              value={airtelCounted}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setAirtelCounted(val);
+                                const sum = (parseFloat(val) || 0) + (parseFloat(mtnCounted) || 0);
+                                setMomoCounted(sum > 0 ? sum.toFixed(2) : '');
+                              }}
+                              className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono font-bold focus:outline-hidden focus:border-rose-500 text-rose-300 placeholder-slate-600"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] font-bold text-amber-300 flex items-center justify-between font-sans">
+                            <span className="flex items-center gap-1">
+                              <Smartphone size={11} className="text-amber-400" />
+                              <span>3b. MTN MONEY</span>
+                            </span>
+                            <span className="font-mono text-[9px] text-slate-400">Exp: {settings.currency}{(salesMtnSum + laybyMtnSum).toFixed(2)}</span>
+                          </label>
+                          <div className="relative">
+                            <span className="absolute left-3 top-2.5 text-xs text-slate-500 font-mono font-bold">{settings.currency}</span>
+                            <input
+                              type="number"
+                              placeholder="0.00"
+                              value={mtnCounted}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setMtnCounted(val);
+                                const sum = (parseFloat(airtelCounted) || 0) + (parseFloat(val) || 0);
+                                setMomoCounted(sum > 0 ? sum.toFixed(2) : '');
+                              }}
+                              className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono font-bold focus:outline-hidden focus:border-amber-500 text-amber-300 placeholder-slate-600"
+                            />
+                          </div>
                         </div>
                       </div>
+
+                      {customPaymentMethods.length > 0 && (
+                        <div className="flex flex-col gap-2 border-t border-slate-800 pt-2">
+                          {customPaymentMethods.map(cm => (
+                            <div key={cm.id} className="flex flex-col gap-1">
+                              <label className="text-[10px] font-bold text-cyan-300 flex items-center justify-between font-sans">
+                                <span>{cm.name.toUpperCase()} COUNTED</span>
+                                <span className="font-mono text-[9px] text-slate-400">
+                                  Exp: {settings.currency}{((salesCustomSums[cm.name] || 0) + (laybyCustomSums[cm.name] || 0)).toFixed(2)}
+                                </span>
+                              </label>
+                              <div className="relative">
+                                <span className="absolute left-3 top-2 text-xs text-slate-500 font-mono font-bold">{settings.currency}</span>
+                                <input
+                                  type="number"
+                                  placeholder="0.00"
+                                  value={customMethodCounted[cm.name] || ''}
+                                  onChange={(e) => setCustomMethodCounted(prev => ({ ...prev, [cm.name]: e.target.value }))}
+                                  className="w-full pl-9 pr-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono font-bold focus:outline-hidden focus:border-cyan-500 text-cyan-300 placeholder-slate-600"
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
 
                     {/* Column 2: Reconciliation Discrepancy & Balances Table */}
@@ -5562,7 +6552,7 @@ export default function BillingTerminal({
                           <div className="pl-1.5 border-l border-slate-800 flex flex-col gap-0.5 text-slate-400 font-mono text-[9px] my-1">
                             <div className="flex justify-between">
                               <span>+ Opening Cash Float:</span>
-                              <span>{settings.currency}{(parseFloat(openingCash) || 0).toFixed(2)}</span>
+                              <span>{settings.currency}{(cashUpSummary ? cashUpSummary.openingCash : (parseFloat(openingCash) || 0)).toFixed(2)}</span>
                             </div>
                             <div className="flex justify-between">
                               <span>+ Cash Completed Sales:</span>
@@ -5584,6 +6574,19 @@ export default function BillingTerminal({
                           <div className="flex justify-between items-center font-mono font-bold pt-1 border-t border-slate-850/60">
                             <span className="text-slate-400">Physical Cash Counted:</span>
                             <span className="text-amber-300">{settings.currency}{(parseFloat(cashCounted) || 0).toFixed(2)}</span>
+                          </div>
+                        </div>
+
+                        {/* Mobile Money Variance Summary */}
+                        <div className="bg-slate-900/60 p-2 text-xs rounded-lg border border-slate-800 flex flex-col gap-1 font-mono text-[10px]">
+                          <span className="font-sans font-black text-[10px] text-emerald-400 uppercase tracking-wider">Mobile Money Audit</span>
+                          <div className="flex justify-between items-center text-slate-300">
+                            <span>Airtel Money (Exp {settings.currency}{(salesAirtelSum + laybyAirtelSum).toFixed(2)}):</span>
+                            <span className="font-bold text-rose-300">{settings.currency}{(parseFloat(airtelCounted) || 0).toFixed(2)}</span>
+                          </div>
+                          <div className="flex justify-between items-center text-slate-300">
+                            <span>MTN Money (Exp {settings.currency}{(salesMtnSum + laybyMtnSum).toFixed(2)}):</span>
+                            <span className="font-bold text-amber-300">{settings.currency}{(parseFloat(mtnCounted) || 0).toFixed(2)}</span>
                           </div>
                         </div>
 
@@ -5961,9 +6964,9 @@ export default function BillingTerminal({
                       className="px-3 py-2 bg-white border border-slate-200 text-slate-800 font-extrabold text-xs rounded-xl focus:outline-hidden focus:border-indigo-500 shadow-3xs cursor-pointer font-mono shrink-0"
                     >
                       <option value="all">🌐 All Branches</option>
-                      <option value="lusaka">📍 Lusaka Hub</option>
-                      <option value="kitwe">📍 Kitwe Hub</option>
-                      <option value="ndola">📍 Ndola Hub</option>
+                      {loginStores.map((st: any) => (
+                        <option key={st.id} value={st.id}>📍 {st.name}</option>
+                      ))}
                     </select>
                   </div>
 
@@ -6499,8 +7502,12 @@ export default function BillingTerminal({
                         className="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-800"
                       >
                         <option value="Cash">Cash Sale</option>
+                        <option value="Airtel Money">Airtel Money</option>
+                        <option value="MTN Mobile Money">MTN Mobile Money</option>
                         <option value="Credit Card">Credit Card</option>
-                        <option value="Mobile Wallet">Mobile Wallet / MoMo</option>
+                        {customPaymentMethods.map(cm => (
+                          <option key={cm.id} value={cm.name}>{cm.name}</option>
+                        ))}
                       </select>
                     </div>
                   </div>
@@ -6548,6 +7555,152 @@ export default function BillingTerminal({
                 </div>
               </form>
 
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* MODAL: HTML RECEIPT PRINT PREVIEW (58MM / 80MM) */}
+      <AnimatePresence>
+        {showReceiptHtmlPreview && activeReceipt && (
+          <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4 z-60 overflow-y-auto">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl w-full max-w-md p-5 flex flex-col gap-4 text-left"
+            >
+              <div className="flex justify-between items-center border-b border-slate-800 pb-3 print:hidden">
+                <div>
+                  <h3 className="text-xs font-black uppercase tracking-wider text-white">
+                    {pendingPrintMode === 'bluetooth' ? 'Bluetooth Print Preview' : 'Receipt Print Preview'} ({previewPaperSize})
+                  </h3>
+                  <p className="text-[10px] text-slate-400 font-mono">Ticket #{activeReceipt.id}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowReceiptHtmlPreview(false)}
+                  className="text-slate-400 hover:text-white font-bold text-sm cursor-pointer px-2 py-1"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="flex justify-center bg-slate-950/60 p-4 rounded-xl border border-slate-800 max-h-[65vh] overflow-y-auto print:p-0 print:border-none print:bg-white print:max-h-none">
+                {(() => {
+                  const br = getBranchReceiptDetails(activeReceipt.store_id);
+                  return (
+                    <div
+                      className={`bg-[#FCFCFA] text-slate-900 p-5 border border-slate-300 shadow-lg document-print-section ${
+                        previewPaperSize === '80mm' ? 'w-[300px]' : 'w-[230px]'
+                      } text-[10px] leading-relaxed`}
+                      style={{ fontFamily: '"Times New Roman", Times, serif' }}
+                    >
+                      <div className="text-center border-b-2 border-double border-slate-800 pb-2 mb-2 flex flex-col gap-0.5">
+                        {(settings.logoUrl || DEFAULT_COMPANY_LOGO) && (
+                          <div className="flex justify-center mb-1">
+                            <img
+                              src={settings.logoUrl || DEFAULT_COMPANY_LOGO}
+                              alt="Company Logo"
+                              className="max-h-12 max-w-[96px] object-contain"
+                              referrerPolicy="no-referrer"
+                            />
+                          </div>
+                        )}
+                        <span className="font-extrabold text-xs uppercase tracking-wider text-slate-900">{settings.storeName}</span>
+                        <span className="font-bold text-[9.5px] text-indigo-950 uppercase">Branch: {br.name}</span>
+                        {br.location && <span className="text-[8.5px] text-slate-700">{br.location}</span>}
+                        {(br.phone || br.email) && (
+                          <span className="text-[8.5px] text-slate-700">
+                            {[br.phone ? `Tel: ${br.phone}` : '', br.email].filter(Boolean).join(' • ')}
+                          </span>
+                        )}
+                        {settings.tpin && <span className="text-[8.5px] font-bold text-slate-700">TPIN: {settings.tpin}</span>}
+                        {settings.receiptHeader && <span className="text-[8.5px] text-slate-600">{settings.receiptHeader}</span>}
+                      </div>
+
+                      <div className="flex flex-col gap-0.5 border-b border-dashed border-slate-400 pb-2 mb-2 text-[8.5px]">
+                        <div className="flex justify-between">
+                          <span className="font-bold">INVOICE:</span>
+                          <span className="font-mono font-bold">{activeReceipt.id}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="font-bold">DATE:</span>
+                          <span>{activeReceipt.date}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="font-bold">BRANCH:</span>
+                          <span>{br.name.toUpperCase()}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="font-bold">CASHIER:</span>
+                          <span>{(activeReceipt.performed_by || localStorage.getItem('logged_in_user_name') || 'Cashier').toUpperCase()}</span>
+                        </div>
+                        {activeReceipt.customer && (
+                          <div className="flex justify-between">
+                            <span className="font-bold">CUSTOMER:</span>
+                            <span>{activeReceipt.customer.name}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-col gap-1 border-b border-dashed border-slate-400 pb-2 mb-2 text-[9px]">
+                        {activeReceipt.items.map((x: any, idx: number) => (
+                          <div key={idx} className="flex justify-between gap-2">
+                            <span className="font-semibold flex-1">{x.quantity}x {x.product.name}</span>
+                            <span className="font-bold shrink-0">{settings.currency}{(x.product.price * x.quantity).toFixed(2)}</span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="flex flex-col gap-0.5 border-b border-dashed border-slate-400 pb-2 mb-2 text-[9px]">
+                        <div className="flex justify-between">
+                          <span>Subtotal:</span>
+                          <span>{settings.currency}{activeReceipt.subtotal.toFixed(2)}</span>
+                        </div>
+                        {activeReceipt.discount > 0 && (
+                          <div className="flex justify-between text-rose-700 font-bold">
+                            <span>Discount:</span>
+                            <span>-{settings.currency}{activeReceipt.discount.toFixed(2)}</span>
+                          </div>
+                        )}
+                        <div className="flex justify-between">
+                          <span>VAT ({activeReceipt.taxRate ?? settings.taxRate}%):</span>
+                          <span>{settings.currency}{activeReceipt.tax.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between font-black text-[10.5px] border-t border-slate-800 pt-1 mt-1">
+                          <span>TOTAL:</span>
+                          <span>{settings.currency}{activeReceipt.total.toFixed(2)}</span>
+                        </div>
+                      </div>
+
+                      <div className="text-[8.5px] text-center text-slate-600">
+                        <div>Payment: <strong className="uppercase">{activeReceipt.paymentMethod}</strong></div>
+                        {settings.receiptFooter && <div className="mt-1">{settings.receiptFooter}</div>}
+                        <div className="italic mt-0.5">Thank you for shopping with us!</div>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              <div className="flex gap-2 print:hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowReceiptHtmlPreview(false)}
+                  className="flex-1 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-extrabold rounded-xl uppercase tracking-wider cursor-pointer"
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmAndPrint}
+                  className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-black rounded-xl uppercase tracking-wider cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Printer size={12} />
+                  Confirm & Print
+                </button>
+              </div>
             </motion.div>
           </div>
         )}

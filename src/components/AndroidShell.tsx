@@ -65,7 +65,7 @@ export default function AndroidShell({
   }, []);
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-slate-100 p-0 sm:p-4 font-sans select-none overflow-x-hidden">
+    <div className="flex flex-col items-center justify-center min-h-screen bg-slate-100 p-0 sm:p-4 font-sans overflow-x-hidden">
       {/* Outer Quick-Controls Menu (Platform level decoration but in bounds) */}
       <div className="w-full max-w-6xl mb-3 flex flex-wrap justify-between items-center px-2 hidden sm:flex">
         <div className="flex flex-col gap-0.5">
@@ -107,7 +107,7 @@ export default function AndroidShell({
       {/* Main Device Outer Housing Container */}
       <motion.div
         layout
-        className={`relative bg-slate-900 shadow-none sm:shadow-2xl border-0 sm:border-4 border-slate-700/60 rounded-none sm:rounded-3xl transition-all duration-300 w-full h-[100dvh] sm:h-auto ${
+        className={`relative bg-slate-900 shadow-none sm:shadow-2xl border-0 sm:border-4 border-slate-700/60 rounded-none sm:rounded-3xl transition-all duration-300 w-full h-[100dvh] sm:h-auto sm:max-h-[90vh] overflow-hidden ${
           deviceMode === 'tablet'
             ? 'sm:w-full sm:max-w-6xl sm:aspect-[16/10.5] sm:p-4 md:p-6 flex flex-col'
             : 'sm:w-full sm:max-w-sm sm:aspect-[9/18.5] sm:p-3 flex flex-col'
@@ -125,7 +125,7 @@ export default function AndroidShell({
         </div>
 
         {/* Screen/Glass Surface */}
-        <div className="relative flex-1 flex flex-col bg-slate-50 rounded-none sm:rounded-2xl overflow-hidden border-0 sm:border border-slate-900 h-full">
+        <div className="relative flex-1 min-h-0 flex flex-col bg-slate-50 rounded-none sm:rounded-2xl overflow-hidden border-0 sm:border border-slate-900 h-full">
           
           {/* Android Status Bar */}
           <div className="flex items-center justify-between px-3.5 py-1.5 bg-slate-900 text-slate-300 text-xs font-semibold font-mono z-30 transition-all border-b border-slate-800">
@@ -161,9 +161,9 @@ export default function AndroidShell({
           </div>
 
           {/* Display Working Surface Panel */}
-          <div className="flex-1 flex overflow-hidden relative min-w-0 w-full">
+          <div className="flex-1 min-h-0 flex overflow-hidden relative min-w-0 w-full">
             {/* Inner Surface Slots Grid */}
-            <div className="flex-1 flex flex-col h-full relative min-w-0 w-full">
+            <div className="flex-1 min-h-0 flex flex-col h-full relative min-w-0 w-full">
               {children}
             </div>
           </div>

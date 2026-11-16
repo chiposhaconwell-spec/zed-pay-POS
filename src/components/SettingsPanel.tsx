@@ -20,13 +20,21 @@ import {
   Building2,
   Printer,
   Package,
-  Upload
+  Upload,
+  CreditCard,
+  Plus,
+  QrCode,
+  Wifi,
+  WifiOff,
+  AlertCircle
 } from 'lucide-react';
-import { runSql, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer } from '../db';
+import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod } from '../db';
 import { exportAndShareText } from '../androidUtils';
-import { StoreSettings } from '../types';
+import { StoreSettings, CustomPaymentMethod } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
 import { auth, googleProvider, backupToCloud, restoreFromCloud, getTransportSecurityStatus, registerOrSignInWithEmailPassword } from '../firebase';
+import { getZraConfig, saveZraConfig, subscribeZraConfig, ZraConfig, ZraTaxTypeCode, ZRA_TAX_TYPES, ZRA_PACKAGING_UNITS, ZRA_QTY_UNITS } from '../zra/zraConfig';
+import { FiscalService, ZraOfflineQueueItem } from '../zra/fiscalService';
 
 interface SettingsPanelProps {
   settings: StoreSettings;
@@ -34,8 +42,20 @@ interface SettingsPanelProps {
   onRefreshDatabase: (template: SeedTemplate) => void;
   activeStore?: string;
   setActiveStore?: (storeId: string) => void;
+  userRole?: string;
+  activeBusiness?: any;
+  setActiveBusiness?: (biz: any) => void;
+  businesses?: any[];
+  onSelectBusinessWorkspace?: (biz: any) => void;
+  onSyncExistingAccount?: (e: React.FormEvent) => void;
+  syncLoginEmail?: string;
+  setSyncLoginEmail?: (val: string) => void;
+  syncLoginPassword?: string;
+  setSyncLoginPassword?: (val: string) => void;
+  isHeaderSyncing?: boolean;
+  onNavigateToTab?: (tab: string) => void;
   onNavigateToInventory?: () => void;
-  initialSubTab?: 'general' | 'stores' | 'users' | 'stock' | 'workspaces';
+  initialSubTab?: 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces' | 'printer' | 'database';
 }
 
 export default function SettingsPanel({
@@ -44,6 +64,8 @@ export default function SettingsPanel({
   onRefreshDatabase,
   activeStore = '',
   setActiveStore,
+  userRole: currentUserRole = 'owner',
+  activeBusiness,
   onNavigateToInventory,
   initialSubTab = 'general',
 }: SettingsPanelProps) {
@@ -84,14 +106,56 @@ export default function SettingsPanel({
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
 
-  // Unified settings & admin control tabs ('general' | 'stores' | 'users' | 'stock' | 'workspaces')
-  const [activeSubTab, setActiveSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'workspaces'>(initialSubTab);
+  const normalizeSubTab = (tab?: string): 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces' => {
+    if (tab === 'stores' || tab === 'users' || tab === 'stock' || tab === 'payments' || tab === 'zra' || tab === 'workspaces') {
+      return tab;
+    }
+    return 'general';
+  };
+
+  // Unified settings & admin control tabs ('general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces')
+  const [activeSubTab, setActiveSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces'>(() => normalizeSubTab(initialSubTab));
+
+  const [customMethods, setCustomMethods] = useState<CustomPaymentMethod[]>(() => getCustomPaymentMethods(true));
+  const [newMethodName, setNewMethodName] = useState('');
+  const [newMethodCategory, setNewMethodCategory] = useState<CustomPaymentMethod['category']>('Other');
+  const [paymentMethodFeedback, setPaymentMethodFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // ZRA Smart Invoice (VSDC) Admin Configuration states
+  const [zraForm, setZraForm] = useState<ZraConfig>(() => getZraConfig());
+  const [zraQueue, setZraQueue] = useState<ZraOfflineQueueItem[]>(() => FiscalService.getOfflineQueue());
+  const [zraInitLoading, setZraInitLoading] = useState(false);
+  const [zraSyncLoading, setZraSyncLoading] = useState(false);
+  const [zraFeedback, setZraFeedback] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   useEffect(() => {
     if (initialSubTab) {
-      setActiveSubTab(initialSubTab);
+      setActiveSubTab(normalizeSubTab(initialSubTab));
     }
   }, [initialSubTab]);
+
+  useEffect(() => {
+    const refreshCustomMethods = () => {
+      setCustomMethods(getCustomPaymentMethods(true));
+    };
+    const refreshZraQueue = () => {
+      setZraQueue(FiscalService.getOfflineQueue());
+    };
+    const unsubZra = subscribeZraConfig((cfg) => {
+      setZraForm(cfg);
+    });
+    refreshCustomMethods();
+    refreshZraQueue();
+    window.addEventListener('pos_data_updated', refreshCustomMethods);
+    window.addEventListener('local_db_restored', refreshCustomMethods);
+    window.addEventListener('zra_queue_updated', refreshZraQueue);
+    return () => {
+      unsubZra();
+      window.removeEventListener('pos_data_updated', refreshCustomMethods);
+      window.removeEventListener('local_db_restored', refreshCustomMethods);
+      window.removeEventListener('zra_queue_updated', refreshZraQueue);
+    };
+  }, []);
 
   // State for Users list, Stores/Branches list, Products count, and Businesses list
   const [usersList, setUsersList] = useState<any[]>([]);
@@ -111,14 +175,21 @@ export default function SettingsPanel({
   const [quickProdExpiry, setQuickProdExpiry] = useState('');
   const [quickStockMsg, setQuickStockMsg] = useState<string | null>(null);
 
-  // Store creation states inside SettingsPanel
+  // Store creation & editing states inside SettingsPanel
   const [newBranchName, setNewBranchName] = useState('');
   const [newBranchCode, setNewBranchCode] = useState('');
   const [newBranchLocation, setNewBranchLocation] = useState('');
+  const [newBranchPhone, setNewBranchPhone] = useState('');
+  const [newBranchEmail, setNewBranchEmail] = useState('');
   const [newBranchDiscounts, setNewBranchDiscounts] = useState(true);
   const [newBranchRefunds, setNewBranchRefunds] = useState(true);
   const [newBranchLaybys, setNewBranchLaybys] = useState(true);
   const [newBranchManagerReq, setNewBranchManagerReq] = useState(false);
+  const [editingBranchId, setEditingBranchId] = useState<string | null>(null);
+  const [editBranchName, setEditBranchName] = useState('');
+  const [editBranchLocation, setEditBranchLocation] = useState('');
+  const [editBranchPhone, setEditBranchPhone] = useState('');
+  const [editBranchEmail, setEditBranchEmail] = useState('');
 
   // User form states
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
@@ -184,12 +255,19 @@ export default function SettingsPanel({
       });
     }
 
-    // 2. Fetch business owners
+    // 2. Fetch business owners (deduplicated by id)
     const bizRes = runSql('SELECT * FROM businesses', 'Load corporate directory for accounts management');
     let mappedBiz: any[] = [];
     if (bizRes.success && Array.isArray(bizRes.data)) {
-      setBusinessesList(bizRes.data);
-      mappedBiz = bizRes.data.map(bz => {
+      const seenBizIds = new Set<string>();
+      const uniqueBizRows = bizRes.data.filter((bz: any) => {
+        const key = String(bz?.id || '');
+        if (!key || seenBizIds.has(key)) return false;
+        seenBizIds.add(key);
+        return true;
+      });
+      setBusinessesList(uniqueBizRows);
+      mappedBiz = uniqueBizRows.map(bz => {
         const ownerName = bz.owner || 'Business Owner';
         const spaceIdx = ownerName.indexOf(' ');
         const fName = spaceIdx > 0 ? ownerName.substring(0, spaceIdx) : ownerName;
@@ -214,12 +292,8 @@ export default function SettingsPanel({
   };
 
   const loadStoresList = () => {
-    const res = runSql('SELECT * FROM stores', 'Load store branch indexes');
-    if (res.success && Array.isArray(res.data) && res.data.length > 0) {
-      setStoresList(res.data);
-    } else {
-      setStoresList([]);
-    }
+    const central = getCentralBranches(getActiveBusinessId() || undefined);
+    setStoresList(central);
     const pRes = runSql('SELECT COUNT(*) AS cnt FROM products', 'Count products');
     if (pRes.success && Array.isArray(pRes.data) && pRes.data[0]) {
       setProductsCount(Number(pRes.data[0].cnt || 0));
@@ -310,8 +384,10 @@ export default function SettingsPanel({
 
       if (user) {
         try {
-          const fbRes = await backupToCloud(bizId);
+          const fbRes = await backupToCloud(bizId, { silentIfNotOwner: true });
           if (fbRes.success) {
+            msg += ' | ' + fbRes.details;
+          } else if (fbRes.details) {
             msg += ' | ' + fbRes.details;
           }
         } catch (fbErr: any) {
@@ -422,7 +498,8 @@ export default function SettingsPanel({
       termsAndConditions,
       printerName,
       printerInterface,
-      printerStatus
+      printerStatus,
+      customPaymentMethods: getCustomPaymentMethods(true)
     };
     setSettings(updated);
     localStorage.setItem('android_pos_settings', JSON.stringify(updated));
@@ -454,7 +531,7 @@ export default function SettingsPanel({
       persistTablesToStorage();
       pushDatabaseToServer(activeBizId).catch(() => {});
       if (auth.currentUser) {
-        backupToCloud(activeBizId).catch(() => {});
+        backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
       }
       window.dispatchEvent(new Event('pos_data_updated'));
     }
@@ -469,23 +546,8 @@ export default function SettingsPanel({
       return;
     }
     const activeBizId = getActiveBusinessId();
-    let targetStore = quickProdStoreId || activeStore || (storesList[0]?.id ?? '');
-    if (!targetStore) {
-      targetStore = 'store_main';
-      const defaultStoreName = (storeName || 'Main Store') + ' Branch';
-      runSql(`
-        INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency) VALUES (
-          '${targetStore}',
-          '${activeBizId}',
-          '${defaultStoreName.replace(/'/g, "''")}',
-          '${(billingCity || 'Main').replace(/'/g, "''")}',
-          1, 1, 1, 0, 'weekly'
-        )
-      `, 'SettingsPanel: Auto-create Main Store branch for first product');
-      if (setActiveStore) setActiveStore(targetStore);
-      localStorage.setItem('pos_shift_active', 'true');
-      localStorage.setItem('shift_active_' + targetStore, 'true');
-    }
+    const centralStores = getCentralBranches(activeBizId || undefined);
+    const targetStore = quickProdStoreId || activeStore || (centralStores[0]?.id ?? '');
 
     const prodId = Math.floor(10000 + Math.random() * 90000);
     const sku = quickProdBarcode.trim() || `SKU-${prodId}`;
@@ -561,7 +623,7 @@ export default function SettingsPanel({
     persistTablesToStorage();
     pushDatabaseToServer(activeBizId).catch(() => {});
     if (auth.currentUser) {
-      backupToCloud(activeBizId).catch(() => {});
+      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
     }
     window.dispatchEvent(new Event('pos_data_updated'));
     setQuickStockMsg(`✓ Saved "${savedName}" (SKU: ${sku}, Price: ${currency || 'K'}${price.toFixed(2)}, Stock: ${qty}) to inventory & synchronized!`);
@@ -582,12 +644,14 @@ export default function SettingsPanel({
       return;
     }
     runSql(`
-      INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency)
+      INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency)
       VALUES (
         '${finalId}',
         '${activeBizId}',
         '${newBranchName.trim().replace(/'/g, "''")}',
         '${newBranchLocation.trim().replace(/'/g, "''")}',
+        '${newBranchPhone.trim().replace(/'/g, "''")}',
+        '${newBranchEmail.trim().replace(/'/g, "''")}',
         ${newBranchDiscounts ? 1 : 0},
         ${newBranchRefunds ? 1 : 0},
         ${newBranchLaybys ? 1 : 0},
@@ -610,14 +674,41 @@ export default function SettingsPanel({
     setNewBranchName('');
     setNewBranchCode('');
     setNewBranchLocation('');
+    setNewBranchPhone('');
+    setNewBranchEmail('');
     loadStoresList();
     persistTablesToStorage();
     pushDatabaseToServer(activeBizId).catch(() => {});
     if (auth.currentUser) {
-      backupToCloud(activeBizId).catch(() => {});
+      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
     }
     window.dispatchEvent(new Event('pos_data_updated'));
     triggerNotify(`✓ Store branch [${newBranchName}] created & synchronized!`);
+  };
+
+  const handleSaveBranchEdit = (storeId: string) => {
+    if (!editBranchName.trim()) {
+      alert('Branch Name is required.');
+      return;
+    }
+    const activeBizId = getActiveBusinessId();
+    runSql(`
+      UPDATE stores
+      SET name = '${editBranchName.trim().replace(/'/g, "''")}',
+          location = '${editBranchLocation.trim().replace(/'/g, "''")}',
+          phone = '${editBranchPhone.trim().replace(/'/g, "''")}',
+          email = '${editBranchEmail.trim().replace(/'/g, "''")}'
+      WHERE id = '${storeId}'
+    `, `SettingsPanel: Update branch [${editBranchName.trim()}] contact details`);
+    setEditingBranchId(null);
+    loadStoresList();
+    persistTablesToStorage();
+    pushDatabaseToServer(activeBizId).catch(() => {});
+    if (auth.currentUser) {
+      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+    }
+    window.dispatchEvent(new Event('pos_data_updated'));
+    triggerNotify(`✓ Branch [${editBranchName.trim()}] details updated!`);
   };
 
   const handleDeleteBranchInSettings = (storeId: string, branchName: string) => {
@@ -767,7 +858,7 @@ export default function SettingsPanel({
           if (Array.isArray(bundle.database.orders) && bundle.database.orders.length > 0) {
             runSql('DELETE FROM orders');
             bundle.database.orders.forEach((o: any) => {
-              runSql(`INSERT INTO orders VALUES ('${o.id}', ${o.customerId||'NULL'}, '${o.orderDate||''}', ${o.subtotal||0}, ${o.tax||0}, ${o.discount||0}, ${o.total||0}, '${o.paymentMethod||''}', '${o.status||''}', '${o.store_id||'lusaka'}')`);
+              runSql(`INSERT INTO orders VALUES ('${o.id}', ${o.customerId||'NULL'}, '${o.orderDate||''}', ${o.subtotal||0}, ${o.tax||0}, ${o.discount||0}, ${o.total||0}, '${o.paymentMethod||''}', '${o.status||''}', '${o.store_id||activeStore||''}')`);
             });
           }
           if (Array.isArray(bundle.database.order_items) && bundle.database.order_items.length > 0) {
@@ -823,7 +914,7 @@ export default function SettingsPanel({
     if (orderRes.success && Array.isArray(orderRes.data)) {
       orderRes.data.forEach((o: any) => {
         const custVal = o.customerId === null ? 'NULL' : o.customerId;
-        const storeVal = o.store_id ? `'${o.store_id}'` : "'lusaka'";
+        const storeVal = o.store_id ? `'${o.store_id}'` : `'${activeStore || ''}'`;
         dump += `INSERT INTO orders VALUES ('${o.id}', ${custVal}, '${o.orderDate}', ${o.subtotal}, ${o.tax}, ${o.discount}, ${o.total}, '${o.paymentMethod}', '${o.status}', ${storeVal});\n`;
       });
     }
@@ -1002,7 +1093,7 @@ export default function SettingsPanel({
     persistTablesToStorage();
     pushDatabaseToServer(activeBizId).catch(() => {});
     if (auth.currentUser) {
-      backupToCloud(activeBizId).catch(() => {});
+      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
     }
     window.dispatchEvent(new Event('pos_data_updated'));
     triggerNotify('✓ User security credentials and branch routing saved & synchronized!');
@@ -1140,6 +1231,46 @@ export default function SettingsPanel({
           >
             5. Cloud Sync &amp; Workspaces
           </button>
+          {currentUserRole === 'owner' && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSubTab('payments');
+                setCustomMethods(getCustomPaymentMethods(true));
+              }}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+                activeSubTab === 'payments'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              6. Payment Methods ({customMethods.length})
+            </button>
+          )}
+          {currentUserRole === 'owner' && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSubTab('zra');
+                setZraForm(getZraConfig());
+                setZraQueue(FiscalService.getOfflineQueue());
+              }}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all flex items-center gap-1.5 ${
+                activeSubTab === 'zra'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              <span>7. ZRA Smart Invoice</span>
+              <span className={`px-1.5 py-0.5 rounded text-[9px] font-black ${
+                zraForm.enabled
+                  ? (activeSubTab === 'zra' ? 'bg-white text-emerald-700' : 'bg-emerald-100 text-emerald-800')
+                  : (activeSubTab === 'zra' ? 'bg-emerald-800 text-emerald-100' : 'bg-slate-200 text-slate-600')
+              }`}>
+                {zraForm.enabled ? 'ON' : 'OFF'}
+              </span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -1187,6 +1318,61 @@ export default function SettingsPanel({
                         <p className="text-[11px] text-slate-600 mt-1">
                           Location / Address: <span className="font-semibold text-slate-800">{st.location || 'Not specified'}</span>
                         </p>
+                        {(st.phone || st.email) && (
+                          <p className="text-[10px] text-slate-500 mt-0.5 font-mono">
+                            {[st.phone ? `Tel: ${st.phone}` : '', st.email ? `Email: ${st.email}` : ''].filter(Boolean).join(' · ')}
+                          </p>
+                        )}
+                        {editingBranchId === st.id && (
+                          <div className="mt-2.5 p-2.5 bg-white border border-indigo-200 rounded-lg flex flex-col gap-2">
+                            <input
+                              type="text"
+                              value={editBranchName}
+                              onChange={(e) => setEditBranchName(e.target.value)}
+                              placeholder="Branch Name"
+                              className="w-full px-2 py-1 text-xs font-bold border border-slate-200 rounded"
+                            />
+                            <input
+                              type="text"
+                              value={editBranchLocation}
+                              onChange={(e) => setEditBranchLocation(e.target.value)}
+                              placeholder="Branch Physical Address / Location"
+                              className="w-full px-2 py-1 text-xs border border-slate-200 rounded"
+                            />
+                            <div className="grid grid-cols-2 gap-1.5">
+                              <input
+                                type="tel"
+                                value={editBranchPhone}
+                                onChange={(e) => setEditBranchPhone(e.target.value)}
+                                placeholder="Branch Phone"
+                                className="w-full px-2 py-1 text-xs border border-slate-200 rounded"
+                              />
+                              <input
+                                type="email"
+                                value={editBranchEmail}
+                                onChange={(e) => setEditBranchEmail(e.target.value)}
+                                placeholder="Branch Email"
+                                className="w-full px-2 py-1 text-xs border border-slate-200 rounded"
+                              />
+                            </div>
+                            <div className="flex justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setEditingBranchId(null)}
+                                className="px-2 py-1 text-[10px] font-bold text-slate-600 bg-slate-100 rounded cursor-pointer"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSaveBranchEdit(st.id)}
+                                className="px-2.5 py-1 text-[10px] font-bold text-white bg-indigo-600 rounded cursor-pointer"
+                              >
+                                Save Changes
+                              </button>
+                            </div>
+                          </div>
+                        )}
                         <div className="flex flex-wrap gap-2 mt-2 text-[10px] text-slate-500">
                           <span>Discounts: {st.allow_discounts ? 'Allowed' : 'Disabled'}</span>
                           <span>·</span>
@@ -1195,7 +1381,7 @@ export default function SettingsPanel({
                           <span>Laybys: {st.allow_laybys ? 'Allowed' : 'Disabled'}</span>
                         </div>
                       </div>
-                      <div className="flex items-center justify-between border-t border-slate-200/70 pt-2">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5 border-t border-slate-200/70 pt-2">
                         {!isCurrentStore && setActiveStore ? (
                           <button
                             type="button"
@@ -1212,13 +1398,28 @@ export default function SettingsPanel({
                         ) : (
                           <span className="text-[10px] font-bold text-emerald-700">✓ Currently Selected</span>
                         )}
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteBranchInSettings(st.id, st.name)}
-                          className="px-2.5 py-1 text-[10px] font-bold text-red-600 hover:bg-red-50 rounded border border-red-200 cursor-pointer flex items-center gap-1"
-                        >
-                          <Trash2 size={11} /> Remove Store
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingBranchId(st.id);
+                              setEditBranchName(st.name || '');
+                              setEditBranchLocation(st.location || '');
+                              setEditBranchPhone(st.phone || '');
+                              setEditBranchEmail(st.email || '');
+                            }}
+                            className="px-2.5 py-1 text-[10px] font-bold text-indigo-700 hover:bg-indigo-50 rounded border border-indigo-200 cursor-pointer"
+                          >
+                            Edit Contact
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteBranchInSettings(st.id, st.name)}
+                            className="px-2.5 py-1 text-[10px] font-bold text-red-600 hover:bg-red-50 rounded border border-red-200 cursor-pointer flex items-center gap-1"
+                          >
+                            <Trash2 size={11} /> Remove Store
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -1267,6 +1468,29 @@ export default function SettingsPanel({
                   value={newBranchLocation}
                   onChange={(e) => setNewBranchLocation(e.target.value)}
                   placeholder="Street / City"
+                  className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs text-slate-800 outline-hidden"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex flex-col gap-1">
+                <label className="text-[9px] text-slate-500 font-extrabold uppercase">Branch Phone</label>
+                <input
+                  type="tel"
+                  value={newBranchPhone}
+                  onChange={(e) => setNewBranchPhone(e.target.value)}
+                  placeholder="+260 ..."
+                  className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs text-slate-800 outline-hidden"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[9px] text-slate-500 font-extrabold uppercase">Branch Email</label>
+                <input
+                  type="email"
+                  value={newBranchEmail}
+                  onChange={(e) => setNewBranchEmail(e.target.value)}
+                  placeholder="branch@company.com"
                   className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs text-slate-800 outline-hidden"
                 />
               </div>
@@ -1426,7 +1650,7 @@ export default function SettingsPanel({
                   className="w-full px-2.5 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 text-xs font-semibold focus:outline-hidden"
                 >
                   {storesList.length === 0 ? (
-                    <option value="">Auto-create Main Branch</option>
+                    <option value="">— No Branch Created Yet (Create in Branches Tab) —</option>
                   ) : (
                     storesList.map((st: any) => (
                       <option key={st.id} value={st.id}>{st.name}</option>
@@ -1486,11 +1710,11 @@ export default function SettingsPanel({
                   No business workspaces found.
                 </div>
               ) : (
-                businessesList.map((b: any) => {
+                businessesList.map((b: any, idx: number) => {
                   const isActiveBiz = b.id === getActiveBusinessId();
                   return (
                     <div
-                      key={b.id}
+                      key={`${b.id}-${idx}`}
                       className={`p-4 rounded-xl border flex items-center justify-between ${
                         isActiveBiz
                           ? 'bg-indigo-50/70 border-indigo-400 text-slate-900'
@@ -2148,6 +2372,649 @@ export default function SettingsPanel({
           </div>
 
         </div>
+      ) : activeSubTab === 'payments' ? (
+        currentUserRole !== 'owner' ? (
+          <div className="bg-white border border-rose-200 rounded-xl p-8 text-center shadow-xs max-w-lg mx-auto my-8">
+            <Lock size={32} className="text-rose-500 mx-auto mb-3" />
+            <h3 className="text-sm font-black uppercase text-slate-900">Administrator Access Required</h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Only the business administrator (Owner) can create, enable, or remove custom payment methods.
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col lg:flex-row gap-5">
+            {/* LEFT COLUMN: Built-in Channels & Admin Form */}
+            <div className="w-full lg:w-[430px] flex flex-col gap-5 shrink-0">
+              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-3">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                    <CreditCard size={15} className="text-indigo-600" />
+                    Built-In Payment Channels
+                  </h3>
+                  <span className="text-[9px] font-black uppercase px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full">
+                    System Active
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  Built-in Mobile Money strictly supports <strong>Airtel Money</strong> and <strong>MTN Mobile Money</strong>. Both appear in POS checkout, EOD Cash Up, and double-entry account balances.
+                </p>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <span className="font-black text-slate-800 block">Cash Counter</span>
+                    <span className="text-[9.5px] font-mono text-slate-500">acc_cash</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <span className="font-black text-slate-800 block">Credit Card / Bank</span>
+                    <span className="text-[9.5px] font-mono text-slate-500">acc_bank</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-rose-50/70 border border-rose-200">
+                    <span className="font-black text-rose-900 block">Airtel Money</span>
+                    <span className="text-[9.5px] font-mono text-rose-700">acc_airtel</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-amber-50/70 border border-amber-200">
+                    <span className="font-black text-amber-900 block">MTN Mobile Money</span>
+                    <span className="text-[9.5px] font-mono text-amber-700">acc_mtn</span>
+                  </div>
+                </div>
+              </div>
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const adminActor = activeBusiness?.owner || 'Admin';
+                  const res = saveCustomPaymentMethod(newMethodName, newMethodCategory, adminActor);
+                  if (!res.success) {
+                    setPaymentMethodFeedback({ type: 'error', text: res.error || 'Could not create payment method.' });
+                    return;
+                  }
+                  const updatedMethods = getCustomPaymentMethods(true);
+                  setCustomMethods(updatedMethods);
+                  const nextSettings: StoreSettings = {
+                    ...settings,
+                    customPaymentMethods: updatedMethods
+                  };
+                  setSettings(nextSettings);
+                  localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                  const activeBizId = getActiveBusinessId();
+                  if (activeBizId) {
+                    pushDatabaseToServer(activeBizId).catch(() => {});
+                    if (auth.currentUser) {
+                      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+                    }
+                  }
+                  setNewMethodName('');
+                  setPaymentMethodFeedback({
+                    type: 'success',
+                    text: `Payment method "${res.method?.name}" created and linked to ledger account ${res.method?.accountId}.`
+                  });
+                  triggerNotify(`✓ Created payment method: ${res.method?.name}`);
+                }}
+                className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-3.5"
+              >
+                <div className="border-b border-slate-100 pb-2.5">
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                    <Plus size={15} className="text-indigo-600" />
+                    Create Other Payment Method (Admin)
+                  </h3>
+                  <p className="text-[10.5px] text-slate-500 mt-0.5">
+                    New methods immediately appear in POS Checkout, Laybys, Cash Up, Expenses, Transfers, and Double-Entry Balances.
+                  </p>
+                </div>
+
+                {paymentMethodFeedback && (
+                  <div className={`p-2.5 rounded-lg text-[11px] font-bold border ${
+                    paymentMethodFeedback.type === 'success'
+                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                      : 'bg-rose-50 text-rose-800 border-rose-200'
+                  }`}>
+                    {paymentMethodFeedback.text}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Payment Method Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={newMethodName}
+                    onChange={(e) => setNewMethodName(e.target.value)}
+                    placeholder="e.g. Zoona Wallet, EFT Bank Transfer, Cheque, Store Voucher"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-bold text-slate-800"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Accounting Category
+                  </label>
+                  <select
+                    value={newMethodCategory}
+                    onChange={(e) => setNewMethodCategory(e.target.value as CustomPaymentMethod['category'])}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 focus:outline-hidden text-xs rounded-lg font-bold text-slate-800 cursor-pointer"
+                  >
+                    <option value="Mobile Money">Mobile Money Wallet</option>
+                    <option value="Bank / Card">Bank / Card Transfer</option>
+                    <option value="Cash">Physical Cash / Till</option>
+                    <option value="Other">Other Tender / Voucher</option>
+                  </select>
+                </div>
+
+                <button
+                  type="submit"
+                  className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs uppercase tracking-wider rounded-lg shadow-xs cursor-pointer transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <Plus size={14} />
+                  Create Payment Method
+                </button>
+              </form>
+            </div>
+
+            {/* RIGHT COLUMN: Existing Custom Payment Methods Directory */}
+            <div className="flex-1 bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
+              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                <div>
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">
+                    Admin-Created Custom Payment Methods ({customMethods.length})
+                  </h3>
+                  <p className="text-[10.5px] text-slate-500 mt-0.5">
+                    Toggle availability or remove custom tender channels without affecting historical transactions.
+                  </p>
+                </div>
+              </div>
+
+              {customMethods.length === 0 ? (
+                <div className="p-8 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 text-xs text-slate-500">
+                  No custom payment methods created yet. Use the Admin form on the left to add additional payment channels.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 text-slate-500 font-extrabold text-[9.5px] uppercase tracking-wider border-b border-slate-200">
+                        <th className="py-2.5 px-3">Method Name</th>
+                        <th className="py-2.5 px-3">Category</th>
+                        <th className="py-2.5 px-3">Ledger Account</th>
+                        <th className="py-2.5 px-3 text-center">Status</th>
+                        <th className="py-2.5 px-3 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {customMethods.map((pm) => (
+                        <tr key={pm.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-3 px-3 font-extrabold text-slate-800">{pm.name}</td>
+                          <td className="py-3 px-3">
+                            <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold">
+                              {pm.category}
+                            </span>
+                          </td>
+                          <td className="py-3 px-3 font-mono text-[11px] text-slate-500">{pm.accountId}</td>
+                          <td className="py-3 px-3 text-center">
+                            <span className={`px-2 py-0.5 rounded-full text-[9.5px] font-black uppercase ${
+                              pm.isActive
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : 'bg-slate-200 text-slate-600'
+                            }`}>
+                              {pm.isActive ? 'Active' : 'Disabled'}
+                            </span>
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const updated = toggleCustomPaymentMethod(pm.id, !pm.isActive);
+                                  setCustomMethods(updated);
+                                  const nextSettings = { ...settings, customPaymentMethods: updated };
+                                  setSettings(nextSettings);
+                                  localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                                  const activeBizId = getActiveBusinessId();
+                                  if (activeBizId) {
+                                    pushDatabaseToServer(activeBizId).catch(() => {});
+                                    if (auth.currentUser) backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+                                  }
+                                }}
+                                className="px-2 py-1 text-[10px] font-bold rounded border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 cursor-pointer"
+                              >
+                                {pm.isActive ? 'Disable' : 'Enable'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (!window.confirm(`Remove custom payment method "${pm.name}"?`)) return;
+                                  const updated = deleteCustomPaymentMethod(pm.id);
+                                  setCustomMethods(updated);
+                                  const nextSettings = { ...settings, customPaymentMethods: updated };
+                                  setSettings(nextSettings);
+                                  localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                                  const activeBizId = getActiveBusinessId();
+                                  if (activeBizId) {
+                                    pushDatabaseToServer(activeBizId).catch(() => {});
+                                    if (auth.currentUser) backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+                                  }
+                                }}
+                                className="p-1.5 text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded cursor-pointer"
+                                title="Delete Custom Payment Method"
+                              >
+                                <Trash2 size={12} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      ) : activeSubTab === 'zra' ? (
+        currentUserRole !== 'owner' ? (
+          <div className="bg-white border border-rose-200 rounded-xl p-8 text-center shadow-xs max-w-lg mx-auto my-8">
+            <Lock size={32} className="text-rose-500 mx-auto mb-3" />
+            <h3 className="text-sm font-black uppercase text-slate-900">Administrator Access Required</h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Only the business administrator (Owner) can configure ZRA Smart Invoice VSDC credentials and toggle fiscalization.
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col lg:flex-row gap-5 text-left">
+            {/* LEFT COLUMN: ZRA Smart Invoice (VSDC) Configuration Form */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const saved = saveZraConfig(zraForm);
+                setZraForm(saved);
+                const nextSettings: StoreSettings = {
+                  ...settings,
+                  tpin: saved.tpin || settings.tpin,
+                  zraConfig: saved,
+                };
+                setSettings(nextSettings);
+                localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                const activeBizId = getActiveBusinessId();
+                if (activeBizId) {
+                  pushDatabaseToServer(activeBizId).catch(() => {});
+                  if (auth.currentUser) {
+                    backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+                  }
+                }
+                setZraFeedback({
+                  type: 'success',
+                  text: saved.enabled
+                    ? `ZRA Smart Invoice ENABLED (TPIN: ${saved.tpin || 'Not Set'}, Branch: ${saved.bhfId}, Endpoint: ${saved.vsdcApiUrl}).`
+                    : 'ZRA Smart Invoice set to OFF. Sales will complete immediately as LOCAL_ONLY.',
+                });
+                triggerNotify(saved.enabled ? '✓ ZRA Smart Invoice Enabled & Saved' : '✓ ZRA Smart Invoice Saved (LOCAL_ONLY Mode)');
+              }}
+              className="flex-1 bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                <div className="flex items-center gap-2">
+                  <QrCode size={18} className="text-emerald-600" />
+                  <div>
+                    <h3 className="text-xs font-black uppercase tracking-wider text-slate-900">
+                      ZRA Smart Invoice (VSDC) Configuration
+                    </h3>
+                    <p className="text-[10.5px] text-slate-500">
+                      Plug-and-play connection to Zambia Revenue Authority VSDC Fiscal API (`/trnsSales/saveSales`).
+                    </p>
+                  </div>
+                </div>
+
+                {/* Master ON / OFF Switch */}
+                <button
+                  type="button"
+                  id="zra-master-toggle"
+                  onClick={() => {
+                    const toggled = saveZraConfig({ ...zraForm, enabled: !zraForm.enabled });
+                    setZraForm(toggled);
+                    const nextSettings: StoreSettings = { ...settings, zraConfig: toggled };
+                    setSettings(nextSettings);
+                    localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                    setZraFeedback({
+                      type: toggled.enabled ? 'success' : 'info',
+                      text: toggled.enabled
+                        ? 'ZRA Smart Invoice toggled ON. Every completed sale will be submitted to VSDC.'
+                        : 'ZRA Smart Invoice toggled OFF. Sales will immediately return LOCAL_ONLY without calling VSDC.',
+                    });
+                  }}
+                  className={`px-3.5 py-2 rounded-xl font-black text-xs uppercase tracking-wider flex items-center gap-2 cursor-pointer border transition-all ${
+                    zraForm.enabled
+                      ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 shadow-xs'
+                      : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'
+                  }`}
+                >
+                  <span className={`w-2.5 h-2.5 rounded-full ${zraForm.enabled ? 'bg-white' : 'bg-slate-400'}`} />
+                  <span>{zraForm.enabled ? 'ZRA FISCAL: ON' : 'ZRA FISCAL: OFF (LOCAL_ONLY)'}</span>
+                </button>
+              </div>
+
+              {zraFeedback && (
+                <div className={`p-3 rounded-lg text-xs font-bold border flex items-start gap-2 ${
+                  zraFeedback.type === 'success'
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    : zraFeedback.type === 'error'
+                      ? 'bg-rose-50 text-rose-800 border-rose-200'
+                      : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                }`}>
+                  <AlertCircle size={15} className="shrink-0 mt-0.5" />
+                  <span>{zraFeedback.text}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Taxpayer TPIN (10 Digits) *
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={10}
+                    value={zraForm.tpin}
+                    onChange={(e) => setZraForm({ ...zraForm, tpin: e.target.value.replace(/\s+/g, '') })}
+                    placeholder="e.g. 2000000000"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-900"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Branch ID (bhfId) *
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={3}
+                    value={zraForm.bhfId}
+                    onChange={(e) => setZraForm({ ...zraForm, bhfId: e.target.value.trim() })}
+                    placeholder="000"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                  VSDC API Base URL *
+                </label>
+                <input
+                  type="url"
+                  value={zraForm.vsdcApiUrl}
+                  onChange={(e) => setZraForm({ ...zraForm, vsdcApiUrl: e.target.value })}
+                  placeholder="http://localhost:8080/zrasandboxvsdc"
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-mono font-semibold text-slate-900"
+                />
+                <span className="text-[10px] text-slate-400">
+                  Endpoints appended automatically: <code className="font-mono">/initializer/selectInitInfo</code> and <code className="font-mono">/trnsSales/saveSales</code>.
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Device Serial Number (dvcSrlNo)
+                  </label>
+                  <input
+                    type="text"
+                    value={zraForm.dvcSrlNo}
+                    onChange={(e) => setZraForm({ ...zraForm, dvcSrlNo: e.target.value })}
+                    placeholder="POS-VSDC-001"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-800"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    CIS Software Code
+                  </label>
+                  <input
+                    type="text"
+                    value={zraForm.cisCode}
+                    onChange={(e) => setZraForm({ ...zraForm, cisCode: e.target.value })}
+                    placeholder="CIS-POS-01"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-800"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Default UNSPSC Item Class Code (itemClsCd)
+                  </label>
+                  <input
+                    type="text"
+                    value={zraForm.defaultItemClsCd}
+                    onChange={(e) => setZraForm({ ...zraForm, defaultItemClsCd: e.target.value })}
+                    placeholder="50102518"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-800"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Default ZRA Tax Type (taxTyCd)
+                  </label>
+                  <select
+                    value={zraForm.defaultTaxTyCd}
+                    onChange={(e) => setZraForm({ ...zraForm, defaultTaxTyCd: e.target.value as ZraTaxTypeCode })}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-bold text-slate-800 cursor-pointer"
+                  >
+                    {ZRA_TAX_TYPES.map((t) => (
+                      <option key={t.code} value={t.code}>{t.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Default Packaging Unit (pkgUnitCd)
+                  </label>
+                  <select
+                    value={zraForm.defaultPkgUnitCd}
+                    onChange={(e) => setZraForm({ ...zraForm, defaultPkgUnitCd: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-bold text-slate-800 cursor-pointer"
+                  >
+                    {ZRA_PACKAGING_UNITS.map((u) => (
+                      <option key={u.code} value={u.code}>{u.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] text-slate-500 font-extrabold uppercase tracking-wide">
+                    Default Quantity Unit (qtyUnitCd)
+                  </label>
+                  <select
+                    value={zraForm.defaultQtyUnitCd}
+                    onChange={(e) => setZraForm({ ...zraForm, defaultQtyUnitCd: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-emerald-500 focus:outline-hidden text-xs rounded-lg font-bold text-slate-800 cursor-pointer"
+                  >
+                    {ZRA_QTY_UNITS.map((u) => (
+                      <option key={u.code} value={u.code}>{u.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <label className="flex items-center gap-2.5 p-3 rounded-lg bg-slate-50 border border-slate-200 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={zraForm.useServerProxy}
+                  onChange={(e) => setZraForm({ ...zraForm, useServerProxy: e.target.checked })}
+                  className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 h-4 w-4 cursor-pointer"
+                />
+                <div className="flex flex-col">
+                  <span className="text-xs font-bold text-slate-800">Use POS Server Relay Proxy (`/api/zra/forward`)</span>
+                  <span className="text-[10px] text-slate-500">Recommended when connecting HTTPS web POS to a local HTTP VSDC instance.</span>
+                </div>
+              </label>
+
+              <div className="flex flex-wrap gap-3 pt-1">
+                <button
+                  type="submit"
+                  className="flex-1 min-w-[180px] py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs uppercase tracking-wider rounded-lg shadow-xs cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Save size={14} />
+                  <span>Save ZRA Configuration</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={zraInitLoading}
+                  onClick={async () => {
+                    setZraInitLoading(true);
+                    setZraFeedback(null);
+                    try {
+                      const res = await FiscalService.initializeDevice(zraForm);
+                      setZraForm(getZraConfig());
+                      setZraFeedback({
+                        type: res.success ? 'success' : 'error',
+                        text: res.message,
+                      });
+                    } finally {
+                      setZraInitLoading(false);
+                    }
+                  }}
+                  className="flex-1 min-w-[200px] py-2.5 px-4 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-black text-xs uppercase tracking-wider rounded-lg shadow-xs cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <RefreshCw size={14} className={zraInitLoading ? 'animate-spin' : ''} />
+                  <span>{zraInitLoading ? 'Connecting VSDC...' : 'Initialize / Test VSDC Device'}</span>
+                </button>
+              </div>
+            </form>
+
+            {/* RIGHT COLUMN: Registered Device Info & Offline Sync Queue */}
+            <div className="w-full lg:w-[420px] flex flex-col gap-5 shrink-0">
+              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-3">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
+                    <ShieldCheck size={15} className="text-emerald-600" />
+                    Registered SDC Device Status
+                  </h3>
+                  <span className={`px-2 py-0.5 rounded-full text-[9.5px] font-black uppercase ${
+                    zraForm.sdcId ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600'
+                  }`}>
+                    {zraForm.sdcId ? 'Device Linked' : 'Not Initialized'}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5 text-xs">
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <span className="text-[9.5px] font-bold uppercase text-slate-400 block">SDC ID</span>
+                    <span className="font-mono font-black text-slate-900">{zraForm.sdcId || '—'}</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <span className="text-[9.5px] font-bold uppercase text-slate-400 block">MRC No</span>
+                    <span className="font-mono font-black text-slate-900">{zraForm.mrcNo || '—'}</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <span className="text-[9.5px] font-bold uppercase text-slate-400 block">Last Invoice No</span>
+                    <span className="font-mono font-black text-slate-900">{zraForm.lastSaleInvcNo || 0}</span>
+                  </div>
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <span className="text-[9.5px] font-bold uppercase text-slate-400 block">Fiscal Mode</span>
+                    <span className={`font-mono font-black ${zraForm.enabled ? 'text-emerald-700' : 'text-slate-600'}`}>
+                      {zraForm.enabled ? 'VSDC LIVE' : 'LOCAL_ONLY'}
+                    </span>
+                  </div>
+                </div>
+                {zraForm.taxprNm && (
+                  <div className="text-[11px] bg-emerald-50/70 border border-emerald-200 rounded-lg p-2.5 text-emerald-900 font-semibold">
+                    Taxpayer: {zraForm.taxprNm} {zraForm.bhfNm ? `(${zraForm.bhfNm})` : ''}
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-3">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                  <div className="flex items-center gap-1.5">
+                    {zraQueue.length > 0 ? (
+                      <WifiOff size={15} className="text-amber-600" />
+                    ) : (
+                      <Wifi size={15} className="text-emerald-600" />
+                    )}
+                    <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">
+                      Offline Fiscal Sync Queue ({zraQueue.length})
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={zraSyncLoading || zraQueue.length === 0}
+                    onClick={async () => {
+                      setZraSyncLoading(true);
+                      try {
+                        const res = await FiscalService.processOfflineQueue();
+                        setZraQueue(FiscalService.getOfflineQueue());
+                        setZraFeedback({
+                          type: res.succeeded > 0 ? 'success' : 'error',
+                          text: `Queue Sync Complete: ${res.succeeded}/${res.processed} invoices fiscalized. ${res.remaining} remaining.`,
+                        });
+                      } finally {
+                        setZraSyncLoading(false);
+                      }
+                    }}
+                    className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white text-[10px] font-black uppercase rounded-lg cursor-pointer flex items-center gap-1"
+                  >
+                    <RefreshCw size={11} className={zraSyncLoading ? 'animate-spin' : ''} />
+                    <span>Retry Sync Now</span>
+                  </button>
+                </div>
+
+                {zraQueue.length === 0 ? (
+                  <div className="p-6 text-center bg-slate-50 border border-dashed border-slate-200 rounded-xl text-xs text-slate-500">
+                    All fiscal invoices are synchronized. Offline failures while ZRA is ON queue here and auto-retry when back online.
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2 max-h-[320px] overflow-y-auto">
+                    {zraQueue.map((item) => (
+                      <div key={item.id} className="p-3 rounded-lg bg-amber-50/70 border border-amber-200 flex flex-col gap-1.5 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono font-black text-slate-900">{item.orderId}</span>
+                          <span className="text-[10px] font-bold text-amber-800">Retries: {item.retryCount}</span>
+                        </div>
+                        <div className="text-[10.5px] text-slate-600 flex justify-between">
+                          <span>Total: {settings.currency}{Number(item.payload?.totAmt || 0).toFixed(2)}</span>
+                          <span>{new Date(item.createdAt).toLocaleString()}</span>
+                        </div>
+                        {item.lastError && (
+                          <div className="text-[10px] font-mono text-rose-700 bg-rose-50 px-2 py-1 rounded border border-rose-200 break-words">
+                            {item.lastError}
+                          </div>
+                        )}
+                        <div className="flex justify-end gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const r = await FiscalService.retryQueueItem(item.id);
+                              setZraQueue(FiscalService.getOfflineQueue());
+                              setZraFeedback({ type: r.synced ? 'success' : 'error', text: r.message });
+                            }}
+                            className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold rounded cursor-pointer"
+                          >
+                            Retry
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setZraQueue(FiscalService.removeQueueItem(item.id));
+                            }}
+                            className="px-2.5 py-1 bg-rose-100 hover:bg-rose-200 text-rose-800 text-[10px] font-bold rounded cursor-pointer"
+                          >
+                            Discard
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )
       ) : (
         <div className="flex flex-col lg:flex-row gap-5">
           {/* USER DIRECTORY TABLE COLUMN */}
@@ -2174,7 +3041,7 @@ export default function SettingsPanel({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-800">
-                  {usersList.map((usr) => {
+                  {usersList.map((usr, idx) => {
                     const avatarColor = usr.role === 'owner' 
                       ? 'bg-purple-100 text-purple-700 border-purple-200' 
                       : usr.role === 'manager' 
@@ -2188,7 +3055,7 @@ export default function SettingsPanel({
                         : '💼 CASHIER (Sales operator)';
 
                     return (
-                      <tr key={usr.id} className="hover:bg-slate-50/40 transition-colors">
+                      <tr key={`${usr.is_owner ? 'owner' : 'staff'}-${usr.id}-${idx}`} className="hover:bg-slate-50/40 transition-colors">
                         <td className="py-3 px-3">
                           <div className="flex items-center gap-2.5">
                             <div className={`w-8 h-8 rounded-lg border font-black text-xs flex items-center justify-center select-none ${avatarColor}`}>
@@ -2222,8 +3089,8 @@ export default function SettingsPanel({
                                   All branches
                                 </span>
                               ) : (
-                                usr.accessible_branches.map((bId: string) => (
-                                  <span key={bId} className="text-[8.5px] px-1.5 py-0.2 font-black uppercase tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-150 rounded-xs">
+                                usr.accessible_branches.map((bId: string, bIdx: number) => (
+                                  <span key={`${bId}-${bIdx}`} className="text-[8.5px] px-1.5 py-0.2 font-black uppercase tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-150 rounded-xs">
                                     {bId.toUpperCase()}
                                   </span>
                                 ))

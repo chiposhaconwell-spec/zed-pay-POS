@@ -1,27 +1,61 @@
 import React, { useState, useEffect } from 'react';
 import { runSql, persistTablesToStorage } from '../db';
 import { jsPDF } from 'jspdf';
-import { exportAndSharePdf } from '../androidUtils';
+import { exportAndSharePdf, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
+import SignaturePad from './SignaturePad';
 import { 
   FileText, 
   Search, 
-  Phone, 
-  Mail, 
   Trash2, 
   Plus, 
   Printer, 
   CheckCircle, 
   ShoppingBag, 
   Edit3, 
-  RefreshCcw, 
   Building, 
-  CreditCard 
+  Send,
+  Share2,
+  Download,
+  AlertCircle,
+  X,
+  PenTool,
+  UserCheck
 } from 'lucide-react';
 import { StoreSettings } from '../types';
 
 interface QuotationsCreatorProps {
   settings: StoreSettings;
+  activeStore?: string;
 }
+
+const loadNormalizedPngImage = (src: string): Promise<{ dataUrl: string; width: number; height: number } | null> => {
+  return new Promise((resolve) => {
+    if (!src) return resolve(null);
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth || img.width || 160;
+        const h = img.naturalHeight || img.height || 160;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return resolve(null);
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve({ dataUrl: canvas.toDataURL('image/png'), width: w, height: h });
+      } catch {
+        if (src.startsWith('data:image/png') || src.startsWith('data:image/jpeg') || src.startsWith('data:image/jpg')) {
+          resolve({ dataUrl: src, width: 160, height: 160 });
+        } else {
+          resolve(null);
+        }
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+};
 
 interface Quotation {
   id: string;
@@ -38,9 +72,39 @@ interface Quotation {
   bank_branch: string;
   status: 'QUOTATION' | 'INVOICE' | 'DELIVERY_NOTE';
   created_at: string;
+  updated_at?: string;
+  extra_json?: string;
 }
 
-export default function QuotationsCreator({ settings }: QuotationsCreatorProps) {
+const toDateInputValue = (isoOrDate?: string): string => {
+  if (!isoOrDate) {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  }
+  const str = String(isoOrDate).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+};
+
+const applyDateInputToIso = (dateInput: string, baseIso?: string): string => {
+  const match = String(dateInput || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return baseIso || new Date().toISOString();
+  const year = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10) - 1;
+  const day = parseInt(match[3], 10);
+  const base = baseIso ? new Date(baseIso) : new Date();
+  const hours = !isNaN(base.getTime()) ? base.getHours() : 12;
+  const mins = !isNaN(base.getTime()) ? base.getMinutes() : 0;
+  const secs = !isNaN(base.getTime()) ? base.getSeconds() : 0;
+  return new Date(year, month, day, hours || 12, mins, secs).toISOString();
+};
+
+export default function QuotationsCreator({ settings, activeStore = '' }: QuotationsCreatorProps) {
   const [quotations, setQuotations] = useState<Quotation[]>([]);
   const [selectedQuote, setSelectedQuote] = useState<Quotation | null>(null);
   
@@ -50,15 +114,18 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
   const [companyTPIN, setCompanyTPIN] = useState(settings.tpin || '');
   const [companyAddress, setCompanyAddress] = useState(fullBillingAddress || '');
   const [logoText, setLogoText] = useState((settings.storeName || 'POS').slice(0, 3).toUpperCase());
+  const [draftDocType, setDraftDocType] = useState<'QUOTATION' | 'INVOICE' | 'DELIVERY_NOTE'>('QUOTATION');
+  const [draftDate, setDraftDate] = useState<string>(() => toDateInputValue());
   
-  // The 5 Core Banking Fields (configured by business, blank by default)
+  // The 5 Core Banking Fields (optional, configured by business)
   const [bankName, setBankName] = useState('');
   const [bankAccountName, setBankAccountName] = useState(settings.storeName || '');
   const [bankAccountNumber, setBankAccountNumber] = useState('');
   const [bankBranchName, setBankBranchName] = useState('');
   const [bankSortCode, setBankSortCode] = useState('');
 
-  // Client Info
+  // Client Info & existing customers list
+  const [existingCustomers, setExistingCustomers] = useState<any[]>([]);
   const [cName, setCName] = useState('');
   const [cPhone, setCPhone] = useState('');
   const [cEmail, setCEmail] = useState('');
@@ -68,18 +135,24 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
   const [discountVal, setDiscountVal] = useState('0.00');
   const [allProducts, setAllProducts] = useState<any[]>([]);
   
-  // Custom editing states for the currently selected quotation (Delivery Note easing!)
+  // Custom editing states for the currently selected document
   const [editItems, setEditItems] = useState<any[]>([]);
+  const [deliveryDateInput, setDeliveryDateInput] = useState<string>(() => toDateInputValue());
 
-  // Filter state
+  // Filter & Archive Search state
   const [docFilter, setDocFilter] = useState<'ALL' | 'QUOTATION' | 'INVOICE' | 'DELIVERY_NOTE'>('ALL');
+  const [docSearch, setDocSearch] = useState('');
 
-  // Quotation/Invoice Editing state
+  // Document Editing state (supports QUOTATION, INVOICE, and DELIVERY_NOTE)
   const [isEditingQuote, setIsEditingQuote] = useState(false);
   const [editCName, setEditCName] = useState('');
   const [editCPhone, setEditCPhone] = useState('');
   const [editCEmail, setEditCEmail] = useState('');
+  const [editDocDate, setEditDocDate] = useState('');
   const [editDiscountVal, setEditDiscountVal] = useState('0.00');
+  const [customItemName, setCustomItemName] = useState('');
+  const [customItemPrice, setCustomItemPrice] = useState('');
+  const [customItemQty, setCustomItemQty] = useState('1');
 
   // Editing Bank States
   const [editBankName, setEditBankName] = useState('');
@@ -88,9 +161,33 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
   const [editBankBranchName, setEditBankBranchName] = useState('');
   const [editBankSortCode, setEditBankSortCode] = useState('');
   const [editSelectedTermTexts, setEditSelectedTermTexts] = useState<string[]>([]);
+  const [editIssuedBy, setEditIssuedBy] = useState('');
+  const [editIssuerSignature, setEditIssuerSignature] = useState('');
 
-  // WhatsApp share phone state
+  // Issuer Name & Digital Signature states
+  const [issuerName, setIssuerName] = useState(
+    () => (typeof localStorage !== 'undefined' && localStorage.getItem('logged_in_user_name')) || ''
+  );
+  const [issuerSignature, setIssuerSignature] = useState(
+    () => (typeof localStorage !== 'undefined' && localStorage.getItem('pos_default_issuer_signature')) || ''
+  );
+
+  // Delivery Note Receiver Acceptance states
+  const [deliveryReceiverName, setDeliveryReceiverName] = useState('');
+  const [deliveryReceiverSig, setDeliveryReceiverSig] = useState('');
+  const [isEditingReceiverSig, setIsEditingReceiverSig] = useState(false);
+
+  // WhatsApp share PDF state
   const [whatsappSharePhone, setWhatsappSharePhone] = useState('');
+  const [waSending, setWaSending] = useState(false);
+  const [waError, setWaError] = useState<string | null>(null);
+  const [waResult, setWaResult] = useState<WhatsAppPdfDispatchResult | null>(null);
+  const [lastCompiledQuotePdf, setLastCompiledQuotePdf] = useState<{ doc: jsPDF; filename: string; caption: string } | null>(null);
+
+  // Inline notices & confirm guards (replaces blocked window.alert/confirm in iframes)
+  const [formNotice, setFormNotice] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
+  const [confirmDeleteDocId, setConfirmDeleteDocId] = useState<string | null>(null);
+  const [confirmDeleteTermId, setConfirmDeleteTermId] = useState<string | null>(null);
 
   // Form Section tab state
   const [activeFormTab, setActiveFormTab] = useState<'client_bank' | 'items_stock' | 'terms_conditions'>('client_bank');
@@ -113,25 +210,67 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
   const [newTermText, setNewTermText] = useState('');
   const [selectedTermIds, setSelectedTermIds] = useState<string[]>([]);
 
+  const parseQuoteItems = (rawJson: string | undefined | null): any[] => {
+    if (!rawJson) return [];
+    try {
+      const parsed = JSON.parse(rawJson);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
   // Fetch / Retrieve extra quote attributes helper
   interface QuoteExtraData {
     appliedTerms: string[];
     bankAccountName: string;
     bankSortCode: string;
+    issuedBy?: string;
+    issuerSignature?: string;
+    receiverName?: string;
+    receiverSignature?: string;
+    acceptedAt?: string;
+    sourceDocId?: string;
+    convertedInvoiceId?: string;
+    convertedDeliveryNoteId?: string;
   }
 
-  const getQuoteExtra = (quoteId: string): QuoteExtraData => {
+  const getQuoteExtra = (quoteId: string, rawExtraJson?: string): QuoteExtraData => {
+    let fromDb: Partial<QuoteExtraData> | null = null;
+    if (rawExtraJson) {
+      try {
+        fromDb = JSON.parse(rawExtraJson);
+      } catch {}
+    }
+    let fromLs: Partial<QuoteExtraData> | null = null;
     const data = localStorage.getItem(`pos_quote_extra_${quoteId}`);
     if (data) {
       try {
-        return JSON.parse(data);
-      } catch (e) {}
+        fromLs = JSON.parse(data);
+      } catch {}
     }
+    const merged = { ...(fromDb || {}), ...(fromLs || {}) };
     return {
-      appliedTerms: [],
-      bankAccountName: companyName,
-      bankSortCode: '01-02-03'
+      appliedTerms: Array.isArray(merged.appliedTerms) ? merged.appliedTerms : [],
+      bankAccountName: merged.bankAccountName || companyName,
+      bankSortCode: merged.bankSortCode || '',
+      issuedBy: merged.issuedBy || issuerName,
+      issuerSignature: merged.issuerSignature || '',
+      receiverName: merged.receiverName || '',
+      receiverSignature: merged.receiverSignature || '',
+      acceptedAt: merged.acceptedAt || '',
+      sourceDocId: merged.sourceDocId || '',
+      convertedInvoiceId: merged.convertedInvoiceId || '',
+      convertedDeliveryNoteId: merged.convertedDeliveryNoteId || ''
     };
+  };
+
+  const persistQuoteExtra = (quoteId: string, extra: QuoteExtraData): string => {
+    const serialized = JSON.stringify(extra);
+    try {
+      localStorage.setItem(`pos_quote_extra_${quoteId}`, serialized);
+    } catch {}
+    return serialized;
   };
 
   const loadQuotations = () => {
@@ -139,10 +278,28 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
     if (res.success && Array.isArray(res.data)) {
       setQuotations(res.data);
     }
+
+    const spRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Quotations: Fetch branch stock', true);
+    const spRows = (spRes.success && Array.isArray(spRes.data)) ? spRes.data : [];
     const prodRes = runSql('SELECT * FROM products', 'Quotations: Fetch catalog reference');
     if (prodRes.success && Array.isArray(prodRes.data)) {
-      setAllProducts(prodRes.data);
+      const enriched = prodRes.data.map((p: any) => {
+        if (!activeStore) return p;
+        const match = spRows.find(
+          (sp: any) => String(sp.product_id) === String(p.id) && String(sp.store_id || '').toLowerCase() === activeStore.toLowerCase()
+        );
+        return match
+          ? { ...p, stock: Number(match.stock ?? p.stock ?? 0), price: Number(match.price ?? p.price ?? 0) }
+          : p;
+      });
+      setAllProducts(enriched);
     }
+
+    const custRes = runSql('SELECT id, name, phone, email FROM customers ORDER BY name ASC', 'Quotations: Fetch customers', true);
+    if (custRes.success && Array.isArray(custRes.data)) {
+      setExistingCustomers(custRes.data);
+    }
+
     if (selectedQuote) {
       const qRes = runSql(`SELECT * FROM quotations WHERE id = '${selectedQuote.id}'`, 'Quotations: Fetch active');
       if (qRes.success && Array.isArray(qRes.data) && qRes.data.length > 0) {
@@ -153,6 +310,9 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
 
   useEffect(() => {
     loadQuotations();
+    const handleSync = () => loadQuotations();
+    window.addEventListener('pos_data_updated', handleSync);
+    window.addEventListener('local_db_restored', handleSync);
 
     // Load custom terms library
     const loadedTerms = localStorage.getItem('pos_custom_terms');
@@ -182,96 +342,142 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
         if (parsed.bankSortCode) setBankSortCode(parsed.bankSortCode);
       } catch (e) {}
     }
-  }, []);
+
+    return () => {
+      window.removeEventListener('pos_data_updated', handleSync);
+      window.removeEventListener('local_db_restored', handleSync);
+    };
+  }, [activeStore]);
+
+  useEffect(() => {
+    setCompanyName(settings.storeName || '');
+    setCompanyTPIN(settings.tpin || '');
+    const addr = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
+    setCompanyAddress(addr || '');
+    setLogoText((settings.storeName || 'POS').slice(0, 3).toUpperCase());
+  }, [settings.storeName, settings.tpin, settings.billingAddress, settings.billingCity, settings.billingCountry]);
+
+  useEffect(() => {
+    setWaError(null);
+    setWaResult(null);
+    setLastCompiledQuotePdf(null);
+    setConfirmDeleteDocId(null);
+    if (selectedQuote) {
+      const extra = getQuoteExtra(selectedQuote.id, selectedQuote.extra_json);
+      setDeliveryReceiverName(extra.receiverName || '');
+      setDeliveryReceiverSig(extra.receiverSignature || '');
+      setIsEditingReceiverSig(!extra.receiverSignature);
+      setDeliveryDateInput(toDateInputValue(selectedQuote.created_at));
+      if (selectedQuote.customer_phone) {
+        setWhatsappSharePhone(selectedQuote.customer_phone);
+      }
+    } else {
+      setDeliveryReceiverName('');
+      setDeliveryReceiverSig('');
+      setIsEditingReceiverSig(false);
+    }
+  }, [selectedQuote?.id, selectedQuote?.status]);
 
   const addToCart = (prod: any) => {
-    const idx = cartItems.findIndex(x => x.id === prod.id);
+    setFormNotice(null);
+    if (selectedQuote) {
+      setSelectedQuote(null);
+      setIsEditingQuote(false);
+    }
+    const idx = cartItems.findIndex(x => String(x.id) === String(prod.id));
     if (idx > -1) {
       const updated = [...cartItems];
       updated[idx].quantity += 1;
       setCartItems(updated);
     } else {
-      setCartItems([...cartItems, { id: prod.id, name: prod.name, quantity: 1, unitPrice: prod.price }]);
+      setCartItems([...cartItems, { id: prod.id, name: prod.name, quantity: 1, unitPrice: Number(prod.price || 0) }]);
     }
   };
 
-  const removeCartItem = (pId: number) => {
-    setCartItems(cartItems.filter(x => x.id !== pId));
+  const removeCartItem = (pId: number | string) => {
+    setCartItems(cartItems.filter(x => String(x.id) !== String(pId)));
   };
 
-  const handleUpdateCartQty = (pId: number, qtyString: string) => {
-    const qty = parseInt(qtyString) || 1;
-    setCartItems(cartItems.map(item => item.id === pId ? { ...item, quantity: qty } : item));
+  const handleUpdateCartQty = (pId: number | string, qtyString: string) => {
+    const qty = Math.max(1, parseInt(qtyString, 10) || 1);
+    setCartItems(cartItems.map(item => String(item.id) === String(pId) ? { ...item, quantity: qty } : item));
+  };
+
+  const handleUpdateCartPrice = (pId: number | string, priceString: string) => {
+    const parsed = parseFloat(priceString);
+    const price = isNaN(parsed) ? 0 : Math.max(0, parsed);
+    setCartItems(cartItems.map(item => String(item.id) === String(pId) ? { ...item, unitPrice: price } : item));
   };
 
   const calculateSubtotal = () => {
-    return cartItems.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0);
+    return cartItems.reduce((sum, item) => sum + (Number(item.unitPrice || 0) * Number(item.quantity || 0)), 0);
+  };
+
+  const generateUniqueDocId = (prefix: 'QT' | 'INV' | 'DN', baseDigits?: string): string => {
+    const existingIds = new Set(quotations.map(q => String(q.id)));
+    const digits = (baseDigits || String(Math.floor(1000 + Math.random() * 9000))).replace(/[^a-zA-Z0-9]/g, '');
+    let candidate = `${prefix}-${digits}`;
+    let counter = 2;
+    while (existingIds.has(candidate)) {
+      candidate = `${prefix}-${digits}-${counter}`;
+      counter++;
+    }
+    return candidate;
   };
 
   const handleSaveQuotation = (e?: React.FormEvent | React.MouseEvent) => {
     if (e) e.preventDefault();
-    
-    // Explicit manual validation of client profile & stock
+    setFormNotice(null);
+
     if (!cName || cName.trim() === '') {
-      alert('REQUIRED: Please fill out Customer Corporate Name under "1. Client & Bank" tab!');
+      setFormNotice({ type: 'error', text: 'Please enter the Customer / Corporate Name under "1. Info & Bank" first.' });
       setActiveFormTab('client_bank');
       return;
     }
-    
+
     if (cartItems.length === 0) {
-      alert('REQUIRED: Your quotation basket is empty! Please add products from the "2. Stock" tab.');
+      setFormNotice({ type: 'error', text: 'Your document basket is empty. Add at least one item under "2. Stock".' });
       setActiveFormTab('items_stock');
       return;
     }
 
-    if (!bankName || bankName.trim() === '') {
-      alert('REQUIRED: Please fill out Bank Name under "1. Client & Bank" tab!');
-      setActiveFormTab('client_bank');
-      return;
-    }
-
-    if (!bankAccountName || bankAccountName.trim() === '') {
-      alert('REQUIRED: Please fill out Bank Account Name under "1. Client & Bank" tab!');
-      setActiveFormTab('client_bank');
-      return;
-    }
-
-    if (!bankAccountNumber || bankAccountNumber.trim() === '') {
-      alert('REQUIRED: Please fill out Bank Account Number under "1. Client & Bank" tab!');
-      setActiveFormTab('client_bank');
-      return;
-    }
-
-    if (!bankBranchName || bankBranchName.trim() === '') {
-      alert('REQUIRED: Please fill out Bank Branch Name under "1. Client & Bank" tab!');
-      setActiveFormTab('client_bank');
-      return;
-    }
-
-    if (!bankSortCode || bankSortCode.trim() === '') {
-      alert('REQUIRED: Please fill out Bank Sort Code under "1. Client & Bank" tab!');
-      setActiveFormTab('client_bank');
-      return;
-    }
-
     const sub = calculateSubtotal();
-    const discountNum = parseFloat(discountVal) || 0;
-    const taxNum = (sub - discountNum) * (settings.taxRate / 100);
-    const tot = sub - discountNum + taxNum;
+    const discountNum = Math.max(0, parseFloat(discountVal) || 0);
+    const taxRate = Number(settings.taxRate || 0);
+    const taxNum = Math.max(0, (sub - discountNum) * (taxRate / 100));
+    const tot = Math.max(0, sub - discountNum + taxNum);
 
-    const qId = 'QT-' + Math.floor(1000 + Math.random() * 9000);
-    const dateStr = new Date().toISOString();
+    const prefix = draftDocType === 'INVOICE' ? 'INV' : draftDocType === 'DELIVERY_NOTE' ? 'DN' : 'QT';
+    const qId = generateUniqueDocId(prefix);
+    const dateStr = applyDateInputToIso(draftDate);
+    const nowIso = new Date().toISOString();
     const itemsJson = JSON.stringify(cartItems);
 
-    const escapedCName = (cName || '').replace(/'/g, "''");
-    const escapedCPhone = (cPhone || '').replace(/'/g, "''");
-    const escapedCEmail = (cEmail || '').replace(/'/g, "''");
-    const escapedBankName = (bankName || '').replace(/'/g, "''");
-    const escapedBankAccountNumber = (bankAccountNumber || '').replace(/'/g, "''");
-    const escapedBankBranchName = (bankBranchName || '').replace(/'/g, "''");
+    const resolvedIssuer = (issuerName || localStorage.getItem('logged_in_user_name') || 'Authorized Staff').trim();
+    if (issuerSignature) {
+      localStorage.setItem('pos_default_issuer_signature', issuerSignature);
+    }
+    const extra: QuoteExtraData = {
+      appliedTerms: savedTerms.filter(t => selectedTermIds.includes(t.id)).map(t => t.text),
+      bankAccountName: (bankAccountName || companyName || '').trim(),
+      bankSortCode: (bankSortCode || '').trim(),
+      issuedBy: resolvedIssuer,
+      issuerSignature: issuerSignature || '',
+      receiverName: '',
+      receiverSignature: '',
+      acceptedAt: ''
+    };
+    const extraJson = persistQuoteExtra(qId, extra);
+
+    const escapedCName = cName.trim().replace(/'/g, "''");
+    const escapedCPhone = (cPhone || '').trim().replace(/'/g, "''");
+    const escapedCEmail = (cEmail || '').trim().replace(/'/g, "''");
+    const escapedBankName = (bankName || '').trim().replace(/'/g, "''");
+    const escapedBankAccountNumber = (bankAccountNumber || '').trim().replace(/'/g, "''");
+    const escapedBankBranchName = (bankBranchName || '').trim().replace(/'/g, "''");
 
     const qry = `
-      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at)
+      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json)
       VALUES (
         '${qId}',
         '${escapedCName}',
@@ -285,19 +491,17 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
         '${escapedBankName}',
         '${escapedBankAccountNumber}',
         '${escapedBankBranchName}',
-        'QUOTATION',
-        '${dateStr}'
+        '${draftDocType}',
+        '${dateStr}',
+        '${nowIso}',
+        '${extraJson.replace(/'/g, "''")}'
       )
     `;
-    const res = runSql(qry, `Docs: File new sales quotation document ${qId}`);
+    const res = runSql(qry, `Docs: File new ${draftDocType} document ${qId}`);
     if (res.success) {
-      // Save extra metadata
-      const extra: QuoteExtraData = {
-        appliedTerms: savedTerms.filter(t => selectedTermIds.includes(t.id)).map(t => t.text),
-        bankAccountName: bankAccountName || companyName,
-        bankSortCode: bankSortCode || '01-02-03'
-      };
-      localStorage.setItem(`pos_quote_extra_${qId}`, JSON.stringify(extra));
+      if (cPhone.trim()) {
+        setWhatsappSharePhone(cPhone.trim());
+      }
 
       setCName('');
       setCPhone('');
@@ -305,67 +509,194 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
       setCartItems([]);
       setDiscountVal('0.00');
       setSelectedTermIds([]);
+      setDraftDate(toDateInputValue());
       setActiveFormTab('client_bank');
-      
-      // Auto-fetch and select the newly created document
+
       const qRes = runSql(`SELECT * FROM quotations WHERE id = '${qId}'`, 'Quotations: Retrieve just created doc');
       if (qRes.success && Array.isArray(qRes.data) && qRes.data.length > 0) {
         setSelectedQuote(qRes.data[0]);
-        setEditItems([]);
+        setEditItems(parseQuoteItems(qRes.data[0].items_json));
         setIsEditingQuote(false);
       }
-      
-      alert(`Custom Quotation ${qId} successfully recorded and displayed.`);
+
+      const label = draftDocType === 'INVOICE' ? 'Tax Invoice' : draftDocType === 'DELIVERY_NOTE' ? 'Delivery Note' : 'Quotation';
+      setFormNotice({ type: 'success', text: `✓ ${label} ${qId} recorded and saved to archive for future reprint & editing.` });
       loadQuotations();
       persistTablesToStorage();
+      try {
+        window.dispatchEvent(new Event('pos_data_updated'));
+      } catch {}
     } else {
-      alert('Error recording: ' + res.error);
+      setFormNotice({ type: 'error', text: 'Error recording document: ' + (res.error || 'Unknown SQL error') });
     }
   };
 
-  // 1-Click Conversions: Convert Quotation ➔ Invoice
+  // Non-destructive Conversion: Keeps Quotation record intact and creates a linked Invoice record
   const handleConvertToInvoice = (quoteId: string) => {
-    const freshRes = runSql(`UPDATE quotations SET status = 'INVOICE' WHERE id = '${quoteId}'`, `Docs: Convert Quote ${quoteId} to Registered Invoice`);
-    if (freshRes.success) {
-      alert(`Document ${quoteId} converted successfully to INVOICE.`);
+    const srcRes = runSql(`SELECT * FROM quotations WHERE id = '${quoteId}'`, `Docs: Load Quotation ${quoteId} for Invoice`);
+    const src: Quotation | null = (srcRes.success && Array.isArray(srcRes.data) && srcRes.data[0]) ? srcRes.data[0] : selectedQuote;
+    if (!src) return;
+
+    const baseDigits = quoteId.replace(/^(QT|INV|DN)-/, '');
+    const invId = generateUniqueDocId('INV', baseDigits);
+    const nowIso = new Date().toISOString();
+    const srcExtra = getQuoteExtra(quoteId, src.extra_json);
+    const invExtra: QuoteExtraData = {
+      ...srcExtra,
+      sourceDocId: quoteId,
+      convertedInvoiceId: undefined,
+      convertedDeliveryNoteId: undefined,
+    };
+    const invExtraJson = persistQuoteExtra(invId, invExtra);
+
+    const updatedSrcExtra: QuoteExtraData = { ...srcExtra, convertedInvoiceId: invId };
+    const updatedSrcExtraJson = persistQuoteExtra(quoteId, updatedSrcExtra);
+
+    const insertInvSql = `
+      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json)
+      VALUES (
+        '${invId}',
+        '${String(src.customer_name || '').replace(/'/g, "''")}',
+        '${String(src.customer_phone || '').replace(/'/g, "''")}',
+        '${String(src.customer_email || '').replace(/'/g, "''")}',
+        '${String(src.items_json || '[]').replace(/'/g, "''")}',
+        ${Number(src.subtotal || 0).toFixed(2)},
+        ${Number(src.tax || 0).toFixed(2)},
+        ${Number(src.discount || 0).toFixed(2)},
+        ${Number(src.total || 0).toFixed(2)},
+        '${String(src.bank_name || '').replace(/'/g, "''")}',
+        '${String(src.bank_account || '').replace(/'/g, "''")}',
+        '${String(src.bank_branch || '').replace(/'/g, "''")}',
+        'INVOICE',
+        '${nowIso}',
+        '${nowIso}',
+        '${invExtraJson.replace(/'/g, "''")}'
+      )
+    `;
+    const res = runSql(insertInvSql, `Docs: Issue Invoice ${invId} from Quotation ${quoteId}`);
+    if (res.success) {
+      runSql(
+        `UPDATE quotations SET extra_json = '${updatedSrcExtraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${quoteId}'`,
+        `Docs: Link Quotation ${quoteId} -> ${invId}`,
+        true
+      );
+      const invRes = runSql(`SELECT * FROM quotations WHERE id = '${invId}'`, 'Docs: Select new Invoice');
+      if (invRes.success && Array.isArray(invRes.data) && invRes.data[0]) {
+        setSelectedQuote(invRes.data[0]);
+        setEditItems(parseQuoteItems(invRes.data[0].items_json));
+        setIsEditingQuote(false);
+      }
+      setFormNotice({ type: 'success', text: `✓ Tax Invoice ${invId} created. Original Quotation ${quoteId} remains saved in the archive.` });
       loadQuotations();
       persistTablesToStorage();
+      try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+    } else {
+      setFormNotice({ type: 'error', text: 'Error creating invoice: ' + (res.error || 'Unknown error') });
     }
   };
 
-  // Convert Invoice ➔ Delivery Note
-  const handleConvertToDeliveryNote = (quoteId: string) => {
-    const freshRes = runSql(`UPDATE quotations SET status = 'DELIVERY_NOTE' WHERE id = '${quoteId}'`, `Docs: Convert Invoice ${quoteId} to Delivery Note`);
-    if (freshRes.success) {
-      alert(`Document ${quoteId} converted successfully to DELIVERY NOTE. Line items quantities can now be customized easily.`);
+  // Non-destructive Conversion: Keeps Invoice record intact and creates a linked Delivery Note record
+  const handleConvertToDeliveryNote = (invoiceId: string) => {
+    const srcRes = runSql(`SELECT * FROM quotations WHERE id = '${invoiceId}'`, `Docs: Load Invoice ${invoiceId} for Delivery Note`);
+    const src: Quotation | null = (srcRes.success && Array.isArray(srcRes.data) && srcRes.data[0]) ? srcRes.data[0] : selectedQuote;
+    if (!src) return;
+
+    const baseDigits = invoiceId.replace(/^(QT|INV|DN)-/, '');
+    const dnId = generateUniqueDocId('DN', baseDigits);
+    const nowIso = new Date().toISOString();
+    const srcExtra = getQuoteExtra(invoiceId, src.extra_json);
+    const dnExtra: QuoteExtraData = {
+      ...srcExtra,
+      sourceDocId: invoiceId,
+      convertedInvoiceId: undefined,
+      convertedDeliveryNoteId: undefined,
+      receiverName: '',
+      receiverSignature: '',
+      acceptedAt: '',
+    };
+    const dnExtraJson = persistQuoteExtra(dnId, dnExtra);
+
+    const updatedSrcExtra: QuoteExtraData = { ...srcExtra, convertedDeliveryNoteId: dnId };
+    const updatedSrcExtraJson = persistQuoteExtra(invoiceId, updatedSrcExtra);
+
+    const insertDnSql = `
+      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json)
+      VALUES (
+        '${dnId}',
+        '${String(src.customer_name || '').replace(/'/g, "''")}',
+        '${String(src.customer_phone || '').replace(/'/g, "''")}',
+        '${String(src.customer_email || '').replace(/'/g, "''")}',
+        '${String(src.items_json || '[]').replace(/'/g, "''")}',
+        ${Number(src.subtotal || 0).toFixed(2)},
+        ${Number(src.tax || 0).toFixed(2)},
+        ${Number(src.discount || 0).toFixed(2)},
+        ${Number(src.total || 0).toFixed(2)},
+        '${String(src.bank_name || '').replace(/'/g, "''")}',
+        '${String(src.bank_account || '').replace(/'/g, "''")}',
+        '${String(src.bank_branch || '').replace(/'/g, "''")}',
+        'DELIVERY_NOTE',
+        '${nowIso}',
+        '${nowIso}',
+        '${dnExtraJson.replace(/'/g, "''")}'
+      )
+    `;
+    const res = runSql(insertDnSql, `Docs: Issue Delivery Note ${dnId} from ${invoiceId}`);
+    if (res.success) {
+      runSql(
+        `UPDATE quotations SET extra_json = '${updatedSrcExtraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${invoiceId}'`,
+        `Docs: Link Invoice ${invoiceId} -> ${dnId}`,
+        true
+      );
+      const dnRes = runSql(`SELECT * FROM quotations WHERE id = '${dnId}'`, 'Docs: Select new Delivery Note');
+      if (dnRes.success && Array.isArray(dnRes.data) && dnRes.data[0]) {
+        setSelectedQuote(dnRes.data[0]);
+        setEditItems(parseQuoteItems(dnRes.data[0].items_json));
+        setIsEditingQuote(false);
+      }
+      setFormNotice({ type: 'success', text: `✓ Delivery Note ${dnId} created. Original Invoice ${invoiceId} remains saved in the archive.` });
       loadQuotations();
       persistTablesToStorage();
+      try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+    } else {
+      setFormNotice({ type: 'error', text: 'Error creating delivery note: ' + (res.error || 'Unknown error') });
     }
   };
 
-  // EDIT LINE ITEMS IN DELIVERY NOTE / EASING OF QUANTITIES
+  // EDIT LINE ITEMS & PRICE/DATE IN DELIVERY NOTE QUICK PANEL
   const handleUpdateDeliveryQty = (idx: number, qtyString: string) => {
-    const qty = parseInt(qtyString) || 0;
+    const qty = parseInt(qtyString, 10) || 0;
     const updated = [...editItems];
     
     if (qty <= 0) {
-      // remove item from Delivery Note
       updated.splice(idx, 1);
     } else {
-      updated[idx].quantity = qty;
+      updated[idx] = { ...updated[idx], quantity: qty };
     }
     
     setEditItems(updated);
   };
 
+  const handleUpdateDeliveryPrice = (idx: number, priceString: string) => {
+    const parsed = parseFloat(priceString);
+    const price = isNaN(parsed) ? 0 : Math.max(0, parsed);
+    const updated = [...editItems];
+    updated[idx] = { ...updated[idx], unitPrice: price };
+    setEditItems(updated);
+  };
+
   const handleSaveDeliveryEasing = () => {
     if (!selectedQuote) return;
+    if (editItems.length === 0) {
+      setFormNotice({ type: 'error', text: 'Delivery Note must keep at least one item.' });
+      return;
+    }
 
-    // Recalculate totals based on eased items
-    const sub = editItems.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0);
-    const discountNum = selectedQuote.discount;
-    const taxNum = (sub - discountNum) * (settings.taxRate / 100);
-    const tot = sub - discountNum + taxNum;
+    const sub = editItems.reduce((sum, item) => sum + (Number(item.unitPrice || 0) * Number(item.quantity || 0)), 0);
+    const discountNum = Number(selectedQuote.discount || 0);
+    const taxNum = Math.max(0, (sub - discountNum) * (Number(settings.taxRate || 0) / 100));
+    const tot = Math.max(0, sub - discountNum + taxNum);
+    const nextCreatedAt = applyDateInputToIso(deliveryDateInput, selectedQuote.created_at);
+    const nowIso = new Date().toISOString();
 
     const itemsJson = JSON.stringify(editItems);
     const qry = `
@@ -374,48 +705,104 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
         items_json = '${itemsJson.replace(/'/g, "''")}',
         subtotal = ${sub.toFixed(2)},
         tax = ${taxNum.toFixed(2)},
-        total = ${tot.toFixed(2)}
+        total = ${tot.toFixed(2)},
+        created_at = '${nextCreatedAt}',
+        updated_at = '${nowIso}'
       WHERE id = '${selectedQuote.id}'
     `;
-    const res = runSql(qry, `Docs: Ease quantities/items on Delivery Note ${selectedQuote.id}`);
+    const res = runSql(qry, `Docs: Update quantities/prices/date on Delivery Note ${selectedQuote.id}`);
     if (res.success) {
-      alert(`Delivery Note ${selectedQuote.id} items eased and updated successfully in SQL.`);
+      setFormNotice({ type: 'success', text: `✓ Delivery Note ${selectedQuote.id} updated and ready for reprint.` });
       loadQuotations();
       persistTablesToStorage();
+      try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
     }
   };
 
-  // Start Editing Quotation
+  const handleSaveDeliveryAcceptance = () => {
+    if (!selectedQuote) return;
+    if (!deliveryReceiverName.trim()) {
+      setFormNotice({ type: 'error', text: 'Please enter the Receiver Full Name before confirming delivery acceptance.' });
+      return;
+    }
+    if (!deliveryReceiverSig) {
+      setFormNotice({ type: 'error', text: 'Please have the receiver sign inside the signature pad to accept delivery.' });
+      return;
+    }
+    const existingExtra = getQuoteExtra(selectedQuote.id, selectedQuote.extra_json);
+    const nowIso = new Date().toISOString();
+    const updatedExtra: QuoteExtraData = {
+      ...existingExtra,
+      receiverName: deliveryReceiverName.trim(),
+      receiverSignature: deliveryReceiverSig,
+      acceptedAt: nowIso
+    };
+    const extraJson = persistQuoteExtra(selectedQuote.id, updatedExtra);
+    runSql(
+      `UPDATE quotations SET extra_json = '${extraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${selectedQuote.id}'`,
+      `Docs: Save receiver signature on ${selectedQuote.id}`,
+      true
+    );
+    setIsEditingReceiverSig(false);
+    setFormNotice({ type: 'success', text: `✓ Delivery Note ${selectedQuote.id} accepted & signed by ${deliveryReceiverName.trim()}.` });
+    loadQuotations();
+    persistTablesToStorage();
+    try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+  };
+
+  // Start Editing Document (Quotation, Invoice, or Delivery Note)
   const startEditingQuotation = (q: Quotation) => {
     setEditCName(q.customer_name);
     setEditCPhone(q.customer_phone || '');
     setEditCEmail(q.customer_email || '');
-    setEditDiscountVal(q.discount.toString());
-    setEditItems(JSON.parse(q.items_json));
+    setEditDocDate(toDateInputValue(q.created_at));
+    setEditDiscountVal(Number(q.discount || 0).toString());
+    setEditItems(parseQuoteItems(q.items_json));
+    setCustomItemName('');
+    setCustomItemPrice('');
+    setCustomItemQty('1');
 
     // Load extra metadata
-    const extra = getQuoteExtra(q.id);
+    const extra = getQuoteExtra(q.id, q.extra_json);
     setEditSelectedTermTexts(extra.appliedTerms || []);
-    setEditBankAccountName(extra.bankAccountName || q.customer_name);
-    setEditBankSortCode(extra.bankSortCode || '01-02-03');
+    setEditBankAccountName(extra.bankAccountName || q.customer_name || '');
+    setEditBankSortCode(extra.bankSortCode || '');
+    setEditIssuedBy(extra.issuedBy || issuerName || '');
+    setEditIssuerSignature(extra.issuerSignature || issuerSignature || '');
 
     // These columns are part of the db row
-    setEditBankName(q.bank_name || 'Zambia National Commercial Bank (Zanaco)');
-    setEditBankAccountNumber(q.bank_account || '1020088991102');
-    setEditBankBranchName(q.bank_branch || 'Lusaka Commercial Branch');
+    setEditBankName(q.bank_name || '');
+    setEditBankAccountNumber(q.bank_account || '');
+    setEditBankBranchName(q.bank_branch || '');
 
     setIsEditingQuote(true);
   };
 
   const addProductToEditItems = (prod: any) => {
-    const idx = editItems.findIndex(x => x.id === prod.id);
+    const idx = editItems.findIndex(x => String(x.id) === String(prod.id));
     if (idx > -1) {
       const updated = [...editItems];
-      updated[idx].quantity += 1;
+      updated[idx] = { ...updated[idx], quantity: Number(updated[idx].quantity || 0) + 1 };
       setEditItems(updated);
     } else {
-      setEditItems([...editItems, { id: prod.id, name: prod.name, quantity: 1, unitPrice: prod.price }]);
+      setEditItems([...editItems, { id: prod.id, name: prod.name, quantity: 1, unitPrice: Number(prod.price || 0) }]);
     }
+  };
+
+  const handleAddCustomEditItem = () => {
+    if (!customItemName.trim()) {
+      setFormNotice({ type: 'error', text: 'Enter an item description before adding.' });
+      return;
+    }
+    const price = Math.max(0, parseFloat(customItemPrice) || 0);
+    const qty = Math.max(1, parseInt(customItemQty, 10) || 1);
+    setEditItems([
+      ...editItems,
+      { id: 'custom_' + Date.now(), name: customItemName.trim(), quantity: qty, unitPrice: price }
+    ]);
+    setCustomItemName('');
+    setCustomItemPrice('');
+    setCustomItemQty('1');
   };
 
   const removeItemFromEditItems = (idx: number) => {
@@ -426,191 +813,242 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
   const handleSaveQuotationEdits = (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedQuote) return;
-    if (!editCName || editItems.length === 0) {
-      alert('Please fill out Customer corporate name and add at least one item!');
+    if (!editCName.trim() || editItems.length === 0) {
+      setFormNotice({ type: 'error', text: 'Please fill out Customer Corporate Name and include at least one line item.' });
       return;
     }
 
-    const sub = editItems.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0);
-    const discountNum = parseFloat(editDiscountVal) || 0;
-    const taxNum = (sub - discountNum) * (settings.taxRate / 100);
-    const tot = sub - discountNum + taxNum;
+    const sub = editItems.reduce((sum, item) => sum + (Number(item.unitPrice || 0) * Number(item.quantity || 0)), 0);
+    const discountNum = Math.max(0, parseFloat(editDiscountVal) || 0);
+    const taxNum = Math.max(0, (sub - discountNum) * (Number(settings.taxRate || 0) / 100));
+    const tot = Math.max(0, sub - discountNum + taxNum);
+    const nextCreatedAt = applyDateInputToIso(editDocDate, selectedQuote.created_at);
+    const nowIso = new Date().toISOString();
 
     const itemsJson = JSON.stringify(editItems);
+    const existingExtra = getQuoteExtra(selectedQuote.id, selectedQuote.extra_json);
+    const extra: QuoteExtraData = {
+      ...existingExtra,
+      appliedTerms: editSelectedTermTexts,
+      bankAccountName: editBankAccountName,
+      bankSortCode: editBankSortCode,
+      issuedBy: editIssuedBy.trim() || existingExtra.issuedBy || issuerName,
+      issuerSignature: editIssuerSignature || existingExtra.issuerSignature || ''
+    };
+    const extraJson = persistQuoteExtra(selectedQuote.id, extra);
 
     const qry = `
       UPDATE quotations
       SET
-        customer_name = '${editCName.replace(/'/g, "''")}',
-        customer_phone = '${editCPhone}',
-        customer_email = '${editCEmail}',
+        customer_name = '${editCName.trim().replace(/'/g, "''")}',
+        customer_phone = '${(editCPhone || '').replace(/'/g, "''")}',
+        customer_email = '${(editCEmail || '').replace(/'/g, "''")}',
         items_json = '${itemsJson.replace(/'/g, "''")}',
         subtotal = ${sub.toFixed(2)},
         tax = ${taxNum.toFixed(2)},
         discount = ${discountNum.toFixed(2)},
         total = ${tot.toFixed(2)},
-        bank_name = '${editBankName.replace(/'/g, "''")}',
-        bank_account = '${editBankAccountNumber}',
-        bank_branch = '${editBankBranchName.replace(/'/g, "''")}'
+        bank_name = '${(editBankName || '').replace(/'/g, "''")}',
+        bank_account = '${(editBankAccountNumber || '').replace(/'/g, "''")}',
+        bank_branch = '${(editBankBranchName || '').replace(/'/g, "''")}',
+        created_at = '${nextCreatedAt}',
+        updated_at = '${nowIso}',
+        extra_json = '${extraJson.replace(/'/g, "''")}'
       WHERE id = '${selectedQuote.id}'
     `;
 
-    const res = runSql(qry, `Docs: Update Quotation ${selectedQuote.id}`);
+    const res = runSql(qry, `Docs: Update ${selectedQuote.status} ${selectedQuote.id}`);
     if (res.success) {
-      // Save extra metadata
-      const extra: QuoteExtraData = {
-        appliedTerms: editSelectedTermTexts,
-        bankAccountName: editBankAccountName,
-        bankSortCode: editBankSortCode
-      };
-      localStorage.setItem(`pos_quote_extra_${selectedQuote.id}`, JSON.stringify(extra));
-
-      alert(`Quotation ${selectedQuote.id} updated successfully.`);
+      setDeliveryDateInput(toDateInputValue(nextCreatedAt));
+      setFormNotice({ type: 'success', text: `✓ ${selectedQuote.status.replace('_', ' ')} ${selectedQuote.id} updated and ready for reprint.` });
       setIsEditingQuote(false);
       loadQuotations();
       persistTablesToStorage();
+      try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
     } else {
-      alert('Error updating quotation: ' + res.error);
+      setFormNotice({ type: 'error', text: 'Error updating document: ' + (res.error || 'Unknown error') });
     }
   };
 
   const handleDeleteDocument = (docId: string) => {
-    if (window.confirm(`Are you sure you want to permanently delete document ${docId}?`)) {
-      const res = runSql(`DELETE FROM quotations WHERE id = '${docId}'`, `Docs: Delete document ${docId}`);
-      if (res.success) {
-        alert(`Document ${docId} deleted successfully.`);
-        setSelectedQuote(null);
-        setIsEditingQuote(false);
-        loadQuotations();
-        persistTablesToStorage();
-      } else {
-        alert('Error deleting document: ' + res.error);
-      }
+    const res = runSql(`DELETE FROM quotations WHERE id = '${docId}'`, `Docs: Delete document ${docId}`);
+    if (res.success) {
+      setFormNotice({ type: 'success', text: `Document ${docId} deleted.` });
+      setSelectedQuote(null);
+      setIsEditingQuote(false);
+      setConfirmDeleteDocId(null);
+      loadQuotations();
+      persistTablesToStorage();
+      try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+    } else {
+      setFormNotice({ type: 'error', text: 'Error deleting document: ' + (res.error || 'Unknown error') });
     }
   };
 
+  const selectedParsedItems = selectedQuote ? parseQuoteItems(selectedQuote.items_json) : [];
+  const selectedExtra = selectedQuote ? getQuoteExtra(selectedQuote.id, selectedQuote.extra_json) : null;
   const activeDoc = selectedQuote 
     ? {
         id: selectedQuote.id,
         status: selectedQuote.status,
         created_at: selectedQuote.created_at,
+        updated_at: selectedQuote.updated_at || '',
         customer_name: selectedQuote.customer_name,
         customer_phone: selectedQuote.customer_phone,
         customer_email: selectedQuote.customer_email,
         bank_name: selectedQuote.bank_name,
         bank_account: selectedQuote.bank_account,
         bank_branch: selectedQuote.bank_branch,
-        items: selectedQuote.status === 'DELIVERY_NOTE' ? editItems : JSON.parse(selectedQuote.items_json),
-        subtotal: selectedQuote.status === 'DELIVERY_NOTE' ? editItems.reduce((sum: number, item: any) => sum + (item.unitPrice * item.quantity), 0) : selectedQuote.subtotal,
-        discount: selectedQuote.discount,
-        tax: selectedQuote.status === 'DELIVERY_NOTE' ? (editItems.reduce((sum: number, item: any) => sum + (item.unitPrice * item.quantity), 0) - selectedQuote.discount) * (settings.taxRate / 100) : selectedQuote.tax,
-        total: selectedQuote.status === 'DELIVERY_NOTE' ? (editItems.reduce((sum: number, item: any) => sum + (item.unitPrice * item.quantity), 0) - selectedQuote.discount) * (1 + settings.taxRate / 100) : selectedQuote.total,
-        appliedTerms: getQuoteExtra(selectedQuote.id).appliedTerms,
-        bankAccountName: getQuoteExtra(selectedQuote.id).bankAccountName || companyName,
-        bankSortCode: getQuoteExtra(selectedQuote.id).bankSortCode || '01-02-03',
+        items: selectedQuote.status === 'DELIVERY_NOTE' ? editItems : selectedParsedItems,
+        subtotal: Number(selectedQuote.status === 'DELIVERY_NOTE' ? editItems.reduce((sum: number, item: any) => sum + (Number(item.unitPrice || 0) * Number(item.quantity || 0)), 0) : (selectedQuote.subtotal || 0)),
+        discount: Number(selectedQuote.discount || 0),
+        tax: Number(selectedQuote.status === 'DELIVERY_NOTE' ? Math.max(0, (editItems.reduce((sum: number, item: any) => sum + (Number(item.unitPrice || 0) * Number(item.quantity || 0)), 0) - Number(selectedQuote.discount || 0)) * (Number(settings.taxRate || 0) / 100)) : (selectedQuote.tax || 0)),
+        total: Number(selectedQuote.status === 'DELIVERY_NOTE' ? Math.max(0, (editItems.reduce((sum: number, item: any) => sum + (Number(item.unitPrice || 0) * Number(item.quantity || 0)), 0) - Number(selectedQuote.discount || 0)) * (1 + Number(settings.taxRate || 0) / 100)) : (selectedQuote.total || 0)),
+        appliedTerms: selectedExtra?.appliedTerms || [],
+        bankAccountName: selectedExtra?.bankAccountName || companyName,
+        bankSortCode: selectedExtra?.bankSortCode || '',
+        issuedBy: selectedExtra?.issuedBy || issuerName || localStorage.getItem('logged_in_user_name') || '',
+        issuerSignature: selectedExtra?.issuerSignature || '',
+        receiverName: selectedExtra?.receiverName || '',
+        receiverSignature: selectedExtra?.receiverSignature || '',
+        acceptedAt: selectedExtra?.acceptedAt || '',
+        sourceDocId: selectedExtra?.sourceDocId || '',
         isDraft: false
       }
     : (cartItems.length > 0 || cName) 
     ? {
-        id: 'QT-DRAFT-PREVIEW',
-        status: 'DRAFT QUOTATION',
-        created_at: new Date().toISOString(),
+        id: draftDocType === 'INVOICE' ? 'INV-DRAFT-PREVIEW' : draftDocType === 'DELIVERY_NOTE' ? 'DN-DRAFT-PREVIEW' : 'QT-DRAFT-PREVIEW',
+        status: draftDocType === 'INVOICE' ? 'DRAFT INVOICE' : draftDocType === 'DELIVERY_NOTE' ? 'DRAFT DELIVERY NOTE' : 'DRAFT QUOTATION',
+        created_at: applyDateInputToIso(draftDate),
+        updated_at: '',
         customer_name: cName || 'Draft Customer Name',
-        customer_phone: cPhone || 'Not provided yet',
-        customer_email: cEmail || 'Not provided yet',
+        customer_phone: cPhone || '',
+        customer_email: cEmail || '',
         bank_name: bankName,
         bank_account: bankAccountNumber,
         bank_branch: bankBranchName,
         items: cartItems,
         subtotal: calculateSubtotal(),
         discount: parseFloat(discountVal) || 0,
-        tax: (calculateSubtotal() - (parseFloat(discountVal) || 0)) * (settings.taxRate / 100),
-        total: (calculateSubtotal() - (parseFloat(discountVal) || 0)) * (1 + settings.taxRate / 100),
+        tax: Math.max(0, (calculateSubtotal() - (parseFloat(discountVal) || 0)) * (Number(settings.taxRate || 0) / 100)),
+        total: Math.max(0, (calculateSubtotal() - (parseFloat(discountVal) || 0)) * (1 + Number(settings.taxRate || 0) / 100)),
         appliedTerms: savedTerms.filter(t => selectedTermIds.includes(t.id)).map(t => t.text),
         bankAccountName: bankAccountName || companyName,
-        bankSortCode: bankSortCode || '01-02-03',
+        bankSortCode: bankSortCode || '',
+        issuedBy: issuerName || localStorage.getItem('logged_in_user_name') || '',
+        issuerSignature: issuerSignature || '',
+        receiverName: '',
+        receiverSignature: '',
+        acceptedAt: '',
+        sourceDocId: '',
         isDraft: true
       }
     : null;
 
-  const handleDownloadPDF = (docData: any) => {
+  const buildQuotePdfDoc = async (docData: any): Promise<{ doc: jsPDF; fileName: string } | null> => {
     if (!docData) return null;
     try {
       const doc = new jsPDF({ format: 'a4', orientation: 'portrait' });
       const margin = 15;
       const contentWidth = 180; // 210 - 2 * 15
-      
+
+      // Embed uploaded Company Logo if configured in Settings
+      let textStartX = margin;
+      if (settings.logoUrl) {
+        const normalizedLogo = await loadNormalizedPngImage(settings.logoUrl);
+        if (normalizedLogo) {
+          const maxLogoDim = 18;
+          const ratio = Math.min(maxLogoDim / normalizedLogo.width, maxLogoDim / normalizedLogo.height);
+          const drawW = Math.max(8, normalizedLogo.width * ratio);
+          const drawH = Math.max(8, normalizedLogo.height * ratio);
+          doc.addImage(normalizedLogo.dataUrl, 'PNG', margin, 16, drawW, drawH);
+          textStartX = margin + drawW + 5;
+        }
+      }
+
       // Header Section
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(20);
+      doc.setFontSize(18);
       doc.setTextColor(30, 41, 59); // Slate-800
-      doc.text(companyName.toUpperCase(), margin, 25);
-      
+      doc.text((companyName || settings.storeName || 'COMPANY').toUpperCase(), textStartX, 23);
+
       doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
+      doc.setFontSize(8.5);
       doc.setTextColor(100, 116, 139); // Slate-500
-      doc.text(`TPIN: ${companyTPIN}`, margin, 31);
-      doc.text(companyAddress, margin, 36);
-      
+      doc.text(`TPIN: ${companyTPIN || 'N/A'}`, textStartX, 29);
+      if (companyAddress) {
+        const addrLines = doc.splitTextToSize(companyAddress, 75);
+        doc.text(addrLines, textStartX, 34);
+      }
+
       // Right-side document type and metadata
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(18);
+      doc.setFontSize(17);
       doc.setTextColor(79, 70, 229); // Indigo-600
-      const statusLabel = docData.status === 'QUOTATION' ? 'QUOTATION' : docData.status === 'INVOICE' ? 'TAX INVOICE' : 'DELIVERY NOTE';
-      doc.text(statusLabel, 210 - margin, 25, { align: 'right' });
-      
+      const statusLabel = docData.status === 'QUOTATION'
+        ? 'QUOTATION'
+        : docData.status === 'INVOICE'
+          ? 'TAX INVOICE'
+          : docData.status === 'DELIVERY_NOTE'
+            ? 'DELIVERY NOTE'
+            : String(docData.status || 'DOCUMENT');
+      doc.text(statusLabel, 210 - margin, 23, { align: 'right' });
+
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9);
       doc.setTextColor(100, 116, 139); // Slate-500
-      doc.text(`Doc ID: ${docData.id}`, 210 - margin, 31, { align: 'right' });
-      doc.text(`Date: ${new Date(docData.created_at).toLocaleDateString()}`, 210 - margin, 36, { align: 'right' });
-      
+      doc.text(`Doc ID: ${docData.id}`, 210 - margin, 29, { align: 'right' });
+      doc.text(`Date: ${new Date(docData.created_at).toLocaleDateString()}`, 210 - margin, 34, { align: 'right' });
+      if (docData.issuedBy) {
+        doc.text(`Issued By: ${docData.issuedBy}`, 210 - margin, 39, { align: 'right' });
+      }
+
       // Horizontal Line Divider
       doc.setDrawColor(226, 232, 240); // Slate-200
       doc.setLineWidth(0.5);
-      doc.line(margin, 42, 210 - margin, 42);
-      
+      doc.line(margin, 43, 210 - margin, 43);
+
       // Two-column layout: Customer Details & Payment Bank Details
       const colY = 50;
-      
+
       // Column 1: Customer Details
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(10);
       doc.setTextColor(79, 70, 229); // Indigo-600
       doc.text('CLIENT DETAILS', margin, colY);
-      
+
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(11);
       doc.setTextColor(30, 41, 59); // Slate-800
-      doc.text(docData.customer_name, margin, colY + 6);
-      
+      doc.text(docData.customer_name || 'N/A', margin, colY + 6);
+
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9);
       doc.setTextColor(71, 85, 105); // Slate-600
       doc.text(`Phone: ${docData.customer_phone || 'N/A'}`, margin, colY + 11);
       doc.text(`Email: ${docData.customer_email || 'N/A'}`, margin, colY + 16);
-      
+
       // Column 2: Bank Transfer Details
       const rightColX = 115;
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(10);
       doc.setTextColor(79, 70, 229); // Indigo-600
       doc.text('PAYMENT DETAILS', rightColX, colY);
-      
+
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9);
       doc.setTextColor(71, 85, 105); // Slate-600
       doc.text(`Bank: ${docData.bank_name || 'N/A'}`, rightColX, colY + 6);
-      doc.text(`Account Name: ${docData.bankAccountName || companyName}`, rightColX, colY + 11);
+      doc.text(`Account Name: ${docData.bankAccountName || companyName || 'N/A'}`, rightColX, colY + 11);
       doc.text(`Account No: ${docData.bank_account || 'N/A'}`, rightColX, colY + 16);
       doc.text(`Branch: ${docData.bank_branch || 'N/A'}`, rightColX, colY + 21);
-      doc.text(`Sort Code: ${docData.bankSortCode || '01-02-03'}`, rightColX, colY + 26);
-      
+      doc.text(`Sort Code: ${docData.bankSortCode || 'N/A'}`, rightColX, colY + 26);
+
       // Line Items Table Header
-      let tableY = 85;
+      const tableY = 85;
       doc.setFillColor(241, 245, 249); // Slate-100
       doc.rect(margin, tableY, contentWidth, 8, 'F');
-      
+
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(9);
       doc.setTextColor(30, 41, 59); // Slate-800
@@ -619,133 +1057,291 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
       doc.text('Qty', margin + 105, tableY + 5.5, { align: 'right' });
       doc.text('Unit Price', margin + 135, tableY + 5.5, { align: 'right' });
       doc.text('Total Amount', margin + 175, tableY + 5.5, { align: 'right' });
-      
+
       // Table Content Rows
       let currentY = tableY + 8;
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9);
       doc.setTextColor(71, 85, 105); // Slate-600
-      
+
       docData.items.forEach((item: any, idx: number) => {
-        // Draw thin bottom border
-        doc.setDrawColor(241, 245, 249); // Slate-100
+        if (currentY > 250) {
+          doc.addPage();
+          currentY = 20;
+        }
+        doc.setDrawColor(241, 245, 249);
         doc.setLineWidth(0.3);
         doc.line(margin, currentY + 7, 210 - margin, currentY + 7);
-        
-        // Row details
+
+        const uPrice = Number(item.unitPrice || 0);
+        const qty = Number(item.quantity || 0);
         doc.text((idx + 1).toString(), margin + 3, currentY + 5);
         doc.text(item.name || '', margin + 12, currentY + 5);
-        doc.text(item.quantity.toString(), margin + 105, currentY + 5, { align: 'right' });
-        doc.text(`${settings.currency}${item.unitPrice.toFixed(2)}`, margin + 135, currentY + 5, { align: 'right' });
-        doc.text(`${settings.currency}${(item.unitPrice * item.quantity).toFixed(2)}`, margin + 175, currentY + 5, { align: 'right' });
-        
+        doc.text(qty.toString(), margin + 105, currentY + 5, { align: 'right' });
+        doc.text(`${settings.currency}${uPrice.toFixed(2)}`, margin + 135, currentY + 5, { align: 'right' });
+        doc.text(`${settings.currency}${(uPrice * qty).toFixed(2)}`, margin + 175, currentY + 5, { align: 'right' });
+
         currentY += 7.5;
       });
-      
+
       // Totals Panel
       const totalPanelY = currentY + 5;
       const rightAlignX = 195;
-      
+
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9.5);
-      doc.setTextColor(100, 116, 139); // Slate-500
+      doc.setTextColor(100, 116, 139);
       doc.text('Subtotal:', 125, totalPanelY);
-      doc.text(`${settings.currency}${docData.subtotal.toFixed(2)}`, rightAlignX, totalPanelY, { align: 'right' });
-      
+      doc.text(`${settings.currency}${Number(docData.subtotal || 0).toFixed(2)}`, rightAlignX, totalPanelY, { align: 'right' });
+
       let nextTotalY = totalPanelY + 5;
-      if (docData.discount > 0) {
+      if (Number(docData.discount || 0) > 0) {
         doc.text('Discount:', 125, nextTotalY);
-        doc.text(`-${settings.currency}${docData.discount.toFixed(2)}`, rightAlignX, nextTotalY, { align: 'right' });
+        doc.text(`-${settings.currency}${Number(docData.discount || 0).toFixed(2)}`, rightAlignX, nextTotalY, { align: 'right' });
         nextTotalY += 5;
       }
-      
+
       doc.text(`VAT (${settings.taxRate}%):`, 125, nextTotalY);
-      doc.text(`${settings.currency}${docData.tax.toFixed(2)}`, rightAlignX, nextTotalY, { align: 'right' });
-      
+      doc.text(`${settings.currency}${Number(docData.tax || 0).toFixed(2)}`, rightAlignX, nextTotalY, { align: 'right' });
+
       // Grand Total Box
       const gTotalY = nextTotalY + 5;
-      doc.setFillColor(79, 70, 229, 0.05); // Subtle indigo tint
+      doc.setFillColor(79, 70, 229, 0.05);
       doc.rect(120, gTotalY, 75, 8, 'F');
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(11);
-      doc.setTextColor(79, 70, 229); // Indigo-600
+      doc.setTextColor(79, 70, 229);
       doc.text('GRAND TOTAL:', 125, gTotalY + 5.5);
-      doc.text(`${settings.currency}${docData.total.toFixed(2)}`, rightAlignX - 2, gTotalY + 5.5, { align: 'right' });
-      
+      doc.text(`${settings.currency}${Number(docData.total || 0).toFixed(2)}`, rightAlignX - 2, gTotalY + 5.5, { align: 'right' });
+
       // Terms & Conditions Block
+      let cursorY = gTotalY + 16;
       if (docData.appliedTerms && docData.appliedTerms.length > 0) {
-        let termsY = gTotalY + 20;
         doc.setFont('helvetica', 'bold');
-        doc.setFontSize(10);
-        doc.setTextColor(30, 41, 59); // Slate-800
-        doc.text('TERMS & CONDITIONS', margin, termsY);
-        
+        doc.setFontSize(9.5);
+        doc.setTextColor(30, 41, 59);
+        doc.text('TERMS & CONDITIONS', margin, cursorY);
+        cursorY += 5;
+
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(8.5);
-        doc.setTextColor(100, 116, 139); // Slate-500
-        
-        let termOffset = termsY + 5;
+        doc.setTextColor(100, 116, 139);
+
         docData.appliedTerms.forEach((term: string, idx: number) => {
-          doc.text(`${idx + 1}. ${term}`, margin + 3, termOffset);
-          termOffset += 4.5;
+          const wrapped = doc.splitTextToSize(`${idx + 1}. ${term}`, contentWidth - 4);
+          doc.text(wrapped, margin + 2, cursorY);
+          cursorY += wrapped.length * 4 + 1;
         });
       }
-      
+
+      // Authorization & Acceptance Digital Signatures Block
+      let sigY = Math.max(cursorY + 6, gTotalY + 20);
+      if (sigY > 235) {
+        doc.addPage();
+        sigY = 22;
+      }
+
+      doc.setDrawColor(226, 232, 240);
+      doc.setLineWidth(0.4);
+      doc.line(margin, sigY, 210 - margin, sigY);
+      sigY += 6;
+
+      // Issuer Signature Box (Left)
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8.5);
+      doc.setTextColor(79, 70, 229);
+      doc.text('AUTHORIZED SIGNATURE (ISSUED BY)', margin, sigY);
+
+      if (docData.issuerSignature) {
+        const normIssuerSig = await loadNormalizedPngImage(docData.issuerSignature);
+        if (normIssuerSig) {
+          doc.addImage(normIssuerSig.dataUrl, 'PNG', margin, sigY + 2, 42, 15);
+        }
+      }
+      doc.setDrawColor(148, 163, 184);
+      doc.setLineWidth(0.3);
+      doc.line(margin, sigY + 19, margin + 78, sigY + 19);
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9);
+      doc.setTextColor(30, 41, 59);
+      doc.text(`Issued By: ${docData.issuedBy || 'Authorized Staff'}`, margin, sigY + 24);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor(100, 116, 139);
+      doc.text(`Date: ${new Date(docData.created_at).toLocaleDateString()}`, margin, sigY + 28.5);
+
+      // Delivery Receiver Acceptance Signature Box (Right — shown on Delivery Notes or signed documents)
+      if (docData.status === 'DELIVERY_NOTE' || docData.receiverSignature || docData.receiverName) {
+        const rx = 113;
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8.5);
+        doc.setTextColor(5, 150, 105);
+        doc.text('RECEIVER ACCEPTANCE SIGNATURE', rx, sigY);
+
+        if (docData.receiverSignature) {
+          const normRecvSig = await loadNormalizedPngImage(docData.receiverSignature);
+          if (normRecvSig) {
+            doc.addImage(normRecvSig.dataUrl, 'PNG', rx, sigY + 2, 42, 15);
+          }
+        }
+        doc.setDrawColor(148, 163, 184);
+        doc.setLineWidth(0.3);
+        doc.line(rx, sigY + 19, rx + 82, sigY + 19);
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9);
+        doc.setTextColor(30, 41, 59);
+        doc.text(`Received By: ${docData.receiverName || '________________________'}`, rx, sigY + 24);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        doc.setTextColor(100, 116, 139);
+        doc.text(
+          docData.acceptedAt ? `Accepted: ${new Date(docData.acceptedAt).toLocaleString()}` : 'Status: Pending Receiver Acceptance',
+          rx,
+          sigY + 28.5
+        );
+      }
+
       // Footnote at page bottom
       doc.setFont('helvetica', 'italic');
       doc.setFontSize(8.5);
-      doc.setTextColor(148, 163, 184); // Slate-400
-      doc.text('Thank you for choice of partnership!', 105, 280, { align: 'center' });
-      doc.text('This document is dynamically generated via SME Core Corporate POS.', 105, 284, { align: 'center' });
-      
+      doc.setTextColor(148, 163, 184);
+      doc.text('Thank you for choice of partnership!', 105, 282, { align: 'center' });
+      doc.text('This document is dynamically generated via SME Core Corporate POS.', 105, 286, { align: 'center' });
+
       const fileName = `${docData.status.replace(/\s+/g, '_')}_${docData.id}.pdf`;
-      exportAndSharePdf(fileName, doc);
-      return fileName;
-    } catch (err) {
-      console.error('PDF Download Error:', err);
-      alert('Error generating PDF download: ' + err);
+      return { doc, fileName };
+    } catch (err: any) {
+      console.error('PDF Compile Error:', err);
+      setFormNotice({ type: 'error', text: 'Error generating PDF: ' + (err?.message || err) });
       return null;
     }
   };
 
-  const handlePrintDoc = () => {
+  const handleDownloadPDF = async (docData: any) => {
+    const compiled = await buildQuotePdfDoc(docData);
+    if (!compiled) return null;
+    exportAndSharePdf(compiled.fileName, compiled.doc);
+    return compiled.fileName;
+  };
+
+  const handlePrintDoc = async () => {
     if (activeDoc) {
-      handleDownloadPDF(activeDoc);
+      await handleDownloadPDF(activeDoc);
     } else {
-      alert('No active document to generate a PDF for.');
+      setFormNotice({ type: 'error', text: 'No active document selected to generate a PDF for.' });
+    }
+  };
+
+  const handleWhatsAppSharePdf = async () => {
+    setWaError(null);
+    setWaResult(null);
+    if (!activeDoc) {
+      setWaError('No quotation or invoice selected to send.');
+      return;
+    }
+    if (!whatsappSharePhone.trim()) {
+      setWaError('Please enter a customer WhatsApp phone number (e.g. +26097...).');
+      return;
+    }
+    const compiled = await buildQuotePdfDoc(activeDoc);
+    if (!compiled) {
+      setWaError('Failed to compile PDF quotation.');
+      return;
+    }
+    const caption = `${activeDoc.status} #${activeDoc.id} • Customer: ${activeDoc.customer_name} • Total: ${settings.currency}${Number(activeDoc.total || 0).toFixed(2)}`;
+    setLastCompiledQuotePdf({ doc: compiled.doc, filename: compiled.fileName, caption });
+    setWaSending(true);
+    try {
+      const res = await dispatchPdfToWhatsApp({
+        phone: whatsappSharePhone,
+        filename: compiled.fileName,
+        doc: compiled.doc,
+        storeName: companyName || settings.storeName,
+        caption,
+      });
+      if (!res.success) {
+        setWaError(res.error || 'Could not dispatch PDF to WhatsApp.');
+        return;
+      }
+      setWaResult(res);
+    } catch (err: any) {
+      setWaError(err?.message || 'Unexpected error preparing PDF quotation for WhatsApp.');
+    } finally {
+      setWaSending(false);
     }
   };
 
   return (
-    <div className="flex-1 flex overflow-hidden flex-col bg-slate-50 relative">
+    <div className="flex-1 min-h-0 flex overflow-hidden flex-col bg-slate-50 relative">
       
       {/* Upper header action controls */}
-      <div className="px-5 py-4 bg-white border-b border-slate-200 flex flex-wrap justify-between items-center gap-3">
+      <div className="px-5 py-3.5 bg-white border-b border-slate-200 flex flex-wrap justify-between items-center gap-3 shrink-0">
         <div className="flex items-center gap-2.5">
           <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
             <FileText size={20} />
           </div>
           <div>
-            <h2 className="text-md font-bold text-slate-800">Corp Documents Engine</h2>
-            <p className="text-[11px] text-slate-400 font-semibold uppercase tracking-wider">Quotations, Invoices & Delivery Notes</p>
+            <h2 className="text-md font-bold text-slate-800">Quote, Invoice &amp; Delivery Note</h2>
+            <p className="text-[11px] text-slate-400 font-semibold uppercase tracking-wider">Create, Edit, Sign &amp; Reprint Documents</p>
           </div>
         </div>
 
-        {activeDoc && (
-          <button
-            onClick={handlePrintDoc}
-            className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold cursor-pointer transition-all uppercase tracking-wider shadow-sm animate-pulse-once"
-          >
-            <Printer size={14} className="text-white" />
-            PRINT / DOWNLOAD PDF
-          </button>
-        )}
+        <div className="flex items-center gap-2 flex-wrap">
+          {selectedQuote && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedQuote(null);
+                setEditItems([]);
+                setIsEditingQuote(false);
+                setFormNotice(null);
+              }}
+              className="flex items-center gap-1 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold cursor-pointer uppercase tracking-wider"
+            >
+              <Plus size={13} />
+              New Quotation Draft
+            </button>
+          )}
+          {activeDoc && (
+            <button
+              type="button"
+              onClick={handlePrintDoc}
+              className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold cursor-pointer transition-all uppercase tracking-wider shadow-sm"
+            >
+              <Printer size={14} className="text-white" />
+              {activeDoc.isDraft ? 'PRINT / DOWNLOAD PDF' : 'REPRINT / DOWNLOAD PDF'}
+            </button>
+          )}
+        </div>
       </div>
 
-      <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
+      {formNotice && (
+        <div className={`mx-4 mt-3 px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 shrink-0 ${
+          formNotice.type === 'error'
+            ? 'bg-rose-50 border-rose-200 text-rose-800'
+            : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+        }`}>
+          <div className="flex items-center gap-2">
+            {formNotice.type === 'error' ? <AlertCircle size={14} className="shrink-0" /> : <CheckCircle size={14} className="shrink-0" />}
+            <span>{formNotice.text}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFormNotice(null)}
+            className="p-0.5 rounded hover:bg-black/5 cursor-pointer shrink-0"
+            title="Dismiss"
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
+
+      <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden scroll-y-touch touch-pan-y">
         
         {/* LEFTSIDE DOCUMENT SELECTOR & NEW DOC CREATOR */}
-        <div className="w-full lg:w-5/12 bg-white border-r border-slate-200 flex flex-col overflow-y-auto p-4 gap-4 max-h-screen">
+        <div className="w-full lg:w-5/12 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col lg:min-h-0 lg:h-full lg:overflow-y-auto p-4 gap-4 shrink-0">
           
           {/* Section: Create New Quote with Tabbed Flow */}
           <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 shadow-3xs flex flex-col gap-3">
@@ -790,18 +1386,70 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
               {/* TAB 1: CLIENT & BANK INFO */}
               {activeFormTab === 'client_bank' && (
                 <div className="flex flex-col gap-3 font-sans mt-1">
+                  {/* Document Type & Date Controls */}
+                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm grid grid-cols-2 gap-2">
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-400 font-bold uppercase">Document Type</label>
+                      <select
+                        value={draftDocType}
+                        onChange={(e) => setDraftDocType(e.target.value as 'QUOTATION' | 'INVOICE' | 'DELIVERY_NOTE')}
+                        className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold focus:outline-none cursor-pointer"
+                      >
+                        <option value="QUOTATION">Quotation</option>
+                        <option value="INVOICE">Tax Invoice</option>
+                        <option value="DELIVERY_NOTE">Delivery Note</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-400 font-bold uppercase">Document Date</label>
+                      <input
+                        type="date"
+                        value={draftDate}
+                        onChange={(e) => setDraftDate(e.target.value)}
+                        className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
                   {/* Customer Corporate profile */}
                   <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2.5">
-                    <span className="text-[10px] text-indigo-700 font-extrabold uppercase block tracking-wider">Customer Contact Profile</span>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] text-indigo-700 font-extrabold uppercase block tracking-wider">Customer Contact Profile</span>
+                      {existingCustomers.length > 0 && (
+                        <select
+                          value=""
+                          onChange={(e) => {
+                            const cust = existingCustomers.find(c => String(c.id) === e.target.value);
+                            if (cust) {
+                              setCName(cust.name || '');
+                              setCPhone(cust.phone || '');
+                              setCEmail(cust.email || '');
+                              if (selectedQuote) setSelectedQuote(null);
+                            }
+                          }}
+                          className="text-[10px] bg-indigo-50 border border-indigo-200 text-indigo-800 rounded px-2 py-0.5 font-bold cursor-pointer max-w-[160px]"
+                        >
+                          <option value="">Load Saved Customer...</option>
+                          {existingCustomers.map(c => (
+                            <option key={c.id} value={c.id}>{c.name}</option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
                     <div className="flex flex-col gap-1">
                       <label className="text-[9px] text-slate-400 font-bold uppercase">Customer Corporate Name *</label>
                       <input
                         type="text"
+                        dir="ltr"
                         required
                         value={cName}
-                        onChange={(e) => setCName(e.target.value)}
-                        placeholder="Mopani Copper Mines PLC"
-                        className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold focus:outline-none"
+                        onChange={(e) => {
+                          setCName(e.target.value);
+                          if (selectedQuote) setSelectedQuote(null);
+                          if (formNotice) setFormNotice(null);
+                        }}
+                        placeholder="Enter customer or company name"
+                        className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
                       />
                     </div>
                     <div className="grid grid-cols-2 gap-2">
@@ -809,20 +1457,22 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         <label className="text-[9px] text-slate-400 font-bold uppercase">Phone Number</label>
                         <input
                           type="tel"
+                          dir="ltr"
                           value={cPhone}
                           onChange={(e) => setCPhone(e.target.value)}
                           placeholder="+260 977 XXXXXX"
-                          className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800"
+                          className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 text-left select-text"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="text-[9px] text-slate-400 font-bold uppercase">Email Address</label>
                         <input
                           type="email"
+                          dir="ltr"
                           value={cEmail}
                           onChange={(e) => setCEmail(e.target.value)}
-                          placeholder="procurement@mopani.zm"
-                          className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800"
+                          placeholder="client@company.com"
+                          className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 text-left select-text"
                         />
                       </div>
                     </div>
@@ -831,7 +1481,7 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                   {/* Bank details input fields with headings */}
                   <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2">
                     <div className="flex justify-between items-center pb-1 border-b border-slate-100">
-                      <span className="text-[10px] text-indigo-700 font-extrabold uppercase tracking-wider">Payment Bank Details Section</span>
+                      <span className="text-[10px] text-indigo-700 font-extrabold uppercase tracking-wider">Payment Bank Details (Optional)</span>
                       <button
                         type="button"
                         onClick={() => {
@@ -843,9 +1493,9 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                             bankSortCode
                           };
                           localStorage.setItem('pos_default_bank_details', JSON.stringify(details));
-                          alert('Default Bank details saved. These will auto-fill next time.');
+                          setFormNotice({ type: 'success', text: 'Default bank details saved for future quotations.' });
                         }}
-                        className="text-[9px] text-indigo-600 hover:text-indigo-800 font-bold uppercase hover:underline"
+                        className="text-[9px] text-indigo-600 hover:text-indigo-800 font-bold uppercase hover:underline cursor-pointer"
                       >
                         Set as Default
                       </button>
@@ -856,7 +1506,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         <label className="text-[9px] text-slate-400 font-bold uppercase">BANK NAME</label>
                         <input
                           type="text"
-                          required
                           value={bankName}
                           onChange={(e) => setBankName(e.target.value)}
                           placeholder="Zambia National Commercial Bank"
@@ -868,7 +1517,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         <label className="text-[9px] text-slate-400 font-bold uppercase">ACCOUNT NAME</label>
                         <input
                           type="text"
-                          required
                           value={bankAccountName}
                           onChange={(e) => setBankAccountName(e.target.value)}
                           placeholder="SME Retailers Ltd"
@@ -880,7 +1528,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         <label className="text-[9px] text-slate-400 font-bold uppercase">ACCOUNT NUMBER</label>
                         <input
                           type="text"
-                          required
                           value={bankAccountNumber}
                           onChange={(e) => setBankAccountNumber(e.target.value)}
                           placeholder="1020088991102"
@@ -893,7 +1540,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           <label className="text-[9px] text-slate-400 font-bold uppercase">BRANCH NAME</label>
                           <input
                             type="text"
-                            required
                             value={bankBranchName}
                             onChange={(e) => setBankBranchName(e.target.value)}
                             placeholder="Lusaka Commercial Branch"
@@ -904,7 +1550,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           <label className="text-[9px] text-slate-400 font-bold uppercase">SORT CODE</label>
                           <input
                             type="text"
-                            required
                             value={bankSortCode}
                             onChange={(e) => setBankSortCode(e.target.value)}
                             placeholder="01-02-03"
@@ -915,10 +1560,58 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                     </div>
                   </div>
 
+                  {/* Issuer Name & Digital Signature */}
+                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2.5">
+                    <div className="flex justify-between items-center pb-1 border-b border-slate-100">
+                      <span className="text-[10px] text-indigo-700 font-extrabold uppercase tracking-wider flex items-center gap-1">
+                        <PenTool size={11} /> Issuer Name &amp; Digital Signature
+                      </span>
+                      {issuerSignature && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            localStorage.setItem('pos_default_issuer_signature', issuerSignature);
+                            setFormNotice({ type: 'success', text: 'Default issuer digital signature saved for all documents.' });
+                          }}
+                          className="text-[9px] text-indigo-600 hover:text-indigo-800 font-bold uppercase hover:underline cursor-pointer"
+                        >
+                          Save as Default
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-400 font-bold uppercase">Issued By (Full Name)</label>
+                      <input
+                        type="text"
+                        dir="ltr"
+                        value={issuerName}
+                        onChange={(e) => setIssuerName(e.target.value)}
+                        placeholder="Name of person issuing document"
+                        className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                      />
+                    </div>
+
+                    <SignaturePad
+                      value={issuerSignature}
+                      onChange={(sig) => {
+                        setIssuerSignature(sig);
+                        if (sig) {
+                          localStorage.setItem('pos_default_issuer_signature', sig);
+                        } else {
+                          localStorage.removeItem('pos_default_issuer_signature');
+                        }
+                      }}
+                      label="Authorized Issuer Digital Signature"
+                      height={100}
+                      placeholder="Sign here (auto-saved for quotations, invoices & delivery notes)"
+                    />
+                  </div>
+
                   <button
                     type="button"
                     onClick={() => setActiveFormTab('items_stock')}
-                    className="w-full py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold uppercase rounded-lg text-xs"
+                    className="w-full py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold uppercase rounded-lg text-xs cursor-pointer"
                   >
                     Next: Add Products &amp; Stock &rarr;
                   </button>
@@ -980,38 +1673,52 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         <button
                           type="button"
                           onClick={() => {
-                            if (!newCatalogName || !newCatalogPrice) {
-                              alert('Please complete the Name and Price fields.');
+                            if (!newCatalogName.trim() || !newCatalogPrice) {
+                              setFormNotice({ type: 'error', text: 'Please enter both Item Name and Selling Price.' });
                               return;
                             }
-                            const priceVal = parseFloat(newCatalogPrice);
-                            const stockCount = parseInt(newCatalogStock) || 0;
+                            const priceVal = parseFloat(newCatalogPrice) || 0;
+                            const stockCount = parseInt(newCatalogStock, 10) || 0;
                             const costVal = priceVal * 0.7;
-                            const pId = 'P-' + Math.floor(1000 + Math.random() * 9000);
-                            
+                            const pId = Math.floor(100000 + Math.random() * 900000);
+                            const skuVal = `QT-${pId}`;
+                            let bizId = '';
+                            try {
+                              bizId = JSON.parse(localStorage.getItem('active_business_profile') || '{}')?.id || '';
+                            } catch {}
+                            const safeName = newCatalogName.trim().replace(/'/g, "''");
+
                             const qryInsert = `
-                              INSERT INTO products (id, name, stock, cost, price)
+                              INSERT INTO products (id, name, sku, category, stock, cost, price, business_id, is_service)
                               VALUES (
-                                '${pId}',
-                                '${newCatalogName.replace(/'/g, "''")}',
+                                ${pId},
+                                '${safeName}',
+                                '${skuVal}',
+                                'General',
                                 ${stockCount},
                                 ${costVal.toFixed(2)},
-                                ${priceVal.toFixed(2)}
+                                ${priceVal.toFixed(2)},
+                                '${bizId.replace(/'/g, "''")}',
+                                0
                               )
                             `;
                             const r = runSql(qryInsert, `Stock Inventory quick registration: ${newCatalogName}`);
                             if (r.success) {
-                              // Auto add to the quotation cart
-                              setCartItems([...cartItems, { id: pId, name: newCatalogName, quantity: 1, unitPrice: priceVal }]);
+                              if (activeStore) {
+                                runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES ('sp_${pId}_${activeStore}', ${pId}, '${activeStore.replace(/'/g, "''")}', ${stockCount}, ${priceVal.toFixed(2)})`, 'Register branch stock map', true);
+                              }
+                              if (selectedQuote) setSelectedQuote(null);
+                              setCartItems([...cartItems, { id: pId, name: newCatalogName.trim(), quantity: 1, unitPrice: priceVal }]);
                               setNewCatalogName('');
                               setNewCatalogPrice('');
                               setNewCatalogStock('100');
                               setShowAddCatalogProduct(false);
                               loadQuotations();
                               persistTablesToStorage();
-                              alert(`"${newCatalogName}" registered in system and added successfully into current quotation cart!`);
+                              try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+                              setFormNotice({ type: 'success', text: `✓ "${newCatalogName.trim()}" added to catalog and quotation basket.` });
                             } else {
-                              alert('Error registering product: ' + r.error);
+                              setFormNotice({ type: 'error', text: 'Error registering product: ' + (r.error || 'Unknown error') });
                             }
                           }}
                           className="py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-black uppercase rounded shadow-xs text-[10px] tracking-wider mt-1 cursor-pointer"
@@ -1148,20 +1855,48 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           <div className="text-[10px]">
                             <div className="flex items-center justify-between gap-2">
                               <strong className="text-slate-800 uppercase">{t.title}</strong>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.preventDefault();
-                                  e.stopPropagation();
-                                  if (confirm(`Delete the term rule "${t.title}" permanently?`)) {
-                                    setSavedTerms(savedTerms.filter(x => x.id !== t.id));
-                                    localStorage.setItem('pos_custom_terms', JSON.stringify(savedTerms.filter(x => x.id !== t.id)));
-                                  }
-                                }}
-                                className="text-rose-500 hover:text-rose-700 text-[8px] uppercase underline ml-auto"
-                              >
-                                Delete
-                              </button>
+                              {confirmDeleteTermId === t.id ? (
+                                <span className="inline-flex items-center gap-1 ml-auto">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      const next = savedTerms.filter(x => x.id !== t.id);
+                                      setSavedTerms(next);
+                                      setSelectedTermIds(selectedTermIds.filter(id => id !== t.id));
+                                      localStorage.setItem('pos_custom_terms', JSON.stringify(next));
+                                      setConfirmDeleteTermId(null);
+                                    }}
+                                    className="text-rose-700 font-black text-[8px] uppercase underline cursor-pointer"
+                                  >
+                                    Confirm
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      setConfirmDeleteTermId(null);
+                                    }}
+                                    className="text-slate-500 text-[8px] uppercase cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    setConfirmDeleteTermId(t.id);
+                                  }}
+                                  className="text-rose-500 hover:text-rose-700 text-[8px] uppercase underline ml-auto cursor-pointer"
+                                >
+                                  Delete
+                                </button>
+                              )}
                             </div>
                             <p className="text-slate-500 font-medium leading-relaxed mt-0.5">{t.text}</p>
                           </div>
@@ -1194,18 +1929,18 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                       <button
                         type="button"
                         onClick={() => {
-                          if (!newTermTitle || !newTermText) {
-                            alert('Please state Term Heading Title and rules text.');
+                          if (!newTermTitle.trim() || !newTermText.trim()) {
+                            setFormNotice({ type: 'error', text: 'Please enter both a Term Title and Terms rule text.' });
                             return;
                           }
                           const termId = 'term-' + Math.floor(1000 + Math.random() * 9000);
-                          const item = { id: termId, title: newTermTitle, text: newTermText };
+                          const item = { id: termId, title: newTermTitle.trim(), text: newTermText.trim() };
                           const list = [...savedTerms, item];
                           setSavedTerms(list);
                           localStorage.setItem('pos_custom_terms', JSON.stringify(list));
                           setNewTermTitle('');
                           setNewTermText('');
-                          alert('Added to your advance terms library list successfully!');
+                          setFormNotice({ type: 'success', text: '✓ Custom term added to library.' });
                         }}
                         className="py-1 px-3 bg-indigo-600 hover:bg-indigo-700 text-white text-[9px] font-black uppercase rounded self-end cursor-pointer"
                       >
@@ -1234,14 +1969,24 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                     {/* Items List Scroll Area */}
                     <div className="max-h-56 overflow-y-auto divide-y divide-slate-100 pr-1 flex flex-col">
                       {cartItems.map((item) => {
-                        const lineTotal = item.unitPrice * item.quantity;
+                        const lineTotal = Number(item.unitPrice || 0) * Number(item.quantity || 0);
                         return (
-                          <div key={item.id} className="py-2 flex items-center justify-between gap-2.5 text-xs">
+                          <div key={item.id} className="py-2 flex items-center justify-between gap-2 text-xs">
                             <div className="min-w-0 flex-1">
                               <span className="font-extrabold text-slate-800 block truncate">{item.name}</span>
-                              <span className="text-[10px] text-slate-400 font-semibold font-mono">
-                                {settings.currency}{item.unitPrice.toFixed(2)} each
-                              </span>
+                              <div className="flex items-center gap-1 mt-0.5">
+                                <span className="text-[9px] text-slate-400 font-bold">{settings.currency}</span>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min="0"
+                                  value={item.unitPrice}
+                                  onChange={(e) => handleUpdateCartPrice(item.id, e.target.value)}
+                                  className="w-16 px-1.5 py-0.5 text-[10px] text-slate-700 font-bold font-mono bg-slate-50 border border-slate-200 rounded"
+                                  title="Adjust unit price"
+                                />
+                                <span className="text-[9px] text-slate-400">each</span>
+                              </div>
                             </div>
 
                             <div className="flex items-center gap-1 bg-slate-50 border rounded-lg p-0.5 shadow-3xs shrink-0">
@@ -1270,7 +2015,7 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                               </button>
                             </div>
 
-                            <div className="flex items-center gap-2 shrink-0">
+                            <div className="flex items-center gap-1.5 shrink-0">
                               <span className="font-extrabold text-slate-800 font-mono text-right w-16">
                                 {settings.currency}{lineTotal.toFixed(2)}
                               </span>
@@ -1346,74 +2091,174 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                 <button
                   type="button"
                   onClick={() => handleSaveQuotation()}
-                  disabled={cartItems.length === 0}
                   className={`w-full py-2.5 rounded-xl text-xs font-black transition-all flex items-center justify-center gap-1.5 mt-1 cursor-pointer tracking-wider uppercase ${
-                    cartItems.length === 0 
-                      ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300' 
+                    cartItems.length === 0 || !cName.trim()
+                      ? 'bg-slate-200 hover:bg-slate-300 text-slate-700 border border-slate-300' 
                       : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm hover:shadow-md'
                   }`}
                 >
                   <CheckCircle size={13} />
-                  CREATE CHOSEN QUOTATION
+                  {draftDocType === 'INVOICE'
+                    ? 'SAVE TAX INVOICE'
+                    : draftDocType === 'DELIVERY_NOTE'
+                      ? 'SAVE DELIVERY NOTE'
+                      : 'CREATE CHOSEN QUOTATION'}
                 </button>
               </div>
 
             </div>
           </div>
 
-          {/* List of existing Quotations / Invoices */}
+          {/* Saved Archive of Quotations, Invoices & Delivery Notes */}
           <div className="flex flex-col gap-2">
-            <h4 className="text-xs font-extrabold text-slate-400 uppercase tracking-wider">Historical Corporate Documents</h4>
+            <div className="flex items-center justify-between gap-2">
+              <h4 className="text-xs font-extrabold text-slate-400 uppercase tracking-wider">Saved Document Records</h4>
+              <span className="text-[10px] font-bold text-slate-500 font-mono">{quotations.length} total</span>
+            </div>
+
+            {/* Archive Search */}
+            <div className="relative">
+              <input
+                type="text"
+                dir="ltr"
+                value={docSearch}
+                onChange={(e) => setDocSearch(e.target.value)}
+                placeholder="Search ID, customer, phone or date..."
+                className="w-full text-xs py-1.5 pl-8 pr-7 border border-slate-200 rounded-lg bg-white font-medium text-left select-text focus:outline-none focus:border-indigo-400"
+              />
+              <Search size={12} className="absolute left-2.5 top-2.5 text-slate-400" />
+              {docSearch && (
+                <button
+                  type="button"
+                  onClick={() => setDocSearch('')}
+                  className="absolute right-2 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  title="Clear search"
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
             
             {/* Filter Tabs */}
             <div className="flex bg-slate-100 p-1 rounded-lg gap-1 border">
-              {(['ALL', 'QUOTATION', 'INVOICE', 'DELIVERY_NOTE'] as const).map(f => (
-                <button
-                  key={f}
-                  type="button"
-                  onClick={() => setDocFilter(f)}
-                  className={`flex-1 text-[9px] font-extrabold uppercase py-1 rounded-md transition-all leading-tight ${
-                    docFilter === f 
-                      ? 'bg-white text-indigo-700 shadow-3xs' 
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  {f === 'DELIVERY_NOTE' ? 'DELIV' : f}
-                </button>
-              ))}
+              {(['ALL', 'QUOTATION', 'INVOICE', 'DELIVERY_NOTE'] as const).map(f => {
+                const count = f === 'ALL' ? quotations.length : quotations.filter(q => q.status === f).length;
+                return (
+                  <button
+                    key={f}
+                    type="button"
+                    onClick={() => setDocFilter(f)}
+                    className={`flex-1 text-[9px] font-extrabold uppercase py-1 rounded-md transition-all leading-tight cursor-pointer ${
+                      docFilter === f 
+                        ? 'bg-white text-indigo-700 shadow-3xs' 
+                        : 'text-slate-500 hover:text-slate-800'
+                    }`}
+                  >
+                    {f === 'DELIVERY_NOTE' ? 'DELIV' : f} ({count})
+                  </button>
+                );
+              })}
             </div>
 
-            <div className="divide-y divide-slate-100 border rounded-xl overflow-hidden bg-white">
+            <div className="divide-y divide-slate-100 border rounded-xl overflow-hidden bg-white max-h-96 overflow-y-auto">
               {(() => {
+                const qTerm = docSearch.trim().toLowerCase();
                 const filtered = quotations.filter(q => {
-                  if (docFilter === 'ALL') return true;
-                  return q.status === docFilter;
+                  if (docFilter !== 'ALL' && q.status !== docFilter) return false;
+                  if (!qTerm) return true;
+                  const dateTxt = toDateInputValue(q.created_at).toLowerCase();
+                  return (
+                    String(q.id || '').toLowerCase().includes(qTerm) ||
+                    String(q.customer_name || '').toLowerCase().includes(qTerm) ||
+                    String(q.customer_phone || '').toLowerCase().includes(qTerm) ||
+                    dateTxt.includes(qTerm)
+                  );
                 });
                 if (filtered.length === 0) {
-                  return <div className="p-6 text-center text-slate-400 text-xs">No {docFilter.toLowerCase().replace('_', ' ')}s recorded.</div>;
+                  return <div className="p-6 text-center text-slate-400 text-xs">No {docFilter.toLowerCase().replace('_', ' ')}s found.</div>;
                 }
                 return filtered.map(q => {
                   const isQuote = q.status === 'QUOTATION';
                   const isInv = q.status === 'INVOICE';
+                  const qExtra = getQuoteExtra(q.id, q.extra_json);
                   return (
                     <div
                       key={q.id}
-                      onClick={() => { setSelectedQuote(q); setEditItems(JSON.parse(q.items_json)); setIsEditingQuote(false); }}
+                      onClick={() => { setSelectedQuote(q); setEditItems(parseQuoteItems(q.items_json)); setIsEditingQuote(false); setFormNotice(null); }}
                       className={`p-3 hover:bg-slate-50 transition-all cursor-pointer relative flex flex-col gap-1.5 ${
                         selectedQuote?.id === q.id ? 'bg-indigo-50/50 border-l-4 border-l-indigo-600' : ''
                       }`}
                     >
-                      <div className="flex justify-between items-center">
-                        <span className="text-xs font-bold text-slate-800">{q.customer_name}</span>
-                        <span className={`text-[8px] font-extrabold uppercase px-1.5 py-0.5 rounded-md ${
+                      <div className="flex justify-between items-center gap-2">
+                        <span className="text-xs font-bold text-slate-800 truncate">{q.customer_name}</span>
+                        <span className={`text-[8px] font-extrabold uppercase px-1.5 py-0.5 rounded-md shrink-0 ${
                           isQuote ? 'bg-indigo-100 text-indigo-800' : isInv ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
                         }`}>
-                          {q.status}
+                          {q.status === 'DELIVERY_NOTE' ? 'DELIVERY NOTE' : q.status}
                         </span>
                       </div>
                       <div className="flex justify-between items-center text-[10px] text-slate-400 font-mono">
-                        <span>{q.id} • {new Date(q.created_at).toLocaleDateString()}</span>
-                        <strong className="text-slate-700 text-xs">{settings.currency}{q.total.toFixed(2)}</strong>
+                        <span>
+                          {q.id} • {new Date(q.created_at).toLocaleDateString()}
+                          {qExtra.sourceDocId ? ` • From ${qExtra.sourceDocId}` : ''}
+                        </span>
+                        <strong className="text-slate-700 text-xs">{settings.currency}{Number(q.total || 0).toFixed(2)}</strong>
+                      </div>
+                      <div className="flex items-center justify-between gap-2 pt-0.5">
+                        <span className="text-[9px] text-slate-400 font-semibold">
+                          {q.updated_at ? `Edited ${new Date(q.updated_at).toLocaleDateString()}` : 'Original record'}
+                          {qExtra.receiverSignature ? ' • ✓ Signed' : ''}
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedQuote(q);
+                              startEditingQuotation(q);
+                            }}
+                            className="px-2 py-0.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-[9px] font-extrabold uppercase cursor-pointer inline-flex items-center gap-1"
+                          >
+                            <Edit3 size={9} /> Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedQuote(q);
+                              setEditItems(parseQuoteItems(q.items_json));
+                              setIsEditingQuote(false);
+                              const parsedItems = parseQuoteItems(q.items_json);
+                              handleDownloadPDF({
+                                id: q.id,
+                                status: q.status,
+                                created_at: q.created_at,
+                                customer_name: q.customer_name,
+                                customer_phone: q.customer_phone,
+                                customer_email: q.customer_email,
+                                bank_name: q.bank_name,
+                                bank_account: q.bank_account,
+                                bank_branch: q.bank_branch,
+                                items: parsedItems,
+                                subtotal: Number(q.subtotal || 0),
+                                discount: Number(q.discount || 0),
+                                tax: Number(q.tax || 0),
+                                total: Number(q.total || 0),
+                                appliedTerms: qExtra.appliedTerms || [],
+                                bankAccountName: qExtra.bankAccountName || companyName,
+                                bankSortCode: qExtra.bankSortCode || '',
+                                issuedBy: qExtra.issuedBy || issuerName || localStorage.getItem('logged_in_user_name') || '',
+                                issuerSignature: qExtra.issuerSignature || '',
+                                receiverName: qExtra.receiverName || '',
+                                receiverSignature: qExtra.receiverSignature || '',
+                                acceptedAt: qExtra.acceptedAt || '',
+                              });
+                            }}
+                            className="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[9px] font-extrabold uppercase cursor-pointer inline-flex items-center gap-1"
+                          >
+                            <Printer size={9} /> Reprint
+                          </button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -1425,7 +2270,7 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
         </div>
 
         {/* RIGHTSIDE LIVE PREVIEW SHEET / PRINTER MOCK */}
-        <div className="flex-1 bg-slate-100 overflow-y-auto p-5 relative">
+        <div className="flex-1 min-h-0 bg-slate-100 lg:h-full lg:overflow-y-auto p-4 sm:p-5 relative">
           
           {activeDoc ? (
             <div className="flex flex-col gap-4 max-w-2xl mx-auto">
@@ -1466,144 +2311,157 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         <Plus size={11} />
                         CREATE NEW DRAFT
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isEditingQuote) {
+                            setIsEditingQuote(false);
+                          } else {
+                            startEditingQuotation(selectedQuote!);
+                          }
+                        }}
+                        className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-[11px] rounded-lg cursor-pointer tracking-wider flex items-center gap-1 transition-all"
+                      >
+                        <Edit3 size={11} />
+                        {isEditingQuote ? 'VIEW PREVIEW' : 'EDIT PRICE / QTY / DATE'}
+                      </button>
                       {activeDoc.status === 'QUOTATION' && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (isEditingQuote) {
-                                setIsEditingQuote(false);
-                              } else {
-                                startEditingQuotation(selectedQuote!);
-                              }
-                            }}
-                            className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-[11px] rounded-lg cursor-pointer tracking-wider flex items-center gap-1 transition-all"
-                          >
-                            <Edit3 size={11} />
-                            {isEditingQuote ? 'VIEW PREVIEW' : 'EDIT QUOTATION'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleConvertToInvoice(activeDoc.id)}
-                            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-[11px] rounded-lg shadow-3xs cursor-pointer tracking-wider transition-all"
-                          >
-                            CONVERT TO INVOICE
-                          </button>
-                        </>
+                        <button
+                          type="button"
+                          onClick={() => handleConvertToInvoice(activeDoc.id)}
+                          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-[11px] rounded-lg shadow-3xs cursor-pointer tracking-wider transition-all"
+                          title="Keeps Quotation record and issues a linked Tax Invoice"
+                        >
+                          ISSUE INVOICE COPY
+                        </button>
                       )}
                       {activeDoc.status === 'INVOICE' && (
                         <button
                           type="button"
                           onClick={() => handleConvertToDeliveryNote(activeDoc.id)}
                           className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-[11px] rounded-lg shadow-3xs cursor-pointer tracking-wider transition-all"
+                          title="Keeps Invoice record and issues a linked Delivery Note"
                         >
-                          CONVERT TO DELIVERY NOTE
+                          ISSUE DELIVERY NOTE
                         </button>
                       )}
                       {activeDoc.status === 'DELIVERY_NOTE' && (
                         <span className="text-[11px] text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg font-bold uppercase tracking-wider border border-emerald-100">
-                          ✓ Shipments Ready for Easing
+                          ✓ Delivery Note Active
                         </span>
                       )}
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteDocument(activeDoc.id)}
-                        className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-[11px] rounded-lg cursor-pointer tracking-wider flex items-center gap-1 transition-all"
-                        title="Delete permanently"
-                      >
-                        <Trash2 size={11} />
-                        DELETE
-                      </button>
+                      {confirmDeleteDocId === activeDoc.id ? (
+                        <div className="inline-flex items-center gap-1 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1">
+                          <span className="text-[10px] font-bold text-rose-700">Delete?</span>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteDocument(activeDoc.id)}
+                            className="px-2 py-0.5 bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-black rounded cursor-pointer uppercase"
+                          >
+                            Yes
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteDocId(null)}
+                            className="px-2 py-0.5 bg-white border border-slate-200 text-slate-600 text-[10px] font-bold rounded cursor-pointer uppercase"
+                          >
+                            No
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteDocId(activeDoc.id)}
+                          className="px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-[11px] rounded-lg cursor-pointer tracking-wider flex items-center gap-1 transition-all"
+                          title="Delete permanently"
+                        >
+                          <Trash2 size={11} />
+                          DELETE
+                        </button>
+                      )}
                     </>
                   )}
                 </div>
               </div>
 
-              {/* WhatsApp instant sharing layout */}
-              <div className="border border-green-200 bg-green-50/50 p-3.5 rounded-xl flex items-center justify-between flex-wrap gap-3 font-sans">
-                <div className="flex items-center gap-2">
-                  <span className="text-2xl font-sans">💬</span>
-                  <div className="font-sans text-left">
-                    <h4 className="text-xs font-extrabold text-green-900 uppercase">Instant WhatsApp sharing</h4>
-                    <p className="text-[10px] text-green-700 font-semibold leading-tight">
-                      Share quotation/invoice details and bank info direct to customer chat
-                    </p>
+              {/* WhatsApp instant PDF sharing layout */}
+              <div className="border border-green-200 bg-green-50/50 p-3.5 rounded-xl flex flex-col gap-2 font-sans">
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-2xl font-sans">💬</span>
+                    <div className="font-sans text-left">
+                      <h4 className="text-xs font-extrabold text-green-900 uppercase">Send PDF Receipt / Quotation via WhatsApp</h4>
+                      <p className="text-[10px] text-green-700 font-semibold leading-tight">
+                        Compile and deliver the PDF document directly to the customer's WhatsApp number
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 font-sans">
+                    <input
+                      type="tel"
+                      placeholder="e.g. +260977XXXXXX"
+                      value={whatsappSharePhone}
+                      onChange={(e) => { setWhatsappSharePhone(e.target.value); setWaError(null); }}
+                      className="px-2.5 py-1.5 text-xs border border-green-300 rounded-lg bg-white font-bold w-44 text-green-950 focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      disabled={waSending}
+                      onClick={handleWhatsAppSharePdf}
+                      className="px-3.5 py-1.5 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold font-sans cursor-pointer uppercase transition-all tracking-wider inline-flex items-center gap-1"
+                    >
+                      <Send size={11} />
+                      {waSending ? 'Preparing PDF...' : 'Send PDF'}
+                    </button>
                   </div>
                 </div>
-                <div className="flex items-center gap-1.5 font-sans">
-                  <input
-                    type="text"
-                    placeholder="Customer phone prefix"
-                    value={whatsappSharePhone}
-                    onChange={(e) => setWhatsappSharePhone(e.target.value)}
-                    className="px-2.5 py-1.5 text-xs border border-green-300 rounded-lg bg-white font-bold w-44 text-green-950 focus:outline-none"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (!whatsappSharePhone) {
-                        alert('Please fill in a valid phone number (including country prefix, e.g. +260977...) to share this via WhatsApp.');
-                        return;
-                      }
 
-                      // Generate and download the PDF document for the user first
-                      const pdfFileName = handleDownloadPDF(activeDoc);
-                      
-                      const cleanPhone = whatsappSharePhone.replace(/[^\d+]/g, '');
-                      const headerDecor = '━━━━━━━━━━━━━━━━━━━━━━━━━';
-                      let msg = `⚙️ *DOCUMENT DETAILS: ${activeDoc.status}* ⚙️\n`;
-                      msg += `*${companyName.toUpperCase()}*\n`;
-                      msg += `_TPIN: ${companyTPIN}_\n`;
-                      msg += `${companyAddress}\n`;
-                      msg += `${headerDecor}\n`;
-                      msg += `*Doc ID:* ${activeDoc.id}\n`;
-                      msg += `*Date:* ${new Date(activeDoc.created_at).toLocaleDateString()}\n`;
-                      msg += `*Client Name:* ${activeDoc.customer_name}\n`;
-                      msg += `${headerDecor}\n\n`;
+                {waError && (
+                  <p className="text-[10px] font-bold text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-2.5 py-1.5">
+                    {waError}
+                  </p>
+                )}
 
-                      msg += `✨ *LINE ITEMS:*\n`;
-                      activeDoc.items.forEach((item: any) => {
-                        msg += `• *${item.name}*\n`;
-                        msg += `  ${settings.currency}${item.unitPrice.toFixed(2)} x ${item.quantity} ➔ *${settings.currency}${(item.unitPrice * item.quantity).toFixed(2)}*\n`;
-                      });
-                      msg += `\n${headerDecor}\n`;
-                      msg += `*Subtotal:* ${settings.currency}${activeDoc.subtotal.toFixed(2)}\n`;
-                      if (activeDoc.discount > 0) {
-                        msg += `*Discount:* -${settings.currency}${activeDoc.discount.toFixed(2)}\n`;
-                      }
-                      msg += `*VAT (${settings.taxRate}%):* ${settings.currency}${activeDoc.tax.toFixed(2)}\n`;
-                      msg += `*GRAND TOTAL: ${settings.currency}${activeDoc.total.toFixed(2)}*\n`;
-                      msg += `${headerDecor}\n\n`;
-
-                      msg += `🏛️ *ZAMBIA BANK DETAILS FOR PAYMENT:*\n`;
-                      msg += `• *BANK NAME:* ${activeDoc.bank_name}\n`;
-                      msg += `• *ACCOUNT NAME:* ${activeDoc.bankAccountName}\n`;
-                      msg += `• *ACCOUNT NUMBER:* ${activeDoc.bank_account}\n`;
-                      msg += `• *BRANCH NAME:* ${activeDoc.bank_branch}\n`;
-                      msg += `• *SORT CODE:* ${activeDoc.bankSortCode}\n`;
-                      msg += `${headerDecor}\n\n`;
-
-                      if (activeDoc.appliedTerms && activeDoc.appliedTerms.length > 0) {
-                        msg += `📝 *TERMS & CONDITIONS:*\n`;
-                        activeDoc.appliedTerms.forEach((term: string, idx: number) => {
-                          msg += `${idx + 1}. ${term}\n`;
-                        });
-                        msg += `${headerDecor}\n\n`;
-                      }
-
-                      msg += `*Thank you for choice of partnership!*\n`;
-                      msg += `_This document has been synchronized via SME Core POS engine._`;
-
-                      const url = `https://api.whatsapp.com/send?phone=${cleanPhone}&text=${encodeURIComponent(msg)}`;
-                      
-                      alert(`📄 PDF Quotation downloaded successfully as "${pdfFileName || 'document.pdf'}".\n\nWe are now opening WhatsApp. You can simply drag-and-drop or attach the downloaded PDF file directly in the chat to send it to your customer!`);
-                      window.open(url, '_blank');
-                    }}
-                    className="px-3.5 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs font-bold font-sans cursor-pointer uppercase transition-all tracking-wider"
-                  >
-                    Share via WhatsApp
-                  </button>
-                </div>
+                {waResult && waResult.success && (
+                  <div className="bg-white border border-emerald-200 rounded-lg p-2.5 flex flex-col gap-1.5 text-[10px]">
+                    <span className="font-bold text-emerald-800">
+                      {waResult.mode === 'cloud_api'
+                        ? `✓ PDF (${waResult.filename}) sent directly to +${waResult.phone} on WhatsApp.`
+                        : `✓ PDF Document (${waResult.filename}) ready for +${waResult.phone}.`}
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {waResult.whatsappUrl && (
+                        <a
+                          href={waResult.whatsappUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-black uppercase inline-flex items-center gap-1"
+                        >
+                          <Send size={10} /> Open Customer WhatsApp
+                        </a>
+                      )}
+                      {waResult.canShareFile && lastCompiledQuotePdf && (
+                        <button
+                          type="button"
+                          onClick={() => sharePdfFileDirectly(lastCompiledQuotePdf.filename, lastCompiledQuotePdf.doc, lastCompiledQuotePdf.caption)}
+                          className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded font-black uppercase cursor-pointer inline-flex items-center gap-1"
+                        >
+                          <Share2 size={10} /> Share PDF File
+                        </button>
+                      )}
+                      {waResult.pdfUrl && (
+                        <a
+                          href={waResult.pdfUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded font-bold inline-flex items-center gap-1"
+                        >
+                          <Download size={10} /> View PDF
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {isEditingQuote && selectedQuote ? (
@@ -1612,61 +2470,73 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                     <div>
                       <h3 className="text-xs font-extrabold text-indigo-950 uppercase tracking-widest flex items-center gap-1.5">
                         <Edit3 size={14} className="text-indigo-600" />
-                        Edit Quotation: {selectedQuote.id}
+                        Edit {selectedQuote.status.replace('_', ' ')}: {selectedQuote.id}
                       </h3>
-                      <p className="text-[10px] text-slate-400 font-extrabold uppercase mt-0.5">Modifying client profile & items list</p>
+                      <p className="text-[10px] text-slate-400 font-extrabold uppercase mt-0.5">Adjust unit prices, quantities, date, client info &amp; reprint</p>
                     </div>
                     <button
                       type="button"
                       onClick={() => setIsEditingQuote(false)}
-                      className="px-3 py-1 text-slate-500 hover:text-slate-800 text-xs font-bold font-sans border rounded-md"
+                      className="px-3 py-1 text-slate-500 hover:text-slate-800 text-xs font-bold font-sans border rounded-md cursor-pointer"
                     >
                       Cancel
                     </button>
                   </div>
 
                   <form onSubmit={handleSaveQuotationEdits} className="flex flex-col gap-4 font-sans text-xs">
-                    {/* Client details */}
+                    {/* Client & Date details */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="flex flex-col gap-1 col-span-2">
+                      <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-slate-400 font-bold uppercase">Customer Corporate Name</label>
                         <input
                           type="text"
+                          dir="ltr"
                           required
                           value={editCName}
                           onChange={(e) => setEditCName(e.target.value)}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold"
+                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold text-left select-text focus:outline-none"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-indigo-600 font-bold uppercase">Document Date</label>
+                        <input
+                          type="date"
+                          required
+                          value={editDocDate}
+                          onChange={(e) => setEditDocDate(e.target.value)}
+                          className="px-3 py-2 bg-indigo-50/40 border border-indigo-200 rounded-lg text-slate-800 font-bold"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-slate-400 font-bold uppercase">Phone Number</label>
                         <input
                           type="text"
+                          dir="ltr"
                           value={editCPhone}
                           onChange={(e) => setEditCPhone(e.target.value)}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold"
+                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-slate-400 font-bold uppercase">Email Address</label>
                         <input
                           type="email"
+                          dir="ltr"
                           value={editCEmail}
                           onChange={(e) => setEditCEmail(e.target.value)}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold"
+                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
                         />
                       </div>
                     </div>
 
                     {/* Bank Details in Editing Form */}
                     <div className="bg-indigo-50/20 p-3 rounded-xl border border-indigo-100 flex flex-col gap-2">
-                      <span className="text-[10px] text-indigo-900 font-extrabold uppercase">Update Payment Bank Options</span>
+                      <span className="text-[10px] text-indigo-900 font-extrabold uppercase">Update Payment Bank Options (Optional)</span>
                       <div className="flex flex-col gap-1.5 text-xs text-slate-700">
                         <div className="flex flex-col">
                           <label className="text-[9px] text-slate-400 font-bold">BANK NAME</label>
                           <input
                             type="text"
-                            required
                             value={editBankName}
                             onChange={(e) => setEditBankName(e.target.value)}
                             className="bg-white border rounded p-1 px-2 font-bold"
@@ -1676,7 +2546,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           <label className="text-[9px] text-slate-400 font-bold">ACCOUNT NAME</label>
                           <input
                             type="text"
-                            required
                             value={editBankAccountName}
                             onChange={(e) => setEditBankAccountName(e.target.value)}
                             className="bg-white border rounded p-1 px-2 font-bold"
@@ -1686,7 +2555,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           <label className="text-[9px] text-slate-400 font-bold">ACCOUNT NUMBER</label>
                           <input
                             type="text"
-                            required
                             value={editBankAccountNumber}
                             onChange={(e) => setEditBankAccountNumber(e.target.value)}
                             className="bg-white border rounded p-1 px-2 font-bold font-mono"
@@ -1697,7 +2565,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                             <label className="text-[9px] text-slate-400 font-bold">BRANCH NAME</label>
                             <input
                               type="text"
-                              required
                               value={editBankBranchName}
                               onChange={(e) => setEditBankBranchName(e.target.value)}
                               className="bg-white border rounded p-1 px-2 font-semibold"
@@ -1707,7 +2574,6 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                             <label className="text-[9px] text-slate-400 font-bold">SORT CODE</label>
                             <input
                               type="text"
-                              required
                               value={editBankSortCode}
                               onChange={(e) => setEditBankSortCode(e.target.value)}
                               className="bg-white border rounded p-1 px-2 font-semibold font-mono"
@@ -1715,6 +2581,28 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           </div>
                         </div>
                       </div>
+                    </div>
+
+                    {/* Issuer Details & Digital Signature in Editing Form */}
+                    <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 flex flex-col gap-2">
+                      <span className="text-[10px] text-indigo-900 font-extrabold uppercase">Issued By &amp; Digital Signature</span>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[9px] text-slate-400 font-bold uppercase">Issued By (Full Name)</label>
+                        <input
+                          type="text"
+                          dir="ltr"
+                          value={editIssuedBy}
+                          onChange={(e) => setEditIssuedBy(e.target.value)}
+                          placeholder="Name of issuer"
+                          className="bg-white border rounded p-1.5 px-2 font-semibold text-xs text-left select-text focus:outline-none"
+                        />
+                      </div>
+                      <SignaturePad
+                        value={editIssuerSignature}
+                        onChange={setEditIssuerSignature}
+                        label="Issuer Signature"
+                        height={95}
+                      />
                     </div>
 
                     {/* Terms & Conditions selection in Editing Form */}
@@ -1729,9 +2617,9 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                               onChange={(e) => {
                                if (e.target.checked) {
                                   setEditSelectedTermTexts([...editSelectedTermTexts, t.text]);
-                               } else {
+                                } else {
                                   setEditSelectedTermTexts(editSelectedTermTexts.filter(x => x !== t.text));
-                               }
+                                }
                               }}
                               className="mt-0.5 shrink-0"
                             />
@@ -1744,55 +2632,105 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                       </div>
                     </div>
 
-                    {/* Quick Catalog Shelf */}
-                    <div className="border border-indigo-100 rounded-xl p-3 bg-indigo-50/20">
-                      <span className="font-extrabold text-indigo-900 text-[10px] uppercase block mb-1.5">Add products to this quotation</span>
+                    {/* Quick Catalog Shelf + Custom Item Adder */}
+                    <div className="border border-indigo-100 rounded-xl p-3 bg-indigo-50/20 flex flex-col gap-2.5">
+                      <span className="font-extrabold text-indigo-900 text-[10px] uppercase block">Add stock or custom line item</span>
                       <div className="flex items-center gap-1.5 overflow-x-auto py-1 max-w-full">
                         {allProducts.map(p => (
                           <button
                             type="button"
                             key={p.id}
                             onClick={() => addProductToEditItems(p)}
-                            className="px-2.5 py-1 text-[10px] font-bold bg-white hover:bg-slate-50 border border-slate-200 rounded-md whitespace-nowrap"
+                            className="px-2.5 py-1 text-[10px] font-bold bg-white hover:bg-slate-50 border border-slate-200 rounded-md whitespace-nowrap cursor-pointer"
                           >
-                            + {p.name} • {settings.currency}{p.price.toFixed(2)}
+                            + {p.name} • {settings.currency}{Number(p.price || 0).toFixed(2)}
                           </button>
                         ))}
                       </div>
+                      <div className="grid grid-cols-12 gap-1.5 items-center pt-1 border-t border-indigo-100/70">
+                        <input
+                          type="text"
+                          placeholder="Custom item / service..."
+                          value={customItemName}
+                          onChange={(e) => setCustomItemName(e.target.value)}
+                          className="col-span-5 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded font-semibold"
+                        />
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          placeholder="Price"
+                          value={customItemPrice}
+                          onChange={(e) => setCustomItemPrice(e.target.value)}
+                          className="col-span-3 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded font-mono font-bold"
+                        />
+                        <input
+                          type="number"
+                          min="1"
+                          placeholder="Qty"
+                          value={customItemQty}
+                          onChange={(e) => setCustomItemQty(e.target.value)}
+                          className="col-span-2 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded font-mono font-bold text-center"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleAddCustomEditItem}
+                          className="col-span-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-extrabold uppercase cursor-pointer"
+                        >
+                          + Add
+                        </button>
+                      </div>
                     </div>
 
-                    {/* Draft line items table */}
+                    {/* Editable line items table (Price & Quantity) */}
                     <div className="divide-y divide-slate-100 bg-slate-50 border rounded-xl overflow-hidden px-3 py-1">
-                      <div className="flex justify-between items-center font-bold text-slate-400 py-2 border-b text-[9px] uppercase">
-                        <span>Selected items</span>
-                        <div className="flex gap-14 mr-4">
-                          <span>QTY</span>
-                          <span>PRICE</span>
-                        </div>
+                      <div className="grid grid-cols-12 items-center font-bold text-slate-400 py-2 border-b text-[9px] uppercase gap-2">
+                        <span className="col-span-5">Item Description</span>
+                        <span className="col-span-3 text-center">Unit Price ({settings.currency})</span>
+                        <span className="col-span-2 text-center">Qty</span>
+                        <span className="col-span-2 text-right">Total</span>
                       </div>
                       {editItems.map((item, idx) => (
-                        <div key={idx} className="py-2 flex justify-between items-center">
-                          <span className="font-bold text-slate-700">{item.name}</span>
-                          <div className="flex items-center gap-3">
+                        <div key={idx} className="py-2 grid grid-cols-12 items-center gap-2">
+                          <span className="col-span-5 font-bold text-slate-700 truncate">{item.name}</span>
+                          <div className="col-span-3 flex justify-center">
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              value={item.unitPrice}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                const updated = [...editItems];
+                                updated[idx] = { ...updated[idx], unitPrice: isNaN(val) ? 0 : Math.max(0, val) };
+                                setEditItems(updated);
+                              }}
+                              className="w-20 text-center bg-white border border-slate-200 text-xs rounded-md font-bold font-mono py-0.5"
+                            />
+                          </div>
+                          <div className="col-span-2 flex justify-center">
                             <input
                               type="number"
                               min="1"
                               value={item.quantity}
                               onChange={(e) => {
-                                const val = parseInt(e.target.value) || 1;
+                                const val = Math.max(1, parseInt(e.target.value, 10) || 1);
                                 const updated = [...editItems];
-                                updated[idx].quantity = val;
+                                updated[idx] = { ...updated[idx], quantity: val };
                                 setEditItems(updated);
                               }}
-                              className="w-12 text-center bg-white border border-slate-200 text-xs rounded-md font-bold py-0.5"
+                              className="w-14 text-center bg-white border border-slate-200 text-xs rounded-md font-bold font-mono py-0.5"
                             />
-                            <span className="text-slate-550 font-mono w-14 text-right">
-                              {settings.currency}{(item.unitPrice * item.quantity).toFixed(2)}
+                          </div>
+                          <div className="col-span-2 flex items-center justify-end gap-1">
+                            <span className="text-slate-600 font-mono text-[11px] font-bold">
+                              {(Number(item.unitPrice || 0) * Number(item.quantity || 0)).toFixed(2)}
                             </span>
                             <button
                               type="button"
                               onClick={() => removeItemFromEditItems(idx)}
-                              className="text-rose-500 hover:text-rose-700 font-extrabold px-1"
+                              className="text-rose-500 hover:text-rose-700 font-extrabold px-0.5 cursor-pointer"
+                              title="Remove item"
                             >
                               ✕
                             </button>
@@ -1800,70 +2738,193 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                         </div>
                       ))}
                       {editItems.length === 0 && (
-                        <div className="p-4 text-center text-slate-400 font-semibold">No items in this quotation. Add some above.</div>
+                        <div className="p-4 text-center text-slate-400 font-semibold">No items in this document. Add some above.</div>
                       )}
                     </div>
 
-                    {/* Discount option */}
-                    <div className="flex flex-col gap-1 max-w-xs">
-                      <label className="text-[10px] text-slate-400 font-bold uppercase">Discount ({settings.currency})</label>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={editDiscountVal}
-                        onChange={(e) => setEditDiscountVal(e.target.value)}
-                        className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold"
-                      />
+                    {/* Discount & Live Totals Summary */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center bg-slate-50 border border-slate-200 rounded-xl p-3">
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-slate-400 font-bold uppercase">Discount ({settings.currency})</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          value={editDiscountVal}
+                          onChange={(e) => setEditDiscountVal(e.target.value)}
+                          className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-800 font-semibold font-mono"
+                        />
+                      </div>
+                      {(() => {
+                        const sub = editItems.reduce((s, it) => s + Number(it.unitPrice || 0) * Number(it.quantity || 0), 0);
+                        const disc = Math.max(0, parseFloat(editDiscountVal) || 0);
+                        const tax = Math.max(0, (sub - disc) * (Number(settings.taxRate || 0) / 100));
+                        const tot = Math.max(0, sub - disc + tax);
+                        return (
+                          <div className="text-right space-y-0.5 font-mono text-[11px]">
+                            <div className="text-slate-500">Subtotal: <strong className="text-slate-800">{settings.currency}{sub.toFixed(2)}</strong></div>
+                            <div className="text-slate-500">VAT ({settings.taxRate}%): <strong className="text-slate-800">{settings.currency}{tax.toFixed(2)}</strong></div>
+                            <div className="text-indigo-900 font-black text-xs">Updated Total: {settings.currency}{tot.toFixed(2)}</div>
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     {/* Action controls */}
                     <button
                       type="submit"
-                      className="py-2.5 px-4 mt-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg text-xs tracking-wider cursor-pointer transition-all text-center uppercase"
+                      className="py-2.5 px-4 mt-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg text-xs tracking-wider cursor-pointer transition-all text-center uppercase"
                     >
-                      SAVE UPDATED QUOTATION
+                      SAVE CHANGES &amp; UPDATE {selectedQuote.status.replace('_', ' ')}
                     </button>
                   </form>
                 </div>
               ) : (
                 <>
-                  {/* DELIVERY NOTE PRODUCT QUANTITY EASING DRAG PANEL */}
+                  {/* DELIVERY NOTE QUICK QUANTITY, PRICE & DATE EASING PANEL */}
                   {!activeDoc.isDraft && activeDoc.status === 'DELIVERY_NOTE' && (
                     <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col gap-3 font-sans text-left">
-                      <div className="flex justify-between items-center border-b border-amber-150 pb-2">
+                      <div className="flex flex-wrap justify-between items-center gap-2 border-b border-amber-150 pb-2">
                         <h4 className="text-xs font-extrabold text-amber-900 uppercase tracking-wider flex items-center gap-1.5">
                           <Edit3 size={14} />
-                          Delivery Note Shipments Easing Panel
+                          Delivery Note Quick Adjustments (Qty, Price &amp; Date)
                         </h4>
-                        <button
-                          type="button"
-                          onClick={handleSaveDeliveryEasing}
-                          className="px-3 py-1 bg-amber-600 active:bg-amber-700 text-white text-[11px] font-bold rounded-md shadow-xs cursor-pointer"
-                        >
-                          Save Easing Changes
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="date"
+                            value={deliveryDateInput}
+                            onChange={(e) => setDeliveryDateInput(e.target.value)}
+                            className="px-2 py-1 text-[11px] font-bold bg-white border border-amber-300 rounded-md text-amber-950"
+                            title="Delivery Note Date"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleSaveDeliveryEasing}
+                            className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-bold rounded-md shadow-xs cursor-pointer"
+                          >
+                            Save Changes
+                          </button>
+                        </div>
                       </div>
 
                       <p className="text-[11px] text-amber-700 font-semibold leading-relaxed">
-                        Corporate clients frequently request custom quantity easing at delivery due to transit limits. Adjust the delivered counts below. Saving will automatically update the Delivery Note totals.
+                        Adjust delivered quantities, unit prices, or delivery date below before reprinting or collecting receiver signature.
                       </p>
 
-                      <div className="divide-y divide-amber-100 max-h-40 overflow-y-auto font-sans">
+                      <div className="divide-y divide-amber-100 max-h-44 overflow-y-auto font-sans">
                         {editItems.map((item, index) => (
-                          <div key={index} className="py-2 flex justify-between items-center text-xs font-semibold">
-                            <span className="font-bold text-amber-900">{item.name}</span>
+                          <div key={index} className="py-2 flex flex-wrap justify-between items-center gap-2 text-xs font-semibold">
+                            <span className="font-bold text-amber-900 flex-1 min-w-[120px] truncate">{item.name}</span>
                             <div className="flex items-center gap-2">
-                              <span className="text-[10px] text-amber-600">Delivering Count:</span>
+                              <span className="text-[10px] text-amber-700">Price:</span>
                               <input
                                 type="number"
+                                step="0.01"
+                                min="0"
+                                value={item.unitPrice}
+                                onChange={(e) => handleUpdateDeliveryPrice(index, e.target.value)}
+                                className="w-20 text-center text-xs font-bold font-mono bg-white border border-amber-250 text-amber-900 rounded-md py-0.5"
+                              />
+                              <span className="text-[10px] text-amber-700">Qty:</span>
+                              <input
+                                type="number"
+                                min="0"
                                 value={item.quantity}
                                 onChange={(e) => handleUpdateDeliveryQty(index, e.target.value)}
-                                className="w-16 text-center text-xs font-bold bg-white border border-amber-250 text-amber-805 rounded-md py-0.5"
+                                className="w-16 text-center text-xs font-bold font-mono bg-white border border-amber-250 text-amber-900 rounded-md py-0.5"
                               />
                             </div>
                           </div>
                         ))}
                       </div>
+                    </div>
+                  )}
+
+                  {/* DELIVERY NOTE RECEIVER ACCEPTANCE & DIGITAL SIGNATURE PANEL */}
+                  {!activeDoc.isDraft && activeDoc.status === 'DELIVERY_NOTE' && (
+                    <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-col gap-3 font-sans text-left">
+                      <div className="flex flex-wrap justify-between items-center gap-2 border-b border-emerald-200/70 pb-2">
+                        <h4 className="text-xs font-extrabold text-emerald-950 uppercase tracking-wider flex items-center gap-1.5">
+                          <UserCheck size={14} className="text-emerald-700" />
+                          Delivery Acceptance &amp; Receiver Signature
+                        </h4>
+                        {activeDoc.receiverSignature && !isEditingReceiverSig && (
+                          <button
+                            type="button"
+                            onClick={() => setIsEditingReceiverSig(true)}
+                            className="px-2.5 py-1 bg-white hover:bg-emerald-100 text-emerald-800 border border-emerald-300 text-[10px] font-extrabold rounded-md cursor-pointer uppercase"
+                          >
+                            Update / Re-sign
+                          </button>
+                        )}
+                      </div>
+
+                      {activeDoc.receiverSignature && !isEditingReceiverSig ? (
+                        <div className="flex flex-wrap items-center justify-between gap-3 bg-white border border-emerald-200 rounded-lg p-3">
+                          <div>
+                            <p className="text-xs font-extrabold text-emerald-800">
+                              ✓ Accepted &amp; Signed by {activeDoc.receiverName}
+                            </p>
+                            {activeDoc.acceptedAt && (
+                              <p className="text-[10px] text-slate-500 font-semibold mt-0.5">
+                                Accepted on {new Date(activeDoc.acceptedAt).toLocaleString()}
+                              </p>
+                            )}
+                          </div>
+                          <img
+                            src={activeDoc.receiverSignature}
+                            alt="Receiver Signature"
+                            className="h-12 max-w-[160px] object-contain border border-slate-200 rounded bg-slate-50 px-2 py-1"
+                          />
+                        </div>
+                      ) : (
+                        <div className="flex flex-col gap-2.5">
+                          <p className="text-[11px] text-emerald-800 font-semibold leading-snug">
+                            When handing over the goods, have the receiver enter their full name and sign below to confirm acceptance.
+                          </p>
+                          <div className="flex flex-col gap-1">
+                            <label className="text-[9px] text-emerald-900 font-extrabold uppercase">Receiver Full Name *</label>
+                            <input
+                              type="text"
+                              dir="ltr"
+                              value={deliveryReceiverName}
+                              onChange={(e) => setDeliveryReceiverName(e.target.value)}
+                              placeholder="Full name of person receiving goods"
+                              className="px-3 py-1.5 text-xs bg-white border border-emerald-300 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                            />
+                          </div>
+                          <SignaturePad
+                            value={deliveryReceiverSig}
+                            onChange={setDeliveryReceiverSig}
+                            label="Receiver Digital Signature"
+                            height={110}
+                            placeholder="Receiver signs here with finger, stylus, or mouse"
+                          />
+                          <div className="flex items-center gap-2 justify-end">
+                            {activeDoc.receiverSignature && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDeliveryReceiverName(activeDoc.receiverName || '');
+                                  setDeliveryReceiverSig(activeDoc.receiverSignature || '');
+                                  setIsEditingReceiverSig(false);
+                                }}
+                                className="px-3 py-1.5 bg-white border border-slate-300 text-slate-600 text-[10px] font-bold rounded-lg cursor-pointer uppercase"
+                              >
+                                Cancel
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={handleSaveDeliveryAcceptance}
+                              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-black rounded-lg shadow-xs cursor-pointer uppercase tracking-wider flex items-center gap-1.5"
+                            >
+                              <CheckCircle size={12} />
+                              Confirm Acceptance &amp; Save Signature
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -1879,23 +2940,37 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                     {/* Visual Header Grid layout */}
                     <div className="flex justify-between items-start flex-wrap gap-4 border-b border-indigo-100 pb-5">
                       <div className="font-sans">
-                        {/* Mock Logo */}
-                        <div className="flex items-center gap-2">
-                          <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center text-white text-md font-serif font-extrabold shadow-sm">
-                            {logoText}
-                          </div>
+                        {/* Uploaded Company Logo or Monogram Fallback */}
+                        <div className="flex items-center gap-3">
+                          {settings.logoUrl ? (
+                            <img
+                              src={settings.logoUrl}
+                              alt={companyName || 'Company Logo'}
+                              className="w-14 h-14 object-contain rounded-lg border border-slate-200 bg-white p-1 shadow-xs shrink-0"
+                              referrerPolicy="no-referrer"
+                            />
+                          ) : (
+                            <div className="w-11 h-11 bg-indigo-600 rounded-lg flex items-center justify-center text-white text-md font-serif font-extrabold shadow-sm shrink-0">
+                              {logoText}
+                            </div>
+                          )}
                           <div>
                             <h2 className="text-md font-extrabold tracking-tight text-indigo-900 uppercase font-sans leading-none">{companyName}</h2>
                             <p className="text-[10px] text-slate-400 font-bold uppercase mt-1">TPIN: {companyTPIN}</p>
                           </div>
                         </div>
-                        <p className="text-[11px] text-slate-500 mt-3 font-semibold font-sans max-w-[280px] leading-relaxed">{companyAddress}</p>
+                        {companyAddress && (
+                          <p className="text-[11px] text-slate-500 mt-3 font-semibold font-sans max-w-[280px] leading-relaxed">{companyAddress}</p>
+                        )}
                       </div>
 
                       <div className="text-right font-sans min-w-[150px]">
                         <h1 className="text-lg font-extrabold tracking-normal text-indigo-950 font-serif uppercase leading-tight">{activeDoc.status}</h1>
                         <p className="text-xs font-mono mt-1 font-bold text-slate-705">Doc ID: {activeDoc.id}</p>
                         <p className="text-[11px] text-slate-500 font-semibold mt-1">Date: {new Date(activeDoc.created_at).toLocaleString()}</p>
+                        {activeDoc.issuedBy && (
+                          <p className="text-[11px] text-indigo-700 font-bold mt-1">Issued By: {activeDoc.issuedBy}</p>
+                        )}
                       </div>
                     </div>
 
@@ -1909,13 +2984,15 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                       </div>
 
                       <div>
-                        <h4 className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest">Zambia Bank Details</h4>
+                        <h4 className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest">Bank Payment Details</h4>
                         <div className="text-[11px] text-slate-550 mt-1.5 space-y-1 leading-tight">
-                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BANK NAME:</span> <strong className="text-slate-800">{activeDoc.bank_name}</strong></p>
-                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NAME:</span> <strong className="text-slate-800">{activeDoc.bankAccountName || companyName}</strong></p>
-                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NUMBER:</span> <strong className="text-indigo-950 font-bold font-mono">{activeDoc.bank_account}</strong></p>
-                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BRANCH NAME:</span> <strong className="text-slate-800">{activeDoc.bank_branch}</strong></p>
-                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">SORT CODE:</span> <strong className="text-slate-800 font-bold font-mono">{activeDoc.bankSortCode || '01-02-03'}</strong></p>
+                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BANK NAME:</span> <strong className="text-slate-800">{activeDoc.bank_name || 'On Request'}</strong></p>
+                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NAME:</span> <strong className="text-slate-800">{activeDoc.bankAccountName || companyName || 'On Request'}</strong></p>
+                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NUMBER:</span> <strong className="text-indigo-950 font-bold font-mono">{activeDoc.bank_account || 'On Request'}</strong></p>
+                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BRANCH NAME:</span> <strong className="text-slate-800">{activeDoc.bank_branch || 'On Request'}</strong></p>
+                          {activeDoc.bankSortCode && (
+                            <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">SORT CODE:</span> <strong className="text-slate-800 font-bold font-mono">{activeDoc.bankSortCode}</strong></p>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -1935,10 +3012,10 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                           {activeDoc.items.map((item: any, idx: number) => (
                             <tr key={idx} className="hover:bg-slate-50/50">
                               <td className="py-2.5 font-bold text-slate-800">{item.name}</td>
-                              <td className="py-2.5 text-center font-mono">{settings.currency}{item.unitPrice.toFixed(2)}</td>
+                              <td className="py-2.5 text-center font-mono">{settings.currency}{Number(item.unitPrice || 0).toFixed(2)}</td>
                               <td className="py-2.5 text-center font-mono">{item.quantity}</td>
                               <td className="py-2.5 text-right font-mono font-bold text-slate-950">
-                                {settings.currency}{(item.unitPrice * item.quantity).toFixed(2)}
+                                {settings.currency}{(Number(item.unitPrice || 0) * Number(item.quantity || 0)).toFixed(2)}
                               </td>
                             </tr>
                           ))}
@@ -1951,22 +3028,22 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                       <div className="w-[260px] flex flex-col gap-2 text-xs">
                         <div className="flex justify-between text-slate-500 font-bold">
                           <span>Subtotal:</span>
-                          <span className="font-bold font-mono text-slate-800">{settings.currency}{activeDoc.subtotal.toFixed(2)}</span>
+                          <span className="font-bold font-mono text-slate-800">{settings.currency}{Number(activeDoc.subtotal || 0).toFixed(2)}</span>
                         </div>
-                        {activeDoc.discount > 0 && (
+                        {Number(activeDoc.discount || 0) > 0 && (
                           <div className="flex justify-between text-rose-600 font-bold">
                             <span>Discount:</span>
-                            <span className="font-mono">-{settings.currency}{activeDoc.discount.toFixed(2)}</span>
+                            <span className="font-mono">-{settings.currency}{Number(activeDoc.discount || 0).toFixed(2)}</span>
                           </div>
                         )}
                         <div className="flex justify-between text-slate-500 font-bold">
                           <span>Tax (VAT {settings.taxRate}%):</span>
-                          <span className="font-mono text-slate-800">{settings.currency}{activeDoc.tax.toFixed(2)}</span>
+                          <span className="font-mono text-slate-800">{settings.currency}{Number(activeDoc.tax || 0).toFixed(2)}</span>
                         </div>
                         <div className="flex justify-between text-slate-900 border-t border-slate-200 pt-2 font-black text-sm">
                           <span className="text-indigo-900 uppercase text-[11px] tracking-wider">Grand Total:</span>
                           <span className="font-mono text-indigo-950 bg-indigo-50/50 px-2 py-0.5 rounded border border-indigo-100">
-                            {settings.currency}{activeDoc.total.toFixed(2)}
+                            {settings.currency}{Number(activeDoc.total || 0).toFixed(2)}
                           </span>
                         </div>
                       </div>
@@ -1984,8 +3061,65 @@ export default function QuotationsCreator({ settings }: QuotationsCreatorProps) 
                       </div>
                     )}
 
+                    {/* Authorization & Delivery Acceptance Signatures Section */}
+                    <div className="border-t border-slate-200 pt-4 mt-2 grid grid-cols-1 sm:grid-cols-2 gap-6 font-sans">
+                      {/* Issued By Signature */}
+                      <div className="flex flex-col gap-1.5">
+                        <span className="text-[9px] font-extrabold uppercase tracking-widest text-indigo-700">
+                          Authorized Signature (Issued By)
+                        </span>
+                        <div className="h-14 border-b border-slate-300 flex items-end pb-1">
+                          {activeDoc.issuerSignature ? (
+                            <img
+                              src={activeDoc.issuerSignature}
+                              alt="Issuer Digital Signature"
+                              className="max-h-12 max-w-[180px] object-contain"
+                            />
+                          ) : (
+                            <span className="text-[10px] italic text-slate-400">No digital signature attached</span>
+                          )}
+                        </div>
+                        <p className="text-xs font-extrabold text-slate-800">
+                          Issued By: {activeDoc.issuedBy || 'Authorized Staff'}
+                        </p>
+                        <p className="text-[10px] text-slate-500">
+                          Date: {new Date(activeDoc.created_at).toLocaleDateString()}
+                        </p>
+                      </div>
+
+                      {/* Receiver Acceptance Signature (Delivery Note or Signed Doc) */}
+                      {(activeDoc.status === 'DELIVERY_NOTE' || activeDoc.receiverSignature || activeDoc.receiverName) && (
+                        <div className="flex flex-col gap-1.5">
+                          <span className="text-[9px] font-extrabold uppercase tracking-widest text-emerald-700">
+                            Receiver Acceptance Signature
+                          </span>
+                          <div className="h-14 border-b border-slate-300 flex items-end pb-1">
+                            {activeDoc.receiverSignature ? (
+                              <img
+                                src={activeDoc.receiverSignature}
+                                alt="Receiver Acceptance Signature"
+                                className="max-h-12 max-w-[180px] object-contain"
+                              />
+                            ) : (
+                              <span className="text-[10px] italic text-amber-600 font-semibold">
+                                Pending receiver signature upon delivery
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs font-extrabold text-slate-800">
+                            Received By: {activeDoc.receiverName || '______________________'}
+                          </p>
+                          <p className="text-[10px] text-slate-500">
+                            {activeDoc.acceptedAt
+                              ? `Accepted: ${new Date(activeDoc.acceptedAt).toLocaleString()}`
+                              : 'Awaiting delivery acceptance'}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
                     {/* Company Footer note definitions */}
-                    <div className="border-t border-slate-100 pt-4 mt-4 font-sans text-center text-[10px] text-slate-400 font-semibold leading-normal">
+                    <div className="border-t border-slate-100 pt-4 mt-2 font-sans text-center text-[10px] text-slate-400 font-semibold leading-normal">
                       <span>Powering small and medium enterprises across Copperbelt & Upper Zambia. Thank you for your trusted business!</span>
                     </div>
 

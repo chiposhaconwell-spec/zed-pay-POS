@@ -35,7 +35,7 @@ import {
   Info,
   Receipt
 } from 'lucide-react';
-import { runSql, persistTablesToStorage, logEmployeeAudit } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods } from '../db';
 import { StoreSettings, Loan, LoanAmortizationSchedule, AutomatedDeductionLog } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
@@ -84,7 +84,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   const [expenseDescription, setExpenseDescription] = useState('');
   const [expenseRef, setExpenseRef] = useState('');
   const [expenseDate, setExpenseDate] = useState(new Date().toISOString().split('T')[0]);
-  const [expenseStoreId, setExpenseStoreId] = useState(activeStore || 'lusaka');
+  const [expenseStoreId, setExpenseStoreId] = useState(activeStore || '');
   const [expenseSearchQuery, setExpenseSearchQuery] = useState('');
   const [expenseFilterCategory, setExpenseFilterCategory] = useState('ALL');
 
@@ -98,7 +98,29 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   // Goods in Transit / Procurement Form states
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
   const [transitSupplierName, setTransitSupplierName] = useState('');
-  const [transitStoreId, setTransitStoreId] = useState(activeStore || 'lusaka');
+  const [transitStoreId, setTransitStoreId] = useState(activeStore || '');
+  const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
+
+  useEffect(() => {
+    const centralBranches = getCentralBranches();
+    if (centralBranches.length > 0) {
+      const mapped = centralBranches.map((s) => ({
+        id: String(s.id),
+        name: String(s.name || s.id),
+      }));
+      setStoresList(mapped);
+      if (!activeStore && mapped[0]?.id) {
+        setExpenseStoreId(mapped[0].id);
+        setTransitStoreId(mapped[0].id);
+      }
+    } else {
+      setStoresList([]);
+    }
+    if (activeStore) {
+      setExpenseStoreId(activeStore);
+      setTransitStoreId(activeStore);
+    }
+  }, [activeStore]);
   const [transitPaymentAcc, setTransitPaymentAcc] = useState('acc_bank');
   const [transitPaymentMethod, setTransitPaymentMethod] = useState('BANK_TRANSFER');
   const [transitNotes, setTransitNotes] = useState('');
@@ -307,21 +329,33 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
     };
   };
 
-  // Load custom assets and equity on mount or activeStore changes
+  // Load custom assets and equity on mount or activeStore changes (zero pre-seeded amounts)
   useEffect(() => {
     const savedAssets = localStorage.getItem(`pos_custom_assets_${activeStore}`);
     const savedEquity = localStorage.getItem(`pos_custom_equity_${activeStore}`);
 
+    const legacyAssetSignatures = new Map<string, string>([
+      ['asset-1', 'Shop Fixtures & Shelving'],
+      ['asset-2', 'Commercial Espresso Machine & Brewer'],
+      ['asset-3', 'Stock Security Cash Float']
+    ]);
+    const legacyEquitySignatures = new Map<string, string>([
+      ['equity-1', "Owner's Invested Capital"],
+      ['equity-2', 'SME Start-up Matching Grant']
+    ]);
+
     if (savedAssets) {
       try {
         const parsed = JSON.parse(savedAssets);
-        // Migrate legacy assets safely to the new format
-        const migrated: Asset[] = parsed.map((a: any) => ({
+        const filtered = Array.isArray(parsed)
+          ? parsed.filter((a: any) => legacyAssetSignatures.get(String(a?.id || '')) !== String(a?.name || ''))
+          : [];
+        const migrated: Asset[] = filtered.map((a: any) => ({
           id: a.id || 'asset-' + Math.floor(1000 + Math.random() * 9000),
           name: a.name || 'Unnamed Asset',
           category: a.category || 'Fixed',
           type: a.type || 'Equipment',
-          purchaseDate: a.purchaseDate || '2025-01-01',
+          purchaseDate: a.purchaseDate || new Date().toISOString().split('T')[0],
           value: Number(a.value || 0),
           depreciationMethod: a.depreciationMethod || 'None',
           depreciationRate: a.depreciationRate !== undefined ? Number(a.depreciationRate) : 0,
@@ -329,62 +363,34 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
           notes: a.notes || '',
           linkedEquityId: a.linkedEquityId || undefined
         }));
+        if (filtered.length !== (Array.isArray(parsed) ? parsed.length : 0)) {
+          localStorage.setItem(`pos_custom_assets_${activeStore}`, JSON.stringify(migrated));
+        }
         setAssets(migrated);
       } catch (e) {
         console.error('Error migrating loaded assets', e);
+        setAssets([]);
       }
     } else {
-      const defaultAssets: Asset[] = [
-        {
-          id: 'asset-1',
-          name: 'Shop Fixtures & Shelving',
-          category: 'Fixed',
-          type: 'Equipment',
-          purchaseDate: '2025-01-15',
-          value: 15000,
-          depreciationMethod: 'Straight Line',
-          depreciationRate: 10,
-          status: 'Active',
-          notes: 'Standard storage shelving and metal display cabinet structures'
-        },
-        {
-          id: 'asset-2',
-          name: 'Commercial Espresso Machine & Brewer',
-          category: 'Fixed',
-          type: 'Equipment',
-          purchaseDate: '2025-04-22',
-          value: 25000,
-          depreciationMethod: 'Straight Line',
-          depreciationRate: 15,
-          status: 'Active',
-          notes: 'Premium commercial espresso brewer with matching grinders'
-        },
-        {
-          id: 'asset-3',
-          name: 'Stock Security Cash Float',
-          category: 'Current',
-          type: 'Other',
-          purchaseDate: '2026-01-01',
-          value: 5000,
-          depreciationMethod: 'None',
-          depreciationRate: 0,
-          status: 'Active',
-          notes: 'Petty cash and secure vault cash float to facilitate POS transactions'
-        }
-      ];
-      setAssets(defaultAssets);
-      localStorage.setItem(`pos_custom_assets_${activeStore}`, JSON.stringify(defaultAssets));
+      setAssets([]);
     }
 
     if (savedEquity) {
-      setEquity(JSON.parse(savedEquity));
+      try {
+        const parsedEq = JSON.parse(savedEquity);
+        const filteredEq = Array.isArray(parsedEq)
+          ? parsedEq.filter((eq: any) => legacyEquitySignatures.get(String(eq?.id || '')) !== String(eq?.name || ''))
+          : [];
+        if (filteredEq.length !== (Array.isArray(parsedEq) ? parsedEq.length : 0)) {
+          localStorage.setItem(`pos_custom_equity_${activeStore}`, JSON.stringify(filteredEq));
+        }
+        setEquity(filteredEq);
+      } catch (e) {
+        console.error('Error loading custom equity', e);
+        setEquity([]);
+      }
     } else {
-      const defaultEquity = [
-        { id: 'equity-1', name: 'Owner\'s Invested Capital', value: 40000 },
-        { id: 'equity-2', name: 'SME Start-up Matching Grant', value: 5000 },
-      ];
-      setEquity(defaultEquity);
-      localStorage.setItem(`pos_custom_equity_${activeStore}`, JSON.stringify(defaultEquity));
+      setEquity([]);
     }
   }, [activeStore]);
 
@@ -625,9 +631,14 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
 
     const accLabels: Record<string, string> = {
       'acc_cash': 'Counter Cash Drawer',
+      'acc_airtel': 'Airtel Money Account',
+      'acc_mtn': 'MTN Mobile Money Account',
       'acc_momo': 'Mobile Wallet Account',
       'acc_bank': 'Commercial Bank Account'
     };
+    getAllSelectableAccounts().forEach(a => {
+      accLabels[a.accountId] = a.label;
+    });
 
     const narration = `Internal Transfer: ${accLabels[transferSourceAcc] || transferSourceAcc} -> ${accLabels[transferDestAcc] || transferDestAcc} (${transferRef || 'Float Movement'})`;
 
@@ -761,7 +772,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
       `UPDATE purchases_transit SET stage = '${newStage}', updated_at = '${new Date().toISOString()}' WHERE id = '${transitId}'`,
       `Transit Procurement: Update stage to ${newStage}`
     );
-    logEmployeeAudit('PURCHASE', 'Updated Purchase Order Stage', `PO #${transitId} stage updated to ${newStage}`, 0, 'lusaka', userRole);
+    logEmployeeAudit('PURCHASE', 'Updated Purchase Order Stage', `PO #${transitId} stage updated to ${newStage}`, 0, activeStore || '', userRole);
     persistTablesToStorage();
     loadData();
   };
@@ -1097,26 +1108,24 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   const payrollExpense = filteredAttendance.reduce((sum, at) => sum + Number(at.gross_payment || 0), 0);
 
   const filteredExpenses = expensesList.filter(ex => {
-    const matchesStore = !activeStore || ex.store_id === activeStore || ex.store_id === 'lusaka';
+    const matchesStore = !activeStore || ex.store_id === activeStore;
     const matchesPeriod = isDateInPeriod(ex.expense_date || ex.created_at);
     return matchesStore && matchesPeriod;
   });
 
   const recordedExpensesTotal = filteredExpenses.reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
 
-  // Period multiplier for baseline fixed expenses if no recorded expenses exist
-  let periodMonthsMultiplier = 1;
-  if (selectedPeriod === 'this_quarter') periodMonthsMultiplier = 3;
-  else if (selectedPeriod === 'this_year') periodMonthsMultiplier = 12;
-  else if (selectedPeriod === 'all_time') periodMonthsMultiplier = 4; // defaults to 4 months average baseline 
+  const rentExpense = filteredExpenses
+    .filter(ex => String(ex.category || '').toLowerCase().includes('rent'))
+    .reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
+  const utilitiesExpense = filteredExpenses
+    .filter(ex => /utilit|power|water|electric|internet/i.test(String(ex.category || '')))
+    .reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
+  const generalOfficeExpense = filteredExpenses
+    .filter(ex => !String(ex.category || '').toLowerCase().includes('rent') && !/utilit|power|water|electric|internet/i.test(String(ex.category || '')))
+    .reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
 
-  const rentExpense = 4500 * periodMonthsMultiplier;
-  const utilitiesExpense = 1200 * periodMonthsMultiplier;
-  const generalOfficeExpense = 800 * periodMonthsMultiplier;
-
-  const totalExpenses = filteredExpenses.length > 0
-    ? recordedExpensesTotal + payrollExpense
-    : payrollExpense + rentExpense + utilitiesExpense + generalOfficeExpense;
+  const totalExpenses = recordedExpensesTotal + payrollExpense;
 
   // 5. Finance Costs
   const activeLoansOfStore = loans.filter(l => l.status === 'ACTIVE' || l.status === 'PAID_OFF');
@@ -1137,23 +1146,30 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   const balanceQuery = runSql("SELECT * FROM view_account_balances", 'Balance Sheet: Calculate Account Balances', true);
   if (balanceQuery.success && Array.isArray(balanceQuery.data)) {
     balanceQuery.data.forEach((acc: any) => {
+      const bal = Number(acc.current_balance || 0);
       balanceAccounts.push({
         id: acc.account_id,
         name: acc.account_name,
-        balance: Math.abs(Number(acc.current_balance || 0))
+        balance: bal
       });
-      if (acc.account_id && (acc.account_id.includes('clearing') || acc.account_id.includes('wallet') || acc.account_id.includes('cash'))) {
-        ledgersCash += Math.abs(Number(acc.current_balance || 0));
+      if (
+        acc.account_id === 'acc_cash' ||
+        acc.account_id === 'acc_airtel' ||
+        acc.account_id === 'acc_mtn' ||
+        acc.account_id === 'acc_momo' ||
+        acc.account_id === 'acc_bank' ||
+        String(acc.account_id || '').startsWith('acc_pm_')
+      ) {
+        ledgersCash += bal;
       }
     });
   }
 
-  // Baseline positive cash for active systems
-  const computedCash = Math.max(30000 + netRevenue - payrollExpense - totalRepaidCapital, ledgersCash || 20000);
-  
+  const computedCash = ledgersCash;
+
   // Inventory Value
   const prodRes = runSql("SELECT SUM(stock * cost) AS stock_value FROM products", 'Balance Sheet: Inventory pricing', true);
-  const inventoryValuation = prodRes.success && prodRes.data[0]?.stock_value ? Number(prodRes.data[0].stock_value) : 23500;
+  const inventoryValuation = prodRes.success && prodRes.data[0]?.stock_value ? Number(prodRes.data[0].stock_value) : 0;
 
   // Custom Assets registries using Net Book Value (NBV = cost - accumulated depreciation)
   const customCurrentAssetsSum = assets
@@ -1220,7 +1236,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   const netFinancingCash = loanPrincipalDisbursedInperiod - sweepRepaymentsProcessedInperiod + contributedEquitySum;
   const netChangeInCash = netOperatingCash + netInvestingCash + netFinancingCash;
 
-  const startingPeriodCash = Math.max(5000, computedCash - netChangeInCash);
+  const startingPeriodCash = Math.max(0, computedCash - netChangeInCash);
   const closingPeriodCash = startingPeriodCash + netChangeInCash;
 
   // --- FINANCIAL REPORT PDF EXPORTER ---
@@ -1638,9 +1654,9 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                       onChange={(e) => setExpenseAccountId(e.target.value)}
                       className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     >
-                      <option value="acc_cash">Counter Cash Drawer (acc_cash)</option>
-                      <option value="acc_momo">Mobile Money Wallet (acc_momo)</option>
-                      <option value="acc_bank">Commercial Bank Account (acc_bank)</option>
+                      {getAllSelectableAccounts().map(acc => (
+                        <option key={acc.accountId} value={acc.accountId}>{acc.label} ({acc.accountId})</option>
+                      ))}
                     </select>
                   </div>
 
@@ -1677,9 +1693,13 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                         onChange={(e) => setExpenseStoreId(e.target.value)}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                       >
-                        <option value="lusaka">Lusaka Branch</option>
-                        <option value="kitwe">Kitwe Branch</option>
-                        <option value="ndola">Ndola Branch</option>
+                        {storesList.length === 0 ? (
+                          <option value="">No branches configured</option>
+                        ) : (
+                          storesList.map((s) => (
+                            <option key={s.id} value={s.id}>{s.name}</option>
+                          ))
+                        )}
                       </select>
                     </div>
                   </div>
@@ -1775,7 +1795,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                             </td>
                             <td className="py-3 px-3">
                               <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-extrabold bg-slate-100 text-slate-700 uppercase">
-                                {ex.account_id === 'acc_cash' ? 'Cash Drawer' : ex.account_id === 'acc_momo' ? 'Mobile Wallet' : 'Bank Account'}
+                                {getAllSelectableAccounts().find(a => a.accountId === ex.account_id)?.label || (ex.account_id === 'acc_cash' ? 'Cash Drawer' : ex.account_id === 'acc_momo' ? 'Mobile Wallet' : ex.account_id === 'acc_bank' ? 'Bank Account' : ex.account_id)}
                               </span>
                             </td>
                             <td className="py-3 px-3 text-right font-black text-rose-600 whitespace-nowrap">
@@ -1854,7 +1874,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                                 {po.stage === 'LANDED_AT_STORE' ? 'Received at Store' : po.stage || 'IN_TRANSIT'}
                               </span>
                               <span className="text-[10px] font-bold text-slate-500 uppercase bg-slate-200/70 px-2 py-0.5 rounded">
-                                Store: {po.store_id || 'lusaka'}
+                                Store: {po.store_id || 'Unassigned'}
                               </span>
                             </div>
                             <span className="text-xs font-bold text-slate-700 block mt-1">Supplier: {po.supplier_name}</span>
@@ -1964,8 +1984,8 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 <div>
                   <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Counter Cash Drawer</span>
                   <span className="text-lg font-black text-slate-900">
-                    {settings.currency}{(
-                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_cash'", 'Check cash balance', true).data?.[0]?.current_balance || 15400
+                    {settings.currency}{Number(
+                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_cash'", 'Check cash balance', true).data?.[0]?.current_balance ?? 0
                     ).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                   </span>
                   <span className="text-[10px] text-slate-400 block mt-0.5">Account ID: acc_cash</span>
@@ -1976,15 +1996,23 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 <div className="p-3 bg-indigo-50 text-indigo-600 rounded-xl">
                   <CreditCard size={24} />
                 </div>
-                <div>
-                  <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Mobile Money Wallet</span>
-                  <span className="text-lg font-black text-slate-900">
-                    {settings.currency}{(
-                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_momo'", 'Check momo balance', true).data?.[0]?.current_balance || 8200
-                    ).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                  </span>
-                  <span className="text-[10px] text-slate-400 block mt-0.5">MTN / Airtel Merchant</span>
-                </div>
+                {(() => {
+                  const airtelBal = Number(runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_airtel'", 'Check airtel balance', true).data?.[0]?.current_balance ?? 0);
+                  const mtnBal = Number(runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_mtn'", 'Check mtn balance', true).data?.[0]?.current_balance ?? 0);
+                  const legacyMomoBal = Number(runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_momo'", 'Check momo balance', true).data?.[0]?.current_balance ?? 0);
+                  const totalMomoBal = airtelBal + mtnBal + legacyMomoBal;
+                  return (
+                    <div>
+                      <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Mobile Money Wallets</span>
+                      <span className="text-lg font-black text-slate-900">
+                        {settings.currency}{totalMomoBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </span>
+                      <span className="text-[10px] text-slate-500 block mt-0.5 font-mono">
+                        Airtel: {settings.currency}{airtelBal.toFixed(2)} | MTN: {settings.currency}{mtnBal.toFixed(2)}
+                      </span>
+                    </div>
+                  );
+                })()}
               </div>
 
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
@@ -1994,8 +2022,8 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 <div>
                   <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Commercial Bank Account</span>
                   <span className="text-lg font-black text-slate-900">
-                    {settings.currency}{(
-                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_bank'", 'Check bank balance', true).data?.[0]?.current_balance || 42000
+                    {settings.currency}{Number(
+                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_bank'", 'Check bank balance', true).data?.[0]?.current_balance ?? 0
                     ).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                   </span>
                   <span className="text-[10px] text-slate-400 block mt-0.5">Zambia National Commercial Bank</span>
@@ -2020,9 +2048,9 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                       onChange={(e) => setTransferSourceAcc(e.target.value)}
                       className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     >
-                      <option value="acc_bank">Commercial Bank Account</option>
-                      <option value="acc_cash">Counter Cash Drawer</option>
-                      <option value="acc_momo">Mobile Money Wallet</option>
+                      {getAllSelectableAccounts().map(acc => (
+                        <option key={acc.accountId} value={acc.accountId}>{acc.label}</option>
+                      ))}
                     </select>
                   </div>
 
@@ -2033,9 +2061,9 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                       onChange={(e) => setTransferDestAcc(e.target.value)}
                       className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     >
-                      <option value="acc_cash">Counter Cash Drawer</option>
-                      <option value="acc_momo">Mobile Money Wallet</option>
-                      <option value="acc_bank">Commercial Bank Account</option>
+                      {getAllSelectableAccounts().map(acc => (
+                        <option key={acc.accountId} value={acc.accountId}>{acc.label}</option>
+                      ))}
                     </select>
                   </div>
 
@@ -2317,9 +2345,13 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                           onChange={(e) => setTransitStoreId(e.target.value)}
                           className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
                         >
-                          <option value="lusaka">Lusaka Branch</option>
-                          <option value="kitwe">Kitwe Branch</option>
-                          <option value="ndola">Ndola Branch</option>
+                          {storesList.length === 0 ? (
+                            <option value="">No branches configured</option>
+                          ) : (
+                            storesList.map((s) => (
+                              <option key={s.id} value={s.id}>{s.name}</option>
+                            ))
+                          )}
                         </select>
                       </div>
                     </div>
@@ -2332,9 +2364,9 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                           onChange={(e) => setTransitPaymentAcc(e.target.value)}
                           className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
                         >
-                          <option value="acc_bank">Commercial Bank Account (acc_bank)</option>
-                          <option value="acc_cash">Counter Cash Drawer (acc_cash)</option>
-                          <option value="acc_momo">Mobile Money Wallet (acc_momo)</option>
+                          {getAllSelectableAccounts().map(acc => (
+                            <option key={acc.accountId} value={acc.accountId}>{acc.label} ({acc.accountId})</option>
+                          ))}
                         </select>
                       </div>
                       <div>
@@ -2345,8 +2377,12 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                           className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
                         >
                           <option value="BANK_TRANSFER">Bank Wire Transfer</option>
-                          <option value="MOBILE_MONEY">Mobile Money</option>
                           <option value="CASH">Cash</option>
+                          <option value="Airtel Money">Airtel Money</option>
+                          <option value="MTN Mobile Money">MTN Mobile Money</option>
+                          {getCustomPaymentMethods(false).map(cm => (
+                            <option key={cm.id} value={cm.name}>{cm.name}</option>
+                          ))}
                         </select>
                       </div>
                     </div>
@@ -3184,7 +3220,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                     <input
                       type="number"
                       required
-                      placeholder="45000"
+                      placeholder="0.00"
                       value={newAssetValue}
                       onChange={(e: any) => setNewAssetValue(e.target.value)}
                       className="w-full px-3 py-1.5 bg-white border border-slate-250 text-xs text-slate-800 rounded outline-none shadow-3xs"

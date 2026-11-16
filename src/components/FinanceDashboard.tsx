@@ -22,7 +22,7 @@ import {
   AlertCircle,
   Receipt
 } from 'lucide-react';
-import { runSql, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods } from '../db';
 import { StoreSettings } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
@@ -76,7 +76,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   const [expenseDescription, setExpenseDescription] = useState('');
   const [expenseRef, setExpenseRef] = useState('');
   const [expenseDate, setExpenseDate] = useState(new Date().toISOString().split('T')[0]);
-  const [expenseStoreId, setExpenseStoreId] = useState(activeStore || 'lusaka');
+  const [expenseStoreId, setExpenseStoreId] = useState(activeStore || '');
   const [expenseSearchQuery, setExpenseSearchQuery] = useState('');
   const [expenseFilterCategory, setExpenseFilterCategory] = useState('ALL');
 
@@ -90,7 +90,8 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   // Goods in Transit / Procurement Form states
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
   const [transitSupplierName, setTransitSupplierName] = useState('');
-  const [transitStoreId, setTransitStoreId] = useState(activeStore || 'lusaka');
+  const [transitStoreId, setTransitStoreId] = useState(activeStore || '');
+  const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
   const [transitPaymentAcc, setTransitPaymentAcc] = useState('acc_bank');
   const [transitPaymentMethod, setTransitPaymentMethod] = useState('BANK_TRANSFER');
   const [transitNotes, setTransitNotes] = useState('');
@@ -114,6 +115,8 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   const [assets, setAssets] = useState<Asset[]>([]);
   const [equity, setEquity] = useState<{ id: string; name: string; value: number; linkedAssetId?: string }[]>([]);
   const [accountBalances, setAccountBalances] = useState<any[]>([]);
+  const [selectableAccounts, setSelectableAccounts] = useState(() => getAllSelectableAccounts());
+  const [customPaymentMethods, setCustomPaymentMethods] = useState(() => getCustomPaymentMethods(false));
 
   // DB raw tables loaded for Financial Statements
   const [statementOrders, setStatementOrders] = useState<any[]>([]);
@@ -147,8 +150,27 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
 
   // Load finance tables on mount or store change
   const loadFinanceData = (targetStoreFilter: string = statementStoreFilter) => {
+    const centralBranches = getCentralBranches();
+    if (centralBranches.length > 0) {
+      const mapped = centralBranches.map((s) => ({
+        id: String(s.id),
+        name: String(s.name || s.id),
+      }));
+      setStoresList(mapped);
+      if (!activeStore && !expenseStoreId && mapped[0]?.id) {
+        setExpenseStoreId(mapped[0].id);
+      }
+      if (!activeStore && !transitStoreId && mapped[0]?.id) {
+        setTransitStoreId(mapped[0].id);
+      }
+    } else {
+      setStoresList([]);
+    }
+
     // Ensure all double-entry accounting systems are synchronized
     syncAllAccountingSystems('Finance Dashboard Load');
+    setSelectableAccounts(getAllSelectableAccounts());
+    setCustomPaymentMethods(getCustomPaymentMethods(false));
 
     // 1. Load Operating Expenses (filtered by targetStoreFilter when not 'all')
     const expRes = runSql('SELECT * FROM expenses ORDER BY expense_date DESC', 'Finance: Fetch operating expenses');
@@ -208,6 +230,8 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
     );
     if (stmtRes.success && Array.isArray(stmtRes.data) && stmtRes.data.length > 0) {
       setStatementSnapshot(stmtRes.data[0]);
+    } else {
+      setStatementSnapshot(null);
     }
 
     const pmRes = runSql(
@@ -430,7 +454,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
             `Intake PO stock ${itm.productName}`
           );
           runSql(
-            `UPDATE store_products SET stock = stock + ${Number(itm.quantity)} WHERE product_id = ${itm.productId} AND store_id = '${po.store_id || activeStore || 'lusaka'}'`,
+            `UPDATE store_products SET stock = stock + ${Number(itm.quantity)} WHERE product_id = ${itm.productId} AND store_id = '${po.store_id || activeStore || ''}'`,
             `Intake branch PO stock ${itm.productName}`
           );
         }
@@ -789,10 +813,10 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   onChange={(e) => setStatementStoreFilter(e.target.value)}
                   className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 focus:outline-hidden"
                 >
-                  <option value="all">🏢 All Stores Consolidated</option>
-                  <option value="lusaka">📍 Lusaka Main Office</option>
-                  <option value="kitwe">📍 Kitwe Regional Yard</option>
-                  <option value="ndola">📍 Ndola Branch Station</option>
+                  <option value="all">🏢 All Branches Consolidated</option>
+                  {storesList.map((s) => (
+                    <option key={s.id} value={s.id}>📍 {s.name}</option>
+                  ))}
                 </select>
 
                 <button
@@ -939,7 +963,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     <span className="font-bold text-slate-900">{settings.currency}{financials.cashDrawerBalance.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">📱 Mobile Money Wallets (MTN/Airtel/Zamtel)</span>
+                    <span className="font-sans font-medium text-slate-700">📱 Mobile Money Wallets (Airtel / MTN / Custom)</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.mobileMoneyBalance.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
@@ -1021,7 +1045,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   <span className="text-base font-black text-indigo-700 mt-1 block">
                     {settings.currency}{financials.mobileMoneyBalance.toFixed(2)}
                   </span>
-                  <span className="text-[10px] text-slate-500">MTN MoMo + Airtel Money + Zamtel</span>
+                  <span className="text-[10px] text-slate-500">Airtel Money + MTN Mobile Money + Custom</span>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                   <span className="text-[10px] font-black uppercase text-slate-400 block">Bank / Card Liquidity</span>
@@ -1060,10 +1084,10 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   onChange={(e) => setStatementStoreFilter(e.target.value)}
                   className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-800"
                 >
-                  <option value="all">🏢 All Stores Consolidated</option>
-                  <option value="lusaka">📍 Lusaka Main Office</option>
-                  <option value="kitwe">📍 Kitwe Regional Yard</option>
-                  <option value="ndola">📍 Ndola Branch Station</option>
+                  <option value="all">🏢 All Branches Consolidated</option>
+                  {storesList.map((s) => (
+                    <option key={s.id} value={s.id}>📍 {s.name}</option>
+                  ))}
                 </select>
               </div>
 
@@ -1431,9 +1455,9 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     onChange={(e) => setExpenseAccountId(e.target.value)}
                     className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
                   >
-                    <option value="acc_cash">💵 Cash Drawer Account</option>
-                    <option value="acc_momo">📱 Mobile Money Wallet</option>
-                    <option value="acc_bank">🏦 Bank Account</option>
+                    {selectableAccounts.map(acc => (
+                      <option key={acc.accountId} value={acc.accountId}>{acc.label}</option>
+                    ))}
                   </select>
                 </div>
 
@@ -1615,9 +1639,9 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     onChange={(e) => setTransferSourceAcc(e.target.value)}
                     className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
                   >
-                    <option value="acc_bank">🏦 Bank Account</option>
-                    <option value="acc_cash">💵 Cash Drawer Account</option>
-                    <option value="acc_momo">📱 Mobile Money Wallet</option>
+                    {selectableAccounts.map(acc => (
+                      <option key={acc.accountId} value={acc.accountId}>{acc.label}</option>
+                    ))}
                   </select>
                 </div>
 
@@ -1628,9 +1652,9 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     onChange={(e) => setTransferDestAcc(e.target.value)}
                     className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
                   >
-                    <option value="acc_cash">💵 Cash Drawer Account</option>
-                    <option value="acc_momo">📱 Mobile Money Wallet</option>
-                    <option value="acc_bank">🏦 Bank Account</option>
+                    {selectableAccounts.map(acc => (
+                      <option key={acc.accountId} value={acc.accountId}>{acc.label}</option>
+                    ))}
                   </select>
                 </div>
 
@@ -1877,7 +1901,11 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   >
                     <option value="BANK_TRANSFER">Bank Electronic Transfer</option>
                     <option value="CASH">Cash Drawer Payment</option>
-                    <option value="MOBILE_MONEY">Mobile Money Transfer</option>
+                    <option value="Airtel Money">Airtel Money</option>
+                    <option value="MTN Mobile Money">MTN Mobile Money</option>
+                    {customPaymentMethods.map(cm => (
+                      <option key={cm.id} value={cm.name}>{cm.name}</option>
+                    ))}
                   </select>
                 </div>
               </div>

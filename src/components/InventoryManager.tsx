@@ -27,14 +27,16 @@ import {
   FileText,
   Tag
 } from 'lucide-react';
-import { runSql, persistTablesToStorage, logEmployeeAudit } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit } from '../db';
 import { Product, StoreSettings } from '../types';
 import { motion, AnimatePresence, useDragControls } from 'motion/react';
+import { ZRA_TAX_TYPES } from '../zra/zraConfig';
 
 interface InventoryManagerProps {
   settings: StoreSettings;
   userRole: string; // 'owner' | 'manager' | 'sales'
-  activeStore: string; // 'lusaka' | 'kitwe' | 'ndola'
+  activeStore: string;
+  accessibleStores?: Array<{ id: string; name: string; location?: string }>;
   onNavigateToSale?: () => void;
 }
 
@@ -140,6 +142,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   const [editCategory, setEditCategory] = useState<string>('');
   const [editBatchNumber, setEditBatchNumber] = useState('');
   const [editExpiryDate, setEditExpiryDate] = useState('');
+  const [editItemClsCd, setEditItemClsCd] = useState('');
+  const [editTaxTyCd, setEditTaxTyCd] = useState('A');
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
   const [addFormError, setAddFormError] = useState<string | null>(null);
 
@@ -203,6 +207,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   const [newIsService, setNewIsService] = useState(false);
   const [newBatchNumber, setNewBatchNumber] = useState('');
   const [newExpiryDate, setNewExpiryDate] = useState('');
+  const [newItemClsCd, setNewItemClsCd] = useState('');
+  const [newTaxTyCd, setNewTaxTyCd] = useState('A');
   const [newTargetBranch, setNewTargetBranch] = useState(activeStore || '');
 
   // Quick Add / Receive stock modal state
@@ -223,14 +229,14 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
   const getStoresList = (): { id: string; name: string }[] => {
     try {
-      const sRes = runSql('SELECT id, name FROM stores', 'Inventory: Fetch dynamic stores list', true);
-      if (sRes.success && Array.isArray(sRes.data) && sRes.data.length > 0) {
+      const centralBranches = getCentralBranches();
+      if (centralBranches.length > 0) {
         let accessibleIds: string[] = [];
         try {
           const savedAcc = localStorage.getItem('logged_in_accessible_branches');
           if (savedAcc) accessibleIds = JSON.parse(savedAcc);
         } catch {}
-        const allMapped = sRes.data.map((s: any) => ({
+        const allMapped = centralBranches.map((s) => ({
           id: String(s.id),
           name: String(s.name || s.id),
         }));
@@ -241,9 +247,6 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         return allMapped;
       }
     } catch {}
-    if (activeStore) {
-      return [{ id: activeStore, name: activeStore.toUpperCase() }];
-    }
     return [];
   };
 
@@ -378,7 +381,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       txRes.data.forEach((tx: any) => {
         const ch = String(tx.channel || '').toUpperCase();
         const posId = String(tx.pos_terminal_id || '').toLowerCase();
-        const storeCode = posId.includes('kitwe') ? 'kitwe' : posId.includes('ndola') ? 'ndola' : posId.includes('lusaka') ? 'lusaka' : activeStore;
+        const centralMatch = getStoresList().find(st => posId.includes(String(st.id).toLowerCase()));
+        const storeCode = centralMatch ? centralMatch.id : (posId || activeStore || '');
 
         if (ch === 'RECEIVE' || tx.provider_reference === 'BATCH-ADD' || tx.provider_reference === 'CATALOG_INIT') {
           historyList.push({
@@ -567,6 +571,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setEditCategory(prod.category || 'General');
     setEditBatchNumber(prod.batch_number || '');
     setEditExpiryDate(prod.expiry_date || '');
+    setEditItemClsCd(prod.item_cls_cd || '');
+    setEditTaxTyCd(prod.tax_ty_cd || 'A');
   };
 
   const handleSaveEdit = (id: number) => {
@@ -580,7 +586,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const skuToSave = (editSku || targetProd?.sku || `SKU-${id}`).trim();
 
     // 1. Update the default primary products table
-    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}' WHERE id = ${id}`;
+    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}', item_cls_cd = '${editItemClsCd.replace(/'/g, "''")}', tax_ty_cd = '${editTaxTyCd.replace(/'/g, "''")}' WHERE id = ${id}`;
     runSql(updateGlobalSql, `Inventory: Sync baseline pricing and category for Product ID #${id}`);
 
     // 2. Update or insert the store_products row for active branch store!
@@ -695,7 +701,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
     // Insert baseline primary with column specifiers to support optional/default is_service
     runSql(`
-      INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
+      INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, item_cls_cd, tax_ty_cd) VALUES (
         ${nextId}, 
         '${cleanName.replace(/'/g, "''")}', 
         '${cleanSku.replace(/'/g, "''")}', 
@@ -707,21 +713,15 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         '${activeBizId.replace(/'/g, "''")}',
         ${newIsService ? 1 : 0},
         '${newBatchNumber.replace(/'/g, "''")}',
-        '${newExpiryDate}'
+        '${newExpiryDate}',
+        '${newItemClsCd.replace(/'/g, "''")}',
+        '${newTaxTyCd.replace(/'/g, "''")}'
       )
     `, `Catalog: Add global model ${cleanName}`);
 
-    // Add store override values for ALL active branches (stock allocated to selected targetBranch, 0 in other branches unless transferred)
+    // Add store override values ONLY for configured branches in the central stores database (do not auto-create any branch in advance)
     const availableStores = getStoresList();
-    let targetBranch = newTargetBranch || activeStore || (availableStores[0]?.id ?? '');
-    if (!targetBranch) {
-      targetBranch = 'store_main';
-      runSql(`
-        INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency) VALUES (
-          '${targetBranch}', '${activeBizId.replace(/'/g, "''")}', 'Main Store Branch', 'Main', 1, 1, 1, 0, 'weekly'
-        )
-      `, 'Catalog: Auto-create Main Store branch');
-    }
+    const targetBranch = newTargetBranch || activeStore || (availableStores[0]?.id ?? '');
     const storeCodes = Array.from(new Set([...availableStores.map(s => s.id), targetBranch, activeStore].filter(Boolean)));
     storeCodes.forEach(code => {
       const branchStock = code === targetBranch ? stockNum : 0;
@@ -772,6 +772,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setNewIsService(false);
     setNewBatchNumber('');
     setNewExpiryDate('');
+    setNewItemClsCd('');
+    setNewTaxTyCd('A');
     loadRawData();
     persistTablesToStorage();
     window.dispatchEvent(new Event('pos_data_updated'));
@@ -1347,7 +1349,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   }, [filteredHistoryLogs]);
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-slate-50 relative select-text text-left min-w-0 w-full max-w-full">
+    <div className="flex-1 min-h-0 flex flex-col overflow-hidden bg-slate-50 relative select-text text-left min-w-0 w-full max-w-full">
       
       {/* Search and multi-store settings controls */}
       <div className="p-3 sm:p-4 bg-white border-b border-slate-200 flex flex-col gap-3 shrink-0 w-full min-w-0">
@@ -1530,8 +1532,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   }
                   setTransferSearchQuery('');
                   setTransferCart([]);
-                  setTransferFromStore(activeStore);
-                  setTransferToStore(activeStore === 'lusaka' ? 'kitwe' : 'lusaka');
+                  const centralBranches = getStoresList();
+                  const otherBranch = centralBranches.find(s => s.id !== activeStore);
+                  setTransferFromStore(activeStore || (centralBranches[0]?.id ?? ''));
+                  setTransferToStore(otherBranch ? otherBranch.id : (centralBranches[0]?.id ?? ''));
                   setTransferProductId(products.length > 0 ? products[0].id.toString() : '');
                   setShowTransferModal(true);
                 }}
@@ -1563,7 +1567,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       )}
 
       {/* Primary Grid Workspace */}
-      <div className="flex-1 overflow-y-auto overflow-x-hidden p-2.5 sm:p-4 flex flex-col gap-4 w-full min-w-0">
+      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-2.5 sm:p-4 flex flex-col gap-4 w-full min-w-0">
 
         {saveFeedback && (
           <div className="p-3 bg-emerald-600 text-white rounded-xl text-xs font-extrabold flex items-center justify-between shadow-md animate-fadeIn">
@@ -1598,10 +1602,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         )}
 
         {activeSubTab === 'catalog' && (
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs animate-fadeIn w-full min-w-0">
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs animate-fadeIn w-full min-w-0 flex-1 min-h-[360px] flex flex-col">
             {/* Mobile Horizontal Scroll & Wrap Hint Banner */}
-            <div className="flex sm:hidden items-center justify-between px-3 py-1.5 bg-indigo-50/80 border-b border-indigo-100 text-[10px] font-extrabold text-indigo-700">
-              <span>↔ Swipe table horizontally or use quick buttons below</span>
+            <div className="flex sm:hidden items-center justify-between px-3 py-1.5 bg-indigo-50/80 border-b border-indigo-100 text-[10px] font-extrabold text-indigo-700 shrink-0">
+              <span>↕ Scroll up/down or ↔ swipe table horizontally</span>
               <span className="font-mono text-[9px] bg-white px-1.5 py-0.5 rounded border border-indigo-200">{filteredAndSorted.length} items</span>
             </div>
 
@@ -1626,9 +1630,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                 )}
               </div>
             ) : (
-            <div className="overflow-x-auto w-full touch-pan-x">
+            <div className="flex-1 min-h-0 overflow-y-auto overflow-x-auto w-full touch-auto">
               <table className="w-full min-w-[660px] text-left font-sans text-xs border-collapse">
-                <thead>
+                <thead className="sticky top-0 z-10">
                   <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9.5px] select-none whitespace-nowrap">
                     <th className="px-3 sm:px-4 py-3">Product Name</th>
                     <th className="px-3 sm:px-4 py-3">Category</th>
@@ -1737,6 +1741,28 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                       onChange={(e) => setEditExpiryDate(e.target.value)}
                                       className="px-1.5 py-1 text-[10px] border rounded bg-white text-slate-800 font-semibold"
                                     />
+                                  </div>
+                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">ZRA Class (itemClsCd)</span>
+                                    <input
+                                      type="text"
+                                      value={editItemClsCd}
+                                      onChange={(e) => setEditItemClsCd(e.target.value)}
+                                      className="px-1.5 py-1 text-[10px] border rounded bg-white font-mono text-slate-800 font-semibold"
+                                      placeholder="e.g. 50102518"
+                                    />
+                                  </div>
+                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">ZRA Tax Type</span>
+                                    <select
+                                      value={editTaxTyCd}
+                                      onChange={(e) => setEditTaxTyCd(e.target.value)}
+                                      className="px-1 py-1 text-[10px] border rounded bg-white text-slate-800 font-bold"
+                                    >
+                                      {ZRA_TAX_TYPES.map((t) => (
+                                        <option key={t.code} value={t.code}>{t.code} ({t.rate}%)</option>
+                                      ))}
+                                    </select>
                                   </div>
                                   <div className="col-span-2 flex items-center gap-2 pt-1.5 border-t border-slate-200 mt-1">
                                     <button
@@ -2052,7 +2078,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               </div>
             </div>
 
-            <div className="overflow-x-auto touch-pan-x border border-slate-150 rounded-lg w-full">
+            <div className="overflow-auto max-h-[65vh] touch-auto border border-slate-150 rounded-lg w-full">
               <table className="w-full min-w-[600px] text-left font-sans text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-900 text-slate-200 border-b border-slate-850 font-semibold uppercase text-[9px] select-none">
@@ -2443,9 +2469,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                   className="flex-1 sm:flex-initial text-xs bg-white border border-slate-200 rounded-md px-2 py-1.5 font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
                 >
                   <option value="all">All Store Branches</option>
-                  <option value="lusaka">Lusaka Main</option>
-                  <option value="kitwe">Kitwe Outlet</option>
-                  <option value="ndola">Ndola Depot</option>
+                  {getStoresList().map(st => (
+                    <option key={st.id} value={st.id}>{st.name}</option>
+                  ))}
                 </select>
               </div>
             </div>
@@ -3140,7 +3166,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                         className="w-full px-2.5 py-2 bg-white border border-indigo-300 rounded-md text-xs font-bold text-slate-900 focus:border-indigo-600 focus:outline-hidden"
                       >
                         {getStoresList().length === 0 ? (
-                          <option value="">Auto-create Main Store Branch</option>
+                          <option value="">— No Branch Created Yet (Add in Settings → Branches) —</option>
                         ) : (
                           getStoresList().map(st => (
                             <option key={st.id} value={st.id}>
@@ -3183,6 +3209,36 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                       </div>
                     </div>
                   )}
+
+                  <div className="grid grid-cols-2 gap-2 bg-emerald-50/50 p-3 rounded-lg border border-emerald-200/80">
+                    <div className="col-span-2">
+                      <h4 className="text-[10px] text-emerald-900 font-black uppercase tracking-wider mb-0.5">
+                        ZRA Smart Invoice Classification (Optional)
+                      </h4>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-500 font-bold uppercase">UNSPSC Class Code (itemClsCd)</label>
+                      <input
+                        type="text"
+                        value={newItemClsCd}
+                        onChange={(e) => setNewItemClsCd(e.target.value)}
+                        placeholder="Default e.g. 50102518"
+                        className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-900 font-mono font-bold"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="text-[9px] text-slate-500 font-bold uppercase">ZRA Tax Band (taxTyCd)</label>
+                      <select
+                        value={newTaxTyCd}
+                        onChange={(e) => setNewTaxTyCd(e.target.value)}
+                        className="px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md text-slate-900 font-bold"
+                      >
+                        {ZRA_TAX_TYPES.map((t) => (
+                          <option key={t.code} value={t.code}>{t.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
 
                   <div className="flex flex-col gap-1.5 border border-slate-200 rounded-xl p-3 bg-slate-50">
                     <label className="text-[10px] text-indigo-900 font-extrabold uppercase tracking-wide flex items-center gap-1.5">

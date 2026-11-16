@@ -6,7 +6,7 @@ import {
   ChevronLeft, ChevronRight, ArrowUpDown, ArrowUp, ArrowDown, ArrowRight,
   Maximize2, Minimize2, Copy, Check, SlidersHorizontal, ArrowLeftRight, Landmark
 } from 'lucide-react';
-import { runSql, persistTablesToStorage } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage } from '../db';
 import { exportAndShareCsv } from '../androidUtils';
 import { StoreSettings } from '../types';
 
@@ -36,6 +36,7 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
   const [staffList, setStaffList] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
 
   useEffect(() => {
     if (activeStore) {
@@ -59,6 +60,13 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
   const fetchAuditLogs = () => {
     setIsLoading(true);
     try {
+      const centralBranches = getCentralBranches();
+      setStoresList(
+        centralBranches.map((s) => ({
+          id: String(s.id),
+          name: String(s.name || s.id),
+        }))
+      );
       // 1. Fetch from audit_logs table
       const auditRes = runSql('SELECT * FROM audit_logs ORDER BY created_at DESC', 'Audit Trail: Query audit_logs table');
       let combined: AuditLogItem[] = [];
@@ -90,7 +98,7 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
               action: tx.status === 'SUCCESS' ? `Recorded ${mod} Transaction` : 'Audit Event',
               details: tx.narration || 'System action executed',
               amount: Number(tx.amount || 0),
-              store_id: tx.pos_terminal_id?.toLowerCase() || 'lusaka',
+              store_id: tx.pos_terminal_id?.toLowerCase() || activeStore || '',
               performed_by: tx.performed_by || 'Staff Operator',
               created_at: tx.created_at || new Date().toISOString()
             });
@@ -503,9 +511,9 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
                 className="bg-transparent text-xs font-bold text-slate-800 focus:outline-hidden cursor-pointer"
               >
                 <option value="ALL">All Branches</option>
-                <option value="lusaka">Lusaka Main</option>
-                <option value="kitwe">Kitwe Yard</option>
-                <option value="ndola">Ndola Station</option>
+                {storesList.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
               </select>
             </div>
 
@@ -717,7 +725,7 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
                         {/* Branch Store */}
                         <td className={`${pyClass} text-center whitespace-nowrap`}>
                           <span className="px-2 py-0.5 bg-slate-100 text-slate-700 font-mono text-[10px] font-extrabold uppercase rounded-md border border-slate-250">
-                            {(log.store_id || 'lusaka').toUpperCase()}
+                            {(log.store_id || 'UNASSIGNED').toUpperCase()}
                           </span>
                         </td>
 
