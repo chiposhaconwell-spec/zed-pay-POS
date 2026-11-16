@@ -1,0 +1,63 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Allows you to trigger a build manually with a button on your phone
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: 2. Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 3. Setup Java JDK 21 (Required for Android Gradle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 4. Install Dependencies & Build Web App
+        run: |
+          npm install
+          npm run build
+
+      - name: 5. Wrap in Capacitor & Configure Android
+        run: |
+          # Install Capacitor CLI & Android core (compatible with Node 20/22)
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
+          
+          # Initialize Capacitor only if capacitor.config.json doesn't exist yet
+          if [ ! -f "capacitor.config.json" ] && [ ! -f "capacitor.config.ts" ]; then
+            npx cap init "CornB POS" "com.cornb.pos" --web-dir dist
+          fi
+          
+          # Generate the Android native project if not already present
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          
+          # Enable HTTP Cleartext Traffic so ZRA VSDC local/sandbox URLs work on Android
+          sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' android/app/src/main/AndroidManifest.xml
+          
+          # Sync web build into Android container
+          npx cap sync android
+
+      - name: 6. Compile APK with Gradle
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: 7. Upload Downloadable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Smart-POS-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
