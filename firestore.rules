@@ -70,12 +70,13 @@ service cloud.firestore {
 
     function isValidProduct(data) {
       return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl']) &&
-             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
+             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'description', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
              data.id is int &&
              data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              data.name is string && data.name.size() >= 1 && data.name.size() <= 250 &&
+             (!('description' in data) || (data.description is string && data.description.size() <= 4000)) &&
              data.sku is string && data.sku.size() <= 100 &&
              data.category is string && data.category.size() <= 100 &&
              data.price is number && data.price >= 0.0 &&
@@ -211,7 +212,7 @@ service cloud.firestore {
                          incoming().id == existing().id &&
                          incoming().business_id == existing().business_id &&
                          incoming().ownerUid == existing().ownerUid &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
                          isBusinessOwner(businessId);
         allow delete: if isSignedIn() && isValidId(businessId) && isValidId(productId) && isBusinessOwner(businessId);
       }

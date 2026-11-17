@@ -35,6 +35,25 @@ import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } fr
 import { auth, googleProvider, backupToCloud, restoreFromCloud, getTransportSecurityStatus, registerOrSignInWithEmailPassword } from '../firebase';
 import { getZraConfig, saveZraConfig, subscribeZraConfig, ZraConfig, ZraTaxTypeCode, ZRA_TAX_TYPES, ZRA_PACKAGING_UNITS, ZRA_QTY_UNITS } from '../zra/zraConfig';
 import { FiscalService, ZraOfflineQueueItem } from '../zra/fiscalService';
+import {
+  UserPermissions,
+  SettingsPermissionKey,
+  ModulePermissionKey,
+  SETTINGS_PERMISSION_OPTIONS,
+  MODULE_PERMISSION_OPTIONS,
+  ALL_SETTINGS_KEYS,
+  ALL_MODULE_KEYS,
+  getDefaultSettingsForRole,
+  getDefaultModulesForRole,
+  buildUserPermissions,
+  parseStaffPermissions,
+  getPermittedSettingsTabs,
+  canAccessSettingTab,
+  mapSubTabToPermissionKey,
+  loadSessionPermissionsFromStorage,
+  saveSessionPermissionsToStorage,
+  normalizeRole,
+} from '../permissions';
 
 interface SettingsPanelProps {
   settings: StoreSettings;
@@ -43,6 +62,7 @@ interface SettingsPanelProps {
   activeStore?: string;
   setActiveStore?: (storeId: string) => void;
   userRole?: string;
+  userPermissions?: UserPermissions;
   activeBusiness?: any;
   setActiveBusiness?: (biz: any) => void;
   businesses?: any[];
@@ -65,6 +85,7 @@ export default function SettingsPanel({
   activeStore = '',
   setActiveStore,
   userRole: currentUserRole = 'owner',
+  userPermissions,
   activeBusiness,
   onNavigateToInventory,
   initialSubTab = 'general',
@@ -106,15 +127,28 @@ export default function SettingsPanel({
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
 
-  const normalizeSubTab = (tab?: string): 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces' => {
-    if (tab === 'stores' || tab === 'users' || tab === 'stock' || tab === 'payments' || tab === 'zra' || tab === 'workspaces') {
-      return tab;
+  const effectivePermissions: UserPermissions = React.useMemo(() => {
+    if (normalizeRole(currentUserRole) === 'owner') {
+      return buildUserPermissions({ role: 'owner' });
     }
-    return 'general';
+    return userPermissions || loadSessionPermissionsFromStorage(currentUserRole);
+  }, [currentUserRole, userPermissions]);
+
+  const permittedSubTabs = React.useMemo(
+    () => getPermittedSettingsTabs(currentUserRole, effectivePermissions),
+    [currentUserRole, effectivePermissions]
+  );
+
+  const normalizeSubTab = (tab?: string): SettingsPermissionKey => {
+    const mapped = mapSubTabToPermissionKey(tab);
+    if (canAccessSettingTab(mapped, currentUserRole, effectivePermissions)) {
+      return mapped;
+    }
+    return permittedSubTabs[0] || 'general';
   };
 
   // Unified settings & admin control tabs ('general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces')
-  const [activeSubTab, setActiveSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'workspaces'>(() => normalizeSubTab(initialSubTab));
+  const [activeSubTab, setActiveSubTab] = useState<SettingsPermissionKey>(() => normalizeSubTab(initialSubTab));
 
   const [customMethods, setCustomMethods] = useState<CustomPaymentMethod[]>(() => getCustomPaymentMethods(true));
   const [newMethodName, setNewMethodName] = useState('');
@@ -129,10 +163,13 @@ export default function SettingsPanel({
   const [zraFeedback, setZraFeedback] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   useEffect(() => {
-    if (initialSubTab) {
-      setActiveSubTab(normalizeSubTab(initialSubTab));
+    const requested = mapSubTabToPermissionKey(initialSubTab);
+    if (canAccessSettingTab(requested, currentUserRole, effectivePermissions)) {
+      setActiveSubTab(requested);
+    } else if (permittedSubTabs.length > 0 && !permittedSubTabs.includes(activeSubTab)) {
+      setActiveSubTab(permittedSubTabs[0]);
     }
-  }, [initialSubTab]);
+  }, [initialSubTab, currentUserRole, effectivePermissions, permittedSubTabs]);
 
   useEffect(() => {
     const refreshCustomMethods = () => {
@@ -165,6 +202,7 @@ export default function SettingsPanel({
 
   // Quick Add Stock states inside unified SettingsPanel
   const [quickProdName, setQuickProdName] = useState('');
+  const [quickProdDescription, setQuickProdDescription] = useState('');
   const [quickProdBarcode, setQuickProdBarcode] = useState('');
   const [quickProdCategory, setQuickProdCategory] = useState('');
   const [quickProdPrice, setQuickProdPrice] = useState('');
@@ -201,6 +239,8 @@ export default function SettingsPanel({
   const [userSalary, setUserSalary] = useState('');
   const [userContact, setUserContact] = useState('');
   const [selectedBranches, setSelectedBranches] = useState<string[]>([]); // Array of store branch IDs
+  const [allowedSettings, setAllowedSettings] = useState<SettingsPermissionKey[]>(() => getDefaultSettingsForRole('sales'));
+  const [allowedModules, setAllowedModules] = useState<ModulePermissionKey[]>(() => getDefaultModulesForRole('sales'));
 
   useEffect(() => {
     setStoreName(settings.storeName);
@@ -236,6 +276,8 @@ export default function SettingsPanel({
         const parts = fullName.split(' ');
         const fName = st.first_name || parts[0] || 'Staff';
         const sName = st.surname || parts.slice(1).join(' ') || '';
+        const resolvedRole = st.role || perms.role || (parseFloat(st.basic_salary) > 10000 ? 'manager' : 'sales');
+        const parsedPerms = parseStaffPermissions(st.permissions_json, resolvedRole);
         const branches = perms.accessible_branches && perms.accessible_branches.length > 0
           ? perms.accessible_branches
           : (st.store_id ? [st.store_id] : []);
@@ -246,9 +288,11 @@ export default function SettingsPanel({
           email: st.email || '',
           contact: st.contact || '',
           basic_salary: st.basic_salary || 0,
-          role: st.role || perms.role || (parseFloat(st.basic_salary) > 10000 ? 'manager' : 'sales'),
+          role: resolvedRole,
           password: st.password || perms.password || st.pin || '',
           accessible_branches: branches,
+          allowed_settings: parsedPerms.allowed_settings,
+          allowed_modules: parsedPerms.allowed_modules,
           is_owner: false,
           raw: st
         };
@@ -282,6 +326,8 @@ export default function SettingsPanel({
           role: 'owner',
           password: bz.password || '',
           accessible_branches: [], // implicit: all branches
+          allowed_settings: [...ALL_SETTINGS_KEYS],
+          allowed_modules: [...ALL_MODULE_KEYS],
           is_owner: true,
           raw: bz
         };
@@ -560,9 +606,10 @@ export default function SettingsPanel({
     const imgUrl = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=150';
 
     runSql(`
-      INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
+      INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
         ${prodId},
         '${quickProdName.trim().replace(/'/g, "''")}',
+        '${quickProdDescription.trim().replace(/'/g, "''")}',
         '${sku.replace(/'/g, "''")}',
         '${category.replace(/'/g, "''")}',
         ${price},
@@ -612,6 +659,7 @@ export default function SettingsPanel({
 
     const savedName = quickProdName.trim();
     setQuickProdName('');
+    setQuickProdDescription('');
     setQuickProdBarcode('');
     setQuickProdCategory('');
     setQuickProdPrice('');
@@ -846,7 +894,7 @@ export default function SettingsPanel({
           if (Array.isArray(bundle.database.products) && bundle.database.products.length > 0) {
             runSql('DELETE FROM products');
             bundle.database.products.forEach((p: any) => {
-              runSql(`INSERT INTO products VALUES (${p.id}, '${(p.name||'').replace(/'/g, "''")}', '${p.sku||''}', '${p.category||''}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${p.imageUrl||''}')`);
+              runSql(`INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl) VALUES (${p.id}, '${(p.name||'').replace(/'/g, "''")}', '${(p.description||'').replace(/'/g, "''")}', '${(p.sku||'').replace(/'/g, "''")}', '${(p.category||'').replace(/'/g, "''")}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${(p.imageUrl||'').replace(/'/g, "''")}')`);
             });
           }
           if (Array.isArray(bundle.database.customers) && bundle.database.customers.length > 0) {
@@ -886,11 +934,11 @@ export default function SettingsPanel({
 
     // 1. Dump Products
     dump += `-- ==========================================\n-- TABLE: products\n-- ==========================================\n`;
-    dump += `CREATE TABLE products (\n  id INT PRIMARY KEY,\n  name VARCHAR(255),\n  sku VARCHAR(50) UNIQUE,\n  category VARCHAR(100),\n  price NUMERIC(10,2),\n  cost NUMERIC(10,2),\n  stock INT,\n  imageUrl TEXT\n);\n\n`;
+    dump += `CREATE TABLE products (\n  id INT PRIMARY KEY,\n  name VARCHAR(255),\n  description TEXT,\n  sku VARCHAR(50) UNIQUE,\n  category VARCHAR(100),\n  price NUMERIC(10,2),\n  cost NUMERIC(10,2),\n  stock INT,\n  imageUrl TEXT\n);\n\n`;
     const prodRes = runSql('SELECT * FROM products', 'Dump: Extract products');
     if (prodRes.success && Array.isArray(prodRes.data)) {
       prodRes.data.forEach((p: any) => {
-        dump += `INSERT INTO products VALUES (${p.id}, '${p.name.replace(/'/g, "''")}', '${p.sku}', '${p.category}', ${p.price}, ${p.cost}, ${p.stock}, '${p.imageUrl}');\n`;
+        dump += `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl) VALUES (${p.id}, '${(p.name||'').replace(/'/g, "''")}', '${(p.description||'').replace(/'/g, "''")}', '${p.sku||''}', '${p.category||''}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${p.imageUrl||''}');\n`;
       });
     }
 
@@ -977,20 +1025,14 @@ export default function SettingsPanel({
       return;
     }
 
-    // 1. Construct the permissions_json structure
-    const basicPermissions = {
+    // 1. Construct the permissions_json structure with role-based + ticked Settings & Modules access
+    const basicPermissions = buildUserPermissions({
       role: userRole,
       password: userPassword.trim(),
-      accessible_branches: selectedBranches,
-      sales: { checkout: true, refunds: userRole !== 'sales', quotes: true, laybys: true },
-      inventory: { view: true, update: userRole !== 'sales', transfer: userRole !== 'sales' },
-      customer: { view_only: false, create: true, edit: userRole !== 'sales' },
-      reports: { low_stock: true, expired_stock: true, profits: userRole === 'owner', sales: userRole !== 'sales', payment_modes: true, sold_by: true, top_customers: true },
-      expense: { add_expense: true, modify_expense: userRole !== 'sales' },
-      settings: { create_store: userRole === 'owner', manage_settings: userRole === 'owner' },
-      staff: { attendance_management: userRole !== 'sales', payroll_management: userRole === 'owner', manage_staff: userRole === 'owner' },
-      receipt: { create_receipt: true, view_all_receipt: true, edit_receipt: userRole !== 'sales', return_receipt: userRole !== 'sales' }
-    };
+      accessibleBranches: selectedBranches,
+      allowedSettings,
+      allowedModules,
+    });
     const permissionsString = JSON.stringify(basicPermissions);
 
     // 2. Decide if Owner or Staff
@@ -1087,6 +1129,14 @@ export default function SettingsPanel({
       }
     }
 
+    // If editing the currently logged-in user's account, apply updated role & ticked permissions immediately
+    const currentLoggedEmail = (localStorage.getItem('logged_in_user_email') || '').trim().toLowerCase();
+    if (currentLoggedEmail && currentLoggedEmail === emailLower) {
+      localStorage.setItem('logged_in_user_role', userRole);
+      localStorage.setItem('logged_in_accessible_branches', JSON.stringify(basicPermissions.accessible_branches));
+      saveSessionPermissionsToStorage(basicPermissions, normalizeRole(userRole));
+    }
+
     const activeBizId = getActiveBusinessId();
     handleResetUserForm();
     loadUsersList();
@@ -1096,7 +1146,7 @@ export default function SettingsPanel({
       backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
     }
     window.dispatchEvent(new Event('pos_data_updated'));
-    triggerNotify('✓ User security credentials and branch routing saved & synchronized!');
+    triggerNotify('✓ User security credentials, role permissions & settings access saved!');
   };
 
   const handleResetUserForm = () => {
@@ -1109,6 +1159,8 @@ export default function SettingsPanel({
     setUserSalary('7500');
     setUserContact('');
     setSelectedBranches([]);
+    setAllowedSettings(getDefaultSettingsForRole('sales'));
+    setAllowedModules(getDefaultModulesForRole('sales'));
   };
 
   const handleEditUserClick = (usr: any) => {
@@ -1121,6 +1173,12 @@ export default function SettingsPanel({
     setUserSalary(usr.basic_salary?.toString() || '7500');
     setUserContact(usr.contact || '');
     setSelectedBranches(usr.accessible_branches || []);
+    setAllowedSettings(
+      Array.isArray(usr.allowed_settings) ? usr.allowed_settings : getDefaultSettingsForRole(usr.role)
+    );
+    setAllowedModules(
+      Array.isArray(usr.allowed_modules) ? usr.allowed_modules : getDefaultModulesForRole(usr.role)
+    );
   };
 
   const handleDeleteUserClick = (usr: any) => {
@@ -1161,77 +1219,87 @@ export default function SettingsPanel({
           </div>
         </div>
         
-        {/* Unified Navigation Tabs */}
+        {/* Unified Navigation Tabs (Role & Tick-Based Access Control) */}
         <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 flex-wrap gap-1">
-          <button
-            type="button"
-            onClick={() => setActiveSubTab('general')}
-            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
-              activeSubTab === 'general'
-                ? 'bg-indigo-600 text-white shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-            }`}
-          >
-            1. Business &amp; Billing
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveSubTab('stores');
-              loadStoresList();
-            }}
-            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
-              activeSubTab === 'stores'
-                ? 'bg-indigo-600 text-white shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-            }`}
-          >
-            2. Stores ({storesList.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveSubTab('users');
-              loadUsersList();
-              loadStoresList();
-            }}
-            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
-              activeSubTab === 'users'
-                ? 'bg-indigo-600 text-white shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-            }`}
-          >
-            3. Users &amp; Staff ({usersList.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveSubTab('stock');
-              loadStoresList();
-            }}
-            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
-              activeSubTab === 'stock'
-                ? 'bg-indigo-600 text-white shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-            }`}
-          >
-            4. Add Stock ({productsCount})
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveSubTab('workspaces');
-              loadUsersList();
-            }}
-            className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
-              activeSubTab === 'workspaces'
-                ? 'bg-indigo-600 text-white shadow-xs'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
-            }`}
-          >
-            5. Cloud Sync &amp; Workspaces
-          </button>
-          {currentUserRole === 'owner' && (
+          {canAccessSettingTab('general', currentUserRole, effectivePermissions) && (
+            <button
+              type="button"
+              onClick={() => setActiveSubTab('general')}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+                activeSubTab === 'general'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              1. Business &amp; Billing
+            </button>
+          )}
+          {canAccessSettingTab('stores', currentUserRole, effectivePermissions) && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSubTab('stores');
+                loadStoresList();
+              }}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+                activeSubTab === 'stores'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              2. Stores ({storesList.length})
+            </button>
+          )}
+          {canAccessSettingTab('users', currentUserRole, effectivePermissions) && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSubTab('users');
+                loadUsersList();
+                loadStoresList();
+              }}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+                activeSubTab === 'users'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              3. Users &amp; Staff ({usersList.length})
+            </button>
+          )}
+          {canAccessSettingTab('stock', currentUserRole, effectivePermissions) && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSubTab('stock');
+                loadStoresList();
+              }}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+                activeSubTab === 'stock'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              4. Add Stock ({productsCount})
+            </button>
+          )}
+          {canAccessSettingTab('workspaces', currentUserRole, effectivePermissions) && (
+            <button
+              type="button"
+              onClick={() => {
+                setActiveSubTab('workspaces');
+                loadUsersList();
+              }}
+              className={`px-3 py-1.5 text-[11px] font-extrabold uppercase tracking-wider rounded-lg cursor-pointer transition-all ${
+                activeSubTab === 'workspaces'
+                  ? 'bg-indigo-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+              }`}
+            >
+              5. Cloud Sync &amp; Workspaces
+            </button>
+          )}
+          {canAccessSettingTab('payments', currentUserRole, effectivePermissions) && (
             <button
               type="button"
               onClick={() => {
@@ -1247,7 +1315,7 @@ export default function SettingsPanel({
               6. Payment Methods ({customMethods.length})
             </button>
           )}
-          {currentUserRole === 'owner' && (
+          {canAccessSettingTab('zra', currentUserRole, effectivePermissions) && (
             <button
               type="button"
               onClick={() => {
@@ -1274,7 +1342,15 @@ export default function SettingsPanel({
         </div>
       </div>
 
-      {activeSubTab === 'stores' ? (
+      {permittedSubTabs.length === 0 ? (
+        <div className="bg-white border border-rose-200 rounded-xl p-8 text-center shadow-xs max-w-lg mx-auto my-8">
+          <Lock size={32} className="text-rose-500 mx-auto mb-3" />
+          <h3 className="text-sm font-black uppercase text-slate-900">Settings Access Restricted</h3>
+          <p className="text-xs text-slate-500 mt-1.5">
+            Your current role ({normalizeRole(currentUserRole).toUpperCase()}) does not have permission to open any Settings modules. Ask your Administrator (Owner) to tick specific settings access for your staff account.
+          </p>
+        </div>
+      ) : activeSubTab === 'stores' && canAccessSettingTab('stores', currentUserRole, effectivePermissions) ? (
         <div className="flex flex-col lg:flex-row gap-5">
           {/* STORES LIST */}
           <div className="flex-1 bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
@@ -1524,7 +1600,7 @@ export default function SettingsPanel({
             </button>
           </form>
         </div>
-      ) : activeSubTab === 'stock' ? (
+      ) : activeSubTab === 'stock' && canAccessSettingTab('stock', currentUserRole, effectivePermissions) ? (
         <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
             <div className="flex items-center gap-2">
@@ -1570,8 +1646,8 @@ export default function SettingsPanel({
           )}
 
           <form onSubmit={handleQuickAddStockInSettings} className="flex flex-col gap-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="sm:col-span-2">
                 <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Product / Stock Name *</label>
                 <input
                   type="text"
@@ -1583,6 +1659,16 @@ export default function SettingsPanel({
                   placeholder="Enter product name"
                   required
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 text-xs font-bold focus:outline-hidden"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="text-[10px] text-slate-500 font-bold uppercase block mb-1">Item Description / Full Features</label>
+                <textarea
+                  rows={3}
+                  value={quickProdDescription}
+                  onChange={(e) => setQuickProdDescription(e.target.value)}
+                  placeholder="Enter full specifications, features, model details, or warranty (also displayed on Quotations & Invoices)..."
+                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white rounded-lg text-slate-900 text-xs font-medium focus:outline-hidden resize-y"
                 />
               </div>
               <div>
@@ -1692,7 +1778,7 @@ export default function SettingsPanel({
             </div>
           </form>
         </div>
-      ) : activeSubTab === 'workspaces' ? (
+      ) : activeSubTab === 'workspaces' && canAccessSettingTab('workspaces', currentUserRole, effectivePermissions) ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
           {/* Registered Business Workspaces */}
           <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
@@ -1782,7 +1868,7 @@ export default function SettingsPanel({
             )}
           </div>
         </div>
-      ) : activeSubTab === 'general' ? (
+      ) : activeSubTab === 'general' && canAccessSettingTab('general', currentUserRole, effectivePermissions) ? (
         <div className="flex flex-col md:flex-row gap-5">
           
           {/* LEFT COLUMN: MERCHANT PREFERENCE & BILLING ADDRESS CONFIGURATION */}
@@ -2373,12 +2459,12 @@ export default function SettingsPanel({
 
         </div>
       ) : activeSubTab === 'payments' ? (
-        currentUserRole !== 'owner' ? (
+        !canAccessSettingTab('payments', currentUserRole, effectivePermissions) ? (
           <div className="bg-white border border-rose-200 rounded-xl p-8 text-center shadow-xs max-w-lg mx-auto my-8">
             <Lock size={32} className="text-rose-500 mx-auto mb-3" />
             <h3 className="text-sm font-black uppercase text-slate-900">Administrator Access Required</h3>
             <p className="text-xs text-slate-500 mt-1">
-              Only the business administrator (Owner) can create, enable, or remove custom payment methods.
+              You do not have permission to create, enable, or remove custom payment methods.
             </p>
           </div>
         ) : (
@@ -2611,12 +2697,12 @@ export default function SettingsPanel({
           </div>
         )
       ) : activeSubTab === 'zra' ? (
-        currentUserRole !== 'owner' ? (
+        !canAccessSettingTab('zra', currentUserRole, effectivePermissions) ? (
           <div className="bg-white border border-rose-200 rounded-xl p-8 text-center shadow-xs max-w-lg mx-auto my-8">
             <Lock size={32} className="text-rose-500 mx-auto mb-3" />
             <h3 className="text-sm font-black uppercase text-slate-900">Administrator Access Required</h3>
             <p className="text-xs text-slate-500 mt-1">
-              Only the business administrator (Owner) can configure ZRA Smart Invoice VSDC credentials and toggle fiscalization.
+              You do not have permission to configure ZRA Smart Invoice VSDC credentials and toggle fiscalization.
             </p>
           </div>
         ) : (
@@ -3015,7 +3101,7 @@ export default function SettingsPanel({
             </div>
           </div>
         )
-      ) : (
+      ) : activeSubTab === 'users' && canAccessSettingTab('users', currentUserRole, effectivePermissions) ? (
         <div className="flex flex-col lg:flex-row gap-5">
           {/* USER DIRECTORY TABLE COLUMN */}
           <div className="flex-1 bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
@@ -3035,7 +3121,7 @@ export default function SettingsPanel({
                   <tr className="bg-slate-50 text-slate-400 font-extrabold text-[9px] uppercase tracking-wider border-b border-slate-100 select-none">
                     <th className="py-2.5 px-3">Full Employee Card</th>
                     <th className="py-2.5 px-3">Username Key / Email</th>
-                    <th className="py-2.5 px-3">Access Level Rights</th>
+                    <th className="py-2.5 px-3">Access Level &amp; Settings Rights</th>
                     <th className="py-2.5 px-3">Outlet Store Gating</th>
                     <th className="py-2.5 px-3 text-center">Settings Options</th>
                   </tr>
@@ -3053,6 +3139,10 @@ export default function SettingsPanel({
                       : usr.role === 'manager' 
                         ? '👔 MANAGER (Supervisor approval)' 
                         : '💼 CASHIER (Sales operator)';
+
+                    const grantedSettings: SettingsPermissionKey[] = usr.role === 'owner'
+                      ? ALL_SETTINGS_KEYS
+                      : (Array.isArray(usr.allowed_settings) ? usr.allowed_settings : getDefaultSettingsForRole(usr.role));
 
                     return (
                       <tr key={`${usr.is_owner ? 'owner' : 'staff'}-${usr.id}-${idx}`} className="hover:bg-slate-50/40 transition-colors">
@@ -3076,6 +3166,26 @@ export default function SettingsPanel({
                         <td className="py-3 px-3">
                           <span className="text-[10px] font-black uppercase tracking-wide text-slate-800">{roleLabel}</span>
                           {usr.basic_salary > 0 && <span className="text-[9px] font-mono text-slate-450 block mt-0.5">Salary: ZMW {usr.basic_salary.toLocaleString()}</span>}
+                          <div className="flex flex-wrap gap-1 mt-1.5 max-w-[230px]">
+                            {usr.role === 'owner' ? (
+                              <span className="text-[8.5px] px-1.5 py-0.5 font-extrabold uppercase bg-purple-50 text-purple-700 border border-purple-200 rounded">
+                                All 7 Settings &amp; Modules
+                              </span>
+                            ) : grantedSettings.length === 0 ? (
+                              <span className="text-[8.5px] px-1.5 py-0.5 font-bold uppercase bg-rose-50 text-rose-700 border border-rose-200 rounded">
+                                No Settings Access
+                              </span>
+                            ) : (
+                              grantedSettings.map((sKey) => {
+                                const meta = SETTINGS_PERMISSION_OPTIONS.find((opt) => opt.key === sKey);
+                                return (
+                                  <span key={sKey} className="text-[8.5px] px-1.5 py-0.5 font-bold uppercase bg-indigo-50 text-indigo-700 border border-indigo-200 rounded">
+                                    {meta ? meta.label.replace(/^\d+\.\s*/, '') : sKey}
+                                  </span>
+                                );
+                              })
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 px-3">
                           {usr.role === 'owner' ? (
@@ -3221,8 +3331,10 @@ export default function SettingsPanel({
               <select
                 value={userRole}
                 onChange={(e) => {
-                  const roleVal = e.target.value as any;
+                  const roleVal = e.target.value as 'sales' | 'manager' | 'owner';
                   setUserRole(roleVal);
+                  setAllowedSettings(getDefaultSettingsForRole(roleVal));
+                  setAllowedModules(getDefaultModulesForRole(roleVal));
                   if (roleVal === 'owner') {
                     setSelectedBranches([]); // Implicit all branches
                   }
@@ -3248,6 +3360,119 @@ export default function SettingsPanel({
                   placeholder="e.g. 7500.00"
                   className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-505 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-808"
                 />
+              </div>
+            )}
+
+            {/* Tickable Settings Access Permissions */}
+            {userRole !== 'owner' && (
+              <div className="flex flex-col gap-1.5 border-t border-slate-100 pt-3">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-[9.5px] text-indigo-700 font-black uppercase flex items-center gap-1 select-none">
+                    <Sliders size={11} className="text-indigo-600" />
+                    <span>Settings Access Permissions</span>
+                  </label>
+                  <div className="flex items-center gap-1 text-[8.5px] font-extrabold uppercase">
+                    <button
+                      type="button"
+                      onClick={() => setAllowedSettings([...ALL_SETTINGS_KEYS])}
+                      className="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAllowedSettings([])}
+                      className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 hover:bg-slate-200 cursor-pointer"
+                    >
+                      None
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAllowedSettings(getDefaultSettingsForRole(userRole))}
+                      className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 hover:bg-emerald-100 cursor-pointer"
+                    >
+                      Role Default
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[8.5px] text-slate-400 leading-tight">
+                  Tick which Settings sections this staff member can open and configure.
+                </p>
+                <div className="flex flex-col gap-1.5 bg-slate-50 border border-slate-200 p-2.5 rounded-lg">
+                  {SETTINGS_PERMISSION_OPTIONS.map((opt) => {
+                    const isChecked = allowedSettings.includes(opt.key);
+                    return (
+                      <label key={opt.key} className="flex items-start gap-2 text-[10.5px] text-slate-700 cursor-pointer py-0.5">
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setAllowedSettings((prev) => (prev.includes(opt.key) ? prev : [...prev, opt.key]));
+                            } else {
+                              setAllowedSettings((prev) => prev.filter((k) => k !== opt.key));
+                            }
+                          }}
+                          className="mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer h-3.5 w-3.5 shrink-0"
+                        />
+                        <div className="flex flex-col leading-tight">
+                          <span className="font-extrabold text-slate-800 text-[10px]">{opt.label}</span>
+                          <span className="text-[8.5px] text-slate-400">{opt.description}</span>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Tickable Role-Based App Modules Access */}
+            {userRole !== 'owner' && (
+              <div className="flex flex-col gap-1.5 border-t border-slate-100 pt-3">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-[9.5px] text-emerald-700 font-black uppercase flex items-center gap-1 select-none">
+                    <ShieldCheck size={11} className="text-emerald-600" />
+                    <span>App Modules Access ({allowedModules.length}/{MODULE_PERMISSION_OPTIONS.length})</span>
+                  </label>
+                  <div className="flex items-center gap-1 text-[8.5px] font-extrabold uppercase">
+                    <button
+                      type="button"
+                      onClick={() => setAllowedModules([...ALL_MODULE_KEYS])}
+                      className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 hover:bg-emerald-100 cursor-pointer"
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAllowedModules(getDefaultModulesForRole(userRole))}
+                      className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 hover:bg-slate-200 cursor-pointer"
+                    >
+                      Role Default
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 bg-slate-50 border border-slate-200 p-2.5 rounded-lg">
+                  {MODULE_PERMISSION_OPTIONS.map((mod) => {
+                    const isChecked = allowedModules.includes(mod.key);
+                    return (
+                      <label key={mod.key} className="flex items-center gap-1.5 text-[10px] text-slate-700 font-bold cursor-pointer py-0.5">
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setAllowedModules((prev) => (prev.includes(mod.key) ? prev : [...prev, mod.key]));
+                            } else {
+                              setAllowedModules((prev) => prev.filter((k) => k !== mod.key));
+                            }
+                          }}
+                          className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer h-3.5 w-3.5 shrink-0"
+                        />
+                        <span className="truncate">{mod.label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
@@ -3302,6 +3527,14 @@ export default function SettingsPanel({
               )}
             </div>
           </form>
+        </div>
+      ) : (
+        <div className="bg-white border border-rose-200 rounded-xl p-8 text-center shadow-xs max-w-lg mx-auto my-8">
+          <Lock size={32} className="text-rose-500 mx-auto mb-3" />
+          <h3 className="text-sm font-black uppercase text-slate-900">Settings Section Restricted</h3>
+          <p className="text-xs text-slate-500 mt-1">
+            You do not have permission to view this Settings section. Choose one of your permitted tabs above or contact your Administrator.
+          </p>
         </div>
       )}
 

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { runSql, persistTablesToStorage } from '../db';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
@@ -151,6 +151,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   const [editDocDate, setEditDocDate] = useState('');
   const [editDiscountVal, setEditDiscountVal] = useState('0.00');
   const [customItemName, setCustomItemName] = useState('');
+  const [customItemDescription, setCustomItemDescription] = useState('');
   const [customItemPrice, setCustomItemPrice] = useState('');
   const [customItemQty, setCustomItemQty] = useState('1');
 
@@ -196,6 +197,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   const [productSearch, setProductSearch] = useState('');
   const [showAddCatalogProduct, setShowAddCatalogProduct] = useState(false);
   const [newCatalogName, setNewCatalogName] = useState('');
+  const [newCatalogDescription, setNewCatalogDescription] = useState('');
   const [newCatalogPrice, setNewCatalogPrice] = useState('');
   const [newCatalogStock, setNewCatalogStock] = useState('100');
 
@@ -378,6 +380,144 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
     }
   }, [selectedQuote?.id, selectedQuote?.status]);
 
+  // Keyboard-safe scrolling & viewport tracking so soft keyboard never covers active inputs
+  const workspaceRef = useRef<HTMLDivElement | null>(null);
+  const blurTimeoutRef = useRef<number | null>(null);
+  const scrollTimersRef = useRef<number[]>([]);
+  const [isFieldFocused, setIsFieldFocused] = useState(false);
+
+  const clearScheduledScrolls = () => {
+    scrollTimersRef.current.forEach((id) => window.clearTimeout(id));
+    scrollTimersRef.current = [];
+  };
+
+  const applyKeyboardInsetAndScroll = (targetEl?: HTMLElement | null) => {
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    const vvHeight = vv ? vv.height : window.innerHeight;
+    const vvTop = vv ? vv.offsetTop : 0;
+    const detectedInset = vv ? Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop)) : 0;
+    const isCompactOrTouch =
+      window.innerWidth < 1024 ||
+      (typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches);
+
+    const effectiveInset = detectedInset > 60
+      ? detectedInset + 64
+      : isCompactOrTouch
+        ? 320
+        : 48;
+
+    document.documentElement.style.setProperty('--keyboard-inset', `${effectiveInset}px`);
+
+    const el = targetEl || (document.activeElement as HTMLElement | null);
+    if (!el || !workspaceRef.current || !workspaceRef.current.contains(el)) return;
+    if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return;
+    if (el instanceof HTMLInputElement && ['checkbox', 'radio', 'button', 'submit', 'file'].includes(el.type)) return;
+
+    const safeTop = vvTop + 72;
+    const safeBottom = detectedInset > 60
+      ? vvTop + vvHeight - 24
+      : isCompactOrTouch
+        ? vvTop + Math.min(vvHeight - 24, Math.round(window.innerHeight * 0.52))
+        : vvTop + vvHeight - 32;
+
+    const rect = el.getBoundingClientRect();
+    if (rect.bottom > safeBottom || rect.top < safeTop) {
+      const desiredTop = safeTop + Math.max(16, (safeBottom - safeTop) * 0.3);
+      let remainingDelta = rect.top - desiredTop;
+      let node: HTMLElement | null = el.parentElement;
+
+      while (node && node !== document.body && Math.abs(remainingDelta) > 4) {
+        const computed = window.getComputedStyle(node);
+        const canScrollY =
+          (computed.overflowY === 'auto' || computed.overflowY === 'scroll') &&
+          node.scrollHeight > node.clientHeight + 4;
+        if (canScrollY) {
+          const maxDown = node.scrollHeight - node.clientHeight - node.scrollTop;
+          const maxUp = -node.scrollTop;
+          const step = remainingDelta > 0
+            ? Math.min(remainingDelta, maxDown)
+            : Math.max(remainingDelta, maxUp);
+          if (Math.abs(step) > 2) {
+            node.scrollBy({ top: step, behavior: 'smooth' });
+            remainingDelta -= step;
+          }
+        }
+        node = node.parentElement;
+      }
+
+      if (Math.abs(remainingDelta) > 12) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!isFieldFocused) {
+      document.documentElement.style.setProperty('--keyboard-inset', '0px');
+      return;
+    }
+    const handleViewportUpdate = () => {
+      applyKeyboardInsetAndScroll(document.activeElement as HTMLElement | null);
+    };
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener('resize', handleViewportUpdate);
+      vv.addEventListener('scroll', handleViewportUpdate);
+    }
+    window.addEventListener('resize', handleViewportUpdate);
+    return () => {
+      if (vv) {
+        vv.removeEventListener('resize', handleViewportUpdate);
+        vv.removeEventListener('scroll', handleViewportUpdate);
+      }
+      window.removeEventListener('resize', handleViewportUpdate);
+    };
+  }, [isFieldFocused]);
+
+  useEffect(() => {
+    return () => {
+      clearScheduledScrolls();
+      if (blurTimeoutRef.current !== null) window.clearTimeout(blurTimeoutRef.current);
+      document.documentElement.style.setProperty('--keyboard-inset', '0px');
+    };
+  }, []);
+
+  const handleWorkspaceFocusCapture = (e: React.FocusEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement | null;
+    if (!target || !['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+    if (target instanceof HTMLInputElement && ['checkbox', 'radio', 'button', 'submit', 'file'].includes(target.type)) {
+      return;
+    }
+    if (blurTimeoutRef.current !== null) {
+      window.clearTimeout(blurTimeoutRef.current);
+      blurTimeoutRef.current = null;
+    }
+    setIsFieldFocused(true);
+    clearScheduledScrolls();
+    window.requestAnimationFrame(() => applyKeyboardInsetAndScroll(target));
+    scrollTimersRef.current.push(
+      window.setTimeout(() => applyKeyboardInsetAndScroll(target), 180),
+      window.setTimeout(() => applyKeyboardInsetAndScroll(target), 400)
+    );
+  };
+
+  const handleWorkspaceBlurCapture = () => {
+    if (blurTimeoutRef.current !== null) window.clearTimeout(blurTimeoutRef.current);
+    blurTimeoutRef.current = window.setTimeout(() => {
+      const active = document.activeElement as HTMLElement | null;
+      const stillInField =
+        !!active &&
+        !!workspaceRef.current?.contains(active) &&
+        ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) &&
+        !(active instanceof HTMLInputElement && ['checkbox', 'radio', 'button', 'submit', 'file'].includes(active.type));
+      if (!stillInField) {
+        clearScheduledScrolls();
+        setIsFieldFocused(false);
+        document.documentElement.style.setProperty('--keyboard-inset', '0px');
+      }
+    }, 120);
+  };
+
   const addToCart = (prod: any) => {
     setFormNotice(null);
     if (selectedQuote) {
@@ -390,7 +530,16 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       updated[idx].quantity += 1;
       setCartItems(updated);
     } else {
-      setCartItems([...cartItems, { id: prod.id, name: prod.name, quantity: 1, unitPrice: Number(prod.price || 0) }]);
+      setCartItems([
+        ...cartItems,
+        {
+          id: prod.id,
+          name: prod.name,
+          description: prod.description || '',
+          quantity: 1,
+          unitPrice: Number(prod.price || 0)
+        }
+      ]);
     }
   };
 
@@ -407,6 +556,10 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
     const parsed = parseFloat(priceString);
     const price = isNaN(parsed) ? 0 : Math.max(0, parsed);
     setCartItems(cartItems.map(item => String(item.id) === String(pId) ? { ...item, unitPrice: price } : item));
+  };
+
+  const handleUpdateCartDescription = (pId: number | string, description: string) => {
+    setCartItems(cartItems.map(item => String(item.id) === String(pId) ? { ...item, description } : item));
   };
 
   const calculateSubtotal = () => {
@@ -785,22 +938,38 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       updated[idx] = { ...updated[idx], quantity: Number(updated[idx].quantity || 0) + 1 };
       setEditItems(updated);
     } else {
-      setEditItems([...editItems, { id: prod.id, name: prod.name, quantity: 1, unitPrice: Number(prod.price || 0) }]);
+      setEditItems([
+        ...editItems,
+        {
+          id: prod.id,
+          name: prod.name,
+          description: prod.description || '',
+          quantity: 1,
+          unitPrice: Number(prod.price || 0)
+        }
+      ]);
     }
   };
 
   const handleAddCustomEditItem = () => {
     if (!customItemName.trim()) {
-      setFormNotice({ type: 'error', text: 'Enter an item description before adding.' });
+      setFormNotice({ type: 'error', text: 'Enter an item name before adding.' });
       return;
     }
     const price = Math.max(0, parseFloat(customItemPrice) || 0);
     const qty = Math.max(1, parseInt(customItemQty, 10) || 1);
     setEditItems([
       ...editItems,
-      { id: 'custom_' + Date.now(), name: customItemName.trim(), quantity: qty, unitPrice: price }
+      {
+        id: 'custom_' + Date.now(),
+        name: customItemName.trim(),
+        description: customItemDescription.trim(),
+        quantity: qty,
+        unitPrice: price
+      }
     ]);
     setCustomItemName('');
+    setCustomItemDescription('');
     setCustomItemPrice('');
     setCustomItemQty('1');
   };
@@ -1060,29 +1229,65 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
 
       // Table Content Rows
       let currentY = tableY + 8;
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
-      doc.setTextColor(71, 85, 105); // Slate-600
+      const descColWidth = 78;
 
       docData.items.forEach((item: any, idx: number) => {
-        if (currentY > 250) {
+        const uPrice = Number(item.unitPrice || 0);
+        const qty = Number(item.quantity || 0);
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9);
+        const nameLines: string[] = doc.splitTextToSize(String(item.name || ''), descColWidth);
+
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8);
+        const rawDesc = String(item.description || '').trim();
+        const descLines: string[] = rawDesc ? doc.splitTextToSize(rawDesc, descColWidth) : [];
+
+        const nameHeight = nameLines.length * 4.2;
+        const descHeight = descLines.length > 0 ? descLines.length * 3.6 + 1 : 0;
+        const rowHeight = Math.max(7.5, 3.5 + nameHeight + descHeight + 2);
+
+        if (currentY + rowHeight > 260) {
           doc.addPage();
           currentY = 20;
         }
-        doc.setDrawColor(241, 245, 249);
-        doc.setLineWidth(0.3);
-        doc.line(margin, currentY + 7, 210 - margin, currentY + 7);
 
-        const uPrice = Number(item.unitPrice || 0);
-        const qty = Number(item.quantity || 0);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.setTextColor(71, 85, 105);
         doc.text((idx + 1).toString(), margin + 3, currentY + 5);
-        doc.text(item.name || '', margin + 12, currentY + 5);
+
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(9);
+        doc.setTextColor(30, 41, 59);
+        doc.text(nameLines, margin + 12, currentY + 5);
+
+        if (descLines.length > 0) {
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(8);
+          doc.setTextColor(100, 116, 139);
+          doc.text(descLines, margin + 12, currentY + 5 + nameHeight);
+        }
+
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9);
+        doc.setTextColor(71, 85, 105);
         doc.text(qty.toString(), margin + 105, currentY + 5, { align: 'right' });
         doc.text(`${settings.currency}${uPrice.toFixed(2)}`, margin + 135, currentY + 5, { align: 'right' });
         doc.text(`${settings.currency}${(uPrice * qty).toFixed(2)}`, margin + 175, currentY + 5, { align: 'right' });
 
-        currentY += 7.5;
+        doc.setDrawColor(241, 245, 249);
+        doc.setLineWidth(0.3);
+        doc.line(margin, currentY + rowHeight - 0.5, 210 - margin, currentY + rowHeight - 0.5);
+
+        currentY += rowHeight;
       });
+
+      if (currentY > 235) {
+        doc.addPage();
+        currentY = 20;
+      }
 
       // Totals Panel
       const totalPanelY = currentY + 5;
@@ -1274,7 +1479,13 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   };
 
   return (
-    <div className="flex-1 min-h-0 flex overflow-hidden flex-col bg-slate-50 relative">
+    <div
+      ref={workspaceRef}
+      dir="ltr"
+      onFocusCapture={handleWorkspaceFocusCapture}
+      onBlurCapture={handleWorkspaceBlurCapture}
+      className="flex-1 min-h-0 flex overflow-hidden flex-col bg-slate-50 relative text-left select-text"
+    >
       
       {/* Upper header action controls */}
       <div className="px-5 py-3.5 bg-white border-b border-slate-200 flex flex-wrap justify-between items-center gap-3 shrink-0">
@@ -1338,13 +1549,13 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         </div>
       )}
 
-      <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden scroll-y-touch touch-pan-y">
+      <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden scroll-y-touch touch-pan-y keyboard-safe-scroll">
         
         {/* LEFTSIDE DOCUMENT SELECTOR & NEW DOC CREATOR */}
-        <div className="w-full lg:w-5/12 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col lg:min-h-0 lg:h-full lg:overflow-y-auto p-4 gap-4 shrink-0">
+        <div className="w-full lg:w-5/12 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col lg:min-h-0 lg:h-full lg:overflow-y-auto p-4 gap-4 shrink-0 keyboard-safe-scroll">
           
           {/* Section: Create New Quote with Tabbed Flow */}
-          <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 shadow-3xs flex flex-col gap-3">
+          <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 shadow-xs flex flex-col gap-3">
             <h3 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider flex items-center gap-1.5 border-b border-slate-100 pb-2">
               <Building size={14} className="text-indigo-600" />
               1. DOCUMENT WORKSTATION CREATOR
@@ -1355,8 +1566,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
               <button
                 type="button"
                 onClick={() => setActiveFormTab('client_bank')}
-                className={`flex-1 py-1 px-1.5 font-bold uppercase rounded-lg text-center transition-all ${
-                  activeFormTab === 'client_bank' ? 'bg-indigo-600 text-white shadow-2xs' : 'text-slate-500 hover:bg-slate-100'
+                className={`flex-1 py-1.5 px-2 font-bold uppercase rounded-lg text-center transition-all cursor-pointer ${
+                  activeFormTab === 'client_bank' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
                 1. Info &amp; Bank
@@ -1364,8 +1575,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
               <button
                 type="button"
                 onClick={() => setActiveFormTab('items_stock')}
-                className={`flex-1 py-1 px-1.5 font-bold uppercase rounded-lg text-center transition-all ${
-                  activeFormTab === 'items_stock' ? 'bg-indigo-600 text-white shadow-2xs' : 'text-slate-500 hover:bg-slate-100'
+                className={`flex-1 py-1.5 px-2 font-bold uppercase rounded-lg text-center transition-all cursor-pointer ${
+                  activeFormTab === 'items_stock' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
                 2. Stock ({cartItems.length})
@@ -1373,8 +1584,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
               <button
                 type="button"
                 onClick={() => setActiveFormTab('terms_conditions')}
-                className={`flex-1 py-1 px-1.5 font-bold uppercase rounded-lg text-center transition-all ${
-                  activeFormTab === 'terms_conditions' ? 'bg-indigo-600 text-white shadow-2xs' : 'text-slate-500 hover:bg-slate-100'
+                className={`flex-1 py-1.5 px-2 font-bold uppercase rounded-lg text-center transition-all cursor-pointer ${
+                  activeFormTab === 'terms_conditions' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
                 }`}
               >
                 3. T&amp;C ({selectedTermIds.length})
@@ -1387,13 +1598,14 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
               {activeFormTab === 'client_bank' && (
                 <div className="flex flex-col gap-3 font-sans mt-1">
                   {/* Document Type & Date Controls */}
-                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm grid grid-cols-2 gap-2">
+                  <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs grid grid-cols-2 gap-2.5">
                     <div className="flex flex-col gap-1">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase">Document Type</label>
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Document Type</label>
                       <select
+                        dir="ltr"
                         value={draftDocType}
                         onChange={(e) => setDraftDocType(e.target.value as 'QUOTATION' | 'INVOICE' | 'DELIVERY_NOTE')}
-                        className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold focus:outline-none cursor-pointer"
+                        className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-bold text-left focus:outline-hidden cursor-pointer"
                       >
                         <option value="QUOTATION">Quotation</option>
                         <option value="INVOICE">Tax Invoice</option>
@@ -1401,22 +1613,24 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       </select>
                     </div>
                     <div className="flex flex-col gap-1">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase">Document Date</label>
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Document Date</label>
                       <input
                         type="date"
+                        dir="ltr"
                         value={draftDate}
                         onChange={(e) => setDraftDate(e.target.value)}
-                        className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold focus:outline-none"
+                        className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-bold text-left select-text focus:outline-hidden"
                       />
                     </div>
                   </div>
 
                   {/* Customer Corporate profile */}
-                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2.5">
+                  <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs flex flex-col gap-2.5">
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[10px] text-indigo-700 font-extrabold uppercase block tracking-wider">Customer Contact Profile</span>
                       {existingCustomers.length > 0 && (
                         <select
+                          dir="ltr"
                           value=""
                           onChange={(e) => {
                             const cust = existingCustomers.find(c => String(c.id) === e.target.value);
@@ -1427,7 +1641,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                               if (selectedQuote) setSelectedQuote(null);
                             }
                           }}
-                          className="text-[10px] bg-indigo-50 border border-indigo-200 text-indigo-800 rounded px-2 py-0.5 font-bold cursor-pointer max-w-[160px]"
+                          className="text-[10px] bg-indigo-50 border border-indigo-200 text-indigo-800 rounded-lg px-2 py-1 font-bold cursor-pointer max-w-[165px] text-left focus:outline-hidden"
                         >
                           <option value="">Load Saved Customer...</option>
                           {existingCustomers.map(c => (
@@ -1437,7 +1651,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       )}
                     </div>
                     <div className="flex flex-col gap-1">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase">Customer Corporate Name *</label>
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Customer Corporate Name *</label>
                       <input
                         type="text"
                         dir="ltr"
@@ -1449,38 +1663,38 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                           if (formNotice) setFormNotice(null);
                         }}
                         placeholder="Enter customer or company name"
-                        className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                        className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                       />
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       <div className="flex flex-col gap-1">
-                        <label className="text-[9px] text-slate-400 font-bold uppercase">Phone Number</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Phone Number</label>
                         <input
                           type="tel"
                           dir="ltr"
                           value={cPhone}
                           onChange={(e) => setCPhone(e.target.value)}
                           placeholder="+260 977 XXXXXX"
-                          className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 text-left select-text"
+                          className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
-                        <label className="text-[9px] text-slate-400 font-bold uppercase">Email Address</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Email Address</label>
                         <input
                           type="email"
                           dir="ltr"
                           value={cEmail}
                           onChange={(e) => setCEmail(e.target.value)}
                           placeholder="client@company.com"
-                          className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 text-left select-text"
+                          className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                         />
                       </div>
                     </div>
                   </div>
 
                   {/* Bank details input fields with headings */}
-                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2">
-                    <div className="flex justify-between items-center pb-1 border-b border-slate-100">
+                  <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs flex flex-col gap-2.5">
+                    <div className="flex justify-between items-center pb-1.5 border-b border-slate-100">
                       <span className="text-[10px] text-indigo-700 font-extrabold uppercase tracking-wider">Payment Bank Details (Optional)</span>
                       <button
                         type="button"
@@ -1502,58 +1716,63 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     </div>
 
                     <div className="flex flex-col gap-2 text-xs">
-                      <div className="flex flex-col gap-0.5">
-                        <label className="text-[9px] text-slate-400 font-bold uppercase">BANK NAME</label>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Bank Name</label>
                         <input
                           type="text"
+                          dir="ltr"
                           value={bankName}
                           onChange={(e) => setBankName(e.target.value)}
                           placeholder="Zambia National Commercial Bank"
-                          className="px-2.5 py-1 bg-slate-50 border border-slate-201 rounded-md text-slate-850 font-semibold"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 text-xs font-semibold text-left select-text focus:outline-hidden"
                         />
                       </div>
 
-                      <div className="flex flex-col gap-0.5">
-                        <label className="text-[9px] text-slate-400 font-bold uppercase">ACCOUNT NAME</label>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Account Name</label>
                         <input
                           type="text"
+                          dir="ltr"
                           value={bankAccountName}
                           onChange={(e) => setBankAccountName(e.target.value)}
                           placeholder="SME Retailers Ltd"
-                          className="px-2.5 py-1 bg-slate-50 border border-slate-201 rounded-md text-slate-850 font-semibold"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 text-xs font-semibold text-left select-text focus:outline-hidden"
                         />
                       </div>
 
-                      <div className="flex flex-col gap-0.5">
-                        <label className="text-[9px] text-slate-400 font-bold uppercase">ACCOUNT NUMBER</label>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Account Number</label>
                         <input
                           type="text"
+                          dir="ltr"
                           value={bankAccountNumber}
                           onChange={(e) => setBankAccountNumber(e.target.value)}
                           placeholder="1020088991102"
-                          className="px-2.5 py-1 bg-slate-50 border border-slate-201 rounded-md text-slate-850 font-bold font-mono"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 text-xs font-bold font-mono text-left select-text focus:outline-hidden"
                         />
                       </div>
 
-                      <div className="grid grid-cols-2 gap-2">
-                        <div className="flex flex-col gap-0.5">
-                          <label className="text-[9px] text-slate-400 font-bold uppercase">BRANCH NAME</label>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Branch Name</label>
                           <input
                             type="text"
+                            dir="ltr"
                             value={bankBranchName}
                             onChange={(e) => setBankBranchName(e.target.value)}
                             placeholder="Lusaka Commercial Branch"
-                            className="px-2.5 py-1 bg-slate-50 border border-slate-201 rounded-md text-slate-850 font-medium"
+                            className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 text-xs font-medium text-left select-text focus:outline-hidden"
                           />
                         </div>
-                        <div className="flex flex-col gap-0.5">
-                          <label className="text-[9px] text-slate-400 font-bold uppercase">SORT CODE</label>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Sort Code</label>
                           <input
                             type="text"
+                            dir="ltr"
                             value={bankSortCode}
                             onChange={(e) => setBankSortCode(e.target.value)}
                             placeholder="01-02-03"
-                            className="px-2.5 py-1 bg-slate-50 border border-slate-201 rounded-md text-slate-850 font-bold font-mono"
+                            className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 text-xs font-bold font-mono text-left select-text focus:outline-hidden"
                           />
                         </div>
                       </div>
@@ -1561,8 +1780,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   </div>
 
                   {/* Issuer Name & Digital Signature */}
-                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2.5">
-                    <div className="flex justify-between items-center pb-1 border-b border-slate-100">
+                  <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs flex flex-col gap-2.5">
+                    <div className="flex justify-between items-center pb-1.5 border-b border-slate-100">
                       <span className="text-[10px] text-indigo-700 font-extrabold uppercase tracking-wider flex items-center gap-1">
                         <PenTool size={11} /> Issuer Name &amp; Digital Signature
                       </span>
@@ -1581,14 +1800,14 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     </div>
 
                     <div className="flex flex-col gap-1">
-                      <label className="text-[9px] text-slate-400 font-bold uppercase">Issued By (Full Name)</label>
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Issued By (Full Name)</label>
                       <input
                         type="text"
                         dir="ltr"
                         value={issuerName}
                         onChange={(e) => setIssuerName(e.target.value)}
                         placeholder="Name of person issuing document"
-                        className="px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                        className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                       />
                     </div>
 
@@ -1623,50 +1842,64 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                 <div className="flex flex-col gap-3 font-sans mt-1">
                   
                   {/* Quick Product Creator directly to Inventory Stock */}
-                  <div className="border border-indigo-150 rounded-xl p-3 bg-indigo-50/20">
+                  <div className="border border-indigo-200 rounded-xl p-3 bg-indigo-50/20">
                     <div className="flex justify-between items-center">
                       <span className="font-extrabold text-[10px] text-indigo-900 uppercase">📦 Want to add a new stock item?</span>
                       <button
                         type="button"
                         onClick={() => setShowAddCatalogProduct(!showAddCatalogProduct)}
-                        className="text-[9px] bg-indigo-600 hover:bg-indigo-700 text-white font-black px-2 py-0.5 rounded uppercase"
+                        className="text-[9px] bg-indigo-600 hover:bg-indigo-700 text-white font-black px-2 py-0.5 rounded uppercase cursor-pointer"
                       >
                         {showAddCatalogProduct ? 'CLOSE PANEL' : '+ QUICK CREATE NEW ITEM'}
                       </button>
                     </div>
 
                     {showAddCatalogProduct && (
-                      <div className="flex flex-col gap-2 mt-2 pt-2 border-t border-indigo-100 text-xs">
-                        <div className="flex flex-col gap-0.5">
-                          <label className="text-[8px] text-slate-400 font-bold uppercase">ITEM NAME</label>
+                      <div className="flex flex-col gap-2.5 mt-2.5 pt-2.5 border-t border-indigo-100 text-xs">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Item Name *</label>
                           <input
                             type="text"
+                            dir="ltr"
                             placeholder="Copper spool wire 5mm"
                             value={newCatalogName}
                             onChange={(e) => setNewCatalogName(e.target.value)}
-                            className="p-1.5 border rounded-md font-semibold bg-white"
+                            className="w-full px-3 py-2 border border-slate-200 focus:border-indigo-500 rounded-lg font-semibold bg-white text-slate-900 text-xs text-left select-text focus:outline-hidden"
                           />
                         </div>
-                        <div className="grid grid-cols-2 gap-2">
-                          <div>
-                            <label className="text-[8px] text-slate-400 font-bold uppercase">SELLING PRICE ({settings.currency})</label>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Item Description / Full Features</label>
+                          <textarea
+                            rows={3}
+                            dir="ltr"
+                            placeholder="Enter full specifications, features, dimensions, model or warranty details..."
+                            value={newCatalogDescription}
+                            onChange={(e) => setNewCatalogDescription(e.target.value)}
+                            className="w-full px-3 py-2 border border-slate-200 focus:border-indigo-500 rounded-lg font-medium bg-white text-slate-900 text-xs text-left select-text focus:outline-hidden resize-y"
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-2.5">
+                          <div className="flex flex-col gap-1">
+                            <label className="text-[10px] text-slate-500 font-bold uppercase">Selling Price ({settings.currency}) *</label>
                             <input
                               type="number"
+                              dir="ltr"
                               step="0.01"
                               placeholder="350.00"
                               value={newCatalogPrice}
                               onChange={(e) => setNewCatalogPrice(e.target.value)}
-                              className="p-1.5 w-full border rounded-md font-bold text-slate-800 bg-white"
+                              className="w-full px-3 py-2 border border-slate-200 focus:border-indigo-500 rounded-lg font-bold text-slate-900 bg-white text-xs text-left select-text focus:outline-hidden"
                             />
                           </div>
-                          <div>
-                            <label className="text-[8px] text-slate-400 font-bold uppercase">STOCK COUNT</label>
+                          <div className="flex flex-col gap-1">
+                            <label className="text-[10px] text-slate-500 font-bold uppercase">Stock Count</label>
                             <input
                               type="number"
+                              dir="ltr"
                               placeholder="150"
                               value={newCatalogStock}
                               onChange={(e) => setNewCatalogStock(e.target.value)}
-                              className="p-1.5 w-full border rounded-md text-slate-800 bg-white font-medium"
+                              className="w-full px-3 py-2 border border-slate-200 focus:border-indigo-500 rounded-lg text-slate-900 bg-white font-medium text-xs text-left select-text focus:outline-hidden"
                             />
                           </div>
                         </div>
@@ -1687,12 +1920,15 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                               bizId = JSON.parse(localStorage.getItem('active_business_profile') || '{}')?.id || '';
                             } catch {}
                             const safeName = newCatalogName.trim().replace(/'/g, "''");
+                            const cleanDesc = newCatalogDescription.trim();
+                            const safeDesc = cleanDesc.replace(/'/g, "''");
 
                             const qryInsert = `
-                              INSERT INTO products (id, name, sku, category, stock, cost, price, business_id, is_service)
+                              INSERT INTO products (id, name, description, sku, category, stock, cost, price, business_id, is_service)
                               VALUES (
                                 ${pId},
                                 '${safeName}',
+                                '${safeDesc}',
                                 '${skuVal}',
                                 'General',
                                 ${stockCount},
@@ -1708,8 +1944,18 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                                 runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES ('sp_${pId}_${activeStore}', ${pId}, '${activeStore.replace(/'/g, "''")}', ${stockCount}, ${priceVal.toFixed(2)})`, 'Register branch stock map', true);
                               }
                               if (selectedQuote) setSelectedQuote(null);
-                              setCartItems([...cartItems, { id: pId, name: newCatalogName.trim(), quantity: 1, unitPrice: priceVal }]);
+                              setCartItems([
+                                ...cartItems,
+                                {
+                                  id: pId,
+                                  name: newCatalogName.trim(),
+                                  description: cleanDesc,
+                                  quantity: 1,
+                                  unitPrice: priceVal
+                                }
+                              ]);
                               setNewCatalogName('');
+                              setNewCatalogDescription('');
                               setNewCatalogPrice('');
                               setNewCatalogStock('100');
                               setShowAddCatalogProduct(false);
@@ -1733,16 +1979,17 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   <div className="relative">
                     <input
                       type="text"
+                      dir="ltr"
                       placeholder="Search items with stock limits..."
                       value={productSearch}
                       onChange={(e) => setProductSearch(e.target.value)}
-                      className="w-full text-xs py-1.5 pl-8 pr-3 border border-slate-200 rounded-lg font-medium"
+                      className="w-full text-xs py-2 pl-8 pr-3 bg-white border border-slate-200 focus:border-indigo-500 rounded-lg font-medium text-slate-900 text-left select-text focus:outline-hidden"
                     />
                     <span className="absolute left-2.5 top-2.5 text-slate-400"><Search size={12} /></span>
                   </div>
 
                   {/* Stock Available Selector Shelf */}
-                  <div className="max-h-52 overflow-y-auto border bg-white rounded-lg p-1.5 flex flex-col gap-1.5 shadow-inner">
+                  <div className="max-h-52 overflow-y-auto border border-slate-200 bg-white rounded-lg p-1.5 flex flex-col gap-1.5 shadow-inner">
                     {(() => {
                       const filtered = allProducts.filter(p => p.name.toLowerCase().includes(productSearch.toLowerCase()));
                       if (filtered.length === 0) {
@@ -1752,9 +1999,14 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                         const cartItem = cartItems.find(x => x.id === p.id);
                         const qtyInCart = cartItem ? cartItem.quantity : 0;
                         return (
-                          <div key={p.id} className="p-2 bg-slate-50 border border-slate-100 rounded-lg flex items-center justify-between text-xs transition-colors hover:border-slate-200">
-                            <div>
-                              <span className="font-extrabold text-slate-805 leading-tight block">{p.name}</span>
+                          <div key={p.id} className="p-2 bg-slate-50 border border-slate-100 rounded-lg flex items-center justify-between gap-2 text-xs transition-colors hover:border-slate-200">
+                            <div className="min-w-0 flex-1">
+                              <span className="font-extrabold text-slate-900 leading-tight block">{p.name}</span>
+                              {p.description && (
+                                <p className="text-[10px] text-slate-500 font-medium whitespace-pre-line line-clamp-2 mt-0.5 leading-snug" title={p.description}>
+                                  {p.description}
+                                </p>
+                              )}
                               <div className="flex items-center gap-2 text-[9px] mt-0.5">
                                 <span className={`px-1.5 py-0.5 rounded font-bold uppercase text-[8px] ${
                                   p.is_service === 1 ? 'bg-indigo-100 text-indigo-800' : p.stock > 10 ? 'bg-emerald-100 text-emerald-800' : p.stock > 0 ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
@@ -1776,20 +2028,21 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                                       handleUpdateCartQty(p.id, (qtyInCart - 1).toString());
                                     }
                                   }}
-                                  className="w-5 h-5 bg-indigo-50 border text-indigo-700 font-bold rounded flex items-center justify-center hover:bg-indigo-100"
+                                  className="w-5 h-5 bg-indigo-50 border border-indigo-200 text-indigo-700 font-bold rounded flex items-center justify-center hover:bg-indigo-100 cursor-pointer"
                                 >
                                   -
                                 </button>
                                 <input
                                   type="number"
+                                  dir="ltr"
                                   value={qtyInCart}
                                   onChange={(e) => handleUpdateCartQty(p.id, e.target.value)}
-                                  className="w-8 text-center text-[10px] font-extrabold font-mono border rounded bg-white py-0.5"
+                                  className="w-10 text-left px-1.5 text-[10px] font-extrabold font-mono border border-slate-200 focus:border-indigo-500 rounded bg-white text-slate-900 py-0.5 select-text focus:outline-hidden"
                                 />
                                 <button
                                   type="button"
                                   onClick={() => handleUpdateCartQty(p.id, (qtyInCart + 1).toString())}
-                                  className="w-5 h-5 bg-indigo-50 border text-indigo-700 font-bold rounded flex items-center justify-center hover:bg-indigo-100"
+                                  className="w-5 h-5 bg-indigo-50 border border-indigo-200 text-indigo-700 font-bold rounded flex items-center justify-center hover:bg-indigo-100 cursor-pointer"
                                 >
                                   +
                                 </button>
@@ -1798,7 +2051,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                               <button
                                 type="button"
                                 onClick={() => addToCart(p)}
-                                className="px-2 py-1 bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-700 rounded font-bold text-[9px]"
+                                className="px-2 py-1 bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-700 rounded font-bold text-[9px] cursor-pointer"
                               >
                                 + ADD TO QUOTE
                               </button>
@@ -1810,21 +2063,22 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   </div>
 
                   {/* Discount details */}
-                  <div className="flex items-center justify-between bg-white border p-2.5 rounded-lg">
-                    <span className="text-[10px] text-slate-405 font-bold uppercase">Flat Discount Value ({settings.currency}):</span>
+                  <div className="flex items-center justify-between bg-white border border-slate-200 p-2.5 rounded-lg">
+                    <span className="text-[10px] text-slate-500 font-bold uppercase">Flat Discount Value ({settings.currency}):</span>
                     <input
                       type="number"
+                      dir="ltr"
                       step="0.01"
                       value={discountVal}
                       onChange={(e) => setDiscountVal(e.target.value)}
-                      className="w-24 text-center text-xs font-bold bg-slate-50 border border-slate-200 rounded-lg py-1 leading-tight"
+                      className="w-24 text-left px-2.5 text-xs font-bold bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg py-1.5 text-slate-900 select-text focus:outline-hidden leading-tight"
                     />
                   </div>
 
                   <button
                     type="button"
                     onClick={() => setActiveFormTab('terms_conditions')}
-                    className="w-full py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold uppercase rounded-lg text-xs"
+                    className="w-full py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold uppercase rounded-lg text-xs cursor-pointer"
                   >
                     Next: Pick Terms &amp; Conditions &rarr;
                   </button>
@@ -1834,8 +2088,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
               {/* TAB 3: TERMS & CONDITIONS SELECTION LIBRARY */}
               {activeFormTab === 'terms_conditions' && (
                 <div className="flex flex-col gap-3 font-sans mt-1">
-                  <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2">
-                    <span className="text-[10px] text-indigo-750 font-extrabold uppercase tracking-wider">Select Terms that apply to customer</span>
+                  <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs flex flex-col gap-2">
+                    <span className="text-[10px] text-indigo-800 font-extrabold uppercase tracking-wider">Select Terms that apply to customer</span>
                     
                     <div className="flex flex-col gap-2 max-h-40 overflow-y-auto pr-1">
                       {savedTerms.map(t => (
@@ -1909,22 +2163,24 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   </div>
 
                   {/* Advance T&C Creator Panel */}
-                  <div className="bg-indigo-50/20 border border-indigo-150 rounded-xl p-3 flex flex-col gap-2">
+                  <div className="bg-indigo-50/20 border border-indigo-200 rounded-xl p-3 flex flex-col gap-2">
                     <span className="text-[9px] text-indigo-900 font-extrabold uppercase">➕ Create New Terms in Advance</span>
-                    <div className="flex flex-col gap-1.5 text-xs">
+                    <div className="flex flex-col gap-2 text-xs">
                       <input
                         type="text"
+                        dir="ltr"
                         placeholder="e.g. Warranty Period"
                         value={newTermTitle}
                         onChange={(e) => setNewTermTitle(e.target.value)}
-                        className="p-1 px-2 border border-slate-201 rounded bg-white font-semibold"
+                        className="w-full px-3 py-1.5 border border-slate-200 focus:border-indigo-500 rounded-lg bg-white text-slate-900 font-semibold text-xs text-left select-text focus:outline-hidden"
                       />
                       <textarea
+                        dir="ltr"
                         placeholder="Detailed Terms text content that will print beautifully on the quotation sheet..."
                         value={newTermText}
                         onChange={(e) => setNewTermText(e.target.value)}
                         rows={2}
-                        className="p-1 px-2 border border-slate-201 rounded bg-white text-[10px]"
+                        className="w-full px-3 py-1.5 border border-slate-200 focus:border-indigo-500 rounded-lg bg-white text-slate-900 text-xs text-left select-text focus:outline-hidden resize-y"
                       />
                       <button
                         type="button"
@@ -1942,7 +2198,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                           setNewTermText('');
                           setFormNotice({ type: 'success', text: '✓ Custom term added to library.' });
                         }}
-                        className="py-1 px-3 bg-indigo-600 hover:bg-indigo-700 text-white text-[9px] font-black uppercase rounded self-end cursor-pointer"
+                        className="py-1.5 px-3 bg-indigo-600 hover:bg-indigo-700 text-white text-[9px] font-black uppercase rounded-lg self-end cursor-pointer"
                       >
                         Save to Advance Library
                       </button>
@@ -1953,9 +2209,9 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
               )}
 
               {/* ALWAYS VISIBLE LIVE BASKET PREVIEW (Addresses key user request) */}
-              <div className="bg-white p-3.5 rounded-xl border border-indigo-200 mt-2 shadow-3xs flex flex-col gap-3 font-sans">
+              <div className="bg-white p-3.5 rounded-xl border border-indigo-200 mt-2 shadow-xs flex flex-col gap-3 font-sans">
                 <div className="flex justify-between items-center border-b border-slate-100 pb-2">
-                  <span className="text-[10px] text-indigo-750 font-black uppercase tracking-wider flex items-center gap-1">
+                  <span className="text-[10px] text-indigo-800 font-black uppercase tracking-wider flex items-center gap-1">
                     <ShoppingBag size={12} className="text-indigo-600" />
                     🛒 Quotation Live Basket Review
                   </span>
@@ -1971,63 +2227,74 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       {cartItems.map((item) => {
                         const lineTotal = Number(item.unitPrice || 0) * Number(item.quantity || 0);
                         return (
-                          <div key={item.id} className="py-2 flex items-center justify-between gap-2 text-xs">
-                            <div className="min-w-0 flex-1">
-                              <span className="font-extrabold text-slate-800 block truncate">{item.name}</span>
-                              <div className="flex items-center gap-1 mt-0.5">
-                                <span className="text-[9px] text-slate-400 font-bold">{settings.currency}</span>
-                                <input
-                                  type="number"
-                                  step="0.01"
-                                  min="0"
-                                  value={item.unitPrice}
-                                  onChange={(e) => handleUpdateCartPrice(item.id, e.target.value)}
-                                  className="w-16 px-1.5 py-0.5 text-[10px] text-slate-700 font-bold font-mono bg-slate-50 border border-slate-200 rounded"
-                                  title="Adjust unit price"
-                                />
-                                <span className="text-[9px] text-slate-400">each</span>
+                          <div key={item.id} className="py-2.5 flex flex-col gap-1.5 text-xs">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0 flex-1">
+                                <span className="font-extrabold text-slate-800 block truncate">{item.name}</span>
+                                <div className="flex items-center gap-1 mt-0.5">
+                                  <span className="text-[9px] text-slate-400 font-bold">{settings.currency}</span>
+                                  <input
+                                    type="number"
+                                    dir="ltr"
+                                    step="0.01"
+                                    min="0"
+                                    value={item.unitPrice}
+                                    onChange={(e) => handleUpdateCartPrice(item.id, e.target.value)}
+                                    className="w-20 px-2 py-0.5 text-[11px] text-slate-900 font-bold font-mono bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded text-left select-text focus:outline-hidden"
+                                    title="Adjust unit price"
+                                  />
+                                  <span className="text-[9px] text-slate-400">each</span>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-lg p-0.5 shadow-xs shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (item.quantity <= 1) {
+                                      removeCartItem(item.id);
+                                    } else {
+                                      handleUpdateCartQty(item.id, (item.quantity - 1).toString());
+                                    }
+                                  }}
+                                  className="w-5 h-5 text-slate-500 hover:text-indigo-600 font-extrabold rounded flex items-center justify-center hover:bg-slate-200 text-xs transition-colors cursor-pointer"
+                                >
+                                  -
+                                </button>
+                                <span className="w-6 text-center text-[11px] font-black font-mono text-slate-800">
+                                  {item.quantity}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleUpdateCartQty(item.id, (item.quantity + 1).toString())}
+                                  className="w-5 h-5 text-slate-500 hover:text-indigo-600 font-extrabold rounded flex items-center justify-center hover:bg-slate-200 text-xs transition-colors cursor-pointer"
+                                >
+                                  +
+                                </button>
+                              </div>
+
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="font-extrabold text-slate-800 font-mono text-right w-16">
+                                  {settings.currency}{lineTotal.toFixed(2)}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => removeCartItem(item.id)}
+                                  className="p-1 hover:bg-rose-50 text-rose-500 rounded hover:text-rose-700 transition-colors cursor-pointer"
+                                  title="Remove line item"
+                                >
+                                  <Trash2 size={12} />
+                                </button>
                               </div>
                             </div>
-
-                            <div className="flex items-center gap-1 bg-slate-50 border rounded-lg p-0.5 shadow-3xs shrink-0">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (item.quantity <= 1) {
-                                    removeCartItem(item.id);
-                                  } else {
-                                    handleUpdateCartQty(item.id, (item.quantity - 1).toString());
-                                  }
-                                }}
-                                className="w-5 h-5 text-slate-500 hover:text-indigo-600 font-extrabold rounded flex items-center justify-center hover:bg-slate-200 text-xs transition-colors"
-                              >
-                                -
-                              </button>
-                              <span className="w-6 text-center text-[11px] font-black font-mono text-slate-800">
-                                {item.quantity}
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => handleUpdateCartQty(item.id, (item.quantity + 1).toString())}
-                                className="w-5 h-5 text-slate-500 hover:text-indigo-600 font-extrabold rounded flex items-center justify-center hover:bg-slate-200 text-xs transition-colors"
-                              >
-                                +
-                              </button>
-                            </div>
-
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              <span className="font-extrabold text-slate-800 font-mono text-right w-16">
-                                {settings.currency}{lineTotal.toFixed(2)}
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => removeCartItem(item.id)}
-                                className="p-1 hover:bg-rose-50 text-rose-500 rounded hover:text-rose-700 transition-colors"
-                                title="Remove line item"
-                              >
-                                <Trash2 size={12} />
-                              </button>
-                            </div>
+                            <textarea
+                              rows={2}
+                              dir="ltr"
+                              value={item.description || ''}
+                              onChange={(e) => handleUpdateCartDescription(item.id, e.target.value)}
+                              placeholder="Optional item description / full features to show on quotation..."
+                              className="w-full px-2.5 py-1.5 text-[11px] text-slate-900 bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:border-indigo-500 text-left select-text focus:outline-hidden resize-y"
+                            />
                           </div>
                         );
                       })}
@@ -2046,11 +2313,12 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                         <span className="text-[11px] flex items-center gap-1 shrink-0">Discount Amount ({settings.currency}):</span>
                         <input
                           type="number"
+                          dir="ltr"
                           step="0.01"
                           placeholder="0.00"
                           value={discountVal}
                           onChange={(e) => setDiscountVal(e.target.value)}
-                          className="w-16 text-center text-[11px] font-mono font-bold bg-white border rounded py-0.5 shadow-3xs"
+                          className="w-20 text-left px-2 text-[11px] font-mono font-bold bg-white border border-slate-200 focus:border-indigo-500 rounded-lg py-1 text-slate-900 shadow-xs select-text focus:outline-hidden"
                         />
                       </div>
 
@@ -2063,13 +2331,13 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                           <>
                             <div className="flex justify-between items-center text-[11px]">
                               <span>VAT ({settings.taxRate}%):</span>
-                              <span className="font-extrabold font-mono text-slate-750">
+                              <span className="font-extrabold font-mono text-slate-700">
                                 {settings.currency}{tax.toFixed(2)}
                               </span>
                             </div>
                             <div className="flex justify-between items-center text-xs font-black text-indigo-950 border-t pt-1.5 border-slate-200">
                               <span className="uppercase text-[10px] tracking-wider text-indigo-900">Calculated Grand Total:</span>
-                              <span className="text-sm font-mono text-indigo-650 bg-indigo-50 px-2 py-0.5 rounded-lg border border-indigo-100">
+                              <span className="text-sm font-mono text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-lg border border-indigo-100">
                                 {settings.currency}{grandTotal.toFixed(2)}
                               </span>
                             </div>
@@ -2124,7 +2392,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                 value={docSearch}
                 onChange={(e) => setDocSearch(e.target.value)}
                 placeholder="Search ID, customer, phone or date..."
-                className="w-full text-xs py-1.5 pl-8 pr-7 border border-slate-200 rounded-lg bg-white font-medium text-left select-text focus:outline-none focus:border-indigo-400"
+                className="w-full text-xs py-2 pl-8 pr-7 border border-slate-200 focus:border-indigo-500 rounded-lg bg-white text-slate-900 font-medium text-left select-text focus:outline-hidden"
               />
               <Search size={12} className="absolute left-2.5 top-2.5 text-slate-400" />
               {docSearch && (
@@ -2140,7 +2408,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
             </div>
             
             {/* Filter Tabs */}
-            <div className="flex bg-slate-100 p-1 rounded-lg gap-1 border">
+            <div className="flex bg-slate-100 p-1 rounded-lg gap-1 border border-slate-200">
               {(['ALL', 'QUOTATION', 'INVOICE', 'DELIVERY_NOTE'] as const).map(f => {
                 const count = f === 'ALL' ? quotations.length : quotations.filter(q => q.status === f).length;
                 return (
@@ -2150,7 +2418,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     onClick={() => setDocFilter(f)}
                     className={`flex-1 text-[9px] font-extrabold uppercase py-1 rounded-md transition-all leading-tight cursor-pointer ${
                       docFilter === f 
-                        ? 'bg-white text-indigo-700 shadow-3xs' 
+                        ? 'bg-white text-indigo-700 shadow-xs' 
                         : 'text-slate-500 hover:text-slate-800'
                     }`}
                   >
@@ -2270,7 +2538,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         </div>
 
         {/* RIGHTSIDE LIVE PREVIEW SHEET / PRINTER MOCK */}
-        <div className="flex-1 min-h-0 bg-slate-100 lg:h-full lg:overflow-y-auto p-4 sm:p-5 relative">
+        <div className="flex-1 min-h-0 bg-slate-100 lg:h-full lg:overflow-y-auto p-4 sm:p-5 relative keyboard-safe-scroll">
           
           {activeDoc ? (
             <div className="flex flex-col gap-4 max-w-2xl mx-auto">
@@ -2329,7 +2597,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                         <button
                           type="button"
                           onClick={() => handleConvertToInvoice(activeDoc.id)}
-                          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-[11px] rounded-lg shadow-3xs cursor-pointer tracking-wider transition-all"
+                          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-[11px] rounded-lg shadow-xs cursor-pointer tracking-wider transition-all"
                           title="Keeps Quotation record and issues a linked Tax Invoice"
                         >
                           ISSUE INVOICE COPY
@@ -2339,7 +2607,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                         <button
                           type="button"
                           onClick={() => handleConvertToDeliveryNote(activeDoc.id)}
-                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-[11px] rounded-lg shadow-3xs cursor-pointer tracking-wider transition-all"
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-[11px] rounded-lg shadow-xs cursor-pointer tracking-wider transition-all"
                           title="Keeps Invoice record and issues a linked Delivery Note"
                         >
                           ISSUE DELIVERY NOTE
@@ -2399,10 +2667,11 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   <div className="flex items-center gap-1.5 font-sans">
                     <input
                       type="tel"
+                      dir="ltr"
                       placeholder="e.g. +260977XXXXXX"
                       value={whatsappSharePhone}
                       onChange={(e) => { setWhatsappSharePhone(e.target.value); setWaError(null); }}
-                      className="px-2.5 py-1.5 text-xs border border-green-300 rounded-lg bg-white font-bold w-44 text-green-950 focus:outline-none"
+                      className="px-3 py-2 text-xs border border-green-300 focus:border-green-500 rounded-lg bg-white font-bold w-44 text-green-950 text-left select-text focus:outline-hidden"
                     />
                     <button
                       type="button"
@@ -2487,96 +2756,102 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     {/* Client & Date details */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-slate-400 font-bold uppercase">Customer Corporate Name</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Customer Corporate Name</label>
                         <input
                           type="text"
                           dir="ltr"
                           required
                           value={editCName}
                           onChange={(e) => setEditCName(e.target.value)}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold text-left select-text focus:outline-none"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-bold text-left select-text focus:outline-hidden"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-indigo-600 font-bold uppercase">Document Date</label>
                         <input
                           type="date"
+                          dir="ltr"
                           required
                           value={editDocDate}
                           onChange={(e) => setEditDocDate(e.target.value)}
-                          className="px-3 py-2 bg-indigo-50/40 border border-indigo-200 rounded-lg text-slate-800 font-bold"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-bold text-left select-text focus:outline-hidden"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-slate-400 font-bold uppercase">Phone Number</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Phone Number</label>
                         <input
-                          type="text"
+                          type="tel"
                           dir="ltr"
                           value={editCPhone}
                           onChange={(e) => setEditCPhone(e.target.value)}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                         />
                       </div>
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-slate-400 font-bold uppercase">Email Address</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Email Address</label>
                         <input
                           type="email"
                           dir="ltr"
                           value={editCEmail}
                           onChange={(e) => setEditCEmail(e.target.value)}
-                          className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                          className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                         />
                       </div>
                     </div>
 
                     {/* Bank Details in Editing Form */}
-                    <div className="bg-indigo-50/20 p-3 rounded-xl border border-indigo-100 flex flex-col gap-2">
+                    <div className="bg-indigo-50/20 p-3.5 rounded-xl border border-indigo-100 flex flex-col gap-2.5">
                       <span className="text-[10px] text-indigo-900 font-extrabold uppercase">Update Payment Bank Options (Optional)</span>
-                      <div className="flex flex-col gap-1.5 text-xs text-slate-700">
-                        <div className="flex flex-col">
-                          <label className="text-[9px] text-slate-400 font-bold">BANK NAME</label>
+                      <div className="flex flex-col gap-2 text-xs text-slate-700">
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Bank Name</label>
                           <input
                             type="text"
+                            dir="ltr"
                             value={editBankName}
                             onChange={(e) => setEditBankName(e.target.value)}
-                            className="bg-white border rounded p-1 px-2 font-bold"
+                            className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg px-3 py-2 text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                           />
                         </div>
-                        <div className="flex flex-col">
-                          <label className="text-[9px] text-slate-400 font-bold">ACCOUNT NAME</label>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Account Name</label>
                           <input
                             type="text"
+                            dir="ltr"
                             value={editBankAccountName}
                             onChange={(e) => setEditBankAccountName(e.target.value)}
-                            className="bg-white border rounded p-1 px-2 font-bold"
+                            className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg px-3 py-2 text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                           />
                         </div>
-                        <div className="flex flex-col">
-                          <label className="text-[9px] text-slate-400 font-bold">ACCOUNT NUMBER</label>
+                        <div className="flex flex-col gap-1">
+                          <label className="text-[10px] text-slate-500 font-bold uppercase">Account Number</label>
                           <input
                             type="text"
+                            dir="ltr"
                             value={editBankAccountNumber}
                             onChange={(e) => setEditBankAccountNumber(e.target.value)}
-                            className="bg-white border rounded p-1 px-2 font-bold font-mono"
+                            className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg px-3 py-2 text-slate-900 font-bold font-mono text-left select-text focus:outline-hidden"
                           />
                         </div>
-                        <div className="grid grid-cols-2 gap-2">
-                          <div className="flex flex-col">
-                            <label className="text-[9px] text-slate-400 font-bold">BRANCH NAME</label>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                          <div className="flex flex-col gap-1">
+                            <label className="text-[10px] text-slate-500 font-bold uppercase">Branch Name</label>
                             <input
                               type="text"
+                              dir="ltr"
                               value={editBankBranchName}
                               onChange={(e) => setEditBankBranchName(e.target.value)}
-                              className="bg-white border rounded p-1 px-2 font-semibold"
+                              className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg px-3 py-2 text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                             />
                           </div>
-                          <div className="flex flex-col">
-                            <label className="text-[9px] text-slate-400 font-bold">SORT CODE</label>
+                          <div className="flex flex-col gap-1">
+                            <label className="text-[10px] text-slate-500 font-bold uppercase">Sort Code</label>
                             <input
                               type="text"
+                              dir="ltr"
                               value={editBankSortCode}
                               onChange={(e) => setEditBankSortCode(e.target.value)}
-                              className="bg-white border rounded p-1 px-2 font-semibold font-mono"
+                              className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg px-3 py-2 text-slate-900 font-semibold font-mono text-left select-text focus:outline-hidden"
                             />
                           </div>
                         </div>
@@ -2584,17 +2859,17 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     </div>
 
                     {/* Issuer Details & Digital Signature in Editing Form */}
-                    <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 flex flex-col gap-2">
+                    <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 flex flex-col gap-2.5">
                       <span className="text-[10px] text-indigo-900 font-extrabold uppercase">Issued By &amp; Digital Signature</span>
                       <div className="flex flex-col gap-1">
-                        <label className="text-[9px] text-slate-400 font-bold uppercase">Issued By (Full Name)</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Issued By (Full Name)</label>
                         <input
                           type="text"
                           dir="ltr"
                           value={editIssuedBy}
                           onChange={(e) => setEditIssuedBy(e.target.value)}
                           placeholder="Name of issuer"
-                          className="bg-white border rounded p-1.5 px-2 font-semibold text-xs text-left select-text focus:outline-none"
+                          className="w-full bg-white border border-slate-200 focus:border-indigo-500 rounded-lg px-3 py-2 text-slate-900 font-semibold text-xs text-left select-text focus:outline-hidden"
                         />
                       </div>
                       <SignaturePad
@@ -2641,6 +2916,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                             type="button"
                             key={p.id}
                             onClick={() => addProductToEditItems(p)}
+                            title={p.description || p.name}
                             className="px-2.5 py-1 text-[10px] font-bold bg-white hover:bg-slate-50 border border-slate-200 rounded-md whitespace-nowrap cursor-pointer"
                           >
                             + {p.name} • {settings.currency}{Number(p.price || 0).toFixed(2)}
@@ -2650,91 +2926,129 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       <div className="grid grid-cols-12 gap-1.5 items-center pt-1 border-t border-indigo-100/70">
                         <input
                           type="text"
-                          placeholder="Custom item / service..."
+                          dir="ltr"
+                          placeholder="Custom item / service name..."
                           value={customItemName}
                           onChange={(e) => setCustomItemName(e.target.value)}
-                          className="col-span-5 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded font-semibold"
+                          className="col-span-5 px-2.5 py-1.5 text-[11px] bg-white border border-slate-200 focus:border-indigo-500 rounded-lg font-semibold text-slate-900 text-left select-text focus:outline-hidden"
                         />
                         <input
                           type="number"
+                          dir="ltr"
                           step="0.01"
                           min="0"
                           placeholder="Price"
                           value={customItemPrice}
                           onChange={(e) => setCustomItemPrice(e.target.value)}
-                          className="col-span-3 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded font-mono font-bold"
+                          className="col-span-3 px-2.5 py-1.5 text-[11px] bg-white border border-slate-200 focus:border-indigo-500 rounded-lg font-mono font-bold text-slate-900 text-left select-text focus:outline-hidden"
                         />
                         <input
                           type="number"
+                          dir="ltr"
                           min="1"
                           placeholder="Qty"
                           value={customItemQty}
                           onChange={(e) => setCustomItemQty(e.target.value)}
-                          className="col-span-2 px-2 py-1 text-[11px] bg-white border border-slate-200 rounded font-mono font-bold text-center"
+                          className="col-span-2 px-2.5 py-1.5 text-[11px] bg-white border border-slate-200 focus:border-indigo-500 rounded-lg font-mono font-bold text-slate-900 text-left select-text focus:outline-hidden"
                         />
                         <button
                           type="button"
                           onClick={handleAddCustomEditItem}
-                          className="col-span-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-extrabold uppercase cursor-pointer"
+                          className="col-span-2 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[10px] font-extrabold uppercase cursor-pointer"
                         >
                           + Add
                         </button>
+                        <textarea
+                          rows={2}
+                          dir="ltr"
+                          placeholder="Custom item description / full features (optional)..."
+                          value={customItemDescription}
+                          onChange={(e) => setCustomItemDescription(e.target.value)}
+                          className="col-span-12 px-2.5 py-1.5 text-[11px] bg-white border border-slate-200 focus:border-indigo-500 rounded-lg text-slate-900 font-medium text-left select-text focus:outline-hidden resize-y"
+                        />
                       </div>
                     </div>
 
-                    {/* Editable line items table (Price & Quantity) */}
-                    <div className="divide-y divide-slate-100 bg-slate-50 border rounded-xl overflow-hidden px-3 py-1">
-                      <div className="grid grid-cols-12 items-center font-bold text-slate-400 py-2 border-b text-[9px] uppercase gap-2">
-                        <span className="col-span-5">Item Description</span>
-                        <span className="col-span-3 text-center">Unit Price ({settings.currency})</span>
-                        <span className="col-span-2 text-center">Qty</span>
+                    {/* Editable line items table (Price, Quantity & Description) */}
+                    <div className="divide-y divide-slate-100 bg-slate-50 border border-slate-200 rounded-xl overflow-hidden px-3 py-1">
+                      <div className="grid grid-cols-12 items-center font-bold text-slate-500 py-2 border-b text-[9px] uppercase gap-2">
+                        <span className="col-span-5">Item &amp; Full Description</span>
+                        <span className="col-span-3 text-left">Unit Price ({settings.currency})</span>
+                        <span className="col-span-2 text-left">Qty</span>
                         <span className="col-span-2 text-right">Total</span>
                       </div>
                       {editItems.map((item, idx) => (
-                        <div key={idx} className="py-2 grid grid-cols-12 items-center gap-2">
-                          <span className="col-span-5 font-bold text-slate-700 truncate">{item.name}</span>
-                          <div className="col-span-3 flex justify-center">
+                        <div key={idx} className="py-2 flex flex-col gap-1.5">
+                          <div className="grid grid-cols-12 items-center gap-2">
                             <input
-                              type="number"
-                              step="0.01"
-                              min="0"
-                              value={item.unitPrice}
+                              type="text"
+                              dir="ltr"
+                              value={item.name || ''}
                               onChange={(e) => {
-                                const val = parseFloat(e.target.value);
                                 const updated = [...editItems];
-                                updated[idx] = { ...updated[idx], unitPrice: isNaN(val) ? 0 : Math.max(0, val) };
+                                updated[idx] = { ...updated[idx], name: e.target.value };
                                 setEditItems(updated);
                               }}
-                              className="w-20 text-center bg-white border border-slate-200 text-xs rounded-md font-bold font-mono py-0.5"
+                              className="col-span-5 px-2.5 py-1.5 text-xs bg-white border border-slate-200 focus:border-indigo-500 rounded-lg font-bold text-slate-900 text-left select-text focus:outline-hidden"
+                              placeholder="Item name"
                             />
+                            <div className="col-span-3 flex">
+                              <input
+                                type="number"
+                                dir="ltr"
+                                step="0.01"
+                                min="0"
+                                value={item.unitPrice}
+                                onChange={(e) => {
+                                  const val = parseFloat(e.target.value);
+                                  const updated = [...editItems];
+                                  updated[idx] = { ...updated[idx], unitPrice: isNaN(val) ? 0 : Math.max(0, val) };
+                                  setEditItems(updated);
+                                }}
+                                className="w-full text-left px-2 bg-white border border-slate-200 focus:border-indigo-500 text-xs rounded-lg font-bold font-mono py-1 text-slate-900 select-text focus:outline-hidden"
+                              />
+                            </div>
+                            <div className="col-span-2 flex">
+                              <input
+                                type="number"
+                                dir="ltr"
+                                min="1"
+                                value={item.quantity}
+                                onChange={(e) => {
+                                  const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+                                  const updated = [...editItems];
+                                  updated[idx] = { ...updated[idx], quantity: val };
+                                  setEditItems(updated);
+                                }}
+                                className="w-full text-left px-2 bg-white border border-slate-200 focus:border-indigo-500 text-xs rounded-lg font-bold font-mono py-1 text-slate-900 select-text focus:outline-hidden"
+                              />
+                            </div>
+                            <div className="col-span-2 flex items-center justify-end gap-1">
+                              <span className="text-slate-600 font-mono text-[11px] font-bold">
+                                {(Number(item.unitPrice || 0) * Number(item.quantity || 0)).toFixed(2)}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => removeItemFromEditItems(idx)}
+                                className="text-rose-500 hover:text-rose-700 font-extrabold px-0.5 cursor-pointer"
+                                title="Remove item"
+                              >
+                                ✕
+                              </button>
+                            </div>
                           </div>
-                          <div className="col-span-2 flex justify-center">
-                            <input
-                              type="number"
-                              min="1"
-                              value={item.quantity}
-                              onChange={(e) => {
-                                const val = Math.max(1, parseInt(e.target.value, 10) || 1);
-                                const updated = [...editItems];
-                                updated[idx] = { ...updated[idx], quantity: val };
-                                setEditItems(updated);
-                              }}
-                              className="w-14 text-center bg-white border border-slate-200 text-xs rounded-md font-bold font-mono py-0.5"
-                            />
-                          </div>
-                          <div className="col-span-2 flex items-center justify-end gap-1">
-                            <span className="text-slate-600 font-mono text-[11px] font-bold">
-                              {(Number(item.unitPrice || 0) * Number(item.quantity || 0)).toFixed(2)}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeItemFromEditItems(idx)}
-                              className="text-rose-500 hover:text-rose-700 font-extrabold px-0.5 cursor-pointer"
-                              title="Remove item"
-                            >
-                              ✕
-                            </button>
-                          </div>
+                          <textarea
+                            rows={2}
+                            dir="ltr"
+                            value={item.description || ''}
+                            onChange={(e) => {
+                              const updated = [...editItems];
+                              updated[idx] = { ...updated[idx], description: e.target.value };
+                              setEditItems(updated);
+                            }}
+                            placeholder="Item description / full features (shown below item name)..."
+                            className="w-full px-2.5 py-1.5 text-[11px] bg-white border border-slate-200 focus:border-indigo-500 rounded-lg text-slate-800 font-medium text-left select-text focus:outline-hidden resize-y"
+                          />
                         </div>
                       ))}
                       {editItems.length === 0 && (
@@ -2745,14 +3059,15 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     {/* Discount & Live Totals Summary */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center bg-slate-50 border border-slate-200 rounded-xl p-3">
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-slate-400 font-bold uppercase">Discount ({settings.currency})</label>
+                        <label className="text-[10px] text-slate-500 font-bold uppercase">Discount ({settings.currency})</label>
                         <input
                           type="number"
+                          dir="ltr"
                           step="0.01"
                           min="0"
                           value={editDiscountVal}
                           onChange={(e) => setEditDiscountVal(e.target.value)}
-                          className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-800 font-semibold font-mono"
+                          className="w-full px-3 py-2 bg-white border border-slate-200 focus:border-indigo-500 rounded-lg text-slate-900 font-semibold font-mono text-left select-text focus:outline-hidden"
                         />
                       </div>
                       {(() => {
@@ -2784,7 +3099,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   {/* DELIVERY NOTE QUICK QUANTITY, PRICE & DATE EASING PANEL */}
                   {!activeDoc.isDraft && activeDoc.status === 'DELIVERY_NOTE' && (
                     <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex flex-col gap-3 font-sans text-left">
-                      <div className="flex flex-wrap justify-between items-center gap-2 border-b border-amber-150 pb-2">
+                      <div className="flex flex-wrap justify-between items-center gap-2 border-b border-amber-200 pb-2">
                         <h4 className="text-xs font-extrabold text-amber-900 uppercase tracking-wider flex items-center gap-1.5">
                           <Edit3 size={14} />
                           Delivery Note Quick Adjustments (Qty, Price &amp; Date)
@@ -2792,15 +3107,16 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                         <div className="flex items-center gap-2">
                           <input
                             type="date"
+                            dir="ltr"
                             value={deliveryDateInput}
                             onChange={(e) => setDeliveryDateInput(e.target.value)}
-                            className="px-2 py-1 text-[11px] font-bold bg-white border border-amber-300 rounded-md text-amber-950"
+                            className="px-2.5 py-1.5 text-xs font-bold bg-white border border-amber-300 focus:border-amber-500 rounded-lg text-amber-950 text-left select-text focus:outline-hidden"
                             title="Delivery Note Date"
                           />
                           <button
                             type="button"
                             onClick={handleSaveDeliveryEasing}
-                            className="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-bold rounded-md shadow-xs cursor-pointer"
+                            className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-bold rounded-lg shadow-xs cursor-pointer"
                           >
                             Save Changes
                           </button>
@@ -2814,24 +3130,33 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       <div className="divide-y divide-amber-100 max-h-44 overflow-y-auto font-sans">
                         {editItems.map((item, index) => (
                           <div key={index} className="py-2 flex flex-wrap justify-between items-center gap-2 text-xs font-semibold">
-                            <span className="font-bold text-amber-900 flex-1 min-w-[120px] truncate">{item.name}</span>
+                            <div className="flex-1 min-w-[120px]">
+                              <span className="font-bold text-amber-900 block truncate">{item.name}</span>
+                              {item.description && (
+                                <p className="text-[10px] font-normal text-amber-800/80 whitespace-pre-line line-clamp-2 mt-0.5 leading-snug">
+                                  {item.description}
+                                </p>
+                              )}
+                            </div>
                             <div className="flex items-center gap-2">
                               <span className="text-[10px] text-amber-700">Price:</span>
                               <input
                                 type="number"
+                                dir="ltr"
                                 step="0.01"
                                 min="0"
                                 value={item.unitPrice}
                                 onChange={(e) => handleUpdateDeliveryPrice(index, e.target.value)}
-                                className="w-20 text-center text-xs font-bold font-mono bg-white border border-amber-250 text-amber-900 rounded-md py-0.5"
+                                className="w-20 text-left px-2 text-xs font-bold font-mono bg-white border border-amber-300 focus:border-amber-500 text-amber-900 rounded-lg py-1 select-text focus:outline-hidden"
                               />
                               <span className="text-[10px] text-amber-700">Qty:</span>
                               <input
                                 type="number"
+                                dir="ltr"
                                 min="0"
                                 value={item.quantity}
                                 onChange={(e) => handleUpdateDeliveryQty(index, e.target.value)}
-                                className="w-16 text-center text-xs font-bold font-mono bg-white border border-amber-250 text-amber-900 rounded-md py-0.5"
+                                className="w-16 text-left px-2 text-xs font-bold font-mono bg-white border border-amber-300 focus:border-amber-500 text-amber-900 rounded-lg py-1 select-text focus:outline-hidden"
                               />
                             </div>
                           </div>
@@ -2883,14 +3208,14 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                             When handing over the goods, have the receiver enter their full name and sign below to confirm acceptance.
                           </p>
                           <div className="flex flex-col gap-1">
-                            <label className="text-[9px] text-emerald-900 font-extrabold uppercase">Receiver Full Name *</label>
+                            <label className="text-[10px] text-emerald-900 font-extrabold uppercase">Receiver Full Name *</label>
                             <input
                               type="text"
                               dir="ltr"
                               value={deliveryReceiverName}
                               onChange={(e) => setDeliveryReceiverName(e.target.value)}
                               placeholder="Full name of person receiving goods"
-                              className="px-3 py-1.5 text-xs bg-white border border-emerald-300 rounded-lg text-slate-800 font-semibold text-left select-text focus:outline-none"
+                              className="w-full px-3 py-2 text-xs bg-white border border-emerald-300 focus:border-emerald-500 rounded-lg text-slate-900 font-semibold text-left select-text focus:outline-hidden"
                             />
                           </div>
                           <SignaturePad
@@ -2929,10 +3254,10 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                   )}
 
                   {/* SHEET FORM: CUSTOM A4 ELEGANTE BRAND PREVIEW */}
-                  <div className="bg-white rounded-2xl border border-slate-250 p-8 shadow-xl document-print-section flex flex-col gap-6 text-slate-800 font-serif relative overflow-hidden text-left">
+                  <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-xl document-print-section flex flex-col gap-6 text-slate-800 font-serif relative overflow-hidden text-left">
                     
                     {activeDoc.isDraft && (
-                      <div className="absolute top-3 right-3 bg-amber-100 text-amber-800 border border-amber-201 px-3 py-1 rounded text-[9px] font-black uppercase tracking-widest pointer-events-none opacity-80 select-none">
+                      <div className="absolute top-3 right-3 bg-amber-100 text-amber-800 border border-amber-200 px-3 py-1 rounded text-[9px] font-black uppercase tracking-widest pointer-events-none opacity-80 select-none">
                         DRAFT PREVIEW
                       </div>
                     )}
@@ -2966,7 +3291,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
 
                       <div className="text-right font-sans min-w-[150px]">
                         <h1 className="text-lg font-extrabold tracking-normal text-indigo-950 font-serif uppercase leading-tight">{activeDoc.status}</h1>
-                        <p className="text-xs font-mono mt-1 font-bold text-slate-705">Doc ID: {activeDoc.id}</p>
+                        <p className="text-xs font-mono mt-1 font-bold text-slate-700">Doc ID: {activeDoc.id}</p>
                         <p className="text-[11px] text-slate-500 font-semibold mt-1">Date: {new Date(activeDoc.created_at).toLocaleString()}</p>
                         {activeDoc.issuedBy && (
                           <p className="text-[11px] text-indigo-700 font-bold mt-1">Issued By: {activeDoc.issuedBy}</p>
@@ -2985,7 +3310,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
 
                       <div>
                         <h4 className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest">Bank Payment Details</h4>
-                        <div className="text-[11px] text-slate-550 mt-1.5 space-y-1 leading-tight">
+                        <div className="text-[11px] text-slate-600 mt-1.5 space-y-1 leading-tight">
                           <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BANK NAME:</span> <strong className="text-slate-800">{activeDoc.bank_name || 'On Request'}</strong></p>
                           <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NAME:</span> <strong className="text-slate-800">{activeDoc.bankAccountName || companyName || 'On Request'}</strong></p>
                           <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NUMBER:</span> <strong className="text-indigo-950 font-bold font-mono">{activeDoc.bank_account || 'On Request'}</strong></p>
@@ -3001,20 +3326,27 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     <div className="font-sans flex-1 font-serif">
                       <table className="w-full text-left text-xs font-sans">
                         <thead>
-                          <tr className="border-b border-slate-200 text-slate-450 font-extrabold uppercase text-[10px] tracking-wider font-sans">
+                          <tr className="border-b border-slate-200 text-slate-500 font-extrabold uppercase text-[10px] tracking-wider font-sans">
                             <th className="py-2 text-left font-sans">Item Description</th>
                             <th className="py-2 text-center">Unit Price</th>
                             <th className="py-2 text-center">Quantity</th>
                             <th className="py-2 text-right">Line Total</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-slate-105 text-slate-700 font-semibold">
+                        <tbody className="divide-y divide-slate-100 text-slate-700 font-semibold">
                           {activeDoc.items.map((item: any, idx: number) => (
                             <tr key={idx} className="hover:bg-slate-50/50">
-                              <td className="py-2.5 font-bold text-slate-800">{item.name}</td>
-                              <td className="py-2.5 text-center font-mono">{settings.currency}{Number(item.unitPrice || 0).toFixed(2)}</td>
-                              <td className="py-2.5 text-center font-mono">{item.quantity}</td>
-                              <td className="py-2.5 text-right font-mono font-bold text-slate-950">
+                              <td className="py-2.5 align-top pr-3">
+                                <div className="font-bold text-slate-800">{item.name}</div>
+                                {item.description && (
+                                  <div className="text-[10.5px] font-normal text-slate-600 whitespace-pre-line mt-1 leading-relaxed">
+                                    {item.description}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="py-2.5 text-center font-mono align-top">{settings.currency}{Number(item.unitPrice || 0).toFixed(2)}</td>
+                              <td className="py-2.5 text-center font-mono align-top">{item.quantity}</td>
+                              <td className="py-2.5 text-right font-mono font-bold text-slate-950 align-top">
                                 {settings.currency}{(Number(item.unitPrice || 0) * Number(item.quantity || 0)).toFixed(2)}
                               </td>
                             </tr>
@@ -3130,7 +3462,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center text-slate-400 h-96 gap-3 font-sans max-w-sm mx-auto text-center">
-              <div className="w-12 h-12 bg-white border rounded-2xl flex items-center justify-center text-slate-400 shadow-3xs">
+              <div className="w-12 h-12 bg-white border border-slate-200 rounded-2xl flex items-center justify-center text-slate-400 shadow-xs">
                 <FileText size={24} className="stroke-1.5" />
               </div>
               <p className="text-xs font-black text-slate-600 uppercase tracking-widest">No Document Selected</p>

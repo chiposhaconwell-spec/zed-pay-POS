@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { App as CapApp } from '@capacitor/app';
 import { 
   ShoppingCart, Package, TrendingUp, Terminal, Sliders, 
@@ -15,6 +16,20 @@ import { motion, AnimatePresence } from 'motion/react';
 import { initializeDatabase, SeedTemplate, runSql, getCentralBranches, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getAllSelectableAccounts, syncAllAccountingSystems } from './db';
 import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud } from './firebase';
 import { StoreSettings, ActiveTab } from './types';
+import {
+  UserPermissions,
+  StaffRole,
+  AUTH_ROLE_STORAGE_KEY,
+  buildUserPermissions,
+  parseStaffPermissions,
+  getPermittedSettingsTabs,
+  canAccessSettingTab,
+  canAccessModule,
+  loadSessionPermissionsFromStorage,
+  saveSessionPermissionsToStorage,
+  clearSessionPermissionsFromStorage,
+  normalizeRole,
+} from './permissions';
 import { FiscalService } from './zra/fiscalService';
 import { getZraConfig, saveZraConfig } from './zra/zraConfig';
 
@@ -63,7 +78,13 @@ export default function App() {
   const [billingCounterAction, setBillingCounterAction] = useState<'camera' | 'cashup' | 'refunds' | 'history' | null>(null);
 
   // SME global states: Permission levels & Branch store locations
-  const [userRole, setUserRole] = useState<string>('owner'); // 'owner' | 'manager' | 'sales'
+  const [userRole, setUserRole] = useState<string>(() => localStorage.getItem('logged_in_user_role') || 'owner'); // 'owner' | 'manager' | 'sales'
+  const [authenticatedRole, setAuthenticatedRole] = useState<StaffRole>(() =>
+    normalizeRole(localStorage.getItem(AUTH_ROLE_STORAGE_KEY) || localStorage.getItem('logged_in_user_role') || 'owner')
+  );
+  const [userPermissions, setUserPermissions] = useState<UserPermissions>(() =>
+    loadSessionPermissionsFromStorage(localStorage.getItem('logged_in_user_role'))
+  );
   const [activeStore, setActiveStore] = useState<string>('');
 
   // Navigation Drawer state (3-lines hamburger)
@@ -120,9 +141,27 @@ export default function App() {
   const [isHeaderSyncing, setIsHeaderSyncing] = useState(false);
   const [lastHeaderSyncMsg, setLastHeaderSyncMsg] = useState<string | null>(null);
 
-  const openUnifiedSettings = (subTab: 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'printer' | 'database' = 'general') => {
+  const permittedSettingsTabs = getPermittedSettingsTabs(userRole, userPermissions);
+  const hasAnySettingsAccess = permittedSettingsTabs.length > 0;
+  const canViewModule = (tab: ActiveTab | string) => canAccessModule(tab, userRole, userPermissions);
+
+  const navigateToTab = (tab: ActiveTab) => {
+    if (!canAccessModule(tab, userRole, userPermissions)) {
+      return;
+    }
+    setActiveTab2(tab);
+  };
+
+  const openUnifiedSettings = (subTab: 'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'printer' | 'database' | 'workspaces' = 'general') => {
+    if (permittedSettingsTabs.length === 0) {
+      return;
+    }
     loadBusinessData();
-    setSettingsInitialSubTab(subTab);
+    const mapped = subTab === 'database' ? 'workspaces' : subTab;
+    const targetSubTab = canAccessSettingTab(mapped, userRole, userPermissions)
+      ? mapped
+      : permittedSettingsTabs[0];
+    setSettingsInitialSubTab(targetSubTab as any);
     setShowNavDrawer(false);
     setActiveTab2('settings');
   };
@@ -248,7 +287,11 @@ export default function App() {
         if (match) {
           setActiveBusiness(match);
           const savedRole = localStorage.getItem('logged_in_user_role') || 'owner';
+          const savedAuthRole = normalizeRole(localStorage.getItem(AUTH_ROLE_STORAGE_KEY) || savedRole);
+          const savedPerms = loadSessionPermissionsFromStorage(savedRole);
           setUserRole(savedRole);
+          setAuthenticatedRole(savedAuthRole);
+          setUserPermissions(savedPerms);
           const savedStore = localStorage.getItem('active_store_branch') || '';
           if (savedStore) {
             setActiveStore(savedStore);
@@ -257,17 +300,20 @@ export default function App() {
         } else {
           localStorage.removeItem('active_business_profile');
           localStorage.removeItem('pos_authenticated_session');
+          clearSessionPermissionsFromStorage();
           setIsAuthenticatedSession(false);
         }
       } catch (e) {
         localStorage.removeItem('active_business_profile');
         localStorage.removeItem('pos_authenticated_session');
+        clearSessionPermissionsFromStorage();
         setIsAuthenticatedSession(false);
       }
     } else {
       // No authenticated session: start on Log In / Create Account screen (blank state)
       localStorage.removeItem('active_business_profile');
       localStorage.removeItem('pos_authenticated_session');
+      clearSessionPermissionsFromStorage();
       setIsAuthenticatedSession(false);
       setAuthScreenMode(existingBusinesses.length === 0 ? 'register' : 'login');
     }
@@ -278,6 +324,15 @@ export default function App() {
       setSqlSeedTrigger(prev => prev + 1);
       updateBadgeCounts();
       fetchCustomersList();
+      const latestRole = localStorage.getItem('logged_in_user_role');
+      if (latestRole) {
+        setUserRole(latestRole);
+        setUserPermissions(loadSessionPermissionsFromStorage(latestRole));
+      }
+      const latestAuthRole = localStorage.getItem(AUTH_ROLE_STORAGE_KEY);
+      if (latestAuthRole) {
+        setAuthenticatedRole(normalizeRole(latestAuthRole));
+      }
     };
 
     window.addEventListener('pos_sale_completed', handleSaleOrDataUpdate);
@@ -287,8 +342,9 @@ export default function App() {
 
     // Handle native Android hardware back button
     let backListenerHandle: any = null;
-    try {
-      CapApp.addListener('backButton', () => {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        CapApp.addListener('backButton', () => {
         const state = navigationBackStateRef.current;
         if (state.showNavDrawer) {
           setShowNavDrawer(false);
@@ -319,13 +375,14 @@ export default function App() {
         } catch (e) {
           // ignore
         }
-      }).then(handle => {
-        backListenerHandle = handle;
-      }).catch(() => {
-        // web fallback
-      });
-    } catch (e) {
-      // not in capacitor
+        }).then(handle => {
+          backListenerHandle = handle;
+        }).catch(() => {
+          // web fallback
+        });
+      } catch (e) {
+        // not in capacitor
+      }
     }
 
     return () => {
@@ -399,6 +456,14 @@ export default function App() {
       window.removeEventListener('local_db_restored', handleDbRestored);
     };
   }, [sqlSeedTrigger, activeBusiness.id]);
+
+  // Enforce role & ticked module access whenever permissions or active tab changes
+  useEffect(() => {
+    if (!isAuthenticatedSession) return;
+    if (!canAccessModule(activeTab, userRole, userPermissions)) {
+      setActiveTab2('billing');
+    }
+  }, [activeTab, userRole, userPermissions, isAuthenticatedSession]);
 
   const handleRefreshDatabase = (template: SeedTemplate) => {
     initializeDatabase(template, true);
@@ -577,10 +642,15 @@ export default function App() {
     localStorage.setItem('logged_in_user_email', newBizEmail.trim());
     localStorage.setItem('logged_in_user_name', newBizOwner.trim());
     localStorage.setItem('quick_salesperson_name', newBizOwner.trim());
+    localStorage.setItem('logged_in_user_role', 'owner');
+    const ownerPerms = buildUserPermissions({ role: 'owner' });
+    saveSessionPermissionsToStorage(ownerPerms, 'owner');
 
     setActiveBusiness(newlyRegisteredBusiness);
     setActiveStore(storeId);
     setUserRole('owner');
+    setAuthenticatedRole('owner');
+    setUserPermissions(ownerPerms);
     setIsAuthenticatedSession(true);
     persistTablesToStorage();
     setSqlSeedTrigger(prev => prev + 1);
@@ -703,19 +773,20 @@ export default function App() {
       const resolvedRole = matchedStaff && matchedBiz.email?.toLowerCase() !== targetEmail.toLowerCase()
         ? (matchedStaff.role || 'sales')
         : 'owner';
+      const normalizedResolvedRole = normalizeRole(resolvedRole);
       const resolvedUserName = matchedStaff?.name || (matchedStaff?.first_name ? `${matchedStaff.first_name} ${matchedStaff.surname || ''}`.trim() : '') || matchedBiz.owner || 'Admin';
+
+      const resolvedPermissions: UserPermissions =
+        normalizedResolvedRole === 'owner' && !matchedStaff
+          ? buildUserPermissions({ role: 'owner' })
+          : parseStaffPermissions(matchedStaff?.permissions_json, normalizedResolvedRole);
 
       // Extract accessible branches for this account
       let userAllowedBranches: string[] = [];
-      if (resolvedRole !== 'owner' && matchedStaff) {
-        try {
-          if (matchedStaff.permissions_json) {
-            const parsedPerms = JSON.parse(matchedStaff.permissions_json);
-            if (Array.isArray(parsedPerms.accessible_branches) && parsedPerms.accessible_branches.length > 0) {
-              userAllowedBranches = parsedPerms.accessible_branches;
-            }
-          }
-        } catch {}
+      if (normalizedResolvedRole !== 'owner' && matchedStaff) {
+        if (resolvedPermissions.accessible_branches.length > 0) {
+          userAllowedBranches = resolvedPermissions.accessible_branches;
+        }
         if (userAllowedBranches.length === 0 && matchedStaff.store_id) {
           userAllowedBranches = [matchedStaff.store_id];
         }
@@ -732,7 +803,8 @@ export default function App() {
 
       setAccessibleStoreIds(userAllowedBranches);
       localStorage.setItem('logged_in_accessible_branches', JSON.stringify(userAllowedBranches));
-      localStorage.setItem('logged_in_user_role', resolvedRole);
+      localStorage.setItem('logged_in_user_role', normalizedResolvedRole);
+      saveSessionPermissionsToStorage(resolvedPermissions, normalizedResolvedRole);
 
       const activeBizObj = {
         id: matchedBiz.id,
@@ -792,7 +864,10 @@ export default function App() {
       localStorage.setItem('logged_in_user_email', targetEmail);
       localStorage.setItem('logged_in_user_name', resolvedUserName);
       localStorage.setItem('quick_salesperson_name', resolvedUserName);
-      setUserRole(resolvedRole);
+      setUserRole(normalizedResolvedRole);
+      setAuthenticatedRole(normalizedResolvedRole);
+      setUserPermissions(resolvedPermissions);
+      setActiveTab2('billing');
       setSyncLoginEmail('');
       setSyncLoginPassword('');
       setSyncLoginBranch('');
@@ -811,6 +886,10 @@ export default function App() {
     localStorage.removeItem('pos_shift_active');
     localStorage.removeItem('logged_in_accessible_branches');
     localStorage.removeItem('logged_in_user_role');
+    clearSessionPermissionsFromStorage();
+    setUserRole('owner');
+    setAuthenticatedRole('owner');
+    setUserPermissions(buildUserPermissions({ role: 'owner' }));
     setIsAuthenticatedSession(false);
     setShowBranchChoiceGate(false);
     setShowNavDrawer(false);
@@ -1182,13 +1261,21 @@ export default function App() {
 
             {/* Active Business / Settings & Admin Control Panel Button */}
             <button
-              onClick={() => openUnifiedSettings('general')}
-              className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-xs font-extrabold transition-all cursor-pointer shadow-sm font-sans border ${
+              type="button"
+              onClick={() => {
+                if (hasAnySettingsAccess) {
+                  openUnifiedSettings(permittedSettingsTabs[0] || 'general');
+                }
+              }}
+              disabled={!hasAnySettingsAccess}
+              className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-xs font-extrabold transition-all shadow-sm font-sans border ${
+                hasAnySettingsAccess ? 'cursor-pointer' : 'cursor-default opacity-90'
+              } ${
                 activeTab === 'settings'
                   ? 'bg-indigo-600 text-white border-indigo-400'
                   : 'bg-indigo-950/80 text-indigo-200 border-indigo-800/80 hover:bg-indigo-900 hover:text-white'
               }`}
-              title="Open Settings (Merged SME Configuration & Admin Business Control Panel)"
+              title={hasAnySettingsAccess ? 'Open Settings (Permitted Sections)' : 'Business Workspace'}
             >
               <Building2 size={13} className="text-emerald-400 animate-pulse shrink-0" />
               <span className="truncate max-w-[90px] sm:max-w-[160px]">{activeBusiness.name || 'Business Settings'}</span>
@@ -1236,18 +1323,20 @@ export default function App() {
 
           {/* Cloud Sync, Settings & Log Out Badge */}
           <div className="flex items-center gap-1.5 sm:gap-2">
-            <button
-              onClick={() => openUnifiedSettings('general')}
-              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] sm:text-[11px] font-extrabold cursor-pointer transition-all shadow-xs ${
-                activeTab === 'settings'
-                  ? 'bg-indigo-500 text-white ring-2 ring-indigo-300'
-                  : 'bg-indigo-600 hover:bg-indigo-500 text-white'
-              }`}
-              title="Settings: Unified SME Configuration & Admin Business Control Panel"
-            >
-              <Sliders size={12} />
-              <span className="hidden md:inline">Settings</span>
-            </button>
+            {hasAnySettingsAccess && (
+              <button
+                onClick={() => openUnifiedSettings(permittedSettingsTabs[0] || 'general')}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] sm:text-[11px] font-extrabold cursor-pointer transition-all shadow-xs ${
+                  activeTab === 'settings'
+                    ? 'bg-indigo-500 text-white ring-2 ring-indigo-300'
+                    : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+                }`}
+                title="Settings: Permitted Business & System Controls"
+              >
+                <Sliders size={12} />
+                <span className="hidden md:inline">Settings</span>
+              </button>
+            )}
 
             <button
               onClick={handleQuickCloudSync}
@@ -1259,18 +1348,31 @@ export default function App() {
               <span className="hidden sm:inline">{lastHeaderSyncMsg || 'Sync'}</span>
             </button>
 
-            <select
-              value={userRole}
-              onChange={(e) => {
-                setUserRole(e.target.value);
-                setSqlSeedTrigger(prev => prev + 1);
-              }}
-              className="bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer font-sans"
-            >
-              <option value="owner">Admin (Owner)</option>
-              <option value="manager">Manager</option>
-              <option value="sales">Sales</option>
-            </select>
+            {authenticatedRole === 'owner' ? (
+              <select
+                value={userRole}
+                onChange={(e) => {
+                  const nextRole = normalizeRole(e.target.value);
+                  setUserRole(nextRole);
+                  setUserPermissions(buildUserPermissions({ role: nextRole }));
+                  setSqlSeedTrigger(prev => prev + 1);
+                }}
+                title="Owner Role Preview Switcher"
+                className="bg-slate-800 text-slate-100 text-[11px] sm:text-xs font-bold px-1.5 sm:px-2 py-1 rounded-md border border-slate-700 focus:outline-hidden cursor-pointer font-sans"
+              >
+                <option value="owner">Admin (Owner)</option>
+                <option value="manager">Manager</option>
+                <option value="sales">Sales</option>
+              </select>
+            ) : (
+              <span
+                title="Role-based access locked by Administrator"
+                className="flex items-center gap-1 bg-slate-800 text-slate-200 text-[10px] sm:text-[11px] font-extrabold uppercase px-2 py-1 rounded-md border border-slate-700 font-sans select-none"
+              >
+                <Lock size={10} className="text-amber-400" />
+                <span>{userRole === 'manager' ? 'Manager' : 'Cashier'}</span>
+              </span>
+            )}
 
             <button
               onClick={handleLogoutAccount}
@@ -1306,12 +1408,17 @@ export default function App() {
                       onClearInitialAction={() => setBillingCounterAction(null)}
                       onCartCheckedOut={() => setSqlSeedTrigger(prev => prev + 1)}
                       onStoreChange={handleSwitchBranch}
-                      onUserRoleChange={setUserRole}
+                      onUserRoleChange={(newRole) => {
+                        const norm = normalizeRole(newRole);
+                        setUserRole(norm);
+                        setAuthenticatedRole(norm);
+                        setUserPermissions(loadSessionPermissionsFromStorage(norm));
+                      }}
                     />
                   </motion.div>
                 )}
 
-                {activeTab === 'laybys' && (
+                {activeTab === 'laybys' && canViewModule('laybys') && (
                   <motion.div
                     key={`laybys_${sqlSeedTrigger}_${activeStore}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1331,7 +1438,7 @@ export default function App() {
                   </motion.div>
                 )}
 
-                {activeTab === 'inventory' && (
+                {activeTab === 'inventory' && canViewModule('inventory') && (
                   <motion.div
                     key={`inventory_${sqlSeedTrigger}_${activeStore}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1353,7 +1460,7 @@ export default function App() {
                   </motion.div>
                 )}
 
-                {activeTab === 'attendance' && (
+                {activeTab === 'attendance' && canViewModule('attendance') && (
                   <motion.div
                     key={`attendance_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1366,7 +1473,7 @@ export default function App() {
                   </motion.div>
                 )}
 
-                {activeTab === 'quotes' && (
+                {activeTab === 'quotes' && canViewModule('quotes') && (
                   <motion.div
                     key={`quotes_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1378,7 +1485,7 @@ export default function App() {
                     <QuotationsCreator settings={settings} activeStore={activeStore} />
                   </motion.div>
                 )}
-                {activeTab === 'loans' && (
+                {activeTab === 'loans' && canViewModule('loans') && (
                   <motion.div
                     key={`loans_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1390,7 +1497,7 @@ export default function App() {
                     <LoanDashboard settings={settings} userRole={userRole} activeStore={activeStore} />
                   </motion.div>
                 )}
-                {activeTab === 'finance' && (
+                {activeTab === 'finance' && canViewModule('finance') && (
                   <motion.div
                     key={`finance_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1408,7 +1515,7 @@ export default function App() {
                   </motion.div>
                 )}
 
-                {activeTab === 'analytics' && (
+                {activeTab === 'analytics' && canViewModule('analytics') && (
                   <motion.div
                     key={`analytics_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1427,7 +1534,7 @@ export default function App() {
                   </motion.div>
                 )}
 
-                {activeTab === 'workspace' && (
+                {activeTab === 'workspace' && canViewModule('workspace') && (
                   <motion.div
                     key={`workspace_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1443,7 +1550,7 @@ export default function App() {
                   </motion.div>
                 )}
 
-                {activeTab === 'audit' && (
+                {activeTab === 'audit' && canViewModule('audit') && (
                   <motion.div
                     key={`audit_${sqlSeedTrigger}`}
                     initial={{ opacity: 0, x: -10 }}
@@ -1462,7 +1569,7 @@ export default function App() {
 
 
 
-                {activeTab === 'settings' && (
+                {activeTab === 'settings' && hasAnySettingsAccess && (
                   <motion.div
                     key="settings"
                     initial={{ opacity: 0, x: -10 }}
@@ -1478,6 +1585,7 @@ export default function App() {
                       activeStore={activeStore}
                       setActiveStore={setActiveStore}
                       userRole={userRole}
+                      userPermissions={userPermissions}
                       activeBusiness={activeBusiness}
                       setActiveBusiness={setActiveBusiness}
                       businesses={businesses}
@@ -1488,7 +1596,7 @@ export default function App() {
                       syncLoginPassword={syncLoginPassword}
                       setSyncLoginPassword={setSyncLoginPassword}
                       isHeaderSyncing={isHeaderSyncing}
-                      onNavigateToTab={(tab) => setActiveTab2(tab as ActiveTab)}
+                      onNavigateToTab={(tab) => navigateToTab(tab as ActiveTab)}
                       initialSubTab={settingsInitialSubTab}
                     />
                   </motion.div>
@@ -1499,64 +1607,72 @@ export default function App() {
 
         {/* MOBILE ADAPTIVE BOTTOM NAVIGATION BAR */}
         <div className="md:hidden flex items-center justify-around bg-slate-900 border-t border-slate-800 px-1 py-1 shrink-0 z-20 select-none shadow-lg text-slate-400">
-          <button
-            id="mobile_nav_sale"
-            type="button"
-            onClick={() => {
-              setBillingCounterAction(null);
-              setActiveTab2('billing');
-            }}
-            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
-              activeTab === 'billing'
-                ? 'bg-emerald-500/15 text-emerald-400 font-extrabold'
-                : 'hover:text-slate-200'
-            }`}
-          >
-            <ShoppingCart size={17} className={activeTab === 'billing' ? 'text-emerald-400 stroke-[2.5]' : ''} />
-            <span className="mt-0.5 tracking-tight">Sale POS</span>
-          </button>
+          {canViewModule('billing') && (
+            <button
+              id="mobile_nav_sale"
+              type="button"
+              onClick={() => {
+                setBillingCounterAction(null);
+                setActiveTab2('billing');
+              }}
+              className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
+                activeTab === 'billing'
+                  ? 'bg-emerald-500/15 text-emerald-400 font-extrabold'
+                  : 'hover:text-slate-200'
+              }`}
+            >
+              <ShoppingCart size={17} className={activeTab === 'billing' ? 'text-emerald-400 stroke-[2.5]' : ''} />
+              <span className="mt-0.5 tracking-tight">Sale POS</span>
+            </button>
+          )}
 
-          <button
-            id="mobile_nav_inventory"
-            type="button"
-            onClick={() => setActiveTab2('inventory')}
-            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold relative ${
-              activeTab === 'inventory'
-                ? 'bg-blue-500/15 text-blue-400 font-extrabold'
-                : 'hover:text-slate-200'
-            }`}
-          >
-            <Package size={17} className={activeTab === 'inventory' ? 'text-blue-400 stroke-[2.5]' : ''} />
-            <span className="mt-0.5 tracking-tight">Stock</span>
-          </button>
+          {canViewModule('inventory') && (
+            <button
+              id="mobile_nav_inventory"
+              type="button"
+              onClick={() => navigateToTab('inventory')}
+              className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold relative ${
+                activeTab === 'inventory'
+                  ? 'bg-blue-500/15 text-blue-400 font-extrabold'
+                  : 'hover:text-slate-200'
+              }`}
+            >
+              <Package size={17} className={activeTab === 'inventory' ? 'text-blue-400 stroke-[2.5]' : ''} />
+              <span className="mt-0.5 tracking-tight">Stock</span>
+            </button>
+          )}
 
-          <button
-            id="mobile_nav_laybys"
-            type="button"
-            onClick={() => setActiveTab2('laybys')}
-            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
-              activeTab === 'laybys'
-                ? 'bg-amber-500/15 text-amber-400 font-extrabold'
-                : 'hover:text-slate-200'
-            }`}
-          >
-            <Layers size={17} className={activeTab === 'laybys' ? 'text-amber-400 stroke-[2.5]' : ''} />
-            <span className="mt-0.5 tracking-tight">Laybys</span>
-          </button>
+          {canViewModule('laybys') && (
+            <button
+              id="mobile_nav_laybys"
+              type="button"
+              onClick={() => navigateToTab('laybys')}
+              className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
+                activeTab === 'laybys'
+                  ? 'bg-amber-500/15 text-amber-400 font-extrabold'
+                  : 'hover:text-slate-200'
+              }`}
+            >
+              <Layers size={17} className={activeTab === 'laybys' ? 'text-amber-400 stroke-[2.5]' : ''} />
+              <span className="mt-0.5 tracking-tight">Laybys</span>
+            </button>
+          )}
 
-          <button
-            id="mobile_nav_finance"
-            type="button"
-            onClick={() => setActiveTab2('finance')}
-            className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
-              activeTab === 'finance'
-                ? 'bg-purple-500/15 text-purple-400 font-extrabold'
-                : 'hover:text-slate-200'
-            }`}
-          >
-            <FileText size={17} className={activeTab === 'finance' ? 'text-purple-400 stroke-[2.5]' : ''} />
-            <span className="mt-0.5 tracking-tight">Finance</span>
-          </button>
+          {canViewModule('finance') && (
+            <button
+              id="mobile_nav_finance"
+              type="button"
+              onClick={() => navigateToTab('finance')}
+              className={`flex-1 flex flex-col items-center justify-center py-1.5 rounded-lg min-h-[46px] cursor-pointer active:scale-95 transition-all text-[9.5px] font-bold ${
+                activeTab === 'finance'
+                  ? 'bg-purple-500/15 text-purple-400 font-extrabold'
+                  : 'hover:text-slate-200'
+              }`}
+            >
+              <FileText size={17} className={activeTab === 'finance' ? 'text-purple-400 stroke-[2.5]' : ''} />
+              <span className="mt-0.5 tracking-tight">Finance</span>
+            </button>
+          )}
 
           <button
             id="mobile_nav_menu"
@@ -1653,343 +1769,391 @@ export default function App() {
                   </select>
                 </div>
 
-                {/* Unified Settings & Workspace Shortcuts */}
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    onClick={() => openUnifiedSettings('general')}
-                    className="py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[10.5px] font-extrabold uppercase tracking-wider text-center shadow-xs transition-all cursor-pointer font-sans flex items-center justify-center gap-1"
-                  >
-                    <Sliders size={14} />
-                    <span>SETTINGS</span>
-                  </button>
-                  <button
-                    onClick={() => openUnifiedSettings('database')}
-                    className="py-2 px-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[10.5px] font-extrabold uppercase tracking-wider text-center shadow-xs transition-all cursor-pointer font-sans flex items-center justify-center gap-1"
-                  >
-                    <Building2 size={14} />
-                    <span>WORKSPACES</span>
-                  </button>
-                </div>
+                {/* Unified Settings & Workspace Shortcuts (Role & Ticked Permissions) */}
+                {(hasAnySettingsAccess || canAccessSettingTab('workspaces', userRole, userPermissions)) && (
+                  <div className="grid grid-cols-2 gap-2">
+                    {hasAnySettingsAccess && (
+                      <button
+                        onClick={() => openUnifiedSettings(permittedSettingsTabs[0] || 'general')}
+                        className="py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[10.5px] font-extrabold uppercase tracking-wider text-center shadow-xs transition-all cursor-pointer font-sans flex items-center justify-center gap-1"
+                      >
+                        <Sliders size={14} />
+                        <span>SETTINGS</span>
+                      </button>
+                    )}
+                    {canAccessSettingTab('workspaces', userRole, userPermissions) && (
+                      <button
+                        onClick={() => openUnifiedSettings('workspaces')}
+                        className="py-2 px-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[10.5px] font-extrabold uppercase tracking-wider text-center shadow-xs transition-all cursor-pointer font-sans flex items-center justify-center gap-1"
+                      >
+                        <Building2 size={14} />
+                        <span>WORKSPACES</span>
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* SECTION: Management */}
               <div className="p-3 flex flex-col gap-1.5 border-b border-slate-150">
                 <span className="text-[11px] font-extrabold text-slate-400 uppercase tracking-wider px-2 py-0.5 font-mono">
-                  Management
+                  Management ({normalizeRole(userRole).toUpperCase()})
                 </span>
 
                 {/* Point of Sale Register - Placed directly on top of Inventory */}
-                <button
-                  id="drawer_pos_sale_btn"
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setBillingCounterAction(null);
-                    setActiveTab2('billing');
-                  }}
-                  className={`flex items-center justify-between p-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer group ${
-                    activeTab === 'billing'
-                      ? 'bg-emerald-600 text-white shadow-md'
-                      : 'hover:bg-slate-100 text-slate-800 bg-emerald-50/60 border border-emerald-200/80'
-                  }`}
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className={`p-1.5 rounded-lg shadow-xs group-hover:scale-105 transition-transform ${
-                      activeTab === 'billing' ? 'bg-white text-emerald-700' : 'bg-emerald-600 text-white'
-                    }`}>
-                      <ShoppingCart size={16} />
+                {canViewModule('billing') && (
+                  <button
+                    id="drawer_pos_sale_btn"
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      setBillingCounterAction(null);
+                      navigateToTab('billing');
+                    }}
+                    className={`flex items-center justify-between p-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer group ${
+                      activeTab === 'billing'
+                        ? 'bg-emerald-600 text-white shadow-md'
+                        : 'hover:bg-slate-100 text-slate-800 bg-emerald-50/60 border border-emerald-200/80'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className={`p-1.5 rounded-lg shadow-xs group-hover:scale-105 transition-transform ${
+                        activeTab === 'billing' ? 'bg-white text-emerald-700' : 'bg-emerald-600 text-white'
+                      }`}>
+                        <ShoppingCart size={16} />
+                      </div>
+                      <div className="flex flex-col text-left">
+                        <span className="font-extrabold text-xs">Point of Sale (POS Terminal)</span>
+                        <span className="text-[9.5px] opacity-80 font-mono">New Sale Register & Express Checkout</span>
+                      </div>
                     </div>
-                    <div className="flex flex-col text-left">
-                      <span className="font-extrabold text-xs">Point of Sale (POS Terminal)</span>
-                      <span className="text-[9.5px] opacity-80 font-mono">New Sale Register & Express Checkout</span>
-                    </div>
-                  </div>
-                  <span className="px-2 py-0.5 bg-emerald-500 text-white text-[10px] font-black rounded-full font-mono shadow-xs">
-                    SALE
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-emerald-500 text-white text-[10px] font-black rounded-full font-mono shadow-xs">
+                      SALE
+                    </span>
+                  </button>
+                )}
 
                 {/* Inventory Management */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('inventory');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-blue-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Package size={16} />
+                {canViewModule('inventory') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('inventory');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-blue-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Package size={16} />
+                      </div>
+                      <span>Inventory Management</span>
                     </div>
-                    <span>Inventory Management</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-blue-100 text-blue-800 border border-blue-200 text-[10px] font-extrabold rounded-full font-mono">
-                    {badgeCounts.products}
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-blue-100 text-blue-800 border border-blue-200 text-[10px] font-extrabold rounded-full font-mono">
+                      {badgeCounts.products}
+                    </span>
+                  </button>
+                )}
 
                 {/* Layby Functions & Credit Sales */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('laybys');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-amber-500 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Layers size={16} />
+                {canViewModule('laybys') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('laybys');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-amber-500 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Layers size={16} />
+                      </div>
+                      <span>Layby Functions & Deposits</span>
                     </div>
-                    <span>Layby Functions & Deposits</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-extrabold rounded-full font-mono">
-                    LAYBY
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-extrabold rounded-full font-mono">
+                      LAYBY
+                    </span>
+                  </button>
+                )}
 
                 {/* Tasks & Operations */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('workspace');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <CheckSquare size={16} />
+                {canViewModule('workspace') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('workspace');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <CheckSquare size={16} />
+                      </div>
+                      <span>Tasks & Operations</span>
                     </div>
-                    <span>Tasks & Operations</span>
-                  </div>
-                  <span className="px-1.5 py-0.5 bg-indigo-100 text-indigo-800 border border-indigo-200 text-[9px] font-extrabold rounded uppercase tracking-wider font-mono">
-                    TASKS
-                  </span>
-                </button>
+                    <span className="px-1.5 py-0.5 bg-indigo-100 text-indigo-800 border border-indigo-200 text-[9px] font-extrabold rounded uppercase tracking-wider font-mono">
+                      TASKS
+                    </span>
+                  </button>
+                )}
 
                 {/* Quote, Invoice & Delivery Note */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('quotes');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-purple-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <FileText size={16} />
+                {canViewModule('quotes') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('quotes');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-purple-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <FileText size={16} />
+                      </div>
+                      <span>Quote, Invoice &amp; Delivery Note</span>
                     </div>
-                    <span>Quote, Invoice &amp; Delivery Note</span>
-                  </div>
-                </button>
+                  </button>
+                )}
 
                 {/* Add Expense */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setShowExpenseModal(true);
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-rose-500 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Receipt size={16} />
+                {(normalizeRole(userRole) !== 'sales' || canViewModule('finance') || canViewModule('loans')) && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      setShowExpenseModal(true);
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-rose-500 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Receipt size={16} />
+                      </div>
+                      <span>Add Operating Expense</span>
                     </div>
-                    <span>Add Operating Expense</span>
-                  </div>
-                </button>
+                  </button>
+                )}
 
                 {/* Purchase Orders & Outflows */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('loans');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Truck size={16} />
+                {canViewModule('loans') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('loans');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Truck size={16} />
+                      </div>
+                      <span>Purchase Orders & Expenses</span>
                     </div>
-                    <span>Purchase Orders & Expenses</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-indigo-100 text-indigo-800 border border-indigo-200 text-[10px] font-extrabold rounded-full font-mono">
-                    Tab
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-indigo-100 text-indigo-800 border border-indigo-200 text-[10px] font-extrabold rounded-full font-mono">
+                      Tab
+                    </span>
+                  </button>
+                )}
 
                 {/* Customers Management */}
-                <button
-                  onClick={() => {
-                    fetchCustomersList();
-                    setShowNavDrawer(false);
-                    setShowCustomersModal(true);
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-emerald-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Users size={16} />
+                {(canViewModule('billing') || canViewModule('quotes')) && (
+                  <button
+                    onClick={() => {
+                      fetchCustomersList();
+                      setShowNavDrawer(false);
+                      setShowCustomersModal(true);
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-emerald-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Users size={16} />
+                      </div>
+                      <span>Customers Management</span>
                     </div>
-                    <span>Customers Management</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-extrabold rounded-full font-mono">
-                    {badgeCounts.customers}
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-extrabold rounded-full font-mono">
+                      {badgeCounts.customers}
+                    </span>
+                  </button>
+                )}
 
                 {/* Staff Management */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('attendance');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-sky-500 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <UserCheck size={16} />
+                {canViewModule('attendance') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('attendance');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-sky-500 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <UserCheck size={16} />
+                      </div>
+                      <span>Staff Management</span>
                     </div>
-                    <span>Staff Management</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-sky-100 text-sky-800 border border-sky-200 text-[10px] font-extrabold rounded-full font-mono">
-                    {badgeCounts.staff}
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-sky-100 text-sky-800 border border-sky-200 text-[10px] font-extrabold rounded-full font-mono">
+                      {badgeCounts.staff}
+                    </span>
+                  </button>
+                )}
 
                 {/* Employee Audit Trail */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('audit');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-indigo-50 bg-indigo-50/50 text-slate-800 text-xs font-bold transition-all cursor-pointer border border-indigo-200/60 group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <ShieldCheck size={16} />
+                {canViewModule('audit') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('audit');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-indigo-50 bg-indigo-50/50 text-slate-800 text-xs font-bold transition-all cursor-pointer border border-indigo-200/60 group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <ShieldCheck size={16} />
+                      </div>
+                      <span>Employee Audit Trail</span>
                     </div>
-                    <span>Employee Audit Trail</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-indigo-600 text-white text-[10px] font-extrabold rounded-full font-mono font-sans">
-                    AUDIT
-                  </span>
-                </button>
+                    <span className="px-2 py-0.5 bg-indigo-600 text-white text-[10px] font-extrabold rounded-full font-mono font-sans">
+                      AUDIT
+                    </span>
+                  </button>
+                )}
               </div>
 
               {/* SECTION: Finance & Accounting */}
-              <div className="p-3 flex flex-col gap-1.5 border-b border-slate-150 bg-emerald-50/40">
-                <span className="text-[11px] font-extrabold text-emerald-800 uppercase tracking-wider px-2 py-0.5 font-mono">
-                  Finance & Accounting
-                </span>
-
-                {/* Financial Statements & P&L */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('finance');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <FileText size={16} />
-                    </div>
-                    <span>Profit & Loss Statements</span>
-                  </div>
-                  <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 text-[9px] font-extrabold rounded-full font-mono">
-                    P&L
+              {canViewModule('finance') && (
+                <div className="p-3 flex flex-col gap-1.5 border-b border-slate-150 bg-emerald-50/40">
+                  <span className="text-[11px] font-extrabold text-emerald-800 uppercase tracking-wider px-2 py-0.5 font-mono">
+                    Finance & Accounting
                   </span>
-                </button>
 
-                {/* Operating Expenses */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('finance');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Receipt size={16} />
+                  {/* Financial Statements & P&L */}
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('finance');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <FileText size={16} />
+                      </div>
+                      <span>Profit & Loss Statements</span>
                     </div>
-                    <span>Operating Expenses & Ledger</span>
-                  </div>
-                </button>
+                    <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 text-[9px] font-extrabold rounded-full font-mono">
+                      P&L
+                    </span>
+                  </button>
 
-                {/* Goods in Transit & POs */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('finance');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Truck size={16} />
+                  {/* Operating Expenses */}
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('finance');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Receipt size={16} />
+                      </div>
+                      <span>Operating Expenses & Ledger</span>
                     </div>
-                    <span>Purchase Orders & Procurement</span>
-                  </div>
-                </button>
-              </div>
+                  </button>
+
+                  {/* Goods in Transit & POs */}
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('finance');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Truck size={16} />
+                      </div>
+                      <span>Purchase Orders & Procurement</span>
+                    </div>
+                  </button>
+                </div>
+              )}
 
               {/* SECTION: Loans & Merchant Financing */}
-              <div className="p-3 flex flex-col gap-1.5 border-b border-slate-150 bg-blue-50/40">
-                <span className="text-[11px] font-extrabold text-blue-800 uppercase tracking-wider px-2 py-0.5 font-mono">
-                  Loans & Merchant Credit
-                </span>
+              {canViewModule('loans') && (
+                <div className="p-3 flex flex-col gap-1.5 border-b border-slate-150 bg-blue-50/40">
+                  <span className="text-[11px] font-extrabold text-blue-800 uppercase tracking-wider px-2 py-0.5 font-mono">
+                    Loans & Merchant Credit
+                  </span>
 
-                {/* Loan Advances */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('loans');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-blue-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-blue-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Briefcase size={16} />
+                  {/* Loan Advances */}
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('loans');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-blue-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-blue-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Briefcase size={16} />
+                      </div>
+                      <span>Merchant Loan Advances</span>
                     </div>
-                    <span>Merchant Loan Advances</span>
-                  </div>
-                </button>
+                  </button>
 
-                {/* Credit Risk & Swept Capital */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('loans');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-blue-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-blue-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <TrendingUp size={16} />
+                  {/* Credit Risk & Swept Capital */}
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('loans');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-blue-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-blue-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <TrendingUp size={16} />
+                      </div>
+                      <span>Credit Risk & Swept Capital</span>
                     </div>
-                    <span>Credit Risk & Swept Capital</span>
-                  </div>
-                </button>
+                  </button>
 
-                {/* Borrower Statements */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setActiveTab2('loans');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-blue-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-blue-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <FileSpreadsheet size={16} />
+                  {/* Borrower Statements */}
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('loans');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-blue-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-blue-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <FileSpreadsheet size={16} />
+                      </div>
+                      <span>Borrower Amortization Statements</span>
                     </div>
-                    <span>Borrower Amortization Statements</span>
-                  </div>
-                </button>
-              </div>
+                  </button>
+                </div>
+              )}
 
               {/* SECTION: Additional Tools */}
               <div className="p-3 flex flex-col gap-1.5">
+                {/* Analytics Dashboard shortcut if enabled */}
+                {canViewModule('analytics') && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      navigateToTab('analytics');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <LayoutDashboard size={16} />
+                      </div>
+                      <span>Analytics Dashboard</span>
+                    </div>
+                  </button>
+                )}
+
                 {/* Refer App */}
                 <button
                   onClick={() => {
@@ -2007,34 +2171,38 @@ export default function App() {
                 </button>
 
                 {/* Receipts & Refunds Ledger */}
-                <button
-                  onClick={() => {
-                    setShowNavDrawer(false);
-                    setBillingCounterAction('refunds');
-                    setActiveTab2('billing');
-                  }}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-red-600 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <RotateCcw size={16} />
+                {(normalizeRole(userRole) !== 'sales' || userPermissions?.sales?.refunds) && (
+                  <button
+                    onClick={() => {
+                      setShowNavDrawer(false);
+                      setBillingCounterAction('refunds');
+                      navigateToTab('billing');
+                    }}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-red-600 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <RotateCcw size={16} />
+                      </div>
+                      <span>Receipt & Refund Ledger</span>
                     </div>
-                    <span>Receipt & Refund Ledger</span>
-                  </div>
-                </button>
+                  </button>
+                )}
 
                 {/* Settings (Unified SME Configuration & Admin Business Control Panel) */}
-                <button
-                  onClick={() => openUnifiedSettings('general')}
-                  className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-1.5 rounded-lg bg-slate-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                      <Sliders size={16} />
+                {hasAnySettingsAccess && (
+                  <button
+                    onClick={() => openUnifiedSettings(permittedSettingsTabs[0] || 'general')}
+                    className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="p-1.5 rounded-lg bg-slate-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                        <Sliders size={16} />
+                      </div>
+                      <span>Settings ({permittedSettingsTabs.length} Permitted)</span>
                     </div>
-                    <span>Settings (Admin & Business Control)</span>
-                  </div>
-                </button>
+                  </button>
+                )}
               </div>
 
               {/* SECTION: Help Chat & WhatsApp Support (Placed at the bottom) */}

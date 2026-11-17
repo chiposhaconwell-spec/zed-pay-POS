@@ -899,6 +899,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       CREATE TABLE products (
         id INT PRIMARY KEY,
         name STRING,
+        description STRING,
         sku STRING UNIQUE,
         category STRING,
         price NUMERIC,

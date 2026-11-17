@@ -42,6 +42,13 @@ import {
 } from 'lucide-react';
 import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider } from '../db';
 import { Product, Customer, StoreSettings, CustomPaymentMethod } from '../types';
+import {
+  UserPermissions,
+  buildUserPermissions,
+  parseStaffPermissions,
+  saveSessionPermissionsToStorage,
+  normalizeRole,
+} from '../permissions';
 import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { jsPDF } from 'jspdf';
@@ -3832,6 +3839,7 @@ export default function BillingTerminal({
                     let foundUser: any = null;
                     let roleFound = 'sales';
                     let fullName = 'Cashier';
+                    let permissionsFound: UserPermissions = buildUserPermissions({ role: 'sales' });
 
                     const bizRes = runSql('SELECT * FROM businesses', 'Auth: Retrieve businesses');
                     if (bizRes.success && Array.isArray(bizRes.data)) {
@@ -3840,6 +3848,7 @@ export default function BillingTerminal({
                         foundUser = matchBiz;
                         roleFound = 'owner';
                         fullName = matchBiz.owner || matchBiz.name || 'Business Owner';
+                        permissionsFound = buildUserPermissions({ role: 'owner' });
                       }
                     }
 
@@ -3870,20 +3879,21 @@ export default function BillingTerminal({
                             }
 
                             foundUser = matchStaff;
-                            fullName = `${matchStaff.first_name} ${matchStaff.surname}`;
-                            if (parsedPerms.role) {
-                              roleFound = parsedPerms.role;
+                            fullName = `${matchStaff.first_name || ''} ${matchStaff.surname || ''}`.trim() || matchStaff.name || 'Staff User';
+                            if (matchStaff.role || parsedPerms.role) {
+                              roleFound = matchStaff.role || parsedPerms.role;
                             } else if (parseFloat(matchStaff.basic_salary) > 10000) {
                               roleFound = 'manager';
                             } else {
                               roleFound = 'sales';
                             }
+                            permissionsFound = parseStaffPermissions(matchStaff.permissions_json, roleFound);
                           }
                         }
                       }
                     }
 
-                    return { foundUser, roleFound, fullName };
+                    return { foundUser, roleFound, fullName, permissionsFound };
                   };
 
                   // 1. Check local database first
@@ -3933,7 +3943,8 @@ export default function BillingTerminal({
                   }
 
                   const userFullName = authResult.fullName;
-                  const userRoleFound = authResult.roleFound;
+                  const userRoleFound = normalizeRole(authResult.roleFound);
+                  const userPermsFound = authResult.permissionsFound || buildUserPermissions({ role: userRoleFound });
 
                   // Determine store to activate from central branches database
                   let targetStoreId = selectedLoginStore || activeStore;
@@ -3965,6 +3976,11 @@ export default function BillingTerminal({
                   localStorage.setItem('logged_in_user_email', targetEmail);
                   localStorage.setItem('logged_in_user_name', userFullName);
                   localStorage.setItem('logged_in_user_role', userRoleFound);
+                  localStorage.setItem(
+                    'logged_in_accessible_branches',
+                    JSON.stringify(userPermsFound.accessible_branches || [])
+                  );
+                  saveSessionPermissionsToStorage(userPermsFound, userRoleFound);
 
                   // 4. Callback props to update main App state dynamically
                   if (targetStoreId) {

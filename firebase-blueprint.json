@@ -41,6 +41,7 @@
         "business_id": { "type": "string", "maxLength": 128, "description": "Associated business identifier" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "name": { "type": "string", "minLength": 1, "maxLength": 250, "description": "Item product name" },
+        "description": { "type": "string", "maxLength": 4000, "description": "Full item features and product description" },
         "sku": { "type": "string", "maxLength": 100, "description": "Stockkeeping unit SKU code" },
         "category": { "type": "string", "maxLength": 100, "description": "Product category" },
         "price": { "type": "number", "description": "Selling retail price" },

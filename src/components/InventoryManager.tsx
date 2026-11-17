@@ -135,6 +135,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   // Editing state
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editName, setEditName] = useState<string>('');
+  const [editDescription, setEditDescription] = useState<string>('');
   const [editSku, setEditSku] = useState<string>('');
   const [editPrice, setEditPrice] = useState<number>(0);
   const [editCost, setEditCost] = useState<number>(0);
@@ -198,6 +199,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   // Adding product state
   const [showAddModal, setShowAddModal] = useState(false);
   const [newName, setNewName] = useState('');
+  const [newDescription, setNewDescription] = useState('');
   const [newSku, setNewSku] = useState('');
   const [newCat, setNewCat] = useState('');
   const [newPrice, setNewPrice] = useState('0.00');
@@ -564,6 +566,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     }
     setEditingId(prod.id);
     setEditName(prod.name || '');
+    setEditDescription(prod.description || '');
     setEditSku(prod.sku || '');
     setEditPrice(prod.price);
     setEditCost(prod.cost);
@@ -583,10 +586,11 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const stockDiff = editStock - oldStock;
     const catToSave = (editCategory || 'General').trim();
     const nameToSave = (editName || targetProd?.name || `Product #${id}`).trim();
+    const descToSave = (editDescription || '').trim();
     const skuToSave = (editSku || targetProd?.sku || `SKU-${id}`).trim();
 
     // 1. Update the default primary products table
-    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}', item_cls_cd = '${editItemClsCd.replace(/'/g, "''")}', tax_ty_cd = '${editTaxTyCd.replace(/'/g, "''")}' WHERE id = ${id}`;
+    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', description = '${descToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}', item_cls_cd = '${editItemClsCd.replace(/'/g, "''")}', tax_ty_cd = '${editTaxTyCd.replace(/'/g, "''")}' WHERE id = ${id}`;
     runSql(updateGlobalSql, `Inventory: Sync baseline pricing and category for Product ID #${id}`);
 
     // 2. Update or insert the store_products row for active branch store!
@@ -701,9 +705,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
     // Insert baseline primary with column specifiers to support optional/default is_service
     runSql(`
-      INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, item_cls_cd, tax_ty_cd) VALUES (
+      INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, item_cls_cd, tax_ty_cd) VALUES (
         ${nextId}, 
         '${cleanName.replace(/'/g, "''")}', 
+        '${newDescription.trim().replace(/'/g, "''")}', 
         '${cleanSku.replace(/'/g, "''")}', 
         '${cleanCat.replace(/'/g, "''")}', 
         ${priceNum}, 
@@ -763,6 +768,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setAddFormError(null);
     setShowAddModal(false);
     setNewName('');
+    setNewDescription('');
     setNewSku('');
     setNewCat('');
     setNewPrice('0.00');
@@ -1657,9 +1663,14 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                             <div className="flex-1 min-w-0 text-left">
                               <p className="font-extrabold text-slate-800 text-xs">{prod.name}</p>
                               <p className="text-[10px] font-mono font-semibold text-slate-400">SKU: {prod.sku}</p>
+                              {!isEditing && prod.description && (
+                                <p className="text-[10px] text-slate-500 font-medium whitespace-pre-line line-clamp-2 mt-0.5 leading-snug" title={prod.description}>
+                                  {prod.description}
+                                </p>
+                              )}
                               {isEditing ? (
                                 <div className="mt-2 grid grid-cols-2 gap-1.5 bg-slate-50 p-2.5 rounded-lg border border-indigo-200">
-                                  <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
+                                  <div className="flex flex-col gap-0.5 col-span-2">
                                     <span className="text-[8px] text-slate-400 font-bold uppercase">Product Name</span>
                                     <input
                                       type="text"
@@ -1667,6 +1678,16 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                       onChange={(e) => setEditName(e.target.value)}
                                       className="px-1.5 py-1 text-[10px] border rounded bg-white text-slate-800 font-bold"
                                       placeholder="Product Name"
+                                    />
+                                  </div>
+                                  <div className="flex flex-col gap-0.5 col-span-2">
+                                    <span className="text-[8px] text-slate-400 font-bold uppercase">Description / Full Item Features</span>
+                                    <textarea
+                                      rows={2}
+                                      value={editDescription}
+                                      onChange={(e) => setEditDescription(e.target.value)}
+                                      className="px-1.5 py-1 text-[10px] border rounded bg-white text-slate-800 font-medium resize-y"
+                                      placeholder="Full item features, specifications, model or warranty details..."
                                     />
                                   </div>
                                   <div className="flex flex-col gap-0.5 col-span-2 sm:col-span-1">
@@ -3045,6 +3066,17 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                         }}
                         placeholder="e.g. 2kg Sugar / Mineral Water / Cement"
                         className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-md text-slate-900 font-bold focus:border-indigo-500 focus:outline-hidden"
+                      />
+                    </div>
+
+                    <div className="flex flex-col gap-1 col-span-1 sm:col-span-2">
+                      <label className="text-[10px] text-slate-500 font-bold uppercase">Item Description / Full Features</label>
+                      <textarea
+                        rows={3}
+                        value={newDescription}
+                        onChange={(e) => setNewDescription(e.target.value)}
+                        placeholder="Enter full features, specifications, model details, dimensions, or warranty (also displayed on Quotations & Invoices)..."
+                        className="px-3 py-2 text-xs bg-white border border-slate-300 rounded-md text-slate-800 font-medium focus:border-indigo-500 focus:outline-hidden resize-y"
                       />
                     </div>
 

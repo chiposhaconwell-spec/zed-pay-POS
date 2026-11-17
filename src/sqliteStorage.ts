@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS stores (
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY,
   name TEXT,
+  description TEXT,
   sku TEXT,
   category TEXT,
   price REAL,
@@ -609,6 +610,7 @@ export async function initSqliteStorage(): Promise<boolean> {
       try { await dbConnection.execute('ALTER TABLE quotations ADD COLUMN extra_json TEXT;'); } catch {}
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN item_cls_cd TEXT;'); } catch {}
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN tax_ty_cd TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE products ADD COLUMN description TEXT;'); } catch {}
       console.log('[SqliteStorage] SQLite schema verified');
       isSqliteReady = true;
     }
@@ -633,15 +635,21 @@ function setupLifecycleListeners() {
   if (isListenerSet) return;
   isListenerSet = true;
 
-  try {
-    CapApp.addListener('appStateChange', (state) => {
-      if (!state.isActive) {
-        console.log('[SqliteStorage] App went to background, triggering immediate flush');
-        triggerImmediateFlush();
-      }
-    });
-  } catch (e) {
-    // web fallback
+  if (Capacitor.isNativePlatform()) {
+    try {
+      Promise.resolve(
+        CapApp.addListener('appStateChange', (state) => {
+          if (!state.isActive) {
+            console.log('[SqliteStorage] App went to background, triggering immediate flush');
+            triggerImmediateFlush();
+          }
+        })
+      ).catch(() => {
+        // web fallback
+      });
+    } catch (e) {
+      // web fallback
+    }
   }
 
   if (typeof window !== 'undefined') {

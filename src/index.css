@@ -98,10 +98,35 @@ body {
   opacity: 0.9;
 }
 
-input, textarea {
+:root {
+  --keyboard-inset: 0px;
+}
+
+html, body, #root {
+  direction: ltr;
+  text-align: left;
+}
+
+.keyboard-safe-scroll {
+  padding-bottom: calc(2rem + var(--keyboard-inset, 0px));
+  scroll-padding-top: 4rem;
+  scroll-padding-bottom: calc(12rem + var(--keyboard-inset, 0px));
+}
+
+input, textarea, select {
   user-select: text !important;
   -webkit-user-select: text !important;
-  direction: ltr;
-  unicode-bidi: isolate;
+  direction: ltr !important;
+  unicode-bidi: isolate !important;
+}
+
+input[type="text"],
+input[type="tel"],
+input[type="email"],
+input[type="search"],
+input[type="url"],
+input[type="number"],
+textarea {
+  text-align: left;
 }
 

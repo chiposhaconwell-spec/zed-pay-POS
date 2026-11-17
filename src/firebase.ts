@@ -615,6 +615,7 @@ export async function backupToCloud(
         business_id: safeBizId,
         ownerUid: currentUid,
         name: String(prod.name || 'Item').slice(0, 250),
+        description: String(prod.description || '').slice(0, 4000),
         sku: String(prod.sku || `SKU-${prodIdNum}`).slice(0, 100),
         category: String(prod.category || 'General').slice(0, 100),
         price: Math.max(0, parseFloat(prod.price as any) || 0.0),
@@ -909,12 +910,14 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
       pSnap.forEach((docSnap) => {
         const d = docSnap.data();
         const cleanImgUrl = d.imageUrl ? String(d.imageUrl).replace(/'/g, "''") : '';
+        const cleanDesc = d.description ? String(d.description).replace(/'/g, "''") : '';
         const cleanBatch = d.batch_number ? String(d.batch_number).replace(/'/g, "''") : '';
         const cleanExpiry = d.expiry_date ? String(d.expiry_date).replace(/'/g, "''") : '';
         runSql(
-          `INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
+          `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
             ${d.id}, 
             '${String(d.name || 'Item').replace(/'/g, "''")}', 
+            '${cleanDesc}', 
             '${String(d.sku || '').replace(/'/g, "''")}', 
             '${String(d.category || 'General').replace(/'/g, "''")}', 
             ${d.price || 0.0}, 
