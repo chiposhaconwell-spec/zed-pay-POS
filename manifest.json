@@ -1,0 +1,12 @@
+{
+  "background_color": "#ffffff",
+  "description": "An immersive Android-style Point of Sale (POS) system for SMEs, featuring a live, interactive SQL database, real POS terminal billing, product inventory control, sales analytics, and a raw SQL query execution console.",
+  "dir": "ltr",
+  "display": "standalone",
+  "name": "zedpaypos.vercel",
+  "orientation": "any",
+  "scope": "/",
+  "short_name": "zedpaypos.vercel",
+  "start_url": "/",
+  "theme_color": "#0f172a"
+}
