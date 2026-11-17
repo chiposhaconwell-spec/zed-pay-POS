@@ -26,7 +26,9 @@ import {
   QrCode,
   Wifi,
   WifiOff,
-  AlertCircle
+  AlertCircle,
+  Ban,
+  UserCheck
 } from 'lucide-react';
 import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod } from '../db';
 import { exportAndShareText } from '../androidUtils';
@@ -47,6 +49,7 @@ import {
   getDefaultModulesForRole,
   buildUserPermissions,
   parseStaffPermissions,
+  isUserSuspended,
   getPermittedSettingsTabs,
   canAccessSettingTab,
   mapSubTabToPermissionKey,
@@ -238,9 +241,12 @@ export default function SettingsPanel({
   const [userRole, setUserRole] = useState<'sales' | 'manager' | 'owner'>('sales');
   const [userSalary, setUserSalary] = useState('');
   const [userContact, setUserContact] = useState('');
+  const [userSuspended, setUserSuspended] = useState(false);
   const [selectedBranches, setSelectedBranches] = useState<string[]>([]); // Array of store branch IDs
   const [allowedSettings, setAllowedSettings] = useState<SettingsPermissionKey[]>(() => getDefaultSettingsForRole('sales'));
   const [allowedModules, setAllowedModules] = useState<ModulePermissionKey[]>(() => getDefaultModulesForRole('sales'));
+  const [confirmRevokeUserKey, setConfirmRevokeUserKey] = useState<string | null>(null);
+  const [userActionFeedback, setUserActionFeedback] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
 
   useEffect(() => {
     setStoreName(settings.storeName);
@@ -278,6 +284,7 @@ export default function SettingsPanel({
         const sName = st.surname || parts.slice(1).join(' ') || '';
         const resolvedRole = st.role || perms.role || (parseFloat(st.basic_salary) > 10000 ? 'manager' : 'sales');
         const parsedPerms = parseStaffPermissions(st.permissions_json, resolvedRole);
+        const suspended = isUserSuspended(st.permissions_json);
         const branches = perms.accessible_branches && perms.accessible_branches.length > 0
           ? perms.accessible_branches
           : (st.store_id ? [st.store_id] : []);
@@ -293,6 +300,8 @@ export default function SettingsPanel({
           accessible_branches: branches,
           allowed_settings: parsedPerms.allowed_settings,
           allowed_modules: parsedPerms.allowed_modules,
+          suspended,
+          suspended_at: parsedPerms.suspended_at || null,
           is_owner: false,
           raw: st
         };
@@ -328,6 +337,8 @@ export default function SettingsPanel({
           accessible_branches: [], // implicit: all branches
           allowed_settings: [...ALL_SETTINGS_KEYS],
           allowed_modules: [...ALL_MODULE_KEYS],
+          suspended: false,
+          suspended_at: null,
           is_owner: true,
           raw: bz
         };
@@ -1016,12 +1027,50 @@ export default function SettingsPanel({
     triggerNotify('Compiled fully complete raw SQL file script text backup dumper!');
   };
 
+  const buildSqlIdWhereClause = (idVal: unknown): string => {
+    if (typeof idVal === 'number') {
+      return `id = ${idVal}`;
+    }
+    const rawStr = String(idVal ?? '').trim();
+    const safeStr = rawStr.replace(/'/g, "''");
+    const asNum = Number(rawStr);
+    if (rawStr !== '' && !isNaN(asNum) && String(asNum) === rawStr) {
+      return `(id = '${safeStr}' OR id = ${asNum})`;
+    }
+    return `id = '${safeStr}'`;
+  };
+
+  const getProtectedPrimaryOwnerReason = (usr: any, actionLabel: 'revoke' | 'suspend'): string | null => {
+    const currentLoggedEmail = (localStorage.getItem('logged_in_user_email') || '').trim().toLowerCase();
+    const usrEmailLower = String(usr.email || '').trim().toLowerCase();
+    const activeBizId = getActiveBusinessId();
+    const activeBizRow = businessesList.find((b: any) => String(b.id) === String(activeBizId)) || businessesList[0];
+    const primaryOwnerEmail = String(activeBizRow?.email || '').trim().toLowerCase();
+
+    if (usr.id === 'default_biz') {
+      return `Primary Business Owner profiles cannot be ${actionLabel === 'revoke' ? 'revoked' : 'suspended'}. Edit credentials instead.`;
+    }
+    if (currentLoggedEmail && usrEmailLower && currentLoggedEmail === usrEmailLower) {
+      return `You cannot ${actionLabel} your own currently active session.`;
+    }
+    if (usr.is_owner && (String(usr.id) === String(activeBizId) || businessesList.length <= 1)) {
+      return `The active Corporate Owner profile cannot be ${actionLabel === 'revoke' ? 'revoked' : 'suspended'}. Edit credentials instead.`;
+    }
+    if (actionLabel === 'suspend' && (usr.is_owner || usr.role === 'owner')) {
+      return 'Corporate Owner accounts cannot be suspended. Downgrade role or revoke secondary owner access instead.';
+    }
+    if (primaryOwnerEmail && usrEmailLower === primaryOwnerEmail && usr.role === 'owner') {
+      return `Primary Corporate Owner (${usr.email}) cannot be ${actionLabel === 'revoke' ? 'revoked' : 'suspended'}.`;
+    }
+    return null;
+  };
+
   const handleSaveUser = (e: React.FormEvent) => {
     e.preventDefault();
     const emailLower = userEmail.trim().toLowerCase();
     
     if (!emailLower || !userFirstName.trim() || !userSurname.trim() || !userPassword.trim()) {
-      alert("Invalid Form: Please complete all required account identifier fields.");
+      setUserActionFeedback({ type: 'error', text: 'Invalid Form: Please complete First Name, Surname, Email, and Password.' });
       return;
     }
 
@@ -1029,6 +1078,7 @@ export default function SettingsPanel({
     const basicPermissions = buildUserPermissions({
       role: userRole,
       password: userPassword.trim(),
+      suspended: userRole === 'owner' ? false : userSuspended,
       accessibleBranches: selectedBranches,
       allowedSettings,
       allowedModules,
@@ -1043,12 +1093,12 @@ export default function SettingsPanel({
           SET owner = '${userFirstName.trim().replace(/'/g, "''")} ${userSurname.trim().replace(/'/g, "''")}',
               email = '${emailLower.replace(/'/g, "''")}',
               password = '${userPassword.trim().replace(/'/g, "''")}'
-          WHERE id = '${editingUserId}'
+          WHERE id = '${String(editingUserId).replace(/'/g, "''")}'
         `;
         runSql(sql, `SettingsPanel: Update Corporate Owner profile`);
       } else {
         const newBizId = editingUserId || `biz_${Math.floor(100000 + Math.random() * 900000)}`;
-        const existsRes = runSql(`SELECT * FROM businesses WHERE id = '${newBizId}'`);
+        const existsRes = runSql(`SELECT * FROM businesses WHERE id = '${String(newBizId).replace(/'/g, "''")}'`);
         const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
 
         if (alreadyExists) {
@@ -1057,7 +1107,7 @@ export default function SettingsPanel({
             SET owner = '${userFirstName.trim().replace(/'/g, "''")} ${userSurname.trim().replace(/'/g, "''")}',
                 email = '${emailLower.replace(/'/g, "''")}',
                 password = '${userPassword.trim().replace(/'/g, "''")}'
-            WHERE id = '${newBizId}'
+            WHERE id = '${String(newBizId).replace(/'/g, "''")}'
           `;
           runSql(sql, `SettingsPanel: Update Corporate Owner`);
         } else {
@@ -1080,8 +1130,9 @@ export default function SettingsPanel({
       const targetStaffId = editingUserId && editingUserId !== 'default_biz' ? editingUserId : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
       const fullStaffName = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
       const primaryStore = selectedBranches[0] || activeStore || (storesList[0]?.id ?? '');
+      const idWhereClause = buildSqlIdWhereClause(targetStaffId);
       
-      const existsRes = runSql(`SELECT * FROM staff WHERE id = '${targetStaffId}'`);
+      const existsRes = runSql(`SELECT * FROM staff WHERE ${idWhereClause}`);
       const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
 
       if (alreadyExists) {
@@ -1098,7 +1149,7 @@ export default function SettingsPanel({
               basic_salary = ${salaryNum},
               permissions_json = '${permissionsString.replace(/'/g, "''")}',
               password = '${userPassword.trim().replace(/'/g, "''")}'
-          WHERE id = '${targetStaffId}'
+          WHERE ${idWhereClause}
         `;
         runSql(sql, `SettingsPanel: Modify staff profile ${targetStaffId}`);
       } else {
@@ -1106,7 +1157,7 @@ export default function SettingsPanel({
         const sql = `
           INSERT INTO staff (id, name, role, hourly_rate, pin, store_id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password)
           VALUES (
-            '${targetStaffId}',
+            '${String(targetStaffId).replace(/'/g, "''")}',
             '${fullStaffName.replace(/'/g, "''")}',
             '${userRole}',
             0,
@@ -1137,6 +1188,8 @@ export default function SettingsPanel({
       saveSessionPermissionsToStorage(basicPermissions, normalizeRole(userRole));
     }
 
+    const savedLabel = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
+    const isNowSuspended = userRole !== 'owner' && userSuspended;
     const activeBizId = getActiveBusinessId();
     handleResetUserForm();
     loadUsersList();
@@ -1146,6 +1199,12 @@ export default function SettingsPanel({
       backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
     }
     window.dispatchEvent(new Event('pos_data_updated'));
+    setUserActionFeedback({
+      type: isNowSuspended ? 'warning' : 'success',
+      text: isNowSuspended
+        ? `Saved profile for ${savedLabel} (account status: SUSPENDED).`
+        : `✓ Security credentials, role permissions & settings access saved for ${savedLabel}.`,
+    });
     triggerNotify('✓ User security credentials, role permissions & settings access saved!');
   };
 
@@ -1158,12 +1217,15 @@ export default function SettingsPanel({
     setUserRole('sales');
     setUserSalary('7500');
     setUserContact('');
+    setUserSuspended(false);
     setSelectedBranches([]);
     setAllowedSettings(getDefaultSettingsForRole('sales'));
     setAllowedModules(getDefaultModulesForRole('sales'));
   };
 
   const handleEditUserClick = (usr: any) => {
+    setConfirmRevokeUserKey(null);
+    setUserActionFeedback(null);
     setEditingUserId(usr.id);
     setUserFirstName(usr.first_name);
     setUserSurname(usr.surname);
@@ -1172,6 +1234,7 @@ export default function SettingsPanel({
     setUserRole(usr.role);
     setUserSalary(usr.basic_salary?.toString() || '7500');
     setUserContact(usr.contact || '');
+    setUserSuspended(Boolean(usr.suspended));
     setSelectedBranches(usr.accessible_branches || []);
     setAllowedSettings(
       Array.isArray(usr.allowed_settings) ? usr.allowed_settings : getDefaultSettingsForRole(usr.role)
@@ -1181,23 +1244,112 @@ export default function SettingsPanel({
     );
   };
 
-  const handleDeleteUserClick = (usr: any) => {
-    if (usr.id === 'default_biz') {
-      alert("Access Denied: Primary Business Owner profiles cannot be deleted. You can edit their credentials instead to secure access.");
+  const handleRequestRevokeUser = (usr: any, rowKey: string) => {
+    const blockedReason = getProtectedPrimaryOwnerReason(usr, 'revoke');
+    if (blockedReason) {
+      setConfirmRevokeUserKey(null);
+      setUserActionFeedback({ type: 'error', text: blockedReason });
       return;
     }
+    setUserActionFeedback(null);
+    setConfirmRevokeUserKey(rowKey);
+  };
+
+  const handleConfirmRevokeUser = (usr: any) => {
+    const blockedReason = getProtectedPrimaryOwnerReason(usr, 'revoke');
+    if (blockedReason) {
+      setConfirmRevokeUserKey(null);
+      setUserActionFeedback({ type: 'error', text: blockedReason });
+      return;
+    }
+
     if (usr.is_owner) {
-      alert("Access Denied: Corporate Owner profiles cannot be deleted. You can edit their credentials instead to secure access.");
+      const safeId = String(usr.id).replace(/'/g, "''");
+      runSql(`DELETE FROM businesses WHERE id = '${safeId}'`, `SettingsPanel: Revoke secondary owner account ${usr.id}`);
+      if (usr.email) {
+        const safeEmail = String(usr.email).trim().toLowerCase().replace(/'/g, "''");
+        runSql(`DELETE FROM staff WHERE LOWER(email) = '${safeEmail}'`, `SettingsPanel: Clean secondary owner staff link`);
+      }
+    } else {
+      const idWhereClause = buildSqlIdWhereClause(usr.id);
+      runSql(`DELETE FROM staff WHERE ${idWhereClause}`, `SettingsPanel: Revoke staff account ${usr.id}`);
+    }
+
+    if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
+      handleResetUserForm();
+    }
+
+    setConfirmRevokeUserKey(null);
+    const activeBizId = getActiveBusinessId();
+    loadUsersList();
+    persistTablesToStorage();
+    pushDatabaseToServer(activeBizId).catch(() => {});
+    if (auth.currentUser) {
+      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+    }
+    window.dispatchEvent(new Event('pos_data_updated'));
+
+    const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
+    setUserActionFeedback({
+      type: 'success',
+      text: `Access revoked: "${fullName}" has been permanently removed from this terminal.`,
+    });
+    triggerNotify(`Revoked access for ${fullName}!`);
+  };
+
+  const handleToggleSuspendUser = (usr: any) => {
+    setConfirmRevokeUserKey(null);
+    const blockedReason = getProtectedPrimaryOwnerReason(usr, 'suspend');
+    if (blockedReason) {
+      setUserActionFeedback({ type: 'error', text: blockedReason });
       return;
     }
-    if (window.confirm(`Are you absolutely sure you want to permanently delete user "${usr.first_name} ${usr.surname}"? This removes their terminal authorization credentials immediately.`)) {
-      const sql = `DELETE FROM staff WHERE id = '${usr.id}'`;
-      runSql(sql, `SettingsPanel: Delete staff account ${usr.id}`);
-      loadUsersList();
-      persistTablesToStorage();
-      window.dispatchEvent(new Event('pos_data_updated'));
-      triggerNotify(`User account deleted successfully!`);
+
+    const nextSuspended = !Boolean(usr.suspended);
+    const parsedExisting = parseStaffPermissions(usr.raw?.permissions_json, usr.role);
+    const updatedPerms = buildUserPermissions({
+      role: normalizeRole(usr.role || parsedExisting.role),
+      password: usr.password || parsedExisting.password || '',
+      accessibleBranches: Array.isArray(usr.accessible_branches) ? usr.accessible_branches : parsedExisting.accessible_branches,
+      allowedSettings: Array.isArray(usr.allowed_settings) ? usr.allowed_settings : parsedExisting.allowed_settings,
+      allowedModules: Array.isArray(usr.allowed_modules) ? usr.allowed_modules : parsedExisting.allowed_modules,
+      suspended: nextSuspended,
+      suspendedAt: nextSuspended ? new Date().toISOString() : null,
+    });
+
+    const permsJsonEscaped = JSON.stringify(updatedPerms).replace(/'/g, "''");
+    const idWhereClause = buildSqlIdWhereClause(usr.id);
+    const res = runSql(
+      `UPDATE staff SET permissions_json = '${permsJsonEscaped}' WHERE ${idWhereClause}`,
+      `SettingsPanel: ${nextSuspended ? 'Suspend' : 'Reactivate'} staff account ${usr.id}`
+    );
+
+    if (!res.success) {
+      setUserActionFeedback({ type: 'error', text: `Failed updating status: ${res.error || 'Database error'}` });
+      return;
     }
+
+    if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
+      setUserSuspended(nextSuspended);
+    }
+
+    const activeBizId = getActiveBusinessId();
+    loadUsersList();
+    persistTablesToStorage();
+    pushDatabaseToServer(activeBizId).catch(() => {});
+    if (auth.currentUser) {
+      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
+    }
+    window.dispatchEvent(new Event('pos_data_updated'));
+
+    const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
+    setUserActionFeedback({
+      type: nextSuspended ? 'warning' : 'success',
+      text: nextSuspended
+        ? `Account Suspended: "${fullName}" can no longer sign into POS or start shifts until reactivated.`
+        : `Account Reactivated: "${fullName}" now has active terminal access.`,
+    });
+    triggerNotify(nextSuspended ? `Suspended ${fullName}` : `Reactivated ${fullName}`);
   };
 
   return (
@@ -3115,6 +3267,30 @@ export default function SettingsPanel({
               </span>
             </div>
 
+            {userActionFeedback && (
+              <div
+                className={`mb-4 px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between gap-3 ${
+                  userActionFeedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-800'
+                    : userActionFeedback.type === 'warning'
+                      ? 'bg-amber-50 border-amber-200 text-amber-900'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <AlertCircle size={15} className="shrink-0" />
+                  <span>{userActionFeedback.text}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setUserActionFeedback(null)}
+                  className="text-[10px] font-black uppercase px-2 py-0.5 rounded hover:bg-black/5 cursor-pointer shrink-0"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
@@ -3123,16 +3299,21 @@ export default function SettingsPanel({
                     <th className="py-2.5 px-3">Username Key / Email</th>
                     <th className="py-2.5 px-3">Access Level &amp; Settings Rights</th>
                     <th className="py-2.5 px-3">Outlet Store Gating</th>
-                    <th className="py-2.5 px-3 text-center">Settings Options</th>
+                    <th className="py-2.5 px-3 text-center">Account Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-slate-800">
                   {usersList.map((usr, idx) => {
-                    const avatarColor = usr.role === 'owner' 
-                      ? 'bg-purple-100 text-purple-700 border-purple-200' 
-                      : usr.role === 'manager' 
-                        ? 'bg-blue-100 text-blue-700 border-blue-200' 
-                        : 'bg-slate-100 text-slate-700 border-slate-200';
+                    const rowKey = `${usr.is_owner ? 'owner' : 'staff'}-${usr.id}-${idx}`;
+                    const isSuspended = Boolean(usr.suspended);
+                    const isConfirmingRevoke = confirmRevokeUserKey === rowKey;
+                    const avatarColor = isSuspended
+                      ? 'bg-rose-100 text-rose-700 border-rose-200'
+                      : usr.role === 'owner'
+                        ? 'bg-purple-100 text-purple-700 border-purple-200'
+                        : usr.role === 'manager'
+                          ? 'bg-blue-100 text-blue-700 border-blue-200'
+                          : 'bg-slate-100 text-slate-700 border-slate-200';
 
                     const roleLabel = usr.role === 'owner' 
                       ? '👑 OWNER (Full System Control)' 
@@ -3145,14 +3326,32 @@ export default function SettingsPanel({
                       : (Array.isArray(usr.allowed_settings) ? usr.allowed_settings : getDefaultSettingsForRole(usr.role));
 
                     return (
-                      <tr key={`${usr.is_owner ? 'owner' : 'staff'}-${usr.id}-${idx}`} className="hover:bg-slate-50/40 transition-colors">
+                      <tr
+                        key={rowKey}
+                        className={`transition-colors ${
+                          isSuspended ? 'bg-rose-50/40 hover:bg-rose-50/70' : 'hover:bg-slate-50/40'
+                        }`}
+                      >
                         <td className="py-3 px-3">
                           <div className="flex items-center gap-2.5">
                             <div className={`w-8 h-8 rounded-lg border font-black text-xs flex items-center justify-center select-none ${avatarColor}`}>
                               {usr.first_name.charAt(0)}{usr.surname.charAt(0) || 'b'}
                             </div>
                             <div>
-                              <div className="font-extrabold text-slate-800 text-xs">{usr.first_name} {usr.surname}</div>
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className={`font-extrabold text-xs ${isSuspended ? 'text-slate-500 line-through' : 'text-slate-800'}`}>
+                                  {usr.first_name} {usr.surname}
+                                </span>
+                                {isSuspended ? (
+                                  <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 border border-rose-200 tracking-wider">
+                                    Suspended
+                                  </span>
+                                ) : (
+                                  <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 tracking-wider">
+                                    Active
+                                  </span>
+                                )}
+                              </div>
                               <div className="text-[9px] font-mono text-slate-400">{usr.contact || '+260 971 112233'}</div>
                             </div>
                           </div>
@@ -3209,26 +3408,69 @@ export default function SettingsPanel({
                           )}
                         </td>
                         <td className="py-3 px-3 text-center select-none">
-                          <div className="flex items-center justify-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => handleEditUserClick(usr)}
-                              className="p-1 px-1.5 text-indigo-600 bg-indigo-50 hover:bg-indigo-100 border border-indigo-150 rounded transition-colors cursor-pointer"
-                              title="Edit Security Credentials & Branch Access"
-                            >
-                              <Edit3 size={11} className="inline mr-1" />
-                              <span className="text-[9px] font-black uppercase">Edit</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteUserClick(usr)}
-                              className="p-1 px-1.5 text-red-500 bg-red-50 hover:bg-red-101 border border-red-150 rounded transition-colors cursor-pointer"
-                              title="Revoke Control Credentials"
-                            >
-                              <Trash2 size={11} className="inline mr-1" />
-                              <span className="text-[9px] font-black uppercase">Revoke</span>
-                            </button>
-                          </div>
+                          {isConfirmingRevoke ? (
+                            <div className="flex flex-col items-center gap-1 bg-rose-50 border border-rose-200 rounded-lg p-1.5">
+                              <span className="text-[9px] font-black uppercase text-rose-800">Revoke Permanently?</span>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => handleConfirmRevokeUser(usr)}
+                                  className="px-2 py-1 text-[9px] font-black uppercase bg-red-600 hover:bg-red-700 text-white rounded cursor-pointer transition-colors"
+                                >
+                                  Confirm
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmRevokeUserKey(null)}
+                                  className="px-2 py-1 text-[9px] font-bold uppercase bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 rounded cursor-pointer transition-colors"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-center gap-1.5 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => handleEditUserClick(usr)}
+                                className="p-1 px-1.5 text-indigo-600 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded transition-colors cursor-pointer"
+                                title="Edit Security Credentials & Branch Access"
+                              >
+                                <Edit3 size={11} className="inline mr-1" />
+                                <span className="text-[9px] font-black uppercase">Edit</span>
+                              </button>
+                              {!usr.is_owner && usr.role !== 'owner' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleSuspendUser(usr)}
+                                  className={`p-1 px-1.5 border rounded transition-colors cursor-pointer ${
+                                    isSuspended
+                                      ? 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border-emerald-200'
+                                      : 'text-amber-700 bg-amber-50 hover:bg-amber-100 border-amber-200'
+                                  }`}
+                                  title={isSuspended ? 'Reactivate Suspended Account' : 'Suspend Terminal Access'}
+                                >
+                                  {isSuspended ? (
+                                    <UserCheck size={11} className="inline mr-1" />
+                                  ) : (
+                                    <Ban size={11} className="inline mr-1" />
+                                  )}
+                                  <span className="text-[9px] font-black uppercase">
+                                    {isSuspended ? 'Activate' : 'Suspend'}
+                                  </span>
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleRequestRevokeUser(usr, rowKey)}
+                                className="p-1 px-1.5 text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 rounded transition-colors cursor-pointer"
+                                title="Revoke Control Credentials"
+                              >
+                                <Trash2 size={11} className="inline mr-1" />
+                                <span className="text-[9px] font-black uppercase">Revoke</span>
+                              </button>
+                            </div>
+                          )}
                         </td>
                       </tr>
                     );
@@ -3239,7 +3481,7 @@ export default function SettingsPanel({
 
             <div className="mt-4 p-3.5 bg-slate-50 border border-slate-200 rounded-xl leading-relaxed text-[10.5px] text-slate-500 font-sans select-none text-left">
               <strong className="text-slate-700 block mb-0.5">🔐 USER SECURITY ACCOUNTS:</strong>
-              <span>Manage system access roles and credentials for staff members below.</span>
+              <span>Manage system access roles, suspend/reactivate accounts, or permanently revoke staff credentials below.</span>
             </div>
           </div>
 
@@ -3360,6 +3602,29 @@ export default function SettingsPanel({
                   placeholder="e.g. 7500.00"
                   className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-505 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-808"
                 />
+              </div>
+            )}
+
+            {/* Account Status (Active vs Suspended) */}
+            {userRole !== 'owner' && (
+              <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-slate-200 bg-slate-50">
+                <div className="flex flex-col">
+                  <span className="text-[9.5px] font-black uppercase text-slate-700">Account Access Status</span>
+                  <span className="text-[8.5px] text-slate-400">
+                    {userSuspended ? 'Suspended — login & shifts blocked' : 'Active — authorized to sign in'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setUserSuspended((prev) => !prev)}
+                  className={`px-2.5 py-1 rounded-md text-[9px] font-black uppercase border cursor-pointer transition-colors ${
+                    userSuspended
+                      ? 'bg-rose-100 text-rose-700 border-rose-300 hover:bg-rose-200'
+                      : 'bg-emerald-100 text-emerald-700 border-emerald-300 hover:bg-emerald-200'
+                  }`}
+                >
+                  {userSuspended ? 'Suspended' : 'Active'}
+                </button>
               </div>
             )}
 

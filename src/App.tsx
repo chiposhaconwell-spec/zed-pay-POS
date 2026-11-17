@@ -8,7 +8,7 @@ import {
   RefreshCw, Percent, ChevronRight, Sparkles, CheckSquare,
   Menu, X, Phone, Receipt, ShoppingBag, Share2, RotateCcw,
   LayoutDashboard, FileSpreadsheet, MessageSquare, Send, HelpCircle, Truck,
-  Cloud, CloudUpload, CloudDownload, LogOut, UserPlus, MapPin
+  Cloud, CloudUpload, CloudDownload, LogOut, UserPlus, MapPin, AlertCircle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -22,6 +22,7 @@ import {
   AUTH_ROLE_STORAGE_KEY,
   buildUserPermissions,
   parseStaffPermissions,
+  isUserSuspended,
   getPermittedSettingsTabs,
   canAccessSettingTab,
   canAccessModule,
@@ -140,6 +141,7 @@ export default function App() {
   const [gateOpeningCash, setGateOpeningCash] = useState('');
   const [isHeaderSyncing, setIsHeaderSyncing] = useState(false);
   const [lastHeaderSyncMsg, setLastHeaderSyncMsg] = useState<string | null>(null);
+  const [authFeedback, setAuthFeedback] = useState<{ type: 'error' | 'warning' | 'success'; text: string } | null>(null);
 
   const permittedSettingsTabs = getPermittedSettingsTabs(userRole, userPermissions);
   const hasAnySettingsAccess = permittedSettingsTabs.length > 0;
@@ -280,11 +282,46 @@ export default function App() {
     const savedBiz = localStorage.getItem('active_business_profile');
     const isSessionAuth = localStorage.getItem('pos_authenticated_session') === 'true';
 
+    const checkActiveStaffAccessStatus = (bizCandidate?: any): { valid: boolean; reason?: string } => {
+      const loggedEmail = (localStorage.getItem('logged_in_user_email') || '').trim().toLowerCase();
+      if (!loggedEmail) return { valid: true };
+      const bizEmail = String(bizCandidate?.email || '').trim().toLowerCase();
+      const savedAuthRole = normalizeRole(localStorage.getItem(AUTH_ROLE_STORAGE_KEY) || localStorage.getItem('logged_in_user_role'));
+      // Corporate owner session is not gated by staff deletion/suspension
+      if (bizEmail && loggedEmail === bizEmail) {
+        return { valid: true };
+      }
+      const stCheckRes = runSql(`SELECT * FROM staff`, 'Session check: Verify staff status');
+      const stRows = (stCheckRes.success && Array.isArray(stCheckRes.data)) ? stCheckRes.data : [];
+      const matchedStaffRow = stRows.find(
+        (u: any) =>
+          (u.email && String(u.email).trim().toLowerCase() === loggedEmail) ||
+          (u.name && String(u.name).trim().toLowerCase() === loggedEmail)
+      );
+      if (matchedStaffRow) {
+        if (isUserSuspended(matchedStaffRow.permissions_json)) {
+          return {
+            valid: false,
+            reason: 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
+          };
+        }
+        return { valid: true };
+      }
+      if (savedAuthRole !== 'owner') {
+        return {
+          valid: false,
+          reason: 'Access Revoked: Your staff account has been removed by an Administrator.',
+        };
+      }
+      return { valid: true };
+    };
+
     if (isSessionAuth && savedBiz && existingBusinesses.length > 0) {
       try {
         const parsed = JSON.parse(savedBiz);
         const match = existingBusinesses.find((b: any) => b.id === parsed.id);
-        if (match) {
+        const accessCheck = match ? checkActiveStaffAccessStatus(match) : { valid: false };
+        if (match && accessCheck.valid) {
           setActiveBusiness(match);
           const savedRole = localStorage.getItem('logged_in_user_role') || 'owner';
           const savedAuthRole = normalizeRole(localStorage.getItem(AUTH_ROLE_STORAGE_KEY) || savedRole);
@@ -302,6 +339,9 @@ export default function App() {
           localStorage.removeItem('pos_authenticated_session');
           clearSessionPermissionsFromStorage();
           setIsAuthenticatedSession(false);
+          if (accessCheck.reason) {
+            setAuthFeedback({ type: 'error', text: accessCheck.reason });
+          }
         }
       } catch (e) {
         localStorage.removeItem('active_business_profile');
@@ -324,6 +364,33 @@ export default function App() {
       setSqlSeedTrigger(prev => prev + 1);
       updateBadgeCounts();
       fetchCustomersList();
+      if (localStorage.getItem('pos_authenticated_session') === 'true') {
+        let savedBizObj: any = null;
+        try {
+          const rawBiz = localStorage.getItem('active_business_profile');
+          if (rawBiz) savedBizObj = JSON.parse(rawBiz);
+        } catch {}
+        const statusCheck = checkActiveStaffAccessStatus(savedBizObj);
+        if (!statusCheck.valid) {
+          localStorage.removeItem('pos_authenticated_session');
+          localStorage.removeItem('active_business_profile');
+          localStorage.removeItem('pos_shift_active');
+          localStorage.removeItem('logged_in_accessible_branches');
+          localStorage.removeItem('logged_in_user_role');
+          clearSessionPermissionsFromStorage();
+          setUserRole('owner');
+          setAuthenticatedRole('owner');
+          setUserPermissions(buildUserPermissions({ role: 'owner' }));
+          setIsAuthenticatedSession(false);
+          setShowBranchChoiceGate(false);
+          setShowNavDrawer(false);
+          setAuthScreenMode('login');
+          if (statusCheck.reason) {
+            setAuthFeedback({ type: 'error', text: statusCheck.reason });
+          }
+          return;
+        }
+      }
       const latestRole = localStorage.getItem('logged_in_user_role');
       if (latestRole) {
         setUserRole(latestRole);
@@ -522,12 +589,13 @@ export default function App() {
   // Register New Business Account (100% Blank Stock/Batches/Branches Setup + First Account Automatically Becomes Admin)
   const handleRegisterBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthFeedback(null);
     if (!newBizName.trim() || !newBizOwner.trim() || !newBizEmail.trim() || !newBizPassword) {
-      alert('Please fill out Business Name, Admin/Owner Full Name, Admin Email, and Password.');
+      setAuthFeedback({ type: 'error', text: 'Please fill out Business Name, Admin/Owner Full Name, Admin Email, and Password.' });
       return;
     }
     if (newBizPassword.trim().length < 6) {
-      alert('Please enter a password of at least 6 characters for Firebase Email/Password Authentication.');
+      setAuthFeedback({ type: 'error', text: 'Please enter a password of at least 6 characters for Firebase Email/Password Authentication.' });
       return;
     }
 
@@ -689,10 +757,11 @@ export default function App() {
   // Sign In & Pull Existing Business or Staff Account from Firebase Auth + Cloud SQL / Firestore / Storage
   const handleSyncExistingAccount = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthFeedback(null);
     const targetEmail = syncLoginEmail.trim();
     const targetPass = syncLoginPassword.trim();
     if (!targetEmail || !targetPass) {
-      alert('Please enter your Email and Password.');
+      setAuthFeedback({ type: 'error', text: 'Please enter your Email and Password.' });
       return;
     }
 
@@ -751,7 +820,7 @@ export default function App() {
       // If matched a Staff user and there's a business in DB
       if (!matchedBiz && matchedStaff && bizList.length > 0) {
         if (matchedStaff.password && matchedStaff.password !== targetPass && matchedStaff.pin !== targetPass) {
-          alert('Invalid password or PIN for this user account.');
+          setAuthFeedback({ type: 'error', text: 'Invalid password or PIN for this user account.' });
           setIsHeaderSyncing(false);
           return;
         }
@@ -759,13 +828,13 @@ export default function App() {
       }
 
       if (!matchedBiz) {
-        alert(`No account found for [${targetEmail}]. Please check your credentials or switch to "Create an Account" to set up your business.`);
+        setAuthFeedback({ type: 'error', text: `No account found for [${targetEmail}]. Please check your credentials or switch to "Create Account" to set up your business.` });
         setIsHeaderSyncing(false);
         return;
       }
 
       if (!matchedStaff && matchedBiz.password && matchedBiz.password !== 'cloud_recovered' && matchedBiz.password !== targetPass) {
-        alert('Invalid password for this business account.');
+        setAuthFeedback({ type: 'error', text: 'Invalid password for this business account.' });
         setIsHeaderSyncing(false);
         return;
       }
@@ -774,6 +843,17 @@ export default function App() {
         ? (matchedStaff.role || 'sales')
         : 'owner';
       const normalizedResolvedRole = normalizeRole(resolvedRole);
+
+      // Block suspended staff accounts from signing in
+      if (matchedStaff && normalizedResolvedRole !== 'owner' && isUserSuspended(matchedStaff.permissions_json)) {
+        setAuthFeedback({
+          type: 'error',
+          text: 'Account Suspended: Your staff access has been suspended by an Administrator. Please contact your Business Owner.',
+        });
+        setIsHeaderSyncing(false);
+        return;
+      }
+
       const resolvedUserName = matchedStaff?.name || (matchedStaff?.first_name ? `${matchedStaff.first_name} ${matchedStaff.surname || ''}`.trim() : '') || matchedBiz.owner || 'Admin';
 
       const resolvedPermissions: UserPermissions =
@@ -796,7 +876,10 @@ export default function App() {
 
       // Check branch authorization if user picked a branch on the login form
       if (syncLoginBranch && userAllowedBranches.length > 0 && !userAllowedBranches.includes(syncLoginBranch)) {
-        alert(`Access Denied: Account [${targetEmail}] does not have permission to access branch [${syncLoginBranch.toUpperCase()}].\n\nAccessible Branches: ${userAllowedBranches.join(', ').toUpperCase()}`);
+        setAuthFeedback({
+          type: 'error',
+          text: `Access Denied: Account [${targetEmail}] does not have permission to access branch [${syncLoginBranch.toUpperCase()}]. Accessible: ${userAllowedBranches.join(', ').toUpperCase()}`,
+        });
         setIsHeaderSyncing(false);
         return;
       }
@@ -874,7 +957,7 @@ export default function App() {
       setSqlSeedTrigger(prev => prev + 1);
       window.dispatchEvent(new Event('pos_data_updated'));
     } catch (err: any) {
-      alert(`Sign-In Error: ${err?.message || String(err)}`);
+      setAuthFeedback({ type: 'error', text: `Sign-In Error: ${err?.message || String(err)}` });
     } finally {
       setIsHeaderSyncing(false);
     }
@@ -959,7 +1042,10 @@ export default function App() {
               <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 shrink-0 self-start sm:self-auto">
                 <button
                   type="button"
-                  onClick={() => setAuthScreenMode('login')}
+                  onClick={() => {
+                    setAuthFeedback(null);
+                    setAuthScreenMode('login');
+                  }}
                   className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
                     authScreenMode === 'login'
                       ? 'bg-emerald-600 text-white shadow-md'
@@ -970,7 +1056,10 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setAuthScreenMode('register')}
+                  onClick={() => {
+                    setAuthFeedback(null);
+                    setAuthScreenMode('register');
+                  }}
                   className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
                     authScreenMode === 'register'
                       ? 'bg-indigo-600 text-white shadow-md'
@@ -984,6 +1073,29 @@ export default function App() {
 
             {/* Form Body */}
             <div className="p-5 sm:p-6 overflow-y-auto max-h-[76vh]">
+              {authFeedback && (
+                <div
+                  className={`mb-4 px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
+                    authFeedback.type === 'error'
+                      ? 'bg-rose-950/70 border-rose-500/50 text-rose-200'
+                      : authFeedback.type === 'warning'
+                        ? 'bg-amber-950/70 border-amber-500/50 text-amber-200'
+                        : 'bg-emerald-950/70 border-emerald-500/50 text-emerald-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertCircle size={15} className="shrink-0" />
+                    <span>{authFeedback.text}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAuthFeedback(null)}
+                    className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-black/20 hover:bg-black/40 cursor-pointer shrink-0"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
               {authScreenMode === 'login' ? (
                 <div className="flex flex-col gap-5">
                   <form onSubmit={handleSyncExistingAccount} className="flex flex-col gap-4">

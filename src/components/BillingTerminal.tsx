@@ -46,6 +46,7 @@ import {
   UserPermissions,
   buildUserPermissions,
   parseStaffPermissions,
+  isUserSuspended,
   saveSessionPermissionsToStorage,
   normalizeRole,
 } from '../permissions';
@@ -612,6 +613,7 @@ export default function BillingTerminal({
   const [loginPassword, setLoginPassword] = useState<string>('');
   const [selectedLoginStore, setSelectedLoginStore] = useState<string>(activeStore);
   const [loginStores, setLoginStores] = useState<any[]>([]);
+  const [shiftLoginError, setShiftLoginError] = useState<string | null>(null);
 
   const loadDynamicLoginStores = () => {
     const centralStores = getCentralBranches();
@@ -3821,17 +3823,18 @@ export default function BillingTerminal({
               <form
                 onSubmit={async (e) => {
                   e.preventDefault();
+                  setShiftLoginError(null);
                   const targetEmail = loginEmail.trim();
                   const targetPassword = loginPassword.trim();
                   const amt = parseFloat(inputOpeningCash.trim() || '0');
 
                   if (!targetEmail || !targetPassword) {
-                    alert('Please enter your login username (email) and password.');
+                    setShiftLoginError('Please enter your login username (email) and password.');
                     return;
                   }
 
                   if (isNaN(amt) || amt < 0) {
-                    alert('Invalid Balance: Please input a correct non-negative opening register cash value.');
+                    setShiftLoginError('Invalid Balance: Please input a correct non-negative opening register cash value.');
                     return;
                   }
 
@@ -3870,11 +3873,15 @@ export default function BillingTerminal({
                             : (matchStaff.surname && targetPassword.toLowerCase() === matchStaff.surname.toLowerCase());
 
                           if (isPasswordValid) {
+                            if (isUserSuspended(matchStaff.permissions_json)) {
+                              return { error: 'Account Suspended: Your staff account has been suspended by an Administrator. Please contact your Business Owner.' };
+                            }
+
                             const branches = parsedPerms.accessible_branches;
                             if (Array.isArray(branches) && branches.length > 0 && selectedLoginStore) {
                               if (!branches.includes(selectedLoginStore)) {
                                 const storeNamesStr = branches.join(', ').toUpperCase();
-                                return { error: `Access Denied: Your staff account is not authorized to access this branch (${selectedLoginStore.toUpperCase()}).\n\nAuthorized Branch Access: [${storeNamesStr}]` };
+                                return { error: `Access Denied: Your staff account is not authorized to access this branch (${selectedLoginStore.toUpperCase()}). Authorized: [${storeNamesStr}]` };
                               }
                             }
 
@@ -3899,7 +3906,7 @@ export default function BillingTerminal({
                   // 1. Check local database first
                   let authResult = findLocalAuth();
                   if (authResult.error) {
-                    alert(authResult.error);
+                    setShiftLoginError(authResult.error);
                     return;
                   }
 
@@ -3911,7 +3918,7 @@ export default function BillingTerminal({
                       refreshDbData();
                       authResult = findLocalAuth();
                       if (authResult.error) {
-                        alert(authResult.error);
+                        setShiftLoginError(authResult.error);
                         return;
                       }
                     }
@@ -3931,6 +3938,10 @@ export default function BillingTerminal({
                         loadDynamicLoginStores();
                         refreshDbData();
                         authResult = findLocalAuth();
+                        if (authResult.error) {
+                          setShiftLoginError(authResult.error);
+                          return;
+                        }
                       }
                     }
                   } catch (fbErr) {
@@ -3938,7 +3949,7 @@ export default function BillingTerminal({
                   }
 
                   if (!authResult.foundUser) {
-                    alert('Authentication Failed: Account not found or invalid password. If you are a new business, please create your business account first.');
+                    setShiftLoginError('Authentication Failed: Account not found or invalid password.');
                     return;
                   }
 
@@ -3995,11 +4006,17 @@ export default function BillingTerminal({
                   setLoginEmail('');
                   setLoginPassword('');
                   setInputOpeningCash('');
-
-                  alert(`✓ Access Granted! Welcome ${userFullName}.\n\nYour shift has been started for branch: ${(targetStoreId || 'MAIN').toUpperCase()}.`);
+                  setShiftLoginError(null);
                 }}
                 className="flex flex-col gap-3 text-left"
               >
+                {shiftLoginError && (
+                  <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-[11px] font-bold flex items-start gap-2 text-left">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5 text-rose-600" />
+                    <span>{shiftLoginError}</span>
+                  </div>
+                )}
+
                 {/* Email / Username field */}
                 <div className="flex flex-col gap-1">
                   <label className="text-[9px] font-bold text-slate-400 uppercase tracking-wider font-mono">Username / Email Address</label>
@@ -4010,7 +4027,10 @@ export default function BillingTerminal({
                       type="email"
                       placeholder="Enter your registered business or staff email"
                       value={loginEmail}
-                      onChange={(e) => setLoginEmail(e.target.value)}
+                      onChange={(e) => {
+                        setShiftLoginError(null);
+                        setLoginEmail(e.target.value);
+                      }}
                       className="w-full pl-8 pr-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs font-semibold outline-hidden transition-all text-slate-800"
                     />
                   </div>
@@ -4026,7 +4046,10 @@ export default function BillingTerminal({
                       type="password"
                       placeholder="••••••••"
                       value={loginPassword}
-                      onChange={(e) => setLoginPassword(e.target.value)}
+                      onChange={(e) => {
+                        setShiftLoginError(null);
+                        setLoginPassword(e.target.value);
+                      }}
                       className="w-full pl-8 pr-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-500 rounded-lg text-xs font-mono outline-hidden transition-all text-slate-800"
                     />
                   </div>

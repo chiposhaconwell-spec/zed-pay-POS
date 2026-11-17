@@ -26,6 +26,9 @@ export type ModulePermissionKey =
 export interface UserPermissions {
   role: StaffRole;
   password?: string;
+  suspended?: boolean;
+  status?: 'ACTIVE' | 'SUSPENDED';
+  suspended_at?: string | null;
   accessible_branches: string[];
   allowed_settings: SettingsPermissionKey[];
   allowed_modules: ModulePermissionKey[];
@@ -131,11 +134,14 @@ export function getDefaultModulesForRole(role: string): ModulePermissionKey[] {
 export function buildUserPermissions(params: {
   role: StaffRole;
   password?: string;
+  suspended?: boolean;
+  suspendedAt?: string | null;
   accessibleBranches?: string[];
   allowedSettings?: SettingsPermissionKey[];
   allowedModules?: ModulePermissionKey[];
 }): UserPermissions {
   const role = normalizeRole(params.role);
+  const isSuspended = role === 'owner' ? false : Boolean(params.suspended);
   const allowedSettings =
     role === 'owner'
       ? [...ALL_SETTINGS_KEYS]
@@ -159,6 +165,9 @@ export function buildUserPermissions(params: {
   return {
     role,
     password: params.password || '',
+    suspended: isSuspended,
+    status: isSuspended ? 'SUSPENDED' : 'ACTIVE',
+    suspended_at: isSuspended ? (params.suspendedAt || new Date().toISOString()) : null,
     accessible_branches: role === 'owner' ? [] : (params.accessibleBranches || []),
     allowed_settings: allowedSettings,
     allowed_modules: allowedModules,
@@ -237,13 +246,34 @@ export function parseStaffPermissions(
     ? parsed.accessible_branches.map((b: any) => String(b))
     : [];
 
+  const isSuspended = Boolean(parsed.suspended === true || parsed.status === 'SUSPENDED');
+
   return buildUserPermissions({
     role,
     password: parsed.password,
+    suspended: isSuspended,
+    suspendedAt: parsed.suspended_at || null,
     accessibleBranches,
     allowedSettings,
     allowedModules,
   });
+}
+
+export function isUserSuspended(rawPermissionsJson: unknown): boolean {
+  if (!rawPermissionsJson) return false;
+  if (typeof rawPermissionsJson === 'object') {
+    const obj = rawPermissionsJson as any;
+    return Boolean(obj.suspended === true || obj.status === 'SUSPENDED');
+  }
+  if (typeof rawPermissionsJson === 'string') {
+    try {
+      const obj = JSON.parse(rawPermissionsJson);
+      return Boolean(obj?.suspended === true || obj?.status === 'SUSPENDED');
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 export function mapSubTabToPermissionKey(subTab?: string): SettingsPermissionKey {
