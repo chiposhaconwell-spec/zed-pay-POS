@@ -20,13 +20,21 @@ import {
   PackagePlus,
   PackageCheck,
   AlertCircle,
-  Receipt
+  Receipt,
+  Eye
 } from 'lucide-react';
 import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods } from '../db';
 import { StoreSettings } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf } from '../androidUtils';
+import {
+  TransferReceiptAttachment,
+  encodeTransferNotesWithReceipt,
+  getTransferReceipt,
+  saveTransferReceipt,
+} from '../transferReceipts';
+import { TransferReceiptField, TransferReceiptViewerModal } from './TransferReceiptField';
 
 interface FinanceDashboardProps {
   settings: StoreSettings;
@@ -86,6 +94,12 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   const [transferAmount, setTransferAmount] = useState('');
   const [transferRef, setTransferRef] = useState('');
   const [transferDate, setTransferDate] = useState(new Date().toISOString().split('T')[0]);
+  const [transferReceipt, setTransferReceipt] = useState<TransferReceiptAttachment | null>(null);
+  const [transferFeedback, setTransferFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [viewingTransferReceipt, setViewingTransferReceipt] = useState<{
+    receipt: TransferReceiptAttachment;
+    refLabel: string;
+  } | null>(null);
 
   // Goods in Transit / Procurement Form states
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
@@ -350,24 +364,30 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   // Handle Cash / Account Transfer
   const handleExecuteTransfer = (e: React.FormEvent) => {
     e.preventDefault();
+    setTransferFeedback(null);
     const amt = parseFloat(transferAmount);
     if (isNaN(amt) || amt <= 0) {
-      alert('Please enter a valid transfer amount.');
+      setTransferFeedback({ type: 'error', text: 'Please enter a valid transfer amount.' });
       return;
     }
     if (transferSourceAcc === transferDestAcc) {
-      alert('Source and destination accounts must be different!');
+      setTransferFeedback({ type: 'error', text: 'Source and destination accounts must be different!' });
       return;
     }
 
     const trId = 'TRF-' + Math.floor(10000 + Math.random() * 90000);
     const dateVal = transferDate || new Date().toISOString().split('T')[0];
+    const encodedNotes = encodeTransferNotesWithReceipt(transferRef, transferReceipt);
 
     runSql(
-      `INSERT INTO money_transfers (id, source_account, dest_account, amount, reference_no, transfer_date, performed_by)
-       VALUES ('${trId}', '${transferSourceAcc}', '${transferDestAcc}', ${amt}, '${transferRef.replace(/'/g, "''")}', '${dateVal}', 'Finance Admin')`,
+      `INSERT INTO money_transfers (id, source_account, dest_account, amount, reference_no, transfer_date, performed_by, notes)
+       VALUES ('${trId}', '${transferSourceAcc}', '${transferDestAcc}', ${amt}, '${transferRef.replace(/'/g, "''")}', '${dateVal}', 'Finance Admin', '${encodedNotes.replace(/'/g, "''")}')`,
       'Record Cash Transfer'
     );
+
+    if (transferReceipt) {
+      saveTransferReceipt(trId, transferReceipt);
+    }
 
     logEmployeeAudit('TRANSFER', 'Account Transfer', `Transfer #${trId} from ${transferSourceAcc} to ${transferDestAcc} - K${amt.toFixed(2)}`, amt, activeStore, 'Finance Admin');
     syncAllAccountingSystems(`Transfer Executed #${trId}`);
@@ -375,9 +395,13 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
 
     setTransferAmount('');
     setTransferRef('');
+    setTransferReceipt(null);
     loadFinanceData();
     try { window.dispatchEvent(new Event('pos_data_updated')); } catch(e){}
-    alert(`✓ Cash transfer #${trId} executed & updated in Payment Method & Double-Entry Ledgers!`);
+    setTransferFeedback({
+      type: 'success',
+      text: `✓ Cash transfer #${trId} executed & updated in Payment Method & Double-Entry Ledgers!${transferReceipt ? ' (Receipt attached)' : ''}`,
+    });
   };
 
   // Handle PO Goods in Transit Item Add
@@ -1631,7 +1655,29 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                 <span>Inter-Account & Cash Transfers</span>
               </h2>
 
-              <form onSubmit={handleExecuteTransfer} className="grid grid-cols-1 md:grid-cols-5 gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200">
+              {transferFeedback && (
+                <div
+                  className={`mb-4 px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
+                    transferFeedback.type === 'error'
+                      ? 'bg-rose-50 border-rose-200 text-rose-800'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertCircle size={15} className="shrink-0" />
+                    <span>{transferFeedback.text}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setTransferFeedback(null)}
+                    className="text-[10px] font-black uppercase px-2 py-0.5 rounded hover:bg-black/5 cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+
+              <form onSubmit={handleExecuteTransfer} className="grid grid-cols-1 md:grid-cols-6 gap-3 bg-slate-50 p-4 rounded-xl border border-slate-200">
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">Source Account</label>
                   <select
@@ -1671,14 +1717,15 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   />
                 </div>
 
-                <div>
-                  <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">Reference / Note</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Bank Cash Deposit"
-                    value={transferRef}
-                    onChange={(e) => setTransferRef(e.target.value)}
-                    className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
+                <div className="md:col-span-2">
+                  <TransferReceiptField
+                    compact
+                    label="Reference ID / Receipt"
+                    placeholder="e.g. Bank Deposit Ref #8492"
+                    referenceValue={transferRef}
+                    onReferenceChange={setTransferRef}
+                    receipt={transferReceipt}
+                    onReceiptChange={setTransferReceipt}
                   />
                 </div>
 
@@ -1702,34 +1749,65 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     <th className="p-3">From</th>
                     <th className="p-3">To</th>
                     <th className="p-3">Date</th>
-                    <th className="p-3">Ref</th>
+                    <th className="p-3">Reference ID</th>
+                    <th className="p-3 text-center">Receipt</th>
                     <th className="p-3 text-right">Amount</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {transfersList.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="p-6 text-center text-slate-400 font-medium italic">
+                      <td colSpan={7} className="p-6 text-center text-slate-400 font-medium italic">
                         No internal account transfers recorded.
                       </td>
                     </tr>
                   ) : (
-                    transfersList.map(tr => (
-                      <tr key={tr.id} className="hover:bg-slate-50 transition-colors">
-                        <td className="p-3 font-mono font-bold text-slate-800">{tr.id}</td>
-                        <td className="p-3 font-bold text-slate-700">{tr.source_account}</td>
-                        <td className="p-3 font-bold text-slate-700">{tr.dest_account}</td>
-                        <td className="p-3 font-mono text-slate-500">{tr.transfer_date}</td>
-                        <td className="p-3 text-slate-500">{tr.reference_no || '—'}</td>
-                        <td className="p-3 text-right font-black text-indigo-700">
-                          {settings.currency}{Number(tr.amount).toFixed(2)}
-                        </td>
-                      </tr>
-                    ))
+                    transfersList.map(tr => {
+                      const attachedReceipt = getTransferReceipt(String(tr.id || ''), tr.notes);
+                      return (
+                        <tr key={tr.id} className="hover:bg-slate-50 transition-colors">
+                          <td className="p-3 font-mono font-bold text-slate-800">{tr.id}</td>
+                          <td className="p-3 font-bold text-slate-700">{tr.source_account}</td>
+                          <td className="p-3 font-bold text-slate-700">{tr.dest_account}</td>
+                          <td className="p-3 font-mono text-slate-500">{tr.transfer_date}</td>
+                          <td className="p-3 text-slate-600 font-semibold">{tr.reference_no || '—'}</td>
+                          <td className="p-3 text-center">
+                            {attachedReceipt ? (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setViewingTransferReceipt({
+                                    receipt: attachedReceipt,
+                                    refLabel: tr.reference_no || tr.id,
+                                  })
+                                }
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-black uppercase cursor-pointer"
+                              >
+                                <Eye size={11} />
+                                <span>View Receipt</span>
+                              </button>
+                            ) : (
+                              <span className="text-slate-300 font-mono text-[10px]">—</span>
+                            )}
+                          </td>
+                          <td className="p-3 text-right font-black text-indigo-700">
+                            {settings.currency}{Number(tr.amount).toFixed(2)}
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>
             </div>
+
+            {viewingTransferReceipt && (
+              <TransferReceiptViewerModal
+                receipt={viewingTransferReceipt.receipt}
+                referenceLabel={viewingTransferReceipt.refLabel}
+                onClose={() => setViewingTransferReceipt(null)}
+              />
+            )}
           </motion.div>
         )}
 

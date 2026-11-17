@@ -33,13 +33,20 @@ import {
   CheckCircle2,
   AlertCircle,
   Info,
-  Receipt
+  Receipt,
+  Eye
 } from 'lucide-react';
 import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods } from '../db';
 import { StoreSettings, Loan, LoanAmortizationSchedule, AutomatedDeductionLog } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf } from '../androidUtils';
+import {
+  TransferReceiptAttachment,
+  getTransferReceipt,
+  saveTransferReceipt,
+} from '../transferReceipts';
+import { TransferReceiptField, TransferReceiptViewerModal } from './TransferReceiptField';
 
 interface LoanDashboardProps {
   settings: StoreSettings;
@@ -94,6 +101,12 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   const [transferAmount, setTransferAmount] = useState('');
   const [transferRef, setTransferRef] = useState('');
   const [transferDate, setTransferDate] = useState(new Date().toISOString().split('T')[0]);
+  const [transferReceipt, setTransferReceipt] = useState<TransferReceiptAttachment | null>(null);
+  const [transferFeedback, setTransferFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [viewingTransferReceipt, setViewingTransferReceipt] = useState<{
+    receipt: TransferReceiptAttachment;
+    refLabel: string;
+  } | null>(null);
 
   // Goods in Transit / Procurement Form states
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
@@ -616,13 +629,14 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   // --- INTERNAL MONEY TRANSFERS ENGINE ---
   const handleTransferMoney = (e: React.FormEvent) => {
     e.preventDefault();
+    setTransferFeedback(null);
     const amt = parseFloat(transferAmount);
     if (isNaN(amt) || amt <= 0) {
-      alert('Please enter a valid transfer amount.');
+      setTransferFeedback({ type: 'error', text: 'Please enter a valid transfer amount.' });
       return;
     }
     if (transferSourceAcc === transferDestAcc) {
-      alert('Source and destination accounts must be different.');
+      setTransferFeedback({ type: 'error', text: 'Source and destination accounts must be different.' });
       return;
     }
 
@@ -643,7 +657,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
     const narration = `Internal Transfer: ${accLabels[transferSourceAcc] || transferSourceAcc} -> ${accLabels[transferDestAcc] || transferDestAcc} (${transferRef || 'Float Movement'})`;
 
     runSql(
-      `INSERT INTO transactions VALUES ('${txId}', 'idem-${txId}', 'FINANCE-TRANSFER', 'INTERNAL_TRANSFER', '${transferRef || 'TRF-REF'}', ${amt}, 0, 'SUCCESS', '${narration.replace(/'/g, "''")}', '${createdAt}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO transactions VALUES ('${txId}', 'idem-${txId}', 'FINANCE-TRANSFER', 'INTERNAL_TRANSFER', '${(transferRef || 'TRF-REF').replace(/'/g, "''")}', ${amt}, 0, 'SUCCESS', '${narration.replace(/'/g, "''")}', '${createdAt}', '${createdAt}', '${userRole}')`,
       'Transfers: Record journal move'
     );
 
@@ -656,13 +670,21 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
       'Transfers Ledger: Credit Source Account'
     );
 
+    if (transferReceipt) {
+      saveTransferReceipt(txId, transferReceipt);
+    }
+
     persistTablesToStorage();
     loadData();
     loadStatementData();
 
     setTransferAmount('');
     setTransferRef('');
-    alert(`Successfully moved ${settings.currency}${amt.toFixed(2)} from ${accLabels[transferSourceAcc]} to ${accLabels[transferDestAcc]}.`);
+    setTransferReceipt(null);
+    setTransferFeedback({
+      type: 'success',
+      text: `Successfully moved ${settings.currency}${amt.toFixed(2)} from ${accLabels[transferSourceAcc]} to ${accLabels[transferDestAcc]}.${transferReceipt ? ' (Receipt attached)' : ''}`,
+    });
   };
 
   // --- TRANSIT PROCUREMENT ENGINE ---
@@ -2040,6 +2062,28 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                   <span>Transfer Money (Double-Entry)</span>
                 </h3>
 
+                {transferFeedback && (
+                  <div
+                    className={`mb-4 px-3 py-2 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
+                      transferFeedback.type === 'error'
+                        ? 'bg-rose-50 border-rose-200 text-rose-800'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <AlertCircle size={14} className="shrink-0" />
+                      <span>{transferFeedback.text}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setTransferFeedback(null)}
+                      className="text-[10px] font-black uppercase px-1.5 py-0.5 rounded hover:bg-black/5 cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
+
                 <form onSubmit={handleTransferMoney} className="space-y-4">
                   <div>
                     <label className="block text-xs font-bold text-slate-600 mb-1">From Account (Source)</label>
@@ -2083,16 +2127,14 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                     </div>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-bold text-slate-600 mb-1">Reference / Reason</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Daily cash float deposit to bank"
-                      value={transferRef}
-                      onChange={(e) => setTransferRef(e.target.value)}
-                      className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    />
-                  </div>
+                  <TransferReceiptField
+                    label="Reference ID / Reason & Receipt"
+                    placeholder="e.g. Daily cash float deposit to bank"
+                    referenceValue={transferRef}
+                    onReferenceChange={setTransferRef}
+                    receipt={transferReceipt}
+                    onReceiptChange={setTransferReceipt}
+                  />
 
                   <button
                     type="submit"
@@ -2117,36 +2159,59 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                       <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-black uppercase text-slate-500 tracking-wider">
                         <th className="py-2.5 px-3">Date</th>
                         <th className="py-2.5 px-3">Narration / Transfer Details</th>
-                        <th className="py-2.5 px-3">Reference</th>
+                        <th className="py-2.5 px-3">Reference ID</th>
+                        <th className="py-2.5 px-3 text-center">Receipt</th>
                         <th className="py-2.5 px-3 text-right">Amount ({settings.currency})</th>
                         <th className="py-2.5 px-3 text-center">Status</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 text-xs">
-                      {transfersList.map((tr) => (
-                        <tr key={tr.id} className="hover:bg-slate-50/80 transition-colors">
-                          <td className="py-3 px-3 font-medium text-slate-600 whitespace-nowrap">
-                            {tr.created_at ? new Date(tr.created_at).toLocaleDateString() : 'N/A'}
-                          </td>
-                          <td className="py-3 px-3 font-bold text-slate-800">
-                            {tr.narration || 'Internal Account Transfer'}
-                          </td>
-                          <td className="py-3 px-3 font-mono text-[11px] text-slate-500">
-                            {tr.reference_no || 'TRF-REF'}
-                          </td>
-                          <td className="py-3 px-3 text-right font-black text-slate-900 whitespace-nowrap">
-                            {settings.currency}{Number(tr.amount || 0).toFixed(2)}
-                          </td>
-                          <td className="py-3 px-3 text-center">
-                            <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-extrabold bg-emerald-100 text-emerald-800 uppercase">
-                              POSTED
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
+                      {transfersList.map((tr) => {
+                        const attachedReceipt = getTransferReceipt(String(tr.id || ''));
+                        return (
+                          <tr key={`${tr.id}-${tr.account_id}-${tr.type}`} className="hover:bg-slate-50/80 transition-colors">
+                            <td className="py-3 px-3 font-medium text-slate-600 whitespace-nowrap">
+                              {tr.created_at ? new Date(tr.created_at).toLocaleDateString() : 'N/A'}
+                            </td>
+                            <td className="py-3 px-3 font-bold text-slate-800">
+                              {tr.narration || 'Internal Account Transfer'}
+                            </td>
+                            <td className="py-3 px-3 font-mono text-[11px] text-slate-500">
+                              {tr.provider_reference || tr.reference_no || 'TRF-REF'}
+                            </td>
+                            <td className="py-3 px-3 text-center">
+                              {attachedReceipt ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setViewingTransferReceipt({
+                                      receipt: attachedReceipt,
+                                      refLabel: tr.provider_reference || tr.reference_no || tr.id,
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-black uppercase cursor-pointer"
+                                >
+                                  <Eye size={11} />
+                                  <span>View</span>
+                                </button>
+                              ) : (
+                                <span className="text-slate-300 font-mono text-[10px]">—</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-3 text-right font-black text-slate-900 whitespace-nowrap">
+                              {settings.currency}{Number(tr.amount || 0).toFixed(2)}
+                            </td>
+                            <td className="py-3 px-3 text-center">
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-extrabold bg-emerald-100 text-emerald-800 uppercase">
+                                POSTED
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
                       {transfersList.length === 0 && (
                         <tr>
-                          <td colSpan={5} className="text-center py-8 text-slate-400 font-medium text-xs">
+                          <td colSpan={6} className="text-center py-8 text-slate-400 font-medium text-xs">
                             No account transfers logged yet.
                           </td>
                         </tr>
@@ -2156,6 +2221,14 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 </div>
               </div>
             </div>
+
+            {viewingTransferReceipt && (
+              <TransferReceiptViewerModal
+                receipt={viewingTransferReceipt.receipt}
+                referenceLabel={viewingTransferReceipt.refLabel}
+                onClose={() => setViewingTransferReceipt(null)}
+              />
+            )}
           </motion.div>
         )}
 
