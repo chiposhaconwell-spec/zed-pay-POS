@@ -57,6 +57,7 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
   const [scrollProgress, setScrollProgress] = useState<number>(0);
 
   // Fetch audit logs from DB (combining audit_logs table and transactions table as fallbacks)
+  // Strictly restricts visible accounts and staff filter options to real accounts from the `staff` table.
   const fetchAuditLogs = () => {
     setIsLoading(true);
     try {
@@ -67,12 +68,89 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
           name: String(s.name || s.id),
         }))
       );
+
+      // 0. Load real registered accounts strictly from the `staff` table (excluding any legacy preseeded rows)
+      const legacyStaffIds = new Set(['staff-101', 'staff-102', 'staff-103']);
+      const legacyEmails = new Set(['alice@pos.zm', 'brian@pos.zm', 'owner@pos.zm']);
+      const legacyNames = new Set([
+        'alice mwansa',
+        'brian banda',
+        'chiposha conwell',
+        'jane carter',
+        'marcus brody',
+        'staff operator',
+        'finance admin',
+        'system',
+      ]);
+
+      const staffRes = runSql('SELECT * FROM staff ORDER BY id ASC', 'Audit Trail: Query registered staff accounts');
+      const staffProfiles: Array<{ displayName: string; matchKeys: Set<string> }> = [];
+      const keyToDisplayName = new Map<string, string>();
+      const registeredStaffNames: string[] = [];
+      const seenDisplayNames = new Set<string>();
+
+      if (staffRes.success && Array.isArray(staffRes.data)) {
+        staffRes.data.forEach((st: any) => {
+          const stId = String(st?.id || '').trim();
+          const stEmail = String(st?.email || '').trim().toLowerCase();
+          const stBiz = String(st?.business_id || '').trim();
+          const combinedFirstLast = `${st?.first_name || ''} ${st?.surname || ''}`.trim();
+          const displayName = String(st?.name || combinedFirstLast || st?.email || '').trim();
+
+          if (!displayName) return;
+          if (stBiz === 'default_biz' || legacyStaffIds.has(stId) || legacyEmails.has(stEmail)) return;
+          if (legacyNames.has(displayName.toLowerCase())) return;
+
+          const matchKeys = new Set<string>();
+          [
+            displayName,
+            combinedFirstLast,
+            String(st?.name || '').trim(),
+            String(st?.first_name || '').trim(),
+            String(st?.email || '').trim(),
+            stId,
+          ].forEach((k) => {
+            const norm = k.trim().toLowerCase();
+            if (norm && !['owner', 'manager', 'sales', 'admin', 'staff', 'user'].includes(norm)) {
+              matchKeys.add(norm);
+              if (!keyToDisplayName.has(norm)) {
+                keyToDisplayName.set(norm, displayName);
+              }
+            }
+          });
+
+          staffProfiles.push({ displayName, matchKeys });
+          if (!seenDisplayNames.has(displayName.toLowerCase())) {
+            seenDisplayNames.add(displayName.toLowerCase());
+            registeredStaffNames.push(displayName);
+          }
+        });
+      }
+
+      const resolveStaffOperator = (rawPerformer: unknown): string | null => {
+        const cleaned = String(rawPerformer || '').trim();
+        if (!cleaned) return null;
+        const lower = cleaned.toLowerCase();
+        if (legacyNames.has(lower) || legacyEmails.has(lower)) return null;
+        if (keyToDisplayName.has(lower)) {
+          return keyToDisplayName.get(lower)!;
+        }
+        return null;
+      };
+
       // 1. Fetch from audit_logs table
       const auditRes = runSql('SELECT * FROM audit_logs ORDER BY created_at DESC', 'Audit Trail: Query audit_logs table');
       let combined: AuditLogItem[] = [];
 
       if (auditRes.success && Array.isArray(auditRes.data)) {
-        combined = [...auditRes.data];
+        auditRes.data.forEach((row: any) => {
+          const resolvedStaff = resolveStaffOperator(row?.performed_by);
+          if (!resolvedStaff) return;
+          combined.push({
+            ...row,
+            performed_by: resolvedStaff,
+          });
+        });
       }
 
       // 2. Fetch fallback records from transactions table if audit_logs has fewer entries
@@ -86,6 +164,9 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
         txRes.data.forEach((tx: any) => {
           const mappedId = tx.provider_reference || tx.id;
           if (!existingIds.has(mappedId)) {
+            const resolvedStaff = resolveStaffOperator(tx?.performed_by);
+            if (!resolvedStaff) return;
+
             let mod = tx.channel || 'SALES';
             if (mod === 'MANUAL_EDIT' || mod === 'RECEIVE' || mod === 'INVENTORY') mod = 'STOCK';
             if (mod === 'PURCHASE_TRANSIT' || mod === 'PROCUREMENT') mod = 'PURCHASE';
@@ -99,7 +180,7 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
               details: tx.narration || 'System action executed',
               amount: Number(tx.amount || 0),
               store_id: tx.pos_terminal_id?.toLowerCase() || activeStore || '',
-              performed_by: tx.performed_by || 'Staff Operator',
+              performed_by: resolvedStaff,
               created_at: tx.created_at || new Date().toISOString()
             });
           }
@@ -110,14 +191,9 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
       combined.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       setLogs(combined);
 
-      // Extract unique staff names
-      const staffSet = new Set<string>();
-      combined.forEach(item => {
-        if (item.performed_by && item.performed_by.trim()) {
-          staffSet.add(item.performed_by.trim());
-        }
-      });
-      setStaffList(Array.from(staffSet));
+      // Populate staff dropdown strictly from registered `staff` table accounts
+      registeredStaffNames.sort((a, b) => a.localeCompare(b));
+      setStaffList(registeredStaffNames);
     } catch (err) {
       console.warn('Failed fetching audit logs', err);
     } finally {
@@ -690,8 +766,8 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
                               {(log.performed_by || 'S')[0].toUpperCase()}
                             </span>
                             <div className="truncate max-w-[140px]">
-                              <div className="text-xs font-black text-slate-800 truncate">{log.performed_by || 'Staff Operator'}</div>
-                              <div className="text-[9px] font-mono text-slate-400 uppercase">Operator ID</div>
+                              <div className="text-xs font-black text-slate-800 truncate">{log.performed_by}</div>
+                              <div className="text-[9px] font-mono text-slate-400 uppercase">Staff Account</div>
                             </div>
                           </div>
                         </td>

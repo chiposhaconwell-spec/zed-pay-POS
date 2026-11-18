@@ -119,18 +119,39 @@ function scrubCloudSnapshotTables(rawTables: Record<string, any[]>): Record<stri
   if (Array.isArray(t.cash_ups)) {
     t.cash_ups = t.cash_ups.filter((c: any) => !legacyStores.has(String(c?.store_id || '').toLowerCase()) && c?.id !== 'EOD-LIVE-2026-10-18-ALL');
   }
+  const legacyOperators = new Set([
+    'alice mwansa',
+    'brian banda',
+    'alice@pos.zm',
+    'brian@pos.zm',
+    'chiposha conwell',
+    'owner@pos.zm',
+    'jane carter',
+    'marcus brody',
+  ]);
+  if (Array.isArray(t.staff)) {
+    t.staff = t.staff.filter(
+      (st: any) =>
+        st?.business_id !== 'default_biz' &&
+        !['staff-101', 'staff-102', 'staff-103'].includes(String(st?.id || '')) &&
+        !['alice@pos.zm', 'brian@pos.zm', 'owner@pos.zm'].includes(String(st?.email || '').toLowerCase())
+    );
+  }
   if (Array.isArray(t.audit_logs)) {
     t.audit_logs = t.audit_logs.filter((a: any) =>
       String(a?.id || '') !== 'AUDIT_1792321282567_rn0mx' &&
       !String(a?.details || '').includes('LBY-8082') &&
-      !legacyStores.has(String(a?.store_id || '').toLowerCase())
+      !legacyStores.has(String(a?.store_id || '').toLowerCase()) &&
+      !legacyOperators.has(String(a?.performed_by || '').trim().toLowerCase())
     );
   }
   if (Array.isArray(t.transactions)) {
     t.transactions = t.transactions.filter((tx: any) => {
       const id = String(tx?.id || '');
       const terminal = String(tx?.pos_terminal_id || '').toLowerCase();
+      const perf = String(tx?.performed_by || '').trim().toLowerCase();
       if (['tx-999', 'tx-1000', 'TX_AUDIT_1792321282567_rn0mx'].includes(id)) return false;
+      if (legacyOperators.has(perf)) return false;
       if (id.startsWith('ledger_TXN-8')) return false;
       if (String(tx?.narration || '').includes('LBY-8082')) return false;
       if (terminal.includes('pos-lusaka') || terminal.includes('pos-ndola') || terminal.includes('pos-kitwe')) return false;

@@ -194,6 +194,7 @@ export default function App() {
   const [customerSearchQuery, setCustomerSearchQuery] = useState('');
   const [newCustName, setNewCustName] = useState('');
   const [newCustPhone, setNewCustPhone] = useState('');
+  const [custAddMsg, setCustAddMsg] = useState<string | null>(null);
 
   const navigationBackStateRef = useRef({
     showNavDrawer,
@@ -2057,7 +2058,7 @@ export default function App() {
                   </button>
                 )}
 
-                {/* Purchase Orders & Outflows */}
+                {/* Supply Management */}
                 {canViewModule('purchase_orders') && (
                   <button
                     onClick={() => {
@@ -2070,7 +2071,7 @@ export default function App() {
                       <div className="p-1.5 rounded-lg bg-indigo-600 text-white shadow-xs group-hover:scale-105 transition-transform">
                         <Truck size={16} />
                       </div>
-                      <span>Purchase Orders & Expenses</span>
+                      <span>Supply Management</span>
                     </div>
                     <span className="px-2 py-0.5 bg-indigo-100 text-indigo-800 border border-indigo-200 text-[10px] font-extrabold rounded-full font-mono">
                       Tab
@@ -2185,21 +2186,23 @@ export default function App() {
                     </div>
                   </button>
 
-                  {/* Goods in Transit & POs */}
-                  <button
-                    onClick={() => {
-                      setShowNavDrawer(false);
-                      navigateToTab('finance');
-                    }}
-                    className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
-                        <Truck size={16} />
+                  {/* Supply Management */}
+                  {canViewModule('purchase_orders') && (
+                    <button
+                      onClick={() => {
+                        setShowNavDrawer(false);
+                        navigateToTab('purchase_orders');
+                      }}
+                      className="flex items-center justify-between p-2 rounded-xl hover:bg-emerald-100/70 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
+                          <Truck size={16} />
+                        </div>
+                        <span>Supply Management</span>
                       </div>
-                      <span>Purchase Orders & Procurement</span>
-                    </div>
-                  </button>
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -2757,40 +2760,49 @@ export default function App() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                if (!newCustName) return;
+                if (!newCustName.trim()) return;
                 upsertCustomerSync({
-                  name: newCustName,
-                  phone: newCustPhone,
-                  loyalPointsDelta: 50
+                  name: newCustName.trim(),
+                  phone: newCustPhone.trim(),
+                  loyalPointsDelta: 0
                 });
-                alert(`Customer [${newCustName}] registered into central CRM database with 50 bonus points!`);
+                setCustAddMsg(`✓ [${newCustName.trim()}] added to CRM. Loyalty points will accrue on checkout per Settings (${settings.loyaltyRatio || 0} pts/${settings.currency || '$'}1).`);
+                setTimeout(() => setCustAddMsg(null), 4000);
                 setNewCustName('');
                 setNewCustPhone('');
                 fetchCustomersList();
+                window.dispatchEvent(new Event('pos_data_updated'));
               }}
-              className="flex items-center gap-2 bg-slate-950 p-2.5 rounded-xl border border-slate-850"
+              className="flex flex-col gap-2 bg-slate-950 p-2.5 rounded-xl border border-slate-850"
             >
-              <input
-                type="text"
-                value={newCustName}
-                onChange={(e) => setNewCustName(e.target.value)}
-                placeholder="Customer Full Name"
-                required
-                className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 font-bold focus:outline-hidden"
-              />
-              <input
-                type="text"
-                value={newCustPhone}
-                onChange={(e) => setNewCustPhone(e.target.value)}
-                placeholder="Phone (e.g. 097...)"
-                className="w-36 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 font-mono focus:outline-hidden"
-              />
-              <button
-                type="submit"
-                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold uppercase tracking-wider cursor-pointer shadow-sm"
-              >
-                + Add
-              </button>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={newCustName}
+                  onChange={(e) => setNewCustName(e.target.value)}
+                  placeholder="Customer Full Name"
+                  required
+                  className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 font-bold focus:outline-hidden"
+                />
+                <input
+                  type="text"
+                  value={newCustPhone}
+                  onChange={(e) => setNewCustPhone(e.target.value)}
+                  placeholder="Phone (e.g. 097...)"
+                  className="w-36 bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-100 font-mono focus:outline-hidden"
+                />
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold uppercase tracking-wider cursor-pointer shadow-sm"
+                >
+                  + Add
+                </button>
+              </div>
+              {custAddMsg && (
+                <p className="text-[10.5px] font-bold text-emerald-400 px-1">
+                  {custAddMsg}
+                </p>
+              )}
             </form>
 
             {/* Search CRM database */}

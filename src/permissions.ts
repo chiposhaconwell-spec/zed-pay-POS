@@ -98,7 +98,7 @@ export const MODULE_PERMISSION_OPTIONS: Array<{
   { key: 'laybys', label: 'Layby Functions' },
   { key: 'workspace', label: 'Tasks & Operations' },
   { key: 'quotes', label: 'Quotes, Invoices & Delivery' },
-  { key: 'purchase_orders', label: 'Purchase Orders & Expenses' },
+  { key: 'purchase_orders', label: 'Supply Management' },
   { key: 'loans', label: 'Credit Risk & Swept Capital' },
   { key: 'attendance', label: 'Staff & Payroll' },
   { key: 'audit', label: 'Employee Audit Trail' },

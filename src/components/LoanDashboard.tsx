@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { 
   Briefcase, 
   Percent, 
@@ -34,7 +35,15 @@ import {
   AlertCircle,
   Info,
   Receipt,
-  Eye
+  Eye,
+  Edit3,
+  RotateCcw,
+  Phone,
+  Mail,
+  MapPin,
+  Users,
+  History,
+  Save
 } from 'lucide-react';
 import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods } from '../db';
 import { StoreSettings, Loan, LoanAmortizationSchedule, AutomatedDeductionLog } from '../types';
@@ -76,15 +85,15 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   const [deductions, setDeductions] = useState<AutomatedDeductionLog[]>([]);
 
   // Sub-navigation navigation tab state
-  const [subTab, setSubTab] = useState<'expenses' | 'transfers' | 'procurement' | 'statements' | 'loans' | 'assets_equity'>(
-    mode === 'credit_risk' ? 'loans' : 'expenses'
+  const [subTab, setSubTab] = useState<'procurement' | 'expenses' | 'transfers' | 'statements' | 'loans' | 'assets_equity'>(
+    mode === 'credit_risk' ? 'loans' : 'procurement'
   );
-  const [expenseSubView, setExpenseSubView] = useState<'all' | 'operating' | 'purchase_orders'>('all');
 
-  // DB tables for Expenses, Transfers and Transit Procurement
+  // DB tables for Expenses, Transfers, Suppliers and Supply Management
   const [expensesList, setExpensesList] = useState<any[]>([]);
   const [transfersList, setTransfersList] = useState<any[]>([]);
   const [transitPurchasesList, setTransitPurchasesList] = useState<any[]>([]);
+  const [suppliersList, setSuppliersList] = useState<any[]>([]);
   const [productList, setProductList] = useState<any[]>([]);
 
   // Expenses Form states
@@ -111,12 +120,26 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     refLabel: string;
   } | null>(null);
 
-  // Goods in Transit / Procurement Form states
+  // Supply Management / Purchase Order states
+  const [supplyViewFilter, setSupplyViewFilter] = useState<'all' | 'in_transit' | 'received' | 'suppliers'>('all');
+  const [supplySearchQuery, setSupplySearchQuery] = useState('');
+  const [supplySupplierFilter, setSupplySupplierFilter] = useState('ALL');
+
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
   const [poFeedback, setPoFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [poModalError, setPoModalError] = useState<string | null>(null);
   const [confirmReceivePoId, setConfirmReceivePoId] = useState<string | null>(null);
+
+  // Supplier profile fields inside New / Reorder PO modal
+  const [selectedSupplierId, setSelectedSupplierId] = useState('');
   const [transitSupplierName, setTransitSupplierName] = useState('');
+  const [transitSupplierContact, setTransitSupplierContact] = useState('');
+  const [transitSupplierPhone, setTransitSupplierPhone] = useState('');
+  const [transitSupplierEmail, setTransitSupplierEmail] = useState('');
+  const [transitSupplierAddress, setTransitSupplierAddress] = useState('');
+  const [transitSupplierTpin, setTransitSupplierTpin] = useState('');
+  const [saveSupplierProfile, setSaveSupplierProfile] = useState(true);
+
   const [transitStoreId, setTransitStoreId] = useState(activeStore || '');
   const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
 
@@ -149,12 +172,39 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     { name: 'Port & Customs Clearing Fee', amount: 0, category: 'Handling' },
     { name: 'Handling & Offloading', amount: 0, category: 'Handling' }
   ]);
+  const [newPoCostName, setNewPoCostName] = useState('');
+  const [newPoCostAmount, setNewPoCostAmount] = useState('');
 
   // Item form inside transit modal
   const [selectedTransitProduct, setSelectedTransitProduct] = useState('');
   const [customTransitProductName, setCustomTransitProductName] = useState('');
   const [transitItemQty, setTransitItemQty] = useState('10');
   const [transitItemUnitPrice, setTransitItemUnitPrice] = useState('100');
+
+  // Edit Landing Cost modal state (post-order transit cost adjustments)
+  const [editingLandingPo, setEditingLandingPo] = useState<any | null>(null);
+  const [editLandingExpenses, setEditLandingExpenses] = useState<Array<{ name: string; amount: number; category: string }>>([]);
+  const [editLandingStage, setEditLandingStage] = useState('IN_TRANSIT');
+  const [editLandingNotes, setEditLandingNotes] = useState('');
+  const [editLandingError, setEditLandingError] = useState<string | null>(null);
+  const [newEditCostName, setNewEditCostName] = useState('');
+  const [newEditCostAmount, setNewEditCostAmount] = useState('');
+  const [newEditCostCategory, setNewEditCostCategory] = useState('Freight');
+
+  // Saved Supplier Directory modal states
+  const [showSupplierModal, setShowSupplierModal] = useState(false);
+  const [editingSupplier, setEditingSupplier] = useState<any | null>(null);
+  const [supplierFormError, setSupplierFormError] = useState<string | null>(null);
+  const [confirmDeleteSupplierId, setConfirmDeleteSupplierId] = useState<string | null>(null);
+  const [supplierFormName, setSupplierFormName] = useState('');
+  const [supplierFormContact, setSupplierFormContact] = useState('');
+  const [supplierFormPhone, setSupplierFormPhone] = useState('');
+  const [supplierFormEmail, setSupplierFormEmail] = useState('');
+  const [supplierFormAddress, setSupplierFormAddress] = useState('');
+  const [supplierFormTpin, setSupplierFormTpin] = useState('');
+  const [supplierFormTerms, setSupplierFormTerms] = useState('Pay on Order / Advance');
+  const [supplierFormPayMethod, setSupplierFormPayMethod] = useState('BANK_TRANSFER');
+  const [supplierFormNotes, setSupplierFormNotes] = useState('');
 
   // Selected period for financial statements
   const [selectedPeriod, setSelectedPeriod] = useState<'this_month' | 'last_month' | 'this_quarter' | 'this_year' | 'all_time'>('all_time');
@@ -234,12 +284,23 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       }
 
       // 6. Load transit purchases
-      const rxPt = runSql("SELECT * FROM purchases_transit ORDER BY created_at DESC", 'Transit Procurement: Fetch purchases in transit');
+      const rxPt = runSql("SELECT * FROM purchases_transit ORDER BY created_at DESC", 'Supply Management: Fetch purchase orders');
       if (rxPt.success && Array.isArray(rxPt.data)) {
         setTransitPurchasesList(rxPt.data);
       }
 
-      // 7. Load product list for selection
+      // 7. Ensure suppliers table exists & load saved suppliers
+      runSql(
+        `CREATE TABLE IF NOT EXISTS suppliers (id STRING PRIMARY KEY, name STRING, contact_person STRING, phone STRING, email STRING, address STRING, tpin STRING, payment_terms STRING, default_payment_method STRING, notes STRING, created_at STRING, updated_at STRING)`,
+        'Supply Management: Ensure suppliers table',
+        true
+      );
+      const rxSup = runSql("SELECT * FROM suppliers ORDER BY name ASC", 'Supply Management: Fetch saved suppliers', true);
+      if (rxSup.success && Array.isArray(rxSup.data)) {
+        setSuppliersList(rxSup.data);
+      }
+
+      // 8. Load product list for selection
       const rxProds = runSql("SELECT * FROM products ORDER BY name ASC", 'Products: Fetch available items');
       if (rxProds.success && Array.isArray(rxProds.data)) {
         setProductList(rxProds.data);
@@ -701,13 +762,164 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     });
   };
 
-  // --- TRANSIT PROCUREMENT ENGINE ---
-  const openNewPurchaseOrderModal = () => {
+  // --- SUPPLY MANAGEMENT & TRANSIT PROCUREMENT ENGINE ---
+  const ensureSuppliersTableSql = () => {
+    runSql(
+      `CREATE TABLE IF NOT EXISTS suppliers (id STRING PRIMARY KEY, name STRING, contact_person STRING, phone STRING, email STRING, address STRING, tpin STRING, payment_terms STRING, default_payment_method STRING, notes STRING, created_at STRING, updated_at STRING)`,
+      'Supply Management: Ensure suppliers table',
+      true
+    );
+  };
+
+  const applySavedSupplierToPoForm = (sup: any) => {
+    if (!sup) {
+      setSelectedSupplierId('');
+      return;
+    }
+    setSelectedSupplierId(String(sup.id || ''));
+    setTransitSupplierName(String(sup.name || ''));
+    setTransitSupplierContact(String(sup.contact_person || ''));
+    setTransitSupplierPhone(String(sup.phone || ''));
+    setTransitSupplierEmail(String(sup.email || ''));
+    setTransitSupplierAddress(String(sup.address || ''));
+    setTransitSupplierTpin(String(sup.tpin || ''));
+    if (sup.default_payment_method) {
+      setTransitPaymentMethod(String(sup.default_payment_method));
+    }
+  };
+
+  const handleSelectSavedSupplierForPo = (supId: string) => {
+    setPoModalError(null);
+    if (!supId) {
+      setSelectedSupplierId('');
+      return;
+    }
+    const found = suppliersList.find((s) => String(s.id) === String(supId));
+    if (found) {
+      applySavedSupplierToPoForm(found);
+    }
+  };
+
+  const upsertSupplierRecord = (params: {
+    id?: string;
+    name: string;
+    contactPerson?: string;
+    phone?: string;
+    email?: string;
+    address?: string;
+    tpin?: string;
+    paymentTerms?: string;
+    defaultPaymentMethod?: string;
+    notes?: string;
+  }) => {
+    ensureSuppliersTableSql();
+    const cleanName = params.name.trim();
+    if (!cleanName) return null;
+    const nowIso = new Date().toISOString();
+
+    const existing =
+      (params.id ? suppliersList.find((s) => String(s.id) === String(params.id)) : null) ||
+      suppliersList.find((s) => String(s.name || '').trim().toLowerCase() === cleanName.toLowerCase());
+
+    const esc = (v?: string) => String(v || '').trim().replace(/'/g, "''");
+
+    if (existing) {
+      runSql(
+        `UPDATE suppliers SET name = '${esc(cleanName)}', contact_person = '${esc(params.contactPerson)}', phone = '${esc(params.phone)}', email = '${esc(params.email)}', address = '${esc(params.address)}', tpin = '${esc(params.tpin)}', payment_terms = '${esc(params.paymentTerms || existing.payment_terms || 'Pay on Order')}', default_payment_method = '${esc(params.defaultPaymentMethod || existing.default_payment_method || 'BANK_TRANSFER')}', notes = '${esc(params.notes ?? existing.notes)}', updated_at = '${nowIso}' WHERE id = '${esc(existing.id)}'`,
+        `Supply Management: Update saved supplier ${cleanName}`
+      );
+      return String(existing.id);
+    } else {
+      const supId = 'sup-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
+      runSql(
+        `INSERT INTO suppliers (id, name, contact_person, phone, email, address, tpin, payment_terms, default_payment_method, notes, created_at, updated_at) VALUES ('${supId}', '${esc(cleanName)}', '${esc(params.contactPerson)}', '${esc(params.phone)}', '${esc(params.email)}', '${esc(params.address)}', '${esc(params.tpin)}', '${esc(params.paymentTerms || 'Pay on Order')}', '${esc(params.defaultPaymentMethod || 'BANK_TRANSFER')}', '${esc(params.notes)}', '${nowIso}', '${nowIso}')`,
+        `Supply Management: Save supplier ${cleanName}`
+      );
+      return supId;
+    }
+  };
+
+  const resetPoModalFields = () => {
+    setSelectedSupplierId('');
+    setTransitSupplierName('');
+    setTransitSupplierContact('');
+    setTransitSupplierPhone('');
+    setTransitSupplierEmail('');
+    setTransitSupplierAddress('');
+    setTransitSupplierTpin('');
+    setSaveSupplierProfile(true);
+    setTransitItems([]);
+    setTransitAddExpenses([
+      { name: 'Freight & Road Transport', amount: 0, category: 'Freight' },
+      { name: 'Port & Customs Clearing Fee', amount: 0, category: 'Handling' },
+      { name: 'Handling & Offloading', amount: 0, category: 'Handling' }
+    ]);
+    setNewPoCostName('');
+    setNewPoCostAmount('');
+    setTransitNotes('');
+    setSelectedTransitProduct('');
+    setCustomTransitProductName('');
+    setTransitItemQty('10');
+    setTransitItemUnitPrice('100');
+  };
+
+  const openNewPurchaseOrderModal = (prefillSupplier?: any) => {
     setPoModalError(null);
     setPoFeedback(null);
+    resetPoModalFields();
     if (!transitStoreId) {
       setTransitStoreId(activeStore || storesList[0]?.id || 'MAIN');
     }
+    if (prefillSupplier && prefillSupplier.name) {
+      applySavedSupplierToPoForm(prefillSupplier);
+    }
+    setShowNewTransitModal(true);
+  };
+
+  const handleReorderPurchaseOrder = (po: any) => {
+    setPoModalError(null);
+    setPoFeedback(null);
+    resetPoModalFields();
+
+    const matchedSupplier = suppliersList.find(
+      (s) => String(s.name || '').trim().toLowerCase() === String(po.supplier_name || '').trim().toLowerCase()
+    );
+    if (matchedSupplier) {
+      applySavedSupplierToPoForm(matchedSupplier);
+    } else {
+      setTransitSupplierName(String(po.supplier_name || ''));
+    }
+
+    setTransitStoreId(String(po.store_id || activeStore || storesList[0]?.id || 'MAIN'));
+    if (po.payment_account_id) setTransitPaymentAcc(String(po.payment_account_id));
+    if (po.payment_method) setTransitPaymentMethod(String(po.payment_method));
+
+    let parsedItems: any[] = [];
+    try { parsedItems = JSON.parse(po.items_json || '[]'); } catch {}
+    if (Array.isArray(parsedItems) && parsedItems.length > 0) {
+      setTransitItems(
+        parsedItems.map((it: any) => ({
+          productId: it.productId || 'custom-' + Date.now(),
+          productName: String(it.productName || 'Item'),
+          quantity: Math.max(1, Number(it.quantity || 1)),
+          baseUnitPrice: Math.max(0, Number(it.baseUnitPrice || 0)),
+        }))
+      );
+    }
+
+    let parsedExpenses: any[] = [];
+    try { parsedExpenses = JSON.parse(po.additional_expenses_json || '[]'); } catch {}
+    if (Array.isArray(parsedExpenses) && parsedExpenses.length > 0) {
+      setTransitAddExpenses(
+        parsedExpenses.map((ex: any) => ({
+          name: String(ex.name || 'Landing Cost'),
+          amount: Math.max(0, Number(ex.amount || 0)),
+          category: String(ex.category || 'Freight'),
+        }))
+      );
+    }
+
+    setTransitNotes(`Reorder of PO #${po.id}`);
     setShowNewTransitModal(true);
   };
 
@@ -754,6 +966,20 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     setTransitItems(transitItems.filter((_, i) => i !== idx));
   };
 
+  const handleUpdateTransitItemField = (idx: number, field: 'quantity' | 'baseUnitPrice', rawVal: string) => {
+    const val = field === 'quantity' ? Math.max(1, parseInt(rawVal, 10) || 1) : Math.max(0, parseFloat(rawVal) || 0);
+    setTransitItems((prev) => prev.map((it, i) => (i === idx ? { ...it, [field]: val } : it)));
+  };
+
+  const handleAddNewPoCostLine = () => {
+    const cleanName = newPoCostName.trim();
+    if (!cleanName) return;
+    const amt = Math.max(0, parseFloat(newPoCostAmount) || 0);
+    setTransitAddExpenses((prev) => [...prev, { name: cleanName, amount: amt, category: 'Other' }]);
+    setNewPoCostName('');
+    setNewPoCostAmount('');
+  };
+
   const handleCreateTransitPurchase = (e: React.FormEvent) => {
     e.preventDefault();
     setPoModalError(null);
@@ -765,6 +991,19 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     if (transitItems.length === 0) {
       setPoModalError('Please add at least one product line item using "+ Add Item Line".');
       return;
+    }
+
+    if (saveSupplierProfile) {
+      upsertSupplierRecord({
+        id: selectedSupplierId || undefined,
+        name: transitSupplierName.trim(),
+        contactPerson: transitSupplierContact,
+        phone: transitSupplierPhone,
+        email: transitSupplierEmail,
+        address: transitSupplierAddress,
+        tpin: transitSupplierTpin,
+        defaultPaymentMethod: transitPaymentMethod,
+      });
     }
 
     const targetBranch = transitStoreId || activeStore || storesList[0]?.id || 'MAIN';
@@ -782,7 +1021,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     const poInsertRes = runSql(
       `INSERT INTO purchases_transit (id, supplier_name, store_id, payment_account_id, payment_method, items_json, additional_expenses_json, total_base_amount, total_additional_expenses, total_landed_cost, stage, notes, created_at, updated_at, received_at, received_by) VALUES ('${transitId}', '${cleanSupplier}', '${cleanStore}', '${cleanPayAcc}', '${cleanPayMethod}', '${JSON.stringify(transitItems).replace(/'/g, "''")}', '${JSON.stringify(transitAddExpenses).replace(/'/g, "''")}', ${totalBase}, ${totalAdditional}, ${totalLanded}, 'IN_TRANSIT', '${cleanNotes}', '${createdAt}', '${createdAt}', '', '')`,
-      'Transit Procurement: Create shipment in transit'
+      'Supply Management: Create purchase order in transit'
     );
 
     if (!poInsertRes.success) {
@@ -793,26 +1032,26 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const txId = 'tx-pt-' + Date.now();
     runSql(
       `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by) VALUES ('${txId}', 'idem-${transitId}', 'PROCUREMENT', 'PURCHASE_TRANSIT', '${transitId}', ${totalLanded}, 0, 'SUCCESS', 'Transit Purchase: ${cleanSupplier} (Landed Cost: ${settings.currency}${totalLanded.toFixed(2)})', '${createdAt}', '${createdAt}', '${userRole}')`,
-      'Transit Procurement: Journal'
+      'Supply Management: Journal'
     );
 
     runSql(
       `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_transit', 'DEBIT', ${totalLanded}, '${createdAt}')`,
-      'Transit Ledger: Debit Goods in Transit'
+      'Supply Ledger: Debit Goods in Transit'
     );
     runSql(
       `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-2', '${txId}', '${cleanPayAcc}', 'CREDIT', ${totalLanded}, '${createdAt}')`,
-      'Transit Ledger: Credit Payment Source'
+      'Supply Ledger: Credit Payment Source'
     );
 
     // Sync Purchase Order into expenses table for central audit trail
     const expId = 'exp-po-' + Date.now();
     runSql(
       `INSERT INTO expenses (id, category, account_id, amount, description, reference_no, expense_date, store_id, created_at, created_by) VALUES ('${expId}', 'Purchase Order - Goods & Transit', '${cleanPayAcc}', ${totalLanded}, 'PO #${transitId}: Supplier ${cleanSupplier} (${transitItems.length} items)', '${transitId}', '${createdAt.split('T')[0]}', '${cleanStore}', '${createdAt}', '${userRole}')`,
-      'Transit Procurement: Sync Purchase Order to Expenses'
+      'Supply Management: Sync Purchase Order to Expenses'
     );
 
-    logEmployeeAudit('PURCHASE', 'Created Purchase Order', `PO #${transitId}, Supplier: ${transitSupplierName.trim()}, Items: ${transitItems.length}, Landed Cost: K${totalLanded.toFixed(2)}`, totalLanded, targetBranch, userRole);
+    logEmployeeAudit('PURCHASE', 'Created Purchase Order', `PO #${transitId}, Supplier: ${transitSupplierName.trim()}, Items: ${transitItems.length}, Landed Cost: ${settings.currency}${totalLanded.toFixed(2)}`, totalLanded, targetBranch, userRole);
 
     syncAllAccountingSystems(`Purchase Order #${transitId}`);
     persistTablesToStorage();
@@ -822,26 +1061,206 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     setShowNewTransitModal(false);
     setPoModalError(null);
-    setTransitSupplierName('');
-    setTransitItems([]);
-    setTransitAddExpenses([
-      { name: 'Freight & Road Transport', amount: 0, category: 'Freight' },
-      { name: 'Port & Customs Clearing Fee', amount: 0, category: 'Handling' },
-      { name: 'Handling & Offloading', amount: 0, category: 'Handling' }
-    ]);
-    setTransitNotes('');
-    setExpenseSubView('purchase_orders');
+    resetPoModalFields();
+    setSubTab('procurement');
 
     setPoFeedback({
       type: 'success',
-      text: `✓ Purchase Order #${transitId} recorded for ${settings.currency}${totalLanded.toFixed(2)} total landed cost.`,
+      text: `✓ Purchase Order #${transitId} recorded (${settings.currency}${totalLanded.toFixed(2)} total landed cost)${saveSupplierProfile ? ' & supplier info saved for future orders' : ''}.`,
+    });
+  };
+
+  const openEditLandingCostModal = (po: any) => {
+    setEditLandingError(null);
+    let parsedExpenses: Array<{ name: string; amount: number; category: string }> = [];
+    try {
+      const raw = JSON.parse(po.additional_expenses_json || '[]');
+      if (Array.isArray(raw)) {
+        parsedExpenses = raw.map((ex: any) => ({
+          name: String(ex.name || 'Transit Cost'),
+          amount: Math.max(0, Number(ex.amount || 0)),
+          category: String(ex.category || 'Freight'),
+        }));
+      }
+    } catch {}
+    if (parsedExpenses.length === 0) {
+      parsedExpenses = [
+        { name: 'Freight & Road Transport', amount: 0, category: 'Freight' },
+        { name: 'Port & Customs Clearing Fee', amount: 0, category: 'Customs' },
+        { name: 'Handling & Offloading', amount: 0, category: 'Handling' },
+      ];
+    }
+    setEditingLandingPo(po);
+    setEditLandingExpenses(parsedExpenses);
+    setEditLandingStage(String(po.stage || 'IN_TRANSIT'));
+    setEditLandingNotes(String(po.notes || ''));
+    setNewEditCostName('');
+    setNewEditCostAmount('');
+    setNewEditCostCategory('Freight');
+  };
+
+  const handleAddEditLandingCostLine = () => {
+    const cleanName = newEditCostName.trim();
+    if (!cleanName) {
+      setEditLandingError('Please enter a name for the transit landing cost line.');
+      return;
+    }
+    setEditLandingError(null);
+    const amt = Math.max(0, parseFloat(newEditCostAmount) || 0);
+    setEditLandingExpenses((prev) => [
+      ...prev,
+      { name: cleanName, amount: amt, category: newEditCostCategory },
+    ]);
+    setNewEditCostName('');
+    setNewEditCostAmount('');
+  };
+
+  const handleSaveEditedLandingCost = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingLandingPo) return;
+    setEditLandingError(null);
+
+    const baseTotal = Number(editingLandingPo.total_base_amount || 0);
+    const cleanedExpenses = editLandingExpenses.map((ex) => ({
+      name: String(ex.name || 'Transit Cost').trim() || 'Transit Cost',
+      amount: Math.max(0, Number(ex.amount || 0)),
+      category: String(ex.category || 'Other'),
+    }));
+    const newAddTotal = cleanedExpenses.reduce((sum, ex) => sum + ex.amount, 0);
+    const newLandedTotal = parseFloat((baseTotal + newAddTotal).toFixed(2));
+    const updatedAt = new Date().toISOString();
+    const cleanPoId = String(editingLandingPo.id).replace(/'/g, "''");
+    const cleanStage = String(editLandingStage || 'IN_TRANSIT').replace(/'/g, "''");
+    const cleanNotes = String(editLandingNotes || '').trim().replace(/'/g, "''");
+
+    const updRes = runSql(
+      `UPDATE purchases_transit SET additional_expenses_json = '${JSON.stringify(cleanedExpenses).replace(/'/g, "''")}', total_additional_expenses = ${newAddTotal}, total_landed_cost = ${newLandedTotal}, stage = '${cleanStage}', notes = '${cleanNotes}', updated_at = '${updatedAt}' WHERE id = '${cleanPoId}'`,
+      `Supply Management: Update landing cost for PO #${cleanPoId}`
+    );
+
+    if (!updRes.success) {
+      setEditLandingError(updRes.error || 'Could not update landing costs.');
+      return;
+    }
+
+    // Keep linked expense record, transaction & ledger entries synchronized
+    runSql(
+      `UPDATE expenses SET amount = ${newLandedTotal} WHERE reference_no = '${cleanPoId}' AND category = 'Purchase Order - Goods & Transit'`,
+      `Supply Management: Sync updated PO landed cost to expenses`
+    );
+    const linkedTxRes = runSql(
+      `SELECT id FROM transactions WHERE provider_reference = '${cleanPoId}' AND channel = 'PURCHASE_TRANSIT'`,
+      'Supply Management: Lookup PO transaction',
+      true
+    );
+    if (linkedTxRes.success && Array.isArray(linkedTxRes.data) && linkedTxRes.data.length > 0) {
+      const txId = String(linkedTxRes.data[0].id).replace(/'/g, "''");
+      const cleanSup = String(editingLandingPo.supplier_name || '').replace(/'/g, "''");
+      runSql(
+        `UPDATE transactions SET amount = ${newLandedTotal}, narration = 'Transit Purchase: ${cleanSup} (Landed Cost: ${settings.currency}${newLandedTotal.toFixed(2)})', updated_at = '${updatedAt}' WHERE id = '${txId}'`,
+        'Supply Management: Update PO transaction total'
+      );
+      runSql(
+        `UPDATE ledger_entries SET amount = ${newLandedTotal} WHERE transaction_id = '${txId}'`,
+        'Supply Management: Update PO ledger amounts'
+      );
+    }
+
+    logEmployeeAudit(
+      'PURCHASE',
+      'Updated Purchase Order Landing Cost',
+      `PO #${editingLandingPo.id} (${editingLandingPo.supplier_name}): Landing overhead updated to ${settings.currency}${newAddTotal.toFixed(2)}, Total Landed Cost: ${settings.currency}${newLandedTotal.toFixed(2)}`,
+      newLandedTotal,
+      String(editingLandingPo.store_id || activeStore || ''),
+      userRole
+    );
+
+    syncAllAccountingSystems(`Updated Landing Cost PO #${editingLandingPo.id}`);
+    persistTablesToStorage();
+    loadData();
+    loadStatementData();
+    try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+
+    const updatedId = editingLandingPo.id;
+    setEditingLandingPo(null);
+    setPoFeedback({
+      type: 'success',
+      text: `✓ Landing costs updated for PO #${updatedId}. New Total Landed Cost: ${settings.currency}${newLandedTotal.toFixed(2)} (synced to Expenses & Ledgers).`,
+    });
+  };
+
+  const openSupplierModal = (sup?: any) => {
+    setSupplierFormError(null);
+    if (sup) {
+      setEditingSupplier(sup);
+      setSupplierFormName(String(sup.name || ''));
+      setSupplierFormContact(String(sup.contact_person || ''));
+      setSupplierFormPhone(String(sup.phone || ''));
+      setSupplierFormEmail(String(sup.email || ''));
+      setSupplierFormAddress(String(sup.address || ''));
+      setSupplierFormTpin(String(sup.tpin || ''));
+      setSupplierFormTerms(String(sup.payment_terms || 'Pay on Order / Advance'));
+      setSupplierFormPayMethod(String(sup.default_payment_method || 'BANK_TRANSFER'));
+      setSupplierFormNotes(String(sup.notes || ''));
+    } else {
+      setEditingSupplier(null);
+      setSupplierFormName('');
+      setSupplierFormContact('');
+      setSupplierFormPhone('');
+      setSupplierFormEmail('');
+      setSupplierFormAddress('');
+      setSupplierFormTpin('');
+      setSupplierFormTerms('Pay on Order / Advance');
+      setSupplierFormPayMethod('BANK_TRANSFER');
+      setSupplierFormNotes('');
+    }
+    setShowSupplierModal(true);
+  };
+
+  const handleSaveSupplierForm = (e: React.FormEvent) => {
+    e.preventDefault();
+    setSupplierFormError(null);
+    if (!supplierFormName.trim()) {
+      setSupplierFormError('Supplier name is required.');
+      return;
+    }
+    upsertSupplierRecord({
+      id: editingSupplier?.id,
+      name: supplierFormName.trim(),
+      contactPerson: supplierFormContact,
+      phone: supplierFormPhone,
+      email: supplierFormEmail,
+      address: supplierFormAddress,
+      tpin: supplierFormTpin,
+      paymentTerms: supplierFormTerms,
+      defaultPaymentMethod: supplierFormPayMethod,
+      notes: supplierFormNotes,
+    });
+    persistTablesToStorage();
+    loadData();
+    try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
+    setShowSupplierModal(false);
+    setPoFeedback({
+      type: 'success',
+      text: `✓ Supplier "${supplierFormName.trim()}" ${editingSupplier ? 'updated' : 'saved'} for future purchase orders.`,
+    });
+  };
+
+  const handleDeleteSupplier = (supId: string) => {
+    runSql(`DELETE FROM suppliers WHERE id = '${String(supId).replace(/'/g, "''")}'`, 'Supply Management: Delete supplier');
+    setConfirmDeleteSupplierId(null);
+    persistTablesToStorage();
+    loadData();
+    setPoFeedback({
+      type: 'success',
+      text: 'Supplier removed from saved directory (historical purchase orders preserved).',
     });
   };
 
   const handleUpdateTransitStage = (transitId: string, newStage: string) => {
     runSql(
       `UPDATE purchases_transit SET stage = '${newStage}', updated_at = '${new Date().toISOString()}' WHERE id = '${transitId}'`,
-      `Transit Procurement: Update stage to ${newStage}`
+      `Supply Management: Update stage to ${newStage}`
     );
     logEmployeeAudit('PURCHASE', 'Updated Purchase Order Stage', `PO #${transitId} stage updated to ${newStage}`, 0, activeStore || '', userRole);
     persistTablesToStorage();
@@ -860,7 +1279,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     runSql(
       `UPDATE purchases_transit SET stage = 'LANDED_AT_STORE', updated_at = '${receivedAt}', received_at = '${receivedAt}', received_by = '${userRole}' WHERE id = '${po.id}'`,
-      'Transit Procurement: Accept stock at store'
+      'Supply Management: Accept stock at store'
     );
 
     logEmployeeAudit('PURCHASE', 'Received Procurement Goods', `PO #${po.id} accepted & received into branch ${targetBranch.toUpperCase()}. Items landed: ${items.length}`, Number(po.total_landed_cost || 0), targetBranch, userRole);
@@ -920,15 +1339,15 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const txId = 'tx-land-' + Date.now();
     runSql(
       `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by) VALUES ('${txId}', 'idem-${po.id}-landed', 'STORE-${targetBranch.toUpperCase()}', 'STOCK_LANDED', '${po.id}', ${po.total_landed_cost}, 0, 'SUCCESS', 'Stock Accepted: Order #${po.id} landed at ${targetBranch}', '${receivedAt}', '${receivedAt}', '${userRole}')`,
-      'Transit Procurement: Stock landed journal'
+      'Supply Management: Stock landed journal'
     );
     runSql(
       `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_inventory', 'DEBIT', ${po.total_landed_cost}, '${receivedAt}')`,
-      'Transit Ledger: Debit Store Inventory'
+      'Supply Ledger: Debit Store Inventory'
     );
     runSql(
       `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-2', '${txId}', 'acc_transit', 'CREDIT', ${po.total_landed_cost}, '${receivedAt}')`,
-      'Transit Ledger: Credit Goods in Transit'
+      'Supply Ledger: Credit Goods in Transit'
     );
 
     syncAllAccountingSystems(`Stock Received PO #${po.id}`);
@@ -1556,15 +1975,28 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
         <div className="flex border-b border-slate-200 mb-5 gap-1.5 select-none pb-0.5 shrink-0 overflow-x-auto scrollbar-none">
           <button
             type="button"
-            onClick={() => { setSubTab('expenses'); setExpenseSubView('all'); }}
+            onClick={() => setSubTab('procurement')}
             className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-              subTab === 'expenses' && expenseSubView !== 'purchase_orders'
+              subTab === 'procurement'
+                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
+                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
+            }`}
+          >
+            <Truck size={14} />
+            <span>Supply Management</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setSubTab('expenses')}
+            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              subTab === 'expenses'
                 ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
                 : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
             }`}
           >
             <DollarSign size={14} />
-            <span>Expenses & Purchase Orders</span>
+            <span>Operating Expenses</span>
           </button>
 
           <button
@@ -1578,19 +2010,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
           >
             <RefreshCw size={14} />
             <span>Accounts & Transfers</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => { setSubTab('expenses'); setExpenseSubView('purchase_orders'); }}
-            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-              subTab === 'procurement' || (subTab === 'expenses' && expenseSubView === 'purchase_orders')
-                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-            }`}
-          >
-            <Truck size={14} />
-            <span>Goods in Transit & POs</span>
           </button>
 
           <button
@@ -1636,20 +2055,20 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                 <div>
                   <h2 className="text-lg font-black text-slate-900 tracking-tight flex items-center gap-2">
                     <DollarSign className="text-indigo-600" size={22} />
-                    <span>Business Expenses, Outflows & Purchase Orders</span>
+                    <span>Operating Expenses & Business Outflows</span>
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Manage store operating costs (rent, utilities, wages) and supplier Purchase Orders (goods in transit, freight, customs, and landed prices).
+                    Manage store operating costs (rent, utilities, wages) and review outflows synchronized from Supply Management.
                   </p>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={openNewPurchaseOrderModal}
+                    onClick={() => setSubTab('procurement')}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
                   >
-                    <PackagePlus size={15} />
-                    <span>+ Create Purchase Order</span>
+                    <Truck size={15} />
+                    <span>Open Supply Management</span>
                   </button>
                 </div>
               </div>
@@ -1657,7 +2076,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
               {/* Metric Summary Cards */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 border-t border-slate-100 pt-3">
                 <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/70">
-                  <span className="text-[10px] text-slate-400 font-extrabold uppercase block">Operating Expenses</span>
+                  <span className="text-[10px] text-slate-400 font-extrabold uppercase block">Recorded Expense Entries</span>
                   <span className="text-base font-black text-slate-900">
                     {settings.currency}{expensesList.reduce((sum, e) => sum + Number(e.amount || 0), 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                   </span>
@@ -1665,66 +2084,28 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                 </div>
 
                 <div className="bg-indigo-50/50 p-3 rounded-xl border border-indigo-100">
-                  <span className="text-[10px] text-indigo-500 font-extrabold uppercase block">Purchase Orders & Landed Costs</span>
+                  <span className="text-[10px] text-indigo-500 font-extrabold uppercase block">Supply & Landed Costs</span>
                   <span className="text-base font-black text-indigo-900">
                     {settings.currency}{transitPurchasesList.reduce((sum, po) => sum + Number(po.total_landed_cost || 0), 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
                   </span>
-                  <span className="text-[10px] text-indigo-600 block">{transitPurchasesList.length} active purchase orders</span>
+                  <span className="text-[10px] text-indigo-600 block">{transitPurchasesList.length} supply orders</span>
                 </div>
 
                 <div className="bg-rose-50/50 p-3 rounded-xl border border-rose-100">
-                  <span className="text-[10px] text-rose-500 font-extrabold uppercase block">Combined Business Outflows</span>
+                  <span className="text-[10px] text-rose-500 font-extrabold uppercase block">Direct Operating Costs</span>
                   <span className="text-base font-black text-rose-700">
-                    {settings.currency}{(
-                      expensesList.reduce((sum, e) => sum + Number(e.amount || 0), 0) +
-                      transitPurchasesList.reduce((sum, po) => sum + Number(po.total_landed_cost || 0), 0)
-                    ).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                    {settings.currency}{expensesList
+                      .filter((e) => e.category !== 'Purchase Order - Goods & Transit')
+                      .reduce((sum, e) => sum + Number(e.amount || 0), 0)
+                      .toLocaleString('en-US', { minimumFractionDigits: 2 })}
                   </span>
-                  <span className="text-[10px] text-rose-600 block">Total Expenses + PO Investments</span>
+                  <span className="text-[10px] text-rose-600 block">Excludes PO inventory purchases</span>
                 </div>
-              </div>
-
-              {/* Sub-section Selector Tabs */}
-              <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-xl w-fit border border-slate-200 text-xs font-extrabold select-none mt-1">
-                <button
-                  onClick={() => setExpenseSubView('all')}
-                  className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
-                    expenseSubView === 'all'
-                      ? 'bg-white text-indigo-700 shadow-xs font-black'
-                      : 'text-slate-600 hover:text-slate-900 font-bold'
-                  }`}
-                >
-                  <Layers size={14} />
-                  <span>All Expenses & POs ({expensesList.length + transitPurchasesList.length})</span>
-                </button>
-                <button
-                  onClick={() => setExpenseSubView('operating')}
-                  className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
-                    expenseSubView === 'operating'
-                      ? 'bg-white text-indigo-700 shadow-xs font-black'
-                      : 'text-slate-600 hover:text-slate-900 font-bold'
-                  }`}
-                >
-                  <Receipt size={14} />
-                  <span>Operating Expenses ({expensesList.length})</span>
-                </button>
-                <button
-                  onClick={() => setExpenseSubView('purchase_orders')}
-                  className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
-                    expenseSubView === 'purchase_orders'
-                      ? 'bg-white text-indigo-700 shadow-xs font-black'
-                      : 'text-slate-600 hover:text-slate-900 font-bold'
-                  }`}
-                >
-                  <Truck size={14} />
-                  <span>Purchase Orders ({transitPurchasesList.length})</span>
-                </button>
               </div>
             </div>
 
             {/* OPERATING EXPENSES SECTION */}
-            {(expenseSubView === 'all' || expenseSubView === 'operating') && (
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* ENTRY FORM */}
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm h-fit">
                 <h3 className="text-sm font-black text-slate-800 uppercase tracking-wider mb-4 flex items-center gap-2 border-b pb-3">
@@ -1933,178 +2314,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                 </div>
               </div>
             </div>
-            )}
-
-            {/* PURCHASE ORDERS & GOODS IN TRANSIT SECTION (INCLUDED UNDER EXPENSES) */}
-            {(expenseSubView === 'all' || expenseSubView === 'purchase_orders') && (
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col gap-4">
-                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b pb-3">
-                  <div>
-                    <h3 className="text-sm font-black text-slate-900 uppercase tracking-wider flex items-center gap-2">
-                      <Truck className="text-indigo-600" size={18} />
-                      <span>Purchase Orders & Goods in Transit ({transitPurchasesList.length})</span>
-                    </h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Supplier purchase orders, freight charges, customs clearing fees, landed cost calculation, and stock receiving.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={openNewPurchaseOrderModal}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider shadow-xs transition-all cursor-pointer flex items-center gap-1.5"
-                  >
-                    <PackagePlus size={15} />
-                    <span>+ New Purchase Order</span>
-                  </button>
-                </div>
-
-                {poFeedback && (
-                  <div
-                    className={`px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
-                      poFeedback.type === 'error'
-                        ? 'bg-rose-50 border-rose-200 text-rose-800'
-                        : 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      {poFeedback.type === 'error' ? <AlertCircle size={15} className="shrink-0" /> : <CheckCircle2 size={15} className="shrink-0" />}
-                      <span>{poFeedback.text}</span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setPoFeedback(null)}
-                      className="text-[10px] font-black uppercase px-2 py-0.5 rounded hover:bg-black/5 cursor-pointer"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                )}
-
-                <div className="space-y-4">
-                  {transitPurchasesList.map((po) => {
-                    let items: any[] = [];
-                    let addExpenses: any[] = [];
-                    try { items = JSON.parse(po.items_json); } catch (e) {}
-                    try { addExpenses = JSON.parse(po.additional_expenses_json); } catch (e) {}
-
-                    const baseTotal = Number(po.total_base_amount || 0);
-                    const addTotal = Number(po.total_additional_expenses || 0);
-                    const landedTotal = Number(po.total_landed_cost || 0);
-                    const overheadPct = baseTotal > 0 ? ((addTotal / baseTotal) * 100).toFixed(1) : '0.0';
-
-                    return (
-                      <div key={po.id} className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex flex-col gap-3">
-                        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 border-b border-slate-200 pb-2.5">
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs font-black text-slate-900 font-mono">PO #{po.id}</span>
-                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider ${
-                                po.stage === 'LANDED_AT_STORE' 
-                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' 
-                                  : 'bg-amber-100 text-amber-800 border border-amber-200'
-                              }`}>
-                                {po.stage === 'LANDED_AT_STORE' ? 'Received at Store' : po.stage || 'IN_TRANSIT'}
-                              </span>
-                              <span className="text-[10px] font-bold text-slate-500 uppercase bg-slate-200/70 px-2 py-0.5 rounded">
-                                Store: {po.store_id || 'Unassigned'}
-                              </span>
-                            </div>
-                            <span className="text-xs font-bold text-slate-700 block mt-1">Supplier: {po.supplier_name}</span>
-                          </div>
-
-                          <div className="flex items-center gap-2">
-                            {po.stage !== 'LANDED_AT_STORE' && (
-                              confirmReceivePoId === po.id ? (
-                                <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
-                                  <span className="text-[10px] font-bold text-emerald-900">Receive into {(po.store_id || 'MAIN').toUpperCase()}?</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleAcceptTransitDelivery(po)}
-                                    className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-[10px] rounded uppercase cursor-pointer"
-                                  >
-                                    Confirm
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => setConfirmReceivePoId(null)}
-                                    className="px-2 py-0.5 bg-white border border-slate-300 text-slate-600 font-bold text-[10px] rounded uppercase cursor-pointer"
-                                  >
-                                    Cancel
-                                  </button>
-                                </div>
-                              ) : (
-                                <button
-                                  type="button"
-                                  onClick={() => setConfirmReceivePoId(po.id)}
-                                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs uppercase tracking-wider cursor-pointer flex items-center gap-1 shadow-xs"
-                                >
-                                  <PackageCheck size={14} />
-                                  <span>Receive Stock</span>
-                                </button>
-                              )
-                            )}
-                          </div>
-                        </div>
-
-                        {/* PO LINE ITEMS SUMMARY */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                          <div className="bg-white p-3 rounded-lg border border-slate-200/80">
-                            <span className="text-[10px] font-extrabold uppercase text-slate-400 block mb-1">Purchased Line Items ({items.length})</span>
-                            <div className="space-y-1 max-h-28 overflow-y-auto pr-1">
-                              {items.map((it, idx) => (
-                                <div key={idx} className="flex justify-between text-slate-700 text-[11px] font-medium border-b border-slate-100 pb-0.5">
-                                  <span>{it.productName} (x{it.quantity})</span>
-                                  <span className="font-bold">{settings.currency}{(it.quantity * it.baseUnitPrice).toFixed(2)}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-
-                          <div className="bg-white p-3 rounded-lg border border-slate-200/80 flex flex-col justify-between">
-                            <div>
-                              <span className="text-[10px] font-extrabold uppercase text-slate-400 block mb-1">Landed Overhead Breakdown</span>
-                              <div className="space-y-1 text-[11px] text-slate-600">
-                                <div className="flex justify-between">
-                                  <span>Supplier Base Invoice:</span>
-                                  <span className="font-bold">{settings.currency}{baseTotal.toFixed(2)}</span>
-                                </div>
-                                <div className="flex justify-between text-indigo-600 font-semibold">
-                                  <span>Freight & Customs Landing Fees:</span>
-                                  <span>+{settings.currency}{addTotal.toFixed(2)} ({overheadPct}%)</span>
-                                </div>
-                              </div>
-                            </div>
-
-                            <div className="border-t border-slate-200 pt-1.5 mt-2 flex justify-between items-center font-black text-slate-900 text-xs">
-                              <span>Total Landed Expense:</span>
-                              <span className="text-indigo-600 text-sm font-mono">{settings.currency}{landedTotal.toFixed(2)}</span>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-
-                  {transitPurchasesList.length === 0 && (
-                    <div className="bg-slate-50 p-8 rounded-xl border border-dashed border-slate-300 text-center">
-                      <Truck className="mx-auto text-slate-300 mb-2" size={32} />
-                      <h4 className="text-xs font-bold text-slate-700">No Purchase Orders Recorded</h4>
-                      <p className="text-[11px] text-slate-400 mt-0.5">
-                        Create supplier purchase orders to track goods in transit and apportion landing freight costs into expenses.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={openNewPurchaseOrderModal}
-                        className="mt-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <PackagePlus size={14} />
-                        <span>Create First Purchase Order</span>
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
           </motion.div>
         )}
 
@@ -2364,173 +2573,594 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
           </motion.div>
         )}
 
-        {/* PROCUREMENT / GOODS IN TRANSIT SUBTAB */}
-        {subTab === 'procurement' && (
+        {/* SUPPLY MANAGEMENT SUBTAB */}
+        {mode !== 'credit_risk' && subTab === 'procurement' && (
           <motion.div
             key="procurement-tab"
             initial={{ opacity: 0, y: 5 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -5 }}
-            className="flex-1 flex flex-col overflow-y-auto space-y-6 pr-1"
+            className="flex-1 flex flex-col overflow-y-auto space-y-5 pr-1"
           >
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
-              <div>
-                <h2 className="text-lg font-black text-slate-900 tracking-tight flex items-center gap-2">
-                  <Truck className="text-indigo-600" size={20} />
-                  <span>Purchases in Transit & Landed Cost Engine</span>
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Track goods in transit, add landing overhead (freight, customs, handling) to calculate final landed price, and accept stock into store inventory.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={openNewPurchaseOrderModal}
-                className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs uppercase tracking-wider shadow-md hover:shadow-indigo-200 transition-all cursor-pointer flex items-center gap-2"
-              >
-                <PackagePlus size={16} />
-                <span>+ Create Transit Purchase</span>
-              </button>
-            </div>
-
-            {/* TRANSIT SHIPMENTS LIST */}
-            <div className="space-y-4">
-              {transitPurchasesList.map((po) => {
-                let items: any[] = [];
-                let addExpenses: any[] = [];
-                try { items = JSON.parse(po.items_json); } catch (e) {}
-                try { addExpenses = JSON.parse(po.additional_expenses_json); } catch (e) {}
-
-                const baseTotal = Number(po.total_base_amount || 0);
-                const addTotal = Number(po.total_additional_expenses || 0);
-                const landedTotal = Number(po.total_landed_cost || 0);
-                const overheadPct = baseTotal > 0 ? ((addTotal / baseTotal) * 100).toFixed(1) : '0.0';
-
-                return (
-                  <div key={po.id} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col gap-4">
-                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b pb-3">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-black text-slate-900">Shipment #{po.id}</span>
-                          <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase ${
-                            po.stage === 'LANDED_AT_STORE'
-                              ? 'bg-emerald-100 text-emerald-800'
-                              : po.stage === 'CUSTOMS_HANDLING'
-                              ? 'bg-amber-100 text-amber-800'
-                              : 'bg-indigo-100 text-indigo-800'
-                          }`}>
-                            {po.stage.replace(/_/g, ' ')}
-                          </span>
-                        </div>
-                        <span className="text-xs text-slate-500 block mt-0.5">
-                          Supplier: <strong className="text-slate-800">{po.supplier_name}</strong> | Target Branch: <strong className="text-slate-800 uppercase">{po.store_id}</strong>
-                        </span>
-                      </div>
-
-                      <div className="flex items-center gap-3">
-                        <div className="text-right">
-                          <span className="text-[10px] text-slate-400 block font-semibold uppercase">Total Landed Cost</span>
-                          <span className="text-base font-black text-slate-900">
-                            {settings.currency}{landedTotal.toFixed(2)}
-                          </span>
-                          <span className="text-[10px] text-emerald-600 block font-bold">
-                            (Includes +{overheadPct}% freight overhead)
-                          </span>
-                        </div>
-
-                        {po.stage !== 'LANDED_AT_STORE' && (
-                          confirmReceivePoId === po.id ? (
-                            <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
-                              <span className="text-[10px] font-bold text-emerald-900">Confirm?</span>
-                              <button
-                                type="button"
-                                onClick={() => handleAcceptTransitDelivery(po)}
-                                className="px-2 py-0.5 bg-emerald-600 text-white font-black text-[10px] rounded uppercase cursor-pointer"
-                              >
-                                Yes
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setConfirmReceivePoId(null)}
-                                className="px-2 py-0.5 bg-white border border-slate-300 text-slate-600 font-bold text-[10px] rounded uppercase cursor-pointer"
-                              >
-                                No
-                              </button>
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => setConfirmReceivePoId(po.id)}
-                              className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-2 rounded-xl text-xs uppercase tracking-wider shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
-                            >
-                              <PackageCheck size={14} />
-                              <span>Accept Stock at Store</span>
-                            </button>
-                          )
-                        )}
-                      </div>
-                    </div>
-
-                    {/* EXPENSES & ITEMS BREAKDOWN */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50/70 p-4 rounded-xl border border-slate-100 text-xs">
-                      <div>
-                        <span className="font-extrabold text-slate-700 block mb-2 uppercase text-[11px]">Product Line Items</span>
-                        <ul className="space-y-1.5">
-                          {items.map((it: any, idx: number) => {
-                            const ratio = baseTotal > 0 ? (addTotal / baseTotal) : 0;
-                            const landedUnit = it.baseUnitPrice * (1 + ratio);
-                            return (
-                              <li key={idx} className="flex justify-between items-center text-slate-600 border-b border-slate-200/50 pb-1">
-                                <span>{it.quantity}x <strong>{it.productName}</strong></span>
-                                <span className="font-semibold text-slate-800">
-                                  Base: {settings.currency}{it.baseUnitPrice.toFixed(2)} -&gt; <strong className="text-indigo-700">Landed: {settings.currency}{landedUnit.toFixed(2)}/unit</strong>
-                                </span>
-                              </li>
-                            );
-                          })}
-                        </ul>
-                      </div>
-
-                      <div>
-                        <span className="font-extrabold text-slate-700 block mb-2 uppercase text-[11px]">Landing Overhead Expenses</span>
-                        <div className="space-y-1 text-slate-600">
-                          <div className="flex justify-between">
-                            <span>Base Goods Invoice Total:</span>
-                            <span className="font-bold">{settings.currency}{baseTotal.toFixed(2)}</span>
-                          </div>
-                          <div className="flex justify-between text-rose-600 font-medium">
-                            <span>Freight & Customs Landing Fees:</span>
-                            <span>+{settings.currency}{addTotal.toFixed(2)}</span>
-                          </div>
-                          <div className="flex justify-between border-t pt-1 font-black text-slate-900">
-                            <span>Final Landed Inventory Value:</span>
-                            <span>{settings.currency}{landedTotal.toFixed(2)}</span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-
-              {transitPurchasesList.length === 0 && (
-                <div className="bg-white p-12 rounded-2xl border border-slate-200 text-center">
-                  <Truck className="mx-auto text-slate-300 mb-3" size={40} />
-                  <h3 className="text-sm font-bold text-slate-700">No Goods in Transit Currently</h3>
-                  <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
-                    Create a purchase order in transit to track goods prior to store arrival and automatically apportion freight costs to arrive at true landed prices.
+            {/* HEADER & ACTIONS */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col gap-4">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                <div>
+                  <h2 className="text-lg font-black text-slate-900 tracking-tight flex items-center gap-2">
+                    <Truck className="text-indigo-600" size={22} />
+                    <span>Supply Management, Historical Orders & Suppliers</span>
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Create supplier purchase orders, save supplier profiles for repeat orders, adjust landing costs while goods are in transit, and reorder from purchase history.
                   </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={openNewPurchaseOrderModal}
-                    className="mt-4 bg-indigo-600 text-white font-bold px-4 py-2 rounded-xl text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
+                    onClick={() => openSupplierModal()}
+                    className="bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider shadow-2xs transition-all cursor-pointer flex items-center gap-1.5"
                   >
-                    <PackagePlus size={14} />
-                    <span>Create Transit Order</span>
+                    <Users size={15} className="text-indigo-600" />
+                    <span>+ Add Supplier</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openNewPurchaseOrderModal()}
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-4 py-2 rounded-xl text-xs uppercase tracking-wider shadow-md hover:shadow-indigo-200 transition-all cursor-pointer flex items-center gap-1.5"
+                  >
+                    <PackagePlus size={15} />
+                    <span>+ New Purchase Order</span>
                   </button>
                 </div>
-              )}
+              </div>
+
+              {/* SUMMARY METRIC CARDS */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 border-t border-slate-100 pt-3">
+                <div className="bg-amber-50/70 p-3 rounded-xl border border-amber-200/80">
+                  <span className="text-[10px] text-amber-700 font-extrabold uppercase block">Active In Transit</span>
+                  <span className="text-base font-black text-slate-900">
+                    {transitPurchasesList.filter((p) => p.stage !== 'LANDED_AT_STORE').length} Shipment(s)
+                  </span>
+                  <span className="text-[10px] text-amber-700 font-bold block">
+                    {settings.currency}{transitPurchasesList
+                      .filter((p) => p.stage !== 'LANDED_AT_STORE')
+                      .reduce((s, p) => s + Number(p.total_landed_cost || 0), 0)
+                      .toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+
+                <div className="bg-emerald-50/70 p-3 rounded-xl border border-emerald-200/80">
+                  <span className="text-[10px] text-emerald-700 font-extrabold uppercase block">Historical Received</span>
+                  <span className="text-base font-black text-slate-900">
+                    {transitPurchasesList.filter((p) => p.stage === 'LANDED_AT_STORE').length} Order(s)
+                  </span>
+                  <span className="text-[10px] text-emerald-700 font-bold block">
+                    {settings.currency}{transitPurchasesList
+                      .filter((p) => p.stage === 'LANDED_AT_STORE')
+                      .reduce((s, p) => s + Number(p.total_landed_cost || 0), 0)
+                      .toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+
+                <div className="bg-indigo-50/70 p-3 rounded-xl border border-indigo-200/80">
+                  <span className="text-[10px] text-indigo-700 font-extrabold uppercase block">Saved Suppliers</span>
+                  <span className="text-base font-black text-slate-900">
+                    {suppliersList.length} Supplier(s)
+                  </span>
+                  <span className="text-[10px] text-indigo-600 font-semibold block">Ready for quick reorder</span>
+                </div>
+
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-200">
+                  <span className="text-[10px] text-slate-500 font-extrabold uppercase block">Total Supply Spend</span>
+                  <span className="text-base font-black text-slate-900">
+                    {settings.currency}{transitPurchasesList
+                      .reduce((s, p) => s + Number(p.total_landed_cost || 0), 0)
+                      .toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  </span>
+                  <span className="text-[10px] text-slate-500 block">{transitPurchasesList.length} total POs recorded</span>
+                </div>
+              </div>
+
+              {/* VIEW FILTER PILLS + SEARCH & SUPPLIER FILTER */}
+              <div className="flex flex-col lg:flex-row justify-between items-stretch lg:items-center gap-3 pt-1">
+                <div className="flex flex-wrap items-center gap-1.5 bg-slate-100 p-1 rounded-xl w-fit border border-slate-200 text-xs font-extrabold select-none">
+                  <button
+                    type="button"
+                    onClick={() => setSupplyViewFilter('all')}
+                    className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                      supplyViewFilter === 'all'
+                        ? 'bg-white text-indigo-700 shadow-xs font-black'
+                        : 'text-slate-600 hover:text-slate-900 font-bold'
+                    }`}
+                  >
+                    <History size={14} />
+                    <span>All Purchase History ({transitPurchasesList.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSupplyViewFilter('in_transit')}
+                    className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                      supplyViewFilter === 'in_transit'
+                        ? 'bg-white text-amber-700 shadow-xs font-black'
+                        : 'text-slate-600 hover:text-slate-900 font-bold'
+                    }`}
+                  >
+                    <Truck size={14} />
+                    <span>In Transit ({transitPurchasesList.filter((p) => p.stage !== 'LANDED_AT_STORE').length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSupplyViewFilter('received')}
+                    className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                      supplyViewFilter === 'received'
+                        ? 'bg-white text-emerald-700 shadow-xs font-black'
+                        : 'text-slate-600 hover:text-slate-900 font-bold'
+                    }`}
+                  >
+                    <PackageCheck size={14} />
+                    <span>Received History ({transitPurchasesList.filter((p) => p.stage === 'LANDED_AT_STORE').length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSupplyViewFilter('suppliers')}
+                    className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                      supplyViewFilter === 'suppliers'
+                        ? 'bg-white text-indigo-700 shadow-xs font-black'
+                        : 'text-slate-600 hover:text-slate-900 font-bold'
+                    }`}
+                  >
+                    <Users size={14} />
+                    <span>Saved Suppliers ({suppliersList.length})</span>
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative flex-1 sm:w-56">
+                    <Search size={14} className="absolute left-3 top-2.5 text-slate-400" />
+                    <input
+                      type="text"
+                      placeholder="Search PO#, supplier, or item..."
+                      value={supplySearchQuery}
+                      onChange={(e) => setSupplySearchQuery(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-1.5 text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  {supplyViewFilter !== 'suppliers' && (
+                    <select
+                      value={supplySupplierFilter}
+                      onChange={(e) => setSupplySupplierFilter(e.target.value)}
+                      className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                      <option value="ALL">All Suppliers</option>
+                      {Array.from(
+                        new Set([
+                          ...suppliersList.map((s) => String(s.name || '').trim()),
+                          ...transitPurchasesList.map((p) => String(p.supplier_name || '').trim()),
+                        ].filter(Boolean))
+                      )
+                        .sort()
+                        .map((supName) => (
+                          <option key={supName} value={supName}>
+                            {supName}
+                          </option>
+                        ))}
+                    </select>
+                  )}
+                </div>
+              </div>
             </div>
+
+            {poFeedback && (
+              <div
+                className={`px-4 py-3 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
+                  poFeedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-800'
+                    : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {poFeedback.type === 'error' ? <AlertCircle size={15} className="shrink-0" /> : <CheckCircle2 size={15} className="shrink-0" />}
+                  <span>{poFeedback.text}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPoFeedback(null)}
+                  className="text-[10px] font-black uppercase px-2 py-0.5 rounded hover:bg-black/5 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+            {/* SAVED SUPPLIERS DIRECTORY VIEW */}
+            {supplyViewFilter === 'suppliers' ? (
+              <div className="space-y-4">
+                {(() => {
+                  const q = supplySearchQuery.trim().toLowerCase();
+                  const filteredSuppliers = suppliersList.filter((s) => {
+                    if (!q) return true;
+                    return (
+                      String(s.name || '').toLowerCase().includes(q) ||
+                      String(s.contact_person || '').toLowerCase().includes(q) ||
+                      String(s.phone || '').toLowerCase().includes(q) ||
+                      String(s.email || '').toLowerCase().includes(q) ||
+                      String(s.address || '').toLowerCase().includes(q)
+                    );
+                  });
+
+                  if (filteredSuppliers.length === 0) {
+                    return (
+                      <div className="bg-white p-10 rounded-2xl border border-slate-200 text-center">
+                        <Users className="mx-auto text-slate-300 mb-3" size={38} />
+                        <h3 className="text-sm font-bold text-slate-700">No Saved Suppliers Yet</h3>
+                        <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
+                          Save supplier profiles when creating a purchase order or add one here so details auto-fill on subsequent orders.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => openSupplierModal()}
+                          className="mt-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-4 py-2 rounded-xl text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Plus size={14} />
+                          <span>Add First Supplier</span>
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {filteredSuppliers.map((sup) => {
+                        const supOrders = transitPurchasesList.filter(
+                          (po) => String(po.supplier_name || '').trim().toLowerCase() === String(sup.name || '').trim().toLowerCase()
+                        );
+                        const supSpend = supOrders.reduce((sum, po) => sum + Number(po.total_landed_cost || 0), 0);
+                        const lastOrder = supOrders[0] || null;
+
+                        return (
+                          <div key={sup.id} className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-col justify-between gap-3">
+                            <div className="flex justify-between items-start gap-3">
+                              <div>
+                                <h3 className="text-sm font-black text-slate-900">{sup.name}</h3>
+                                {sup.contact_person && (
+                                  <span className="text-[11px] font-semibold text-slate-500 block">
+                                    Contact: {sup.contact_person}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-black uppercase">
+                                {supOrders.length} Order{supOrders.length === 1 ? '' : 's'}
+                              </span>
+                            </div>
+
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-[11px] text-slate-600 bg-slate-50 p-3 rounded-xl border border-slate-100">
+                              <div className="flex items-center gap-1.5">
+                                <Phone size={12} className="text-slate-400 shrink-0" />
+                                <span>{sup.phone || 'No phone saved'}</span>
+                              </div>
+                              <div className="flex items-center gap-1.5 truncate">
+                                <Mail size={12} className="text-slate-400 shrink-0" />
+                                <span className="truncate">{sup.email || 'No email saved'}</span>
+                              </div>
+                              <div className="flex items-center gap-1.5 sm:col-span-2">
+                                <MapPin size={12} className="text-slate-400 shrink-0" />
+                                <span>{sup.address || 'No address saved'}</span>
+                              </div>
+                              {sup.tpin && (
+                                <div className="text-[10px] font-mono font-bold text-slate-500 sm:col-span-2">
+                                  TPIN: {sup.tpin} | Default Pay: {sup.default_payment_method || 'BANK_TRANSFER'}
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-xs">
+                              <div>
+                                <span className="text-[10px] uppercase font-bold text-slate-400 block">Historical Spend</span>
+                                <span className="font-black text-slate-900">
+                                  {settings.currency}{supSpend.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                                </span>
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {lastOrder && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleReorderPurchaseOrder(lastOrder)}
+                                    className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px] rounded-lg uppercase tracking-wider cursor-pointer flex items-center gap-1"
+                                  >
+                                    <RotateCcw size={12} />
+                                    <span>Reorder Last</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => openNewPurchaseOrderModal(sup)}
+                                  className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] rounded-lg uppercase tracking-wider cursor-pointer flex items-center gap-1"
+                                >
+                                  <PackagePlus size={12} />
+                                  <span>New PO</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => openSupplierModal(sup)}
+                                  className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[10px] rounded-lg uppercase cursor-pointer flex items-center gap-1"
+                                >
+                                  <Edit3 size={12} />
+                                  <span>Edit</span>
+                                </button>
+                                {confirmDeleteSupplierId === sup.id ? (
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteSupplier(sup.id)}
+                                      className="px-2 py-1 bg-rose-600 text-white font-bold text-[10px] rounded uppercase cursor-pointer"
+                                    >
+                                      Confirm
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteSupplierId(null)}
+                                      className="px-2 py-1 bg-slate-200 text-slate-700 font-bold text-[10px] rounded uppercase cursor-pointer"
+                                    >
+                                      No
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmDeleteSupplierId(sup.id)}
+                                    title="Remove Supplier"
+                                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg cursor-pointer"
+                                  >
+                                    <Trash size={13} />
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </div>
+            ) : (
+              /* PURCHASE HISTORY & ACTIVE IN-TRANSIT SHIPMENTS LIST */
+              <div className="space-y-4">
+                {(() => {
+                  const q = supplySearchQuery.trim().toLowerCase();
+                  const filteredPos = transitPurchasesList.filter((po) => {
+                    if (supplyViewFilter === 'in_transit' && po.stage === 'LANDED_AT_STORE') return false;
+                    if (supplyViewFilter === 'received' && po.stage !== 'LANDED_AT_STORE') return false;
+                    if (supplySupplierFilter !== 'ALL' && String(po.supplier_name || '').trim() !== supplySupplierFilter) return false;
+                    if (!q) return true;
+                    return (
+                      String(po.id || '').toLowerCase().includes(q) ||
+                      String(po.supplier_name || '').toLowerCase().includes(q) ||
+                      String(po.store_id || '').toLowerCase().includes(q) ||
+                      String(po.items_json || '').toLowerCase().includes(q) ||
+                      String(po.notes || '').toLowerCase().includes(q)
+                    );
+                  });
+
+                  if (filteredPos.length === 0) {
+                    return (
+                      <div className="bg-white p-12 rounded-2xl border border-slate-200 text-center">
+                        <Truck className="mx-auto text-slate-300 mb-3" size={40} />
+                        <h3 className="text-sm font-bold text-slate-700">
+                          {transitPurchasesList.length === 0 ? 'No Purchase History Yet' : 'No Matching Purchase Orders'}
+                        </h3>
+                        <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
+                          Create a purchase order to save supplier details, track goods in transit, update landing costs as freight/customs arrive, and reorder anytime from your history.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => openNewPurchaseOrderModal()}
+                          className="mt-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-4 py-2 rounded-xl text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <PackagePlus size={14} />
+                          <span>Create Purchase Order</span>
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  return filteredPos.map((po) => {
+                    let items: any[] = [];
+                    let addExpenses: any[] = [];
+                    try { items = JSON.parse(po.items_json || '[]'); } catch {}
+                    try { addExpenses = JSON.parse(po.additional_expenses_json || '[]'); } catch {}
+
+                    const baseTotal = Number(po.total_base_amount || 0);
+                    const addTotal = Number(po.total_additional_expenses || 0);
+                    const landedTotal = Number(po.total_landed_cost || 0);
+                    const overheadPct = baseTotal > 0 ? ((addTotal / baseTotal) * 100).toFixed(1) : '0.0';
+                    const matchedSup = suppliersList.find(
+                      (s) => String(s.name || '').trim().toLowerCase() === String(po.supplier_name || '').trim().toLowerCase()
+                    );
+
+                    return (
+                      <div key={po.id} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex flex-col gap-4">
+                        <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-3 border-b border-slate-100 pb-3">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-black text-slate-900 font-mono">PO #{po.id}</span>
+                              <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase ${
+                                po.stage === 'LANDED_AT_STORE'
+                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                  : po.stage === 'CUSTOMS_HANDLING'
+                                  ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                  : 'bg-indigo-100 text-indigo-800 border border-indigo-200'
+                              }`}>
+                                {po.stage === 'LANDED_AT_STORE' ? 'Received at Store' : String(po.stage || 'IN_TRANSIT').replace(/_/g, ' ')}
+                              </span>
+                              <span className="text-[10px] font-bold text-slate-500 uppercase bg-slate-100 px-2 py-0.5 rounded">
+                                Branch: {po.store_id || 'MAIN'}
+                              </span>
+                              <span className="text-[10px] text-slate-400 font-mono">
+                                Ordered: {po.created_at ? new Date(po.created_at).toLocaleDateString() : 'N/A'}
+                                {po.received_at ? ` • Received: ${new Date(po.received_at).toLocaleDateString()}` : ''}
+                              </span>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 mt-1.5">
+                              <span>
+                                Supplier: <strong className="text-slate-900">{po.supplier_name}</strong>
+                              </span>
+                              {matchedSup?.phone && (
+                                <span className="inline-flex items-center gap-1 text-[11px] text-slate-500">
+                                  <Phone size={11} /> {matchedSup.phone}
+                                </span>
+                              )}
+                              {matchedSup?.email && (
+                                <span className="inline-flex items-center gap-1 text-[11px] text-slate-500">
+                                  <Mail size={11} /> {matchedSup.email}
+                                </span>
+                              )}
+                              {po.notes && (
+                                <span className="text-[11px] italic text-slate-500">Note: {po.notes}</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="text-left lg:text-right mr-1">
+                              <span className="text-[10px] text-slate-400 block font-semibold uppercase">Total Landed Cost</span>
+                              <span className="text-base font-black text-slate-900">
+                                {settings.currency}{landedTotal.toFixed(2)}
+                              </span>
+                              <span className="text-[10px] text-emerald-600 block font-bold">
+                                (+{overheadPct}% landing overhead)
+                              </span>
+                            </div>
+
+                            {po.stage !== 'LANDED_AT_STORE' && (
+                              <>
+                                <select
+                                  value={po.stage || 'IN_TRANSIT'}
+                                  onChange={(e) => handleUpdateTransitStage(po.id, e.target.value)}
+                                  title="Update Transit Stage"
+                                  className="bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-2 text-[11px] font-bold text-slate-700 cursor-pointer"
+                                >
+                                  <option value="IN_TRANSIT">In Transit</option>
+                                  <option value="CUSTOMS_HANDLING">Customs & Clearing</option>
+                                  <option value="READY_FOR_RECEIPT">Ready for Receipt</option>
+                                </select>
+
+                                <button
+                                  type="button"
+                                  onClick={() => openEditLandingCostModal(po)}
+                                  className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 font-bold px-3 py-2 rounded-xl text-xs uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1.5"
+                                >
+                                  <Edit3 size={13} />
+                                  <span>Edit Landing Cost</span>
+                                </button>
+                              </>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={() => handleReorderPurchaseOrder(po)}
+                              className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-bold px-3 py-2 rounded-xl text-xs uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1.5"
+                            >
+                              <RotateCcw size={13} />
+                              <span>Reorder</span>
+                            </button>
+
+                            {po.stage !== 'LANDED_AT_STORE' && (
+                              confirmReceivePoId === po.id ? (
+                                <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1.5 rounded-xl">
+                                  <span className="text-[10px] font-bold text-emerald-900">Receive into {(po.store_id || 'MAIN').toUpperCase()}?</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAcceptTransitDelivery(po)}
+                                    className="px-2 py-0.5 bg-emerald-600 text-white font-black text-[10px] rounded uppercase cursor-pointer"
+                                  >
+                                    Yes
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmReceivePoId(null)}
+                                    className="px-2 py-0.5 bg-white border border-slate-300 text-slate-600 font-bold text-[10px] rounded uppercase cursor-pointer"
+                                  >
+                                    No
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmReceivePoId(po.id)}
+                                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-2 rounded-xl text-xs uppercase tracking-wider shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
+                                >
+                                  <PackageCheck size={14} />
+                                  <span>Accept Stock</span>
+                                </button>
+                              )
+                            )}
+                          </div>
+                        </div>
+
+                        {/* EXPENSES & ITEMS BREAKDOWN */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50/70 p-4 rounded-xl border border-slate-100 text-xs">
+                          <div>
+                            <span className="font-extrabold text-slate-700 block mb-2 uppercase text-[11px]">Product Line Items ({items.length})</span>
+                            <ul className="space-y-1.5">
+                              {items.map((it: any, idx: number) => {
+                                const ratio = baseTotal > 0 ? (addTotal / baseTotal) : 0;
+                                const landedUnit = Number(it.baseUnitPrice || 0) * (1 + ratio);
+                                return (
+                                  <li key={idx} className="flex justify-between items-center text-slate-600 border-b border-slate-200/50 pb-1">
+                                    <span>{it.quantity}x <strong>{it.productName}</strong></span>
+                                    <span className="font-semibold text-slate-800">
+                                      Base: {settings.currency}{Number(it.baseUnitPrice || 0).toFixed(2)} -&gt; <strong className="text-indigo-700">Landed: {settings.currency}{landedUnit.toFixed(2)}/unit</strong>
+                                    </span>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+
+                          <div>
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="font-extrabold text-slate-700 uppercase text-[11px]">Landing Overhead Breakdown</span>
+                              {po.stage !== 'LANDED_AT_STORE' && (
+                                <button
+                                  type="button"
+                                  onClick={() => openEditLandingCostModal(po)}
+                                  className="text-[10px] font-black text-indigo-600 hover:text-indigo-800 uppercase cursor-pointer"
+                                >
+                                  + Adjust Costs
+                                </button>
+                              )}
+                            </div>
+                            <div className="space-y-1 text-slate-600">
+                              <div className="flex justify-between">
+                                <span>Base Goods Invoice Total:</span>
+                                <span className="font-bold">{settings.currency}{baseTotal.toFixed(2)}</span>
+                              </div>
+                              {addExpenses.filter((ex) => Number(ex.amount || 0) > 0).map((ex, eIdx) => (
+                                <div key={eIdx} className="flex justify-between text-[11px] text-slate-500 pl-2">
+                                  <span>• {ex.name}:</span>
+                                  <span className="font-semibold">+{settings.currency}{Number(ex.amount || 0).toFixed(2)}</span>
+                                </div>
+                              ))}
+                              <div className="flex justify-between text-rose-600 font-medium">
+                                <span>Total Landing Fees Added:</span>
+                                <span>+{settings.currency}{addTotal.toFixed(2)}</span>
+                              </div>
+                              <div className="flex justify-between border-t pt-1 font-black text-slate-900">
+                                <span>Final Landed Inventory Value:</span>
+                                <span>{settings.currency}{landedTotal.toFixed(2)}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  });
+                })()}
+              </div>
+            )}
           </motion.div>
         )}
 
@@ -3502,18 +4132,18 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
         )}
       </AnimatePresence>
 
-      {/* NEW PURCHASE ORDER / TRANSIT SHIPMENT MODAL (Accessible from all PO buttons) */}
-      {showNewTransitModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+      {/* NEW / REORDER PURCHASE ORDER MODAL (Portaled above app chrome & bottom menu) */}
+      {typeof document !== 'undefined' && showNewTransitModal && createPortal(
+        <div className="fixed inset-0 z-[9999] bg-slate-950/65 backdrop-blur-sm flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto">
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
-            className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90vh]"
+            className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90dvh] my-auto"
           >
-            <div className="p-4 bg-slate-900 text-white flex justify-between items-center">
+            <div className="p-4 bg-slate-900 text-white flex justify-between items-center shrink-0">
               <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
                 <Truck size={18} className="text-indigo-400" />
-                <span>Create New Purchase Order (Goods in Transit)</span>
+                <span>Create Purchase Order (Supply Management)</span>
               </h3>
               <button
                 type="button"
@@ -3524,7 +4154,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
               </button>
             </div>
 
-            <form onSubmit={handleCreateTransitPurchase} className="p-5 overflow-y-auto space-y-4 flex-1 text-left">
+            <form onSubmit={handleCreateTransitPurchase} className="p-4 sm:p-5 overflow-y-auto overscroll-contain space-y-4 flex-1 min-h-0 text-left">
               {poModalError && (
                 <div className="px-3.5 py-2.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs font-bold flex items-center gap-2">
                   <AlertCircle size={15} className="shrink-0" />
@@ -3532,17 +4162,104 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                 </div>
               )}
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-600 mb-1">Supplier Name *</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Trade Kings / Wholesale Supplier"
-                    value={transitSupplierName}
-                    onChange={(e) => { setTransitSupplierName(e.target.value); setPoModalError(null); }}
-                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  />
+              {/* SAVED SUPPLIER PICKER & DETAILS */}
+              <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <span className="text-xs font-black uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                    <Users size={14} className="text-indigo-600" />
+                    <span>Supplier Information</span>
+                  </span>
+                  {suppliersList.length > 0 && (
+                    <select
+                      value={selectedSupplierId}
+                      onChange={(e) => handleSelectSavedSupplierForPo(e.target.value)}
+                      className="bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                      <option value="">-- Load Saved Supplier ({suppliersList.length}) --</option>
+                      {suppliersList.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}{s.phone ? ` (${s.phone})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">Supplier Name *</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Trade Kings / Wholesale Supplier"
+                      value={transitSupplierName}
+                      onChange={(e) => { setTransitSupplierName(e.target.value); setPoModalError(null); }}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">Contact Person</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Sales Rep / Manager"
+                      value={transitSupplierContact}
+                      onChange={(e) => setTransitSupplierContact(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">Phone / WhatsApp</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. +260 97..."
+                      value={transitSupplierPhone}
+                      onChange={(e) => setTransitSupplierPhone(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">Email</label>
+                    <input
+                      type="email"
+                      placeholder="orders@supplier.com"
+                      value={transitSupplierEmail}
+                      onChange={(e) => setTransitSupplierEmail(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">Address / City</label>
+                    <input
+                      type="text"
+                      placeholder="Supplier warehouse / city"
+                      value={transitSupplierAddress}
+                      onChange={(e) => setTransitSupplierAddress(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-600 mb-1">Supplier TPIN / Tax ID</label>
+                    <input
+                      type="text"
+                      placeholder="Optional Tax ID"
+                      value={transitSupplierTpin}
+                      onChange={(e) => setTransitSupplierTpin(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs font-bold text-indigo-800 cursor-pointer pt-1">
+                  <input
+                    type="checkbox"
+                    checked={saveSupplierProfile}
+                    onChange={(e) => setSaveSupplierProfile(e.target.checked)}
+                    className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span>Save / update supplier profile for subsequent purchase orders</span>
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">Landing Target Branch</label>
                   <select
@@ -3559,9 +4276,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                     )}
                   </select>
                 </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-bold text-slate-600 mb-1">Payment Account Source</label>
                   <select
@@ -3656,18 +4370,37 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                   + Add Item Line
                 </button>
 
-                {/* ADDED ITEMS LIST */}
+                {/* ADDED ITEMS LIST (editable qty & cost for quick adjustments/reorders) */}
                 {transitItems.length > 0 && (
-                  <div className="space-y-1 pt-2">
+                  <div className="space-y-1.5 pt-2">
                     {transitItems.map((it, idx) => (
-                      <div key={idx} className="flex justify-between items-center bg-white p-2 rounded border text-xs text-slate-800">
-                        <span><strong>{it.quantity}x</strong> {it.productName} @ {settings.currency}{it.baseUnitPrice.toFixed(2)}/unit</span>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-slate-900">{settings.currency}{(it.quantity * it.baseUnitPrice).toFixed(2)}</span>
+                      <div key={idx} className="flex flex-wrap justify-between items-center gap-2 bg-white p-2 rounded border text-xs text-slate-800">
+                        <span className="font-bold flex-1 min-w-[140px]">{it.productName}</span>
+                        <div className="flex items-center gap-1.5">
+                          <label className="text-[10px] text-slate-400 font-bold">Qty</label>
+                          <input
+                            type="number"
+                            min="1"
+                            value={it.quantity}
+                            onChange={(e) => handleUpdateTransitItemField(idx, 'quantity', e.target.value)}
+                            className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-1 text-xs font-bold text-slate-900"
+                          />
+                          <label className="text-[10px] text-slate-400 font-bold">@</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={it.baseUnitPrice}
+                            onChange={(e) => handleUpdateTransitItemField(idx, 'baseUnitPrice', e.target.value)}
+                            className="w-20 bg-slate-50 border border-slate-200 rounded px-1.5 py-1 text-xs font-bold text-slate-900"
+                          />
+                          <span className="font-black text-slate-900 min-w-[70px] text-right">
+                            {settings.currency}{(it.quantity * it.baseUnitPrice).toFixed(2)}
+                          </span>
                           <button
                             type="button"
                             onClick={() => handleRemoveTransitItem(idx)}
-                            className="text-rose-500 hover:text-rose-700 cursor-pointer"
+                            className="text-rose-500 hover:text-rose-700 cursor-pointer p-1"
                           >
                             <X size={14} />
                           </button>
@@ -3680,11 +4413,14 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
               {/* ADDITION EXPENSES FOR LANDED COST */}
               <div className="bg-indigo-50/50 p-3.5 rounded-xl border border-indigo-100 space-y-3">
-                <span className="text-xs font-black uppercase tracking-wider text-indigo-900 block">Landing Overhead Expenses (Transport & Customs)</span>
+                <div className="flex flex-wrap justify-between items-center gap-1">
+                  <span className="text-xs font-black uppercase tracking-wider text-indigo-900">Initial Landing Overhead (Editable Later in Transit)</span>
+                  <span className="text-[10px] font-semibold text-indigo-600">Can be updated anytime before stock receipt</span>
+                </div>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   {transitAddExpenses.map((exp, idx) => (
-                    <div key={idx}>
-                      <label className="block text-[10px] font-bold text-indigo-800 mb-1">{exp.name}</label>
+                    <div key={idx} className="relative">
+                      <label className="block text-[10px] font-bold text-indigo-800 mb-1 truncate">{exp.name}</label>
                       <input
                         type="number"
                         step="0.01"
@@ -3702,6 +4438,31 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                     </div>
                   ))}
                 </div>
+                <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-indigo-100">
+                  <input
+                    type="text"
+                    placeholder="Add extra cost label (e.g. Border Duty)"
+                    value={newPoCostName}
+                    onChange={(e) => setNewPoCostName(e.target.value)}
+                    className="flex-1 min-w-[160px] bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-900"
+                  />
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    placeholder="Amount"
+                    value={newPoCostAmount}
+                    onChange={(e) => setNewPoCostAmount(e.target.value)}
+                    className="w-24 bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-900"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddNewPoCostLine}
+                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[11px] rounded-lg cursor-pointer"
+                  >
+                    + Add Cost
+                  </button>
+                </div>
               </div>
 
               <div>
@@ -3715,7 +4476,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                 />
               </div>
 
-              <div className="p-3 bg-slate-900 text-white rounded-xl flex flex-wrap justify-between items-center gap-3 text-xs">
+              <div className="p-3.5 bg-slate-900 text-white rounded-xl flex flex-wrap justify-between items-center gap-3 text-xs">
                 <div>
                   <span className="text-slate-400 block font-semibold">Calculated Total Landed Value</span>
                   <span className="text-lg font-black text-emerald-400">
@@ -3743,7 +4504,360 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
               </div>
             </form>
           </motion.div>
-        </div>
+        </div>,
+        document.body
+      )}
+
+      {/* EDIT LANDING COSTS MODAL (Post-Order Transit Overhead Updates) */}
+      {typeof document !== 'undefined' && editingLandingPo && createPortal(
+        <div className="fixed inset-0 z-[9999] bg-slate-950/65 backdrop-blur-sm flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90dvh] my-auto"
+          >
+            <div className="p-4 bg-slate-900 text-white flex justify-between items-center shrink-0">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
+                  <Edit3 size={17} className="text-amber-400" />
+                  <span>Edit Transit Landing Costs — PO #{editingLandingPo.id}</span>
+                </h3>
+                <p className="text-[11px] text-slate-300 mt-0.5">
+                  Supplier: {editingLandingPo.supplier_name} • Update freight, customs, insurance & transit charges incurred along transit
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setEditingLandingPo(null); setEditLandingError(null); }}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditedLandingCost} className="p-4 sm:p-5 overflow-y-auto overscroll-contain space-y-4 flex-1 min-h-0 text-left">
+              {editLandingError && (
+                <div className="px-3.5 py-2.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs font-bold flex items-center gap-2">
+                  <AlertCircle size={15} className="shrink-0" />
+                  <span>{editLandingError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Transit Stage</label>
+                  <select
+                    value={editLandingStage}
+                    onChange={(e) => setEditLandingStage(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-bold text-slate-900"
+                  >
+                    <option value="IN_TRANSIT">In Transit</option>
+                    <option value="CUSTOMS_HANDLING">Customs &amp; Clearing</option>
+                    <option value="READY_FOR_RECEIPT">Ready for Store Receipt</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Waybill / Transit Notes</label>
+                  <input
+                    type="text"
+                    value={editLandingNotes}
+                    onChange={(e) => setEditLandingNotes(e.target.value)}
+                    placeholder="Border ref, clearing agent, tracking note..."
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-indigo-50/50 p-3.5 rounded-xl border border-indigo-100 space-y-2.5">
+                <span className="text-xs font-black uppercase tracking-wider text-indigo-900 block">
+                  Landing Cost Breakdown ({editLandingExpenses.length} line item{editLandingExpenses.length === 1 ? '' : 's'})
+                </span>
+
+                <div className="space-y-2">
+                  {editLandingExpenses.map((ex, idx) => (
+                    <div key={idx} className="flex flex-wrap sm:flex-nowrap items-center gap-2 bg-white p-2 rounded-xl border border-indigo-100">
+                      <input
+                        type="text"
+                        value={ex.name}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setEditLandingExpenses((prev) => prev.map((row, i) => (i === idx ? { ...row, name: val } : row)));
+                        }}
+                        className="flex-1 min-w-[150px] bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
+                      />
+                      <select
+                        value={ex.category}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setEditLandingExpenses((prev) => prev.map((row, i) => (i === idx ? { ...row, category: val } : row)));
+                        }}
+                        className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-[11px] font-bold text-slate-700"
+                      >
+                        <option value="Freight">Freight</option>
+                        <option value="Customs">Customs</option>
+                        <option value="Handling">Handling</option>
+                        <option value="Insurance">Insurance</option>
+                        <option value="Other">Other</option>
+                      </select>
+                      <div className="relative w-28">
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          value={ex.amount || ''}
+                          placeholder="0.00"
+                          onChange={(e) => {
+                            const val = Math.max(0, parseFloat(e.target.value) || 0);
+                            setEditLandingExpenses((prev) => prev.map((row, i) => (i === idx ? { ...row, amount: val } : row)));
+                          }}
+                          className="w-full bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-black text-slate-900 text-right"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setEditLandingExpenses((prev) => prev.filter((_, i) => i !== idx))}
+                        className="text-rose-500 hover:text-rose-700 p-1 cursor-pointer"
+                        title="Remove cost line"
+                      >
+                        <Trash size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Add new transit expense discovered in transit */}
+                <div className="pt-2 border-t border-indigo-100 space-y-2">
+                  <span className="text-[10px] font-black uppercase text-indigo-700 block">+ Add Additional Transit Cost</span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="e.g. Border Duty / Escort / Demurrage"
+                      value={newEditCostName}
+                      onChange={(e) => setNewEditCostName(e.target.value)}
+                      className="flex-1 min-w-[160px] bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-900"
+                    />
+                    <select
+                      value={newEditCostCategory}
+                      onChange={(e) => setNewEditCostCategory(e.target.value)}
+                      className="bg-white border border-indigo-200 rounded-lg px-2 py-1.5 text-xs font-bold text-slate-700"
+                    >
+                      <option value="Freight">Freight</option>
+                      <option value="Customs">Customs</option>
+                      <option value="Handling">Handling</option>
+                      <option value="Insurance">Insurance</option>
+                      <option value="Other">Other</option>
+                    </select>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="Amount"
+                      value={newEditCostAmount}
+                      onChange={(e) => setNewEditCostAmount(e.target.value)}
+                      className="w-24 bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-900"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAddEditLandingCostLine}
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-lg cursor-pointer"
+                    >
+                      + Add Line
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* LIVE RECALCULATED LANDED SUMMARY */}
+              {(() => {
+                const baseTotal = Number(editingLandingPo.total_base_amount || 0);
+                const newAddTotal = editLandingExpenses.reduce((s, ex) => s + Math.max(0, Number(ex.amount || 0)), 0);
+                const newLanded = baseTotal + newAddTotal;
+                const overheadPct = baseTotal > 0 ? ((newAddTotal / baseTotal) * 100).toFixed(1) : '0.0';
+                return (
+                  <div className="p-3.5 bg-slate-900 text-white rounded-xl flex flex-wrap justify-between items-center gap-3 text-xs">
+                    <div className="space-y-0.5">
+                      <span className="text-slate-400 block font-semibold">
+                        Base Invoice: {settings.currency}{baseTotal.toFixed(2)} + Transit Fees: {settings.currency}{newAddTotal.toFixed(2)} (+{overheadPct}%)
+                      </span>
+                      <span className="text-lg font-black text-emerald-400 block">
+                        Updated Total Landed Cost: {settings.currency}{newLanded.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => { setEditingLandingPo(null); setEditLandingError(null); }}
+                        className="bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        className="bg-emerald-500 hover:bg-emerald-600 text-white font-extrabold px-4 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Save size={14} />
+                        <span>Save Landing Cost</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </form>
+          </motion.div>
+        </div>,
+        document.body
+      )}
+
+      {/* ADD / EDIT SUPPLIER MODAL (Portaled above app chrome & bottom menu) */}
+      {typeof document !== 'undefined' && showSupplierModal && createPortal(
+        <div className="fixed inset-0 z-[9999] bg-slate-950/65 backdrop-blur-sm flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90dvh] my-auto"
+          >
+            <div className="p-4 bg-slate-900 text-white flex justify-between items-center shrink-0">
+              <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
+                <Users size={17} className="text-indigo-400" />
+                <span>{editingSupplier ? 'Edit Saved Supplier' : 'Save New Supplier Profile'}</span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => { setShowSupplierModal(false); setSupplierFormError(null); }}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveSupplierForm} className="p-4 sm:p-5 overflow-y-auto overscroll-contain space-y-3.5 flex-1 min-h-0 text-left">
+              {supplierFormError && (
+                <div className="px-3.5 py-2.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs font-bold flex items-center gap-2">
+                  <AlertCircle size={15} className="shrink-0" />
+                  <span>{supplierFormError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Supplier Business Name *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Trade Kings Distributors Ltd"
+                    value={supplierFormName}
+                    onChange={(e) => setSupplierFormName(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Contact Person</label>
+                  <input
+                    type="text"
+                    placeholder="Account manager / sales rep"
+                    value={supplierFormContact}
+                    onChange={(e) => setSupplierFormContact(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Phone / WhatsApp</label>
+                  <input
+                    type="text"
+                    placeholder="+260..."
+                    value={supplierFormPhone}
+                    onChange={(e) => setSupplierFormPhone(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Email</label>
+                  <input
+                    type="email"
+                    placeholder="orders@supplier.com"
+                    value={supplierFormEmail}
+                    onChange={(e) => setSupplierFormEmail(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">TPIN / Tax ID</label>
+                  <input
+                    type="text"
+                    placeholder="Taxpayer ID"
+                    value={supplierFormTpin}
+                    onChange={(e) => setSupplierFormTpin(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Physical Address</label>
+                  <input
+                    type="text"
+                    placeholder="Warehouse / Industrial street address"
+                    value={supplierFormAddress}
+                    onChange={(e) => setSupplierFormAddress(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Default Payment Method</label>
+                  <select
+                    value={supplierFormPayMethod}
+                    onChange={(e) => setSupplierFormPayMethod(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900"
+                  >
+                    <option value="BANK_TRANSFER">Bank Wire Transfer</option>
+                    <option value="CASH">Cash</option>
+                    <option value="Airtel Money">Airtel Money</option>
+                    <option value="MTN Mobile Money">MTN Mobile Money</option>
+                    {getCustomPaymentMethods(false).map(cm => (
+                      <option key={cm.id} value={cm.name}>{cm.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Payment Terms</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Net 30 / Pay on Delivery"
+                    value={supplierFormTerms}
+                    onChange={(e) => setSupplierFormTerms(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Supplier Notes</label>
+                  <input
+                    type="text"
+                    placeholder="Lead time, delivery schedule, bank account notes..."
+                    value={supplierFormNotes}
+                    onChange={(e) => setSupplierFormNotes(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => { setShowSupplierModal(false); setSupplierFormError(null); }}
+                  className="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold px-4 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold px-4 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer flex items-center gap-1.5"
+                >
+                  <Save size={14} />
+                  <span>{editingSupplier ? 'Update Supplier' : 'Save Supplier'}</span>
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>,
+        document.body
       )}
 
     </div>

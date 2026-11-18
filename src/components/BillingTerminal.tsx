@@ -40,7 +40,7 @@ import {
   AlertTriangle,
   Zap
 } from 'lucide-react';
-import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider, calculateLoyaltyPoints, isWalkInCustomerName } from '../db';
 import { Product, Customer, StoreSettings, CustomPaymentMethod } from '../types';
 import {
   UserPermissions,
@@ -93,6 +93,7 @@ interface OfflineOrder {
   activeStore: string;
   salesperson?: string;
   type: 'standard' | 'quicksale';
+  loyaltyAwarded?: boolean;
 }
 
 export default function BillingTerminal({ 
@@ -149,6 +150,7 @@ export default function BillingTerminal({
   const [quickSelectedProduct, setQuickSelectedProduct] = useState<Product | null>(null);
   const [quickSaleQty, setQuickSaleQty] = useState<string>('1');
   const [quickPaymentMethod, setQuickPaymentMethod] = useState<string>('Cash');
+  const [quickSelectedCustomerId, setQuickSelectedCustomerId] = useState<string>('');
 
   // Invoice History and Refund state management
   const [showInvoiceHistoryModal, setShowInvoiceHistoryModal] = useState(false);
@@ -396,8 +398,8 @@ export default function BillingTerminal({
               `, 'Double Entry: Credit Gross Sales Revenue');
             }
 
-            if (trx.customerId) {
-              const awardPts = Math.floor(trx.totalAmount * settings.loyaltyRatio);
+            if (trx.customerId && !trx.loyaltyAwarded) {
+              const awardPts = calculateLoyaltyPoints(trx.totalAmount);
               if (awardPts > 0) {
                 runSql(`UPDATE customers SET loyalPoints = loyalPoints + ${awardPts} WHERE id = ${trx.customerId}`, 'Loyalty: Accrue pts');
               }
@@ -1280,9 +1282,15 @@ export default function BillingTerminal({
       addText(`Cash Tended:    ${settings.currency}${receipt.cashReceived.toFixed(2)}`);
       addText(`Return Change:  ${settings.currency}${receipt.change.toFixed(2)}`);
     }
-    if (receipt.customer) {
+    if (receipt.customer && !isWalkInCustomerName(receipt.customer.name)) {
+      const earnedPts = receipt.loyaltyPointsEarned !== undefined
+        ? receipt.loyaltyPointsEarned
+        : calculateLoyaltyPoints(receipt.total, settings.loyaltyRatio);
       addText(`Customer:       ${receipt.customer.name}`);
-      addText(`Points Gained:  +${Math.floor(receipt.total * settings.loyaltyRatio)} PTS`);
+      addText(`Points Gained:  +${earnedPts} PTS`);
+      if (receipt.customerTotalPoints !== null && receipt.customerTotalPoints !== undefined) {
+        addText(`Total Balance:  ${receipt.customerTotalPoints} PTS`);
+      }
     }
 
     addBytes([0x1B, 0x61, 0x01], 'Align Center');
@@ -1456,7 +1464,9 @@ export default function BillingTerminal({
       if (branchInfo.email) ticketHeight += 5;
       if (settings.receiptHeader) ticketHeight += 6;
       if (settings.tpin) ticketHeight += 5;
-      if (receipt.customer) ticketHeight += 5;
+      if (receipt.customer) {
+        ticketHeight += isWalkInCustomerName(receipt.customer.name) ? 5 : 14;
+      }
       
       ticketHeight += nameLinesTotalHeight;
       ticketHeight += 22; // Subtotal, tax, and totals
@@ -1601,6 +1611,23 @@ export default function BillingTerminal({
         doc.setFont('times', 'normal');
         doc.text(`${receipt.customer.name}`, rightMargin, headingOffset, { align: 'right' });
         headingOffset += 4;
+        if (!isWalkInCustomerName(receipt.customer.name)) {
+          const earnedPts = receipt.loyaltyPointsEarned !== undefined
+            ? receipt.loyaltyPointsEarned
+            : calculateLoyaltyPoints(receipt.total, settings.loyaltyRatio);
+          doc.setFont('times', 'bold');
+          doc.text('POINTS EARNED:', leftMargin, headingOffset);
+          doc.setFont('times', 'normal');
+          doc.text(`+${earnedPts} PTS`, rightMargin, headingOffset, { align: 'right' });
+          headingOffset += 4;
+          if (receipt.customerTotalPoints !== null && receipt.customerTotalPoints !== undefined) {
+            doc.setFont('times', 'bold');
+            doc.text('LOYALTY BALANCE:', leftMargin, headingOffset);
+            doc.setFont('times', 'normal');
+            doc.text(`${receipt.customerTotalPoints} PTS`, rightMargin, headingOffset, { align: 'right' });
+            headingOffset += 4;
+          }
+        }
       }
 
       // Divider Line
@@ -1875,12 +1902,12 @@ export default function BillingTerminal({
 
     const insertSql = `
       INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id)
-      VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 10, '${checkedTpin}', 0, 'A - Standard Rate (16%)', 'default_biz')
+      VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 0, '${checkedTpin}', 0, 'A - Standard Rate (16%)', 'default_biz')
     `;
 
     const res = runSql(insertSql, `Registry Checkout Action: Directly save client [${cleanName}]`);
     if (res.success) {
-      alert(`✓ Customer "${cleanName}" is successfully registered in your Database!\n\nThis client has been added to the master Loyal Members Registry and allocated 10 reward points for future purchases.`);
+      alert(`✓ Customer "${cleanName}" is successfully registered in your Database!\n\nThis client has been added to the master Loyal Members Registry and will earn ${Number(settings.loyaltyRatio || 0)} pts per ${settings.currency || '$'}1 on checkout.`);
       
       // Refresh list
       const custResult = runSql('SELECT * FROM customers', 'Register: Refresh customer profiles database action');
@@ -1950,7 +1977,7 @@ export default function BillingTerminal({
 
         const insertSql = `
           INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id)
-          VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 10, '${checkedTpin}', 0, 'A - Standard Rate (16%)', 'default_biz')
+          VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 0, '${checkedTpin}', 0, 'A - Standard Rate (16%)', 'default_biz')
         `;
 
         const res = runSql(insertSql, `Auto-Registry On: Automatically save client [${cleanName}]`);
@@ -2852,11 +2879,34 @@ export default function BillingTerminal({
     const taxAmountQS = subtotalAmt * (activeTaxRate / 100);
     const totalAmountQS = subtotalAmt + taxAmountQS;
 
+    const quickCustomer = quickSelectedCustomerId
+      ? customers.find(c => String(c.id) === String(quickSelectedCustomerId)) || null
+      : null;
+    const quickIsNamedCust = Boolean(quickCustomer && !isWalkInCustomerName(quickCustomer.name));
+    const quickAwardPts = quickIsNamedCust
+      ? calculateLoyaltyPoints(totalAmountQS, settings.loyaltyRatio)
+      : 0;
+    let syncedQuickCustomer = quickCustomer;
+    if (quickIsNamedCust && quickCustomer) {
+      syncedQuickCustomer = upsertCustomerSync({
+        id: quickCustomer.id,
+        name: quickCustomer.name,
+        phone: quickCustomer.phone,
+        email: quickCustomer.email,
+        tpin: quickCustomer.tpin,
+        loyalPointsDelta: quickAwardPts
+      }) || quickCustomer;
+      const custRes = runSql('SELECT * FROM customers ORDER BY name ASC', 'Quick Sale: Refresh customer points');
+      if (custRes.success && Array.isArray(custRes.data)) {
+        setCustomers(custRes.data);
+      }
+    }
+
     // If offline, store standard parameters in offlineQueue
     if (!isDeviceOnline) {
       const newOfflineQS: OfflineOrder = {
         orderId,
-        customerId: null,
+        customerId: syncedQuickCustomer ? String(syncedQuickCustomer.id) : null,
         items: [{ product: quickSelectedProduct, quantity: qty }],
         dateStr,
         subtotal: subtotalAmt,
@@ -2866,7 +2916,8 @@ export default function BillingTerminal({
         paymentMethod: quickPaymentMethod,
         activeStore,
         salesperson,
-        type: 'quicksale'
+        type: 'quicksale',
+        loyaltyAwarded: quickIsNamedCust
       };
 
       const updatedQueue = [...offlineQueue, newOfflineQS];
@@ -2957,7 +3008,16 @@ export default function BillingTerminal({
         doc.setFont('helvetica', 'bold');
         doc.text('GRAND TOTAL AMOUNT:', 52, qsY, { align: 'right' });
         doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
-        qsY += 8;
+        qsY += 5;
+
+        if (quickIsNamedCust && syncedQuickCustomer) {
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(5.5);
+          doc.text(`Customer: ${syncedQuickCustomer.name}`, 4, qsY); qsY += 3.5;
+          doc.text(`Loyalty Earned: +${quickAwardPts} PTS (Bal: ${syncedQuickCustomer.loyalPoints ?? 0} PTS)`, 4, qsY); qsY += 4;
+        } else {
+          qsY += 3;
+        }
         
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(5);
@@ -2971,11 +3031,12 @@ export default function BillingTerminal({
         console.error('Failed generating quick sale offline PDF:', pdfErr);
       }
 
-      alert(`✓ Quick Sale Offline Queued!\n\nTicket Ref: ${orderId}\nInvoice value: ${settings.currency}${totalAmountQS.toFixed(2)}\nSalesperson: ${salesperson}\n\nPDF Receipt has been generated & downloaded! It has been successfully saved to your local offline queue.`);
+      alert(`✓ Quick Sale Offline Queued!\n\nTicket Ref: ${orderId}\nInvoice value: ${settings.currency}${totalAmountQS.toFixed(2)}\nSalesperson: ${salesperson}${quickIsNamedCust && syncedQuickCustomer ? `\nCustomer: ${syncedQuickCustomer.name} (+${quickAwardPts} PTS)` : ''}\n\nPDF Receipt has been generated & downloaded! It has been successfully saved to your local offline queue.`);
 
       setQuickSearchQuery('');
       setQuickSelectedProduct(null);
       setQuickSaleQty('1');
+      setQuickSelectedCustomerId('');
       setShowQuickSaleModal(false);
       persistTablesToStorage();
       return;
@@ -2985,7 +3046,7 @@ export default function BillingTerminal({
     const orderInsertSql = `
       INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
         '${orderId}', 
-        NULL, 
+        ${syncedQuickCustomer ? syncedQuickCustomer.id : 'NULL'}, 
         '${dateStr}', 
         ${subtotalAmt.toFixed(2)}, 
         ${taxAmountQS.toFixed(2)}, 
@@ -3196,7 +3257,16 @@ export default function BillingTerminal({
         doc.setFont('helvetica', 'bold');
         doc.text('GRAND TOTAL AMOUNT:', 52, qsY, { align: 'right' });
         doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
-        qsY += 6;
+        qsY += 5;
+
+        if (quickIsNamedCust && syncedQuickCustomer) {
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(5.5);
+          doc.text(`Customer: ${syncedQuickCustomer.name}`, 4, qsY); qsY += 3.5;
+          doc.text(`Loyalty Earned: +${quickAwardPts} PTS (Bal: ${syncedQuickCustomer.loyalPoints ?? 0} PTS)`, 4, qsY); qsY += 4;
+        } else {
+          qsY += 1;
+        }
 
         if (qsZraResult.zraData && qsZraResult.zraData.status === 'FISCALIZED') {
           const z = qsZraResult.zraData;
@@ -3258,13 +3328,14 @@ export default function BillingTerminal({
       }
 
       // 5. Notify inside local session
-      alert(`✓ Quick Sale Confirmed Successfully!\n\nTicket Ref: ${orderId}\nInvoice value: ${settings.currency}${totalAmountQS.toFixed(2)}\nSalesperson: ${salesperson}\n\nPDF Receipt has been generated & downloaded!${sweepMessage}`);
+      alert(`✓ Quick Sale Confirmed Successfully!\n\nTicket Ref: ${orderId}\nInvoice value: ${settings.currency}${totalAmountQS.toFixed(2)}\nSalesperson: ${salesperson}${quickIsNamedCust && syncedQuickCustomer ? `\nCustomer: ${syncedQuickCustomer.name} (+${quickAwardPts} PTS, Total: ${syncedQuickCustomer.loyalPoints ?? 0} PTS)` : ''}\n\nPDF Receipt has been generated & downloaded!${sweepMessage}`);
 
       // 6. Synchronize all double-entry accounting systems immediately, reset states and refresh
       syncAllAccountingSystems(`POS Quick Sale #${orderId}`);
       setQuickSearchQuery('');
       setQuickSelectedProduct(null);
       setQuickSaleQty('1');
+      setQuickSelectedCustomerId('');
       setShowQuickSaleModal(false);
       onCartCheckedOut();
       refreshDbData();
@@ -3294,9 +3365,12 @@ export default function BillingTerminal({
     let localSavedCustomer = selectedCustomer;
 
     const currentCustomerName = selectedCustomer ? selectedCustomer.name : customerName.trim();
-    if (currentCustomerName) {
-      const awardPts = Math.floor(totalAmount * settings.loyaltyRatio);
+    const isNamedCustomer = Boolean(currentCustomerName && !isWalkInCustomerName(currentCustomerName));
+    const awardPts = isNamedCustomer ? calculateLoyaltyPoints(totalAmount, settings.loyaltyRatio) : 0;
+
+    if (isNamedCustomer) {
       const synced = upsertCustomerSync({
+        id: selectedCustomer?.id,
         name: currentCustomerName,
         phone: selectedCustomer ? selectedCustomer.phone : customerPhone.trim(),
         email: selectedCustomer ? selectedCustomer.email : customerAddress.trim(),
@@ -3312,15 +3386,17 @@ export default function BillingTerminal({
           setCustomers(custResult.data);
         }
       }
+    } else {
+      localSavedCustomer = null;
     }
 
     const customerIdVal = activeCustomerId;
     
     const receiptCustomer = {
-      name: customerName.trim() || 'General Walk-in Client',
-      phone: customerPhone.trim() || 'N/A',
-      tpin: customerTpin.trim() || 'N/A',
-      address: customerAddress.trim() || 'N/A',
+      name: isNamedCustomer ? currentCustomerName : 'General Walk-in Client',
+      phone: (localSavedCustomer?.phone || customerPhone.trim() || 'N/A'),
+      tpin: (localSavedCustomer?.tpin || customerTpin.trim() || 'N/A'),
+      address: (localSavedCustomer?.email || customerAddress.trim() || 'N/A'),
     };
 
     const isSplitMethod = paymentMethod === 'Split';
@@ -3336,7 +3412,7 @@ export default function BillingTerminal({
 
       const newOfflineStd: OfflineOrder = {
         orderId,
-        customerId: selectedCustomer ? String(selectedCustomer.id) : null,
+        customerId: activeCustomerId !== 'NULL' ? String(activeCustomerId) : null,
         items: [...cart],
         dateStr,
         subtotal,
@@ -3348,7 +3424,8 @@ export default function BillingTerminal({
         splitMobile: isSplitMethod ? splitMobileValOffline : 0,
         activeStore,
         salesperson: cashierNameOffline,
-        type: 'standard'
+        type: 'standard',
+        loyaltyAwarded: isNamedCustomer
       };
 
       const updatedQueue = [...offlineQueue, newOfflineStd];
@@ -3378,6 +3455,9 @@ export default function BillingTerminal({
           provider: splitMobileProvider
         } : null,
         customer: receiptCustomer,
+        loyaltyPointsEarned: awardPts,
+        customerTotalPoints: localSavedCustomer ? Number(localSavedCustomer.loyalPoints ?? 0) : null,
+        isLoyaltyMember: isNamedCustomer,
         items: [...cart],
         offlinePending: true
       });
@@ -3587,12 +3667,7 @@ export default function BillingTerminal({
       `, 'Double Entry: Credit Inventory Asset Valuation');
     }
 
-    if (selectedCustomer) {
-      const awardPts = Math.floor(totalAmount * settings.loyaltyRatio);
-      if (awardPts > 0) {
-        runSql(`UPDATE customers SET loyalPoints = loyalPoints + ${awardPts} WHERE id = ${selectedCustomer.id}`, 'Loyalty: Accrue pts');
-      }
-    }
+    // Loyalty points were already credited once above via upsertCustomerSync when isNamedCustomer is true.
 
     // Try to run automated credit sweep
     let sweepMessage = '';
@@ -3677,6 +3752,9 @@ export default function BillingTerminal({
         provider: splitMobileProvider
       } : null,
       customer: receiptCustomer,
+      loyaltyPointsEarned: awardPts,
+      customerTotalPoints: localSavedCustomer ? Number(localSavedCustomer.loyalPoints ?? 0) : null,
+      isLoyaltyMember: isNamedCustomer,
       items: [...cart],
       fiscalStatus: zraResult.fiscalStatus,
       zra: zraResult.zraData,
@@ -4679,7 +4757,13 @@ export default function BillingTerminal({
                           type="text"
                           required
                           value={customerName}
-                          onChange={(e) => setCustomerName(e.target.value)}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setCustomerName(val);
+                            if (selectedCustomer && val.trim().toLowerCase() !== (selectedCustomer.name || '').trim().toLowerCase()) {
+                              setSelectedCustomer(null);
+                            }
+                          }}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter') {
                               e.preventDefault();
@@ -4781,6 +4865,24 @@ export default function BillingTerminal({
                         <span className="font-mono font-bold">{customerTpin}</span>
                       </div>
                     )}
+
+                    {/* Club Royalty Accrual Preview based on Settings */}
+                    {(() => {
+                      const activeCustLabel = selectedCustomer ? selectedCustomer.name : customerName.trim();
+                      const willEarn = !isWalkInCustomerName(activeCustLabel)
+                        ? calculateLoyaltyPoints(totalAmount, settings.loyaltyRatio)
+                        : 0;
+                      return (
+                        <div className="flex items-center justify-between text-[9.5px] bg-indigo-50/80 border border-indigo-200 px-2.5 py-1.5 rounded-lg text-indigo-800">
+                          <span className="font-extrabold uppercase tracking-wide">
+                            Club Royalty ({Number(settings.loyaltyRatio || 0)} pts/{settings.currency || '$'}1):
+                          </span>
+                          <span className="font-mono font-black">
+                            {!isWalkInCustomerName(activeCustLabel) ? `+${willEarn} PTS on checkout` : 'Guest (0 PTS)'}
+                          </span>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   <div className="flex gap-2">
@@ -5674,7 +5776,20 @@ export default function BillingTerminal({
                   {activeReceipt.customer && (
                     <div className="p-1.5 mt-2 bg-indigo-50/60 border border-indigo-150 text-[8.5px] rounded-md font-sans">
                       <p className="font-bold text-indigo-900 flex justify-between"><span>Account Profile:</span> <span>{activeReceipt.customer.name}</span></p>
-                      <p className="text-indigo-700 mt-0.5 flex justify-between"><span>Accrued Loyalty Points:</span> <span>+{Math.floor(activeReceipt.total * settings.loyaltyRatio)} PTS</span></p>
+                      {!isWalkInCustomerName(activeReceipt.customer.name) && (
+                        <>
+                          <p className="text-indigo-700 mt-0.5 flex justify-between">
+                            <span>Accrued Loyalty Points:</span>
+                            <span>+{activeReceipt.loyaltyPointsEarned !== undefined ? activeReceipt.loyaltyPointsEarned : calculateLoyaltyPoints(activeReceipt.total, settings.loyaltyRatio)} PTS</span>
+                          </p>
+                          {activeReceipt.customerTotalPoints !== null && activeReceipt.customerTotalPoints !== undefined && (
+                            <p className="text-indigo-900 font-bold mt-0.5 flex justify-between">
+                              <span>Total Loyalty Balance:</span>
+                              <span>{activeReceipt.customerTotalPoints} PTS</span>
+                            </p>
+                          )}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -7525,6 +7640,25 @@ export default function BillingTerminal({
                   )}
                 </div>
 
+                {/* Optional Club Loyalty Customer selector for Quick Sale */}
+                <div>
+                  <label className="text-[10px] text-slate-400 font-extrabold uppercase block mb-1">
+                    Club Royalty Customer (Optional)
+                  </label>
+                  <select
+                    value={quickSelectedCustomerId}
+                    onChange={(e) => setQuickSelectedCustomerId(e.target.value)}
+                    className="w-full px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-slate-800 cursor-pointer"
+                  >
+                    <option value="">-- Guest Walk-in (No Loyalty Points) --</option>
+                    {customers.map((c, idx) => (
+                      <option key={`${c.id}-${idx}`} value={String(c.id)}>
+                        {c.name} ({c.phone || 'No phone'} | {c.loyalPoints || 0} pts)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
                 {/* Quantity and Payment side-by-side */}
                 {quickSelectedProduct && (
                   <div className="grid grid-cols-2 gap-3.5">
@@ -7578,6 +7712,14 @@ export default function BillingTerminal({
                       <span>CHARGE GRAND TOTAL VALUE:</span>
                       <span className="font-mono">{settings.currency}{(quickSelectedProduct.price * parseInt(quickSaleQty || '1') * (1 + settings.taxRate / 100)).toFixed(2)}</span>
                     </div>
+                    {quickSelectedCustomerId && (
+                      <div className="flex justify-between font-mono text-[10px] text-indigo-300 pt-1 border-t border-slate-800 mt-1">
+                        <span>Club Royalty Points Earned ({Number(settings.loyaltyRatio || 0)} pts/{settings.currency || '$'}1):</span>
+                        <span className="font-black">
+                          +{calculateLoyaltyPoints(quickSelectedProduct.price * parseInt(quickSaleQty || '1') * (1 + settings.taxRate / 100), settings.loyaltyRatio)} PTS
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
 

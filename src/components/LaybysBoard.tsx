@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
-import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, getCentralBranches, getCustomPaymentMethods, resolvePaymentMethodBucket } from '../db';
+import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, getCentralBranches, getCustomPaymentMethods, resolvePaymentMethodBucket, calculateLoyaltyPoints, isWalkInCustomerName } from '../db';
 import { 
   Users, 
   Search, 
@@ -522,12 +522,16 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
     const dateStr = new Date().toISOString();
     const itemsJson = JSON.stringify(selectedItems.map(x => ({ id: x.id, name: x.name, quantity: x.quantity, unitPrice: x.price })));
 
-    // Central CRM Customer Synchronization
+    // Central CRM Customer Synchronization (accrue loyalty points strictly from Settings)
+    const depositPoints = isWalkInCustomerName(clientName)
+      ? 0
+      : calculateLoyaltyPoints(depositNum, settings.loyaltyRatio);
     const syncedCust = upsertCustomerSync({
+      id: selectedCustId ? parseInt(selectedCustId, 10) : undefined,
       name: clientName,
       phone: clientPhone,
       email: clientEmail,
-      loyalPointsDelta: Math.floor(depositNum * 0.1) // Accrue initial loyalty points for downpayment
+      loyalPointsDelta: depositPoints
     });
     const finalCustId = syncedCust ? syncedCust.id : 100 + Math.floor(Math.random() * 900);
 
@@ -683,12 +687,16 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       }
       persistTablesToStorage();
 
-      // Sync customer profile and loyalty points into central CRM database
+      // Sync customer profile and loyalty points into central CRM database using Settings ratio
+      const installmentPoints = isWalkInCustomerName(selectedLayby.customer_name)
+        ? 0
+        : calculateLoyaltyPoints(payNum, settings.loyaltyRatio);
       upsertCustomerSync({
+        id: selectedLayby.customer_id ?? undefined,
         name: selectedLayby.customer_name,
         phone: selectedLayby.customer_phone,
         email: selectedLayby.customer_email,
-        loyalPointsDelta: Math.floor(payNum * 0.1)
+        loyalPointsDelta: installmentPoints
       });
 
       // Double-entry record for the incoming payment asset

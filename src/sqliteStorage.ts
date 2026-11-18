@@ -39,6 +39,7 @@ export const ALL_TABLE_NAMES = [
   'expenses',
   'purchases_transit',
   'transit_purchases',
+  'suppliers',
   'money_transfers',
   'assets',
   'equity',
@@ -383,6 +384,21 @@ CREATE TABLE IF NOT EXISTS transit_purchases (
   updated_at TEXT,
   received_at TEXT,
   received_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS suppliers (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  contact_person TEXT,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  tpin TEXT,
+  payment_terms TEXT,
+  default_payment_method TEXT,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS money_transfers (

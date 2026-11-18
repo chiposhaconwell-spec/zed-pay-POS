@@ -30,7 +30,7 @@ import {
   Ban,
   UserCheck
 } from 'lucide-react';
-import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod } from '../db';
+import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod, calculateLoyaltyPoints } from '../db';
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings, CustomPaymentMethod } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
@@ -96,7 +96,7 @@ export default function SettingsPanel({
   const [storeName, setStoreName] = useState(settings.storeName);
   const [currency, setCurrency] = useState(settings.currency);
   const [taxRate, setTaxRate] = useState(settings.taxRate);
-  const [loyaltyRatio, setLoyaltyRatio] = useState(settings.loyaltyRatio);
+  const [loyaltyRatio, setLoyaltyRatio] = useState<string>(String(settings.loyaltyRatio ?? 0));
   const [receiptHeader, setReceiptHeader] = useState(settings.receiptHeader);
   const [receiptFooter, setReceiptFooter] = useState(settings.receiptFooter);
   const [paperWidth, setPaperWidth] = useState<'58mm' | '80mm'>(settings.paperWidth);
@@ -252,7 +252,7 @@ export default function SettingsPanel({
     setStoreName(settings.storeName);
     setCurrency(settings.currency);
     setTaxRate(settings.taxRate);
-    setLoyaltyRatio(settings.loyaltyRatio);
+    setLoyaltyRatio(String(settings.loyaltyRatio ?? 0));
     setReceiptHeader(settings.receiptHeader);
     setReceiptFooter(settings.receiptFooter);
     setPaperWidth(settings.paperWidth);
@@ -541,7 +541,7 @@ export default function SettingsPanel({
       storeName,
       currency,
       taxRate: parseFloat(taxRate as any) || 0,
-      loyaltyRatio: parseFloat(loyaltyRatio as any) || 0,
+      loyaltyRatio: Math.max(0, parseFloat(loyaltyRatio) || 0),
       receiptHeader,
       receiptFooter,
       paperWidth,
@@ -2143,15 +2143,23 @@ export default function SettingsPanel({
                 />
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide">Club loyalty Point per $</label>
+                <label className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide">
+                  Club Royalty Points per {currency || '$'}1 Spent
+                </label>
                 <input
                   type="number"
-                  step="0.1"
+                  step="any"
+                  min="0"
                   value={loyaltyRatio}
-                  onChange={(e) => setLoyaltyRatio(parseFloat(e.target.value) || 0)}
+                  onChange={(e) => setLoyaltyRatio(e.target.value)}
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-505 focus:outline-hidden text-xs rounded-lg font-mono font-bold text-slate-850"
                   required
                 />
+                <span className="text-[9.5px] font-mono text-indigo-600 font-semibold">
+                  {(parseFloat(loyaltyRatio) || 0) > 0
+                    ? `Checkout preview: ${currency || '$'}100.00 = +${calculateLoyaltyPoints(100, parseFloat(loyaltyRatio) || 0)} pts`
+                    : 'Set > 0 to award loyalty points on checkout'}
+                </span>
               </div>
             </div>
 

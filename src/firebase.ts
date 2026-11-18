@@ -725,6 +725,8 @@ export async function backupToCloud(
     'layby_installments',
     'quotations',
     'expenses',
+    'purchases_transit',
+    'suppliers',
     'staff',
     'store_products',
     'payment_methods',

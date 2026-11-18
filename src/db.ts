@@ -540,6 +540,8 @@ export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
     'payment_methods',
     'audit_logs',
     'quotations',
+    'suppliers',
+    'purchases_transit',
     'zra_invoices',
     'zra_sync_queue',
   ]);
@@ -749,12 +751,23 @@ function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<stri
       (c: any) => !legacyStoreIds.has(String(c?.store_id || '').toLowerCase())
     );
   }
+  const legacyOperators = new Set([
+    'alice mwansa',
+    'brian banda',
+    'alice@pos.zm',
+    'brian@pos.zm',
+    'chiposha conwell',
+    'owner@pos.zm',
+    'jane carter',
+    'marcus brody',
+  ]);
   if (Array.isArray(cleaned['audit_logs'])) {
     cleaned['audit_logs'] = cleaned['audit_logs'].filter(
       (a: any) =>
         String(a?.id || '') !== 'AUDIT_1792321282567_rn0mx' &&
         !String(a?.details || '').includes('LBY-8082') &&
-        !legacyStoreIds.has(String(a?.store_id || '').toLowerCase())
+        !legacyStoreIds.has(String(a?.store_id || '').toLowerCase()) &&
+        !legacyOperators.has(String(a?.performed_by || '').trim().toLowerCase())
     );
   }
   if (Array.isArray(cleaned['transactions'])) {
@@ -762,7 +775,9 @@ function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<stri
       const id = String(tx?.id || '');
       const provRef = String(tx?.provider_reference || '');
       const terminal = String(tx?.pos_terminal_id || '').toLowerCase();
+      const perf = String(tx?.performed_by || '').trim().toLowerCase();
       if (legacyTxIds.has(id)) return false;
+      if (legacyOperators.has(perf)) return false;
       if (String(tx?.narration || '').includes('LBY-8082')) return false;
       if (terminal.includes('pos-lusaka') || terminal.includes('pos-ndola') || terminal.includes('pos-kitwe')) {
         return false;
@@ -777,7 +792,7 @@ function scrubLegacyPreseededRows(recovered: Record<string, any[]>): Record<stri
 }
 
 function hasAnyUserCreatedData(recovered: Record<string, any[]>): boolean {
-  const userTables = ['businesses', 'stores', 'products', 'customers', 'orders', 'staff', 'expenses', 'laybys', 'quotations', 'loans'];
+  const userTables = ['businesses', 'stores', 'products', 'customers', 'orders', 'staff', 'expenses', 'laybys', 'quotations', 'loans', 'suppliers', 'purchases_transit'];
   return userTables.some(t => Array.isArray(recovered[t]) && recovered[t].length > 0);
 }
 
@@ -821,6 +836,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     runSql('DROP TABLE IF EXISTS expenses', 'Clean database: Drops old expenses');
     runSql('DROP TABLE IF EXISTS purchases_transit', 'Clean database: Drops old purchases transit');
     runSql('DROP TABLE IF EXISTS transit_purchases', 'Clean database: Drops old transit purchases');
+    runSql('DROP TABLE IF EXISTS suppliers', 'Clean database: Drops old suppliers');
     runSql('DROP TABLE IF EXISTS money_transfers', 'Clean database: Drops old money transfers');
     runSql('DROP TABLE IF EXISTS assets', 'Clean database: Drops old assets');
     runSql('DROP TABLE IF EXISTS equity', 'Clean database: Drops old equity');
@@ -1246,6 +1262,23 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       received_by STRING
     )
   `, 'Durable Schema: Create TRANSIT_PURCHASES procurement table');
+
+  runSql(`
+    CREATE TABLE suppliers (
+      id STRING PRIMARY KEY,
+      name STRING,
+      contact_person STRING,
+      phone STRING,
+      email STRING,
+      address STRING,
+      tpin STRING,
+      payment_terms STRING,
+      default_payment_method STRING,
+      notes STRING,
+      created_at STRING,
+      updated_at STRING
+    )
+  `, 'Durable Schema: Create SUPPLIERS directory table');
 
   runSql(`
     CREATE TABLE money_transfers (
@@ -1721,48 +1754,14 @@ function seedTemplateData(template: SeedTemplate) {
     );
   });
 
-  // Double-entry journal, ledger_entries, transactions, loans, and schedules always start with zero pre-seeded amounts.
-
-  // Seed staff members so user accounts and staff management are ready out of the box
-  runSql(`
-    INSERT INTO staff VALUES (
-      'staff-101',
-      'Alice',
-      'Mwansa',
-      '+260 971 123456',
-      'alice@pos.zm',
-      'Plot 41 Rhodes Park, Lusaka',
-      '2026-01-15',
-      '', '', '', '',
-      6500.00,
-      '{"sales":{"create_sale":true,"apply_discounts":true,"issue_refunds":true,"void_transactions":false},"inventory":{"view_stock":true,"edit_stock":false,"adjust_pricing":false},"customer":{"create_customer":true,"edit_customer":true},"reports":{"view_daily_sales":true,"export_reports":false},"expense":{"record_expense":false},"settings":{"configure_system":false},"staff":{"attendance_management":true,"payroll_management":false,"manage_staff":false},"receipt":{"reprint_receipt":true}}',
-      'default_biz',
-      '1234'
-    )
-  `, 'Seed Staff: Alice Mwansa Cashier Profile');
-
-  runSql(`
-    INSERT INTO staff VALUES (
-      'staff-102',
-      'Brian',
-      'Banda',
-      '+260 962 654321',
-      'brian@pos.zm',
-      'Woodlands, Lusaka',
-      '2026-02-01',
-      '', '', '', '',
-      8500.00,
-      '{"sales":{"create_sale":true,"apply_discounts":true,"issue_refunds":true,"void_transactions":true},"inventory":{"view_stock":true,"edit_stock":true,"adjust_pricing":true},"customer":{"create_customer":true,"edit_customer":true},"reports":{"view_daily_sales":true,"export_reports":true},"expense":{"record_expense":true},"settings":{"configure_system":true},"staff":{"attendance_management":true,"payroll_management":true,"manage_staff":true},"receipt":{"reprint_receipt":true}}',
-      'default_biz',
-      'admin123'
-    )
-  `, 'Seed Staff: Brian Banda Store Manager Profile');
+  // Double-entry journal, ledger_entries, transactions, loans, schedules, and staff accounts always start empty (no preseeded staff profiles).
 }
 
 // ==========================================
 // CENTRALIZED CUSTOMER CRM SYNCHRONIZATION
 // ==========================================
 export interface CustomerSyncData {
+  id?: number;
   name: string;
   phone?: string;
   email?: string;
@@ -1772,18 +1771,65 @@ export interface CustomerSyncData {
   tax_band?: string;
 }
 
+export function isWalkInCustomerName(name?: string | null): boolean {
+  if (!name) return true;
+  const normalized = String(name).trim().toLowerCase();
+  return (
+    !normalized ||
+    normalized === 'general walk-in client' ||
+    normalized === 'walk-in client' ||
+    normalized === 'walk-in customer' ||
+    normalized === 'guest' ||
+    normalized === 'anonymous'
+  );
+}
+
+export function getConfiguredLoyaltyRatio(overrideRatio?: number | string | null): number {
+  if (overrideRatio !== undefined && overrideRatio !== null && overrideRatio !== '') {
+    const parsed = Number(overrideRatio);
+    if (Number.isFinite(parsed)) {
+      return Math.max(0, parsed);
+    }
+  }
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const saved = localStorage.getItem('android_pos_settings');
+      if (saved) {
+        const parsedSettings = JSON.parse(saved);
+        const ratio = Number(parsedSettings?.loyaltyRatio);
+        if (Number.isFinite(ratio)) {
+          return Math.max(0, ratio);
+        }
+      }
+    } catch {}
+  }
+  return 0;
+}
+
+export function calculateLoyaltyPoints(amount: number, overrideRatio?: number | string | null): number {
+  const numericAmount = Number(amount);
+  const ratio = getConfiguredLoyaltyRatio(overrideRatio);
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0 || ratio <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(Number((numericAmount * ratio).toFixed(6))));
+}
+
 export function upsertCustomerSync(data: CustomerSyncData): any {
-  if (!data || !data.name || !data.name.trim()) return null;
+  if (!data || !data.name || !data.name.trim() || isWalkInCustomerName(data.name)) return null;
   const cleanName = data.name.trim();
   const cleanPhone = (data.phone || '').trim();
   const cleanEmail = (data.email || '').trim();
   const cleanTpin = (data.tpin || '').trim();
   
-  // Search for existing customer by phone (if provided and non-empty) or by name
+  // Search for existing customer by explicit ID first, then phone, then name
   let existing: any = null;
   const allCustsRes = runSql('SELECT * FROM customers', 'CRM Sync: Fetch customers for lookup');
   if (allCustsRes.success && Array.isArray(allCustsRes.data)) {
-    if (cleanPhone && cleanPhone !== 'N/A' && cleanPhone.length >= 6) {
+    if (data.id !== undefined && data.id !== null) {
+      existing = allCustsRes.data.find((c: any) => Number(c.id) === Number(data.id));
+    }
+    if (!existing && cleanPhone && cleanPhone !== 'N/A' && cleanPhone.length >= 6) {
       const normalizedInputPhone = cleanPhone.replace(/[\s\-\+\(\)]/g, '');
       existing = allCustsRes.data.find((c: any) => c.phone && c.phone.replace(/[\s\-\+\(\)]/g, '') === normalizedInputPhone);
     }
@@ -1792,13 +1838,14 @@ export function upsertCustomerSync(data: CustomerSyncData): any {
     }
   }
 
+  const pointsToAdd = Math.max(0, Math.round(data.loyalPointsDelta || 0));
+
   if (existing) {
     const custId = existing.id;
     const newPhone = cleanPhone && cleanPhone !== 'N/A' ? cleanPhone : (existing.phone || '');
     const newEmail = cleanEmail && cleanEmail !== 'N/A' ? cleanEmail : (existing.email || '');
     const newTpin = cleanTpin ? cleanTpin : (existing.tpin || '');
-    const pointsToAdd = data.loyalPointsDelta || 0;
-    const newPoints = (existing.loyalPoints || 0) + pointsToAdd;
+    const newPoints = Math.max(0, Number(existing.loyalPoints || 0) + pointsToAdd);
 
     const updateSql = `
       UPDATE customers 
@@ -1813,9 +1860,9 @@ export function upsertCustomerSync(data: CustomerSyncData): any {
     persistTablesToStorage();
     return { ...existing, id: custId, name: cleanName, phone: newPhone, email: newEmail, tpin: newTpin, loyalPoints: newPoints };
   } else {
-    // Insert new customer
+    // Insert new customer starting strictly at 0 + earned delta from checkout
     const newCustId = 500 + Math.floor(Math.random() * 950000);
-    const initialPoints = 5 + (data.loyalPointsDelta || 0);
+    const initialPoints = pointsToAdd;
     const insertSql = `
       INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id)
       VALUES (
@@ -1907,7 +1954,16 @@ export function logEmployeeAudit(
   try {
     const id = `AUDIT_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const nowStr = new Date().toISOString();
-    const user = performedBy || localStorage.getItem('logged_in_user_name') || localStorage.getItem('logged_in_user_email') || 'Staff Operator';
+    const sessionUser =
+      (typeof localStorage !== 'undefined' &&
+        (localStorage.getItem('logged_in_user_name') || localStorage.getItem('logged_in_user_email'))) ||
+      '';
+    const genericRoles = new Set(['owner', 'manager', 'sales', 'finance admin', 'staff operator', 'admin', 'system']);
+    const rawPerformed = (performedBy || '').trim();
+    const user =
+      !rawPerformed || genericRoles.has(rawPerformed.toLowerCase())
+        ? sessionUser || rawPerformed || 'Staff Operator'
+        : rawPerformed;
     const centralFirst = getCentralBranches()[0]?.id || '';
     const store = storeId || localStorage.getItem('active_store_branch') || localStorage.getItem('pos_active_store') || centralFirst;
     const cleanAction = (action || '').replace(/'/g, "''");
@@ -2422,6 +2478,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     const attendanceRes = runSql("SELECT * FROM time_attendance WHERE status = 'PAID'", 'Accounting Sync: Paid Payroll', true);
     const transfersRes = runSql('SELECT * FROM money_transfers ORDER BY transfer_date ASC', 'Accounting Sync: Transfers', true);
     const transitRes = runSql('SELECT * FROM transit_purchases ORDER BY created_at ASC', 'Accounting Sync: Transit POs', true);
+    const purchasesTransitRes = runSql('SELECT * FROM purchases_transit ORDER BY created_at ASC', 'Accounting Sync: Supply Management POs', true);
     const assetsRes = runSql('SELECT * FROM assets', 'Accounting Sync: Assets', true);
     const equityRes = runSql('SELECT * FROM equity', 'Accounting Sync: Equity', true);
     const loansRes = runSql("SELECT * FROM loans WHERE status = 'ACTIVE'", 'Accounting Sync: Active Loans', true);
@@ -2440,6 +2497,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     const paidAttendance: any[] = (attendanceRes.success && Array.isArray(attendanceRes.data)) ? attendanceRes.data : [];
     const transfers: any[] = (transfersRes.success && Array.isArray(transfersRes.data)) ? transfersRes.data : [];
     const transitPos: any[] = (transitRes.success && Array.isArray(transitRes.data)) ? transitRes.data : [];
+    const supplyPos: any[] = (purchasesTransitRes.success && Array.isArray(purchasesTransitRes.data)) ? purchasesTransitRes.data : [];
     const assetsList: any[] = (assetsRes.success && Array.isArray(assetsRes.data)) ? assetsRes.data : [];
     const equityList: any[] = (equityRes.success && Array.isArray(equityRes.data)) ? equityRes.data : [];
     const activeLoans: any[] = (loansRes.success && Array.isArray(loansRes.data)) ? loansRes.data : [];
@@ -3588,9 +3646,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const totalCashEquiv = cashDrawerBal + momoBal + bankCardBal;
 
       const stInvVal = st === 'all' ? totalPhysicalInventoryValue : (invValueByStore[st] || 0);
-      const stTransitVal = transitPos
-        .filter(p => matchStore(p.store_id) && p.status !== 'RECEIVED')
-        .reduce((s, p) => s + Number(p.grand_landed_total || 0), 0);
+      const stTransitVal =
+        transitPos
+          .filter(p => matchStore(p.store_id) && p.status !== 'RECEIVED')
+          .reduce((s, p) => s + Number(p.grand_landed_total || 0), 0) +
+        supplyPos
+          .filter(p => matchStore(p.store_id) && p.stage !== 'LANDED_AT_STORE')
+          .reduce((s, p) => s + Number(p.total_landed_cost || 0), 0);
       const stFixedAssets = st === 'all' || st === defaultFallbackStore ? totalFixedAssetsVal : 0;
       const totalAssets = totalCashEquiv + stInvVal + stTransitVal + stFixedAssets;
 
