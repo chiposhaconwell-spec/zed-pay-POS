@@ -75,7 +75,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
   const [password, setPassword] = useState('1234');
 
   // Checklist Permission Matrices conforming precisely to user specifications
-  const [perms, setPerms] = useState({
+  const DEFAULT_PERMS = {
     sales: { discount: true, gift: false, add_charges: false, give_credit: false },
     inventory: { view_only: true, create: false, edit: false },
     customer: { view_only: true, create: false, edit: false },
@@ -84,7 +84,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     settings: { create_store: false, manage_settings: false },
     staff: { attendance_management: false, payroll_management: false, manage_staff: false },
     receipt: { create_receipt: true, view_all_receipt: true, edit_receipt: false, return_receipt: false }
-  });
+  };
+  const [perms, setPerms] = useState(DEFAULT_PERMS);
+  const [extraPermsMeta, setExtraPermsMeta] = useState<Record<string, any>>({});
   
   // Quick clock in / out selections
   const [quickName, setQuickName] = useState('');
@@ -174,16 +176,8 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     setContractFile('');
     setContractFilename('');
     setEditingStaffId(null);
-    setPerms({
-      sales: { discount: true, gift: false, add_charges: false, give_credit: false },
-      inventory: { view_only: true, create: false, edit: false },
-      customer: { view_only: true, create: false, edit: false },
-      reports: { low_stock: false, expired_stock: false, profits: false, sales: false, payment_modes: false, sold_by: false, top_customers: false },
-      expense: { add_expense: false, modify_expense: false },
-      settings: { create_store: false, manage_settings: false },
-      staff: { attendance_management: false, payroll_management: false, manage_staff: false },
-      receipt: { create_receipt: true, view_all_receipt: true, edit_receipt: false, return_receipt: false }
-    });
+    setPerms(DEFAULT_PERMS);
+    setExtraPermsMeta({});
   };
 
   const handleSaveStaff = (e: React.FormEvent) => {
@@ -199,7 +193,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     }
     
     const salaryNum = parseFloat(basicSalary) || 0;
-    const permissionsString = JSON.stringify(perms);
+    const permissionsString = JSON.stringify({ ...extraPermsMeta, ...perms });
     const staffId = editingStaffId || `staff-${Math.floor(1000 + Math.random() * 9000)}`;
     
     if (editingStaffId) {
@@ -268,24 +262,42 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
 
   const handleEditStaff = (st: any) => {
     setEditingStaffId(st.id);
-    setFirstName(st.first_name);
-    setSurname(st.surname);
-    setContact(st.contact);
-    setEmail(st.email);
-    setResAddress(st.residential_address);
-    setJoiningDate(st.joining_date);
-    setBasicSalary(st.basic_salary.toString());
+    setFirstName(st.first_name || st.name || '');
+    setSurname(st.surname || '');
+    setContact(st.contact || '');
+    setEmail(st.email || '');
+    setResAddress(st.residential_address || '');
+    setJoiningDate(st.joining_date || new Date().toISOString().split('T')[0]);
+    setBasicSalary(String(st.basic_salary ?? '0'));
     setPassword(st.password || '1234');
     setNrcFile(st.nrc_file || '');
     setNrcFilename(st.nrc_filename || '');
     setContractFile(st.contract_file || '');
     setContractFilename(st.contract_filename || '');
     try {
-      if (st.permissions_json) {
-        setPerms(JSON.parse(st.permissions_json));
+      const raw = st.permissions_json ? JSON.parse(st.permissions_json) : null;
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const isObj = (v: any) => v && typeof v === 'object' && !Array.isArray(v);
+        setPerms({
+          sales: { ...DEFAULT_PERMS.sales, ...(isObj(raw.sales) ? raw.sales : {}) },
+          inventory: { ...DEFAULT_PERMS.inventory, ...(isObj(raw.inventory) ? raw.inventory : {}) },
+          customer: { ...DEFAULT_PERMS.customer, ...(isObj(raw.customer) ? raw.customer : {}) },
+          reports: { ...DEFAULT_PERMS.reports, ...(isObj(raw.reports) ? raw.reports : {}) },
+          expense: { ...DEFAULT_PERMS.expense, ...(isObj(raw.expense) ? raw.expense : {}) },
+          settings: { ...DEFAULT_PERMS.settings, ...(isObj(raw.settings) ? raw.settings : {}) },
+          staff: { ...DEFAULT_PERMS.staff, ...(isObj(raw.staff) ? raw.staff : {}) },
+          receipt: { ...DEFAULT_PERMS.receipt, ...(isObj(raw.receipt) ? raw.receipt : {}) }
+        });
+        const { sales: _s, inventory: _i, customer: _c, reports: _r, expense: _e, settings: _st, staff: _sf, receipt: _rc, ...restMeta } = raw;
+        setExtraPermsMeta(restMeta);
+      } else {
+        setPerms(DEFAULT_PERMS);
+        setExtraPermsMeta({});
       }
     } catch (e) {
       console.error(e);
+      setPerms(DEFAULT_PERMS);
+      setExtraPermsMeta({});
     }
     setShowRegisterModal(true);
   };
@@ -751,12 +763,20 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
 
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {staffList.map((st) => {
-              let parsedPerms: any = {};
+              let parsedPerms: Record<string, any> = {};
               try {
-                if (st.permissions_json) parsedPerms = JSON.parse(st.permissions_json);
+                const raw = st.permissions_json ? JSON.parse(st.permissions_json) : null;
+                if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+                  parsedPerms = raw;
+                }
               } catch (e) {
                 console.error(e);
               }
+
+              const activePermissionCount = Object.values(parsedPerms || {}).reduce((sum: number, section: any) => {
+                if (!section || typeof section !== 'object' || Array.isArray(section)) return sum;
+                return sum + Object.values(section).filter((val) => val === true).length;
+              }, 0);
 
               return (
                 <div key={st.id} className="bg-white border border-slate-200 rounded-xl p-4 shadow-3xs hover:shadow-2xs transition-all flex flex-col justify-between">
@@ -764,9 +784,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
                     {/* Member Information Header */}
                     <div className="flex justify-between items-start border-b border-slate-100 pb-3 mb-3">
                       <div>
-                        <h4 className="text-sm font-black text-slate-800">{st.first_name} {st.surname}</h4>
+                        <h4 className="text-sm font-black text-slate-800">{st.first_name || st.name || 'Staff'} {st.surname || ''}</h4>
                         <span className="text-[10px] bg-indigo-50 font-semibold px-2 py-0.5 text-indigo-700 rounded-full mt-1 inline-block uppercase">
-                          K{st.basic_salary}/mo Basic
+                          K{st.basic_salary ?? 0}/mo Basic
                         </span>
                       </div>
                       <div className="flex gap-1">
@@ -854,7 +874,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
                         onClick={() => setViewingStaffDetail(st)}
                         className="text-[10px] font-black text-indigo-700 bg-indigo-50 border border-indigo-150 rounded px-2 py-0.5 text-center cursor-pointer ml-auto hover:bg-indigo-100 transition-all"
                       >
-                        See All ({Object.values(parsedPerms).reduce((sum: number, section: any) => sum + Object.values(section).filter(Boolean).length, 0)} Active)
+                        See All ({activePermissionCount} Active)
                       </button>
                     </div>
                   </div>
@@ -891,11 +911,15 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
 
             <div className="flex flex-col gap-4 font-sans text-xs">
               {['sales', 'inventory', 'customer', 'reports', 'expense', 'settings', 'staff', 'receipt'].map((sectionKey) => {
-                let parsed: any = {};
+                let parsed: Record<string, any> = {};
                 try {
-                  if (viewingStaffDetail.permissions_json) parsed = JSON.parse(viewingStaffDetail.permissions_json);
+                  const raw = viewingStaffDetail.permissions_json ? JSON.parse(viewingStaffDetail.permissions_json) : null;
+                  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+                    parsed = raw;
+                  }
                 } catch(e){}
-                const group = parsed[sectionKey] || {};
+                const rawGroup = parsed[sectionKey];
+                const group = rawGroup && typeof rawGroup === 'object' && !Array.isArray(rawGroup) ? rawGroup : {};
                 const keys = Object.keys(group);
                 
                 return (
