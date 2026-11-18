@@ -1774,7 +1774,7 @@ export default function BillingTerminal({
         headingOffset += 4;
         doc.setFont('times', 'normal');
         doc.setFontSize(is58 ? 5.5 : 6.2);
-        doc.text('FISCAL STATUS: LOCAL_ONLY (ZRA OFF)', midPoint, headingOffset, { align: 'center' });
+        doc.text('FISCAL STATUS: LOCAL_ONLY', midPoint, headingOffset, { align: 'center' });
         headingOffset += 4;
       }
 
@@ -5433,7 +5433,7 @@ export default function BillingTerminal({
                             </div>
                           ) : activeReceipt.fiscalStatus === 'LOCAL_ONLY' ? (
                             <div className="border border-slate-200 bg-slate-50 p-1 rounded-xs mb-2 text-[7px] text-slate-500 text-center font-mono">
-                              FISCAL STATUS: LOCAL_ONLY (ZRA OFF)
+                              FISCAL STATUS: LOCAL_ONLY
                             </div>
                           ) : null}
 
@@ -5705,7 +5705,7 @@ export default function BillingTerminal({
                   </div>
                 ) : activeReceipt.fiscalStatus === 'LOCAL_ONLY' ? (
                   <div className="border border-slate-200 bg-slate-50 p-1.5 rounded-xs mb-2.5 text-[7.5px] text-slate-500 text-center font-mono">
-                    FISCAL STATUS: LOCAL_ONLY (ZRA OFF)
+                    FISCAL STATUS: LOCAL_ONLY
                   </div>
                 ) : null}
 
