@@ -92,7 +92,7 @@ export interface StoreSettings {
   zraConfig?: ZraConfig;
 }
 
-export type ActiveTab = 'billing' | 'inventory' | 'analytics' | 'customers' | 'settings' | 'console' | 'laybys' | 'attendance' | 'quotes' | 'loans' | 'finance' | 'workspace' | 'audit';
+export type ActiveTab = 'billing' | 'inventory' | 'analytics' | 'customers' | 'settings' | 'console' | 'laybys' | 'attendance' | 'quotes' | 'loans' | 'purchase_orders' | 'finance' | 'workspace' | 'audit';
 
 export interface Loan {
   id: string;

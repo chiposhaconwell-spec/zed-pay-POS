@@ -103,6 +103,9 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
 
   // Goods in Transit / Procurement Form states
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
+  const [poModalError, setPoModalError] = useState<string | null>(null);
+  const [poFeedback, setPoFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [confirmReceivePoId, setConfirmReceivePoId] = useState<string | null>(null);
   const [transitSupplierName, setTransitSupplierName] = useState('');
   const [transitStoreId, setTransitStoreId] = useState(activeStore || '');
   const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
@@ -404,17 +407,31 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
     });
   };
 
+  const openNewPurchaseOrderModal = () => {
+    setPoModalError(null);
+    if (!transitStoreId) {
+      setTransitStoreId(activeStore || storesList[0]?.id || 'MAIN');
+    }
+    setShowNewTransitModal(true);
+  };
+
   // Handle PO Goods in Transit Item Add
   const handleAddTransitItem = () => {
-    const qty = parseInt(transitItemQty);
+    setPoModalError(null);
+    const qty = parseInt(transitItemQty, 10);
     const price = parseFloat(transitItemUnitPrice);
     if (isNaN(qty) || qty <= 0 || isNaN(price) || price < 0) {
-      alert('Please enter a valid item quantity and unit price.');
+      setPoModalError('Please enter a valid item quantity (> 0) and unit cost (>= 0).');
+      return;
+    }
+
+    if (!selectedTransitProduct && !customTransitProductName.trim()) {
+      setPoModalError('Please select an existing product or choose "+ Custom Goods Item" and enter an item name.');
       return;
     }
 
     let pId: string | number = 'CUSTOM-' + Date.now();
-    let pName = customTransitProductName || 'Custom Goods Item';
+    let pName = customTransitProductName.trim() || 'Custom Goods Item';
 
     if (selectedTransitProduct && selectedTransitProduct !== 'custom') {
       const found = productList.find(p => String(p.id) === String(selectedTransitProduct));
@@ -422,6 +439,9 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
         pId = found.id;
         pName = found.name;
       }
+    } else if (!customTransitProductName.trim()) {
+      setPoModalError('Please enter a custom item name.');
+      return;
     }
 
     setTransitItems([...transitItems, { productId: pId, productName: pName, quantity: qty, baseUnitPrice: price }]);
@@ -431,56 +451,119 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
     setTransitItemUnitPrice('100');
   };
 
+  const handleRemoveTransitItem = (index: number) => {
+    setTransitItems((prev) => prev.filter((_, i) => i !== index));
+  };
+
   // Handle PO Creation
   const handleSaveTransitOrder = () => {
-    if (transitItems.length === 0) {
-      alert('Please add at least one product item to the purchase order.');
+    setPoModalError(null);
+    let effectiveItems = [...transitItems];
+
+    // If user filled the item line fields without clicking "+ Add Line Item", auto-include it
+    if (effectiveItems.length === 0 && ((selectedTransitProduct && selectedTransitProduct !== 'custom') || customTransitProductName.trim())) {
+      const qty = parseInt(transitItemQty, 10);
+      const price = parseFloat(transitItemUnitPrice);
+      if (!isNaN(qty) && qty > 0 && !isNaN(price) && price >= 0) {
+        let pId: string | number = 'CUSTOM-' + Date.now();
+        let pName = customTransitProductName.trim() || 'Custom Goods Item';
+        if (selectedTransitProduct && selectedTransitProduct !== 'custom') {
+          const found = productList.find(p => String(p.id) === String(selectedTransitProduct));
+          if (found) {
+            pId = found.id;
+            pName = found.name;
+          }
+        }
+        effectiveItems = [{ productId: pId, productName: pName, quantity: qty, baseUnitPrice: price }];
+      }
+    }
+
+    if (effectiveItems.length === 0) {
+      setPoModalError('Please add at least one product item to the purchase order.');
       return;
     }
 
     const poId = 'PO-' + Math.floor(10000 + Math.random() * 90000);
-    const baseTotal = transitItems.reduce((acc, item) => acc + (item.quantity * item.baseUnitPrice), 0);
+    const targetStore = transitStoreId || activeStore || storesList[0]?.id || 'MAIN';
+    const supplierLabel = transitSupplierName.trim() || 'Supplier Outflow';
+    const baseTotal = effectiveItems.reduce((acc, item) => acc + (item.quantity * item.baseUnitPrice), 0);
     const addlTotal = transitAddExpenses.reduce((acc, exp) => acc + Number(exp.amount || 0), 0);
     const grandLandedTotal = baseTotal + addlTotal;
 
-    const itemsJson = JSON.stringify(transitItems);
+    const itemsJson = JSON.stringify(effectiveItems);
     const addlJson = JSON.stringify(transitAddExpenses);
 
-    runSql(
+    const poRes = runSql(
       `INSERT INTO transit_purchases (id, supplier_name, store_id, payment_account, payment_method, base_total, additional_expenses_total, grand_landed_total, status, items_json, additional_expenses_json, notes, created_at)
-       VALUES ('${poId}', '${transitSupplierName.replace(/'/g, "''") || 'Supplier Outflow'}', '${transitStoreId}', '${transitPaymentAcc}', '${transitPaymentMethod}', ${baseTotal}, ${addlTotal}, ${grandLandedTotal}, 'IN_TRANSIT', '${itemsJson.replace(/'/g, "''")}', '${addlJson.replace(/'/g, "''")}', '${transitNotes.replace(/'/g, "''")}', '${new Date().toISOString()}')`,
+       VALUES ('${poId}', '${supplierLabel.replace(/'/g, "''")}', '${targetStore.replace(/'/g, "''")}', '${transitPaymentAcc}', '${transitPaymentMethod.replace(/'/g, "''")}', ${baseTotal}, ${addlTotal}, ${grandLandedTotal}, 'IN_TRANSIT', '${itemsJson.replace(/'/g, "''")}', '${addlJson.replace(/'/g, "''")}', '${transitNotes.replace(/'/g, "''")}', '${new Date().toISOString()}')`,
       'Create Purchase Order'
     );
 
-    logEmployeeAudit('PROCUREMENT', 'Created Purchase Order', `PO #${poId} created for ${transitSupplierName} - Landed Total K${grandLandedTotal.toFixed(2)}`, grandLandedTotal, transitStoreId, 'Finance Admin');
+    if (!poRes.success) {
+      setPoModalError(poRes.error || 'Could not save Purchase Order to database.');
+      return;
+    }
+
+    logEmployeeAudit('PROCUREMENT', 'Created Purchase Order', `PO #${poId} created for ${supplierLabel} - Landed Total K${grandLandedTotal.toFixed(2)}`, grandLandedTotal, targetStore, 'Finance Admin');
     syncAllAccountingSystems(`PO Created #${poId}`);
     persistTablesToStorage();
 
     setShowNewTransitModal(false);
+    setPoModalError(null);
     setTransitSupplierName('');
     setTransitNotes('');
     setTransitItems([]);
+    setSelectedTransitProduct('');
+    setCustomTransitProductName('');
+    setTransitItemQty('10');
+    setTransitItemUnitPrice('100');
+    setTransitAddExpenses([
+      { name: 'Freight & Road Transport', amount: 0, category: 'Freight' },
+      { name: 'Port & Customs Clearing Fee', amount: 0, category: 'Handling' },
+      { name: 'Handling & Offloading', amount: 0, category: 'Handling' }
+    ]);
     loadFinanceData();
     try { window.dispatchEvent(new Event('pos_data_updated')); } catch(e){}
-    alert(`✓ Purchase Order #${poId} logged in Goods in Transit & Double-Entry Ledgers!`);
+    setPoFeedback({
+      type: 'success',
+      text: `✓ Purchase Order #${poId} (${supplierLabel}) created & synced to Goods in Transit and Double-Entry Ledgers!`,
+    });
   };
 
   // Receive PO Inventory
   const handleReceiveTransitOrder = (po: any) => {
-    if (!confirm(`Confirm receipt and stock intake for PO #${po.id}? Stock quantities will be updated in store stock.`)) return;
+    setConfirmReceivePoId(null);
+    const targetStore = String(po.store_id || activeStore || 'MAIN').replace(/'/g, "''");
 
     try {
       const items = JSON.parse(po.items_json || '[]');
       items.forEach((itm: any) => {
+        const qty = Number(itm.quantity || 0);
+        if (qty <= 0) return;
+
         if (itm.productId && !String(itm.productId).startsWith('CUSTOM-')) {
-          runSql(
-            `UPDATE products SET stock = stock + ${Number(itm.quantity)} WHERE id = '${itm.productId}'`,
-            `Intake PO stock ${itm.productName}`
-          );
-          runSql(
-            `UPDATE store_products SET stock = stock + ${Number(itm.quantity)} WHERE product_id = ${itm.productId} AND store_id = '${po.store_id || activeStore || ''}'`,
-            `Intake branch PO stock ${itm.productName}`
-          );
+          const numId = Number(itm.productId);
+          if (Number.isFinite(numId) && numId > 0) {
+            runSql(
+              `UPDATE products SET stock = stock + ${qty} WHERE id = ${numId}`,
+              `Intake PO stock ${itm.productName}`
+            );
+            const spCheck = runSql(
+              `SELECT * FROM store_products WHERE product_id = ${numId} AND store_id = '${targetStore}'`,
+              'Check branch product stock'
+            );
+            if (spCheck.success && Array.isArray(spCheck.data) && spCheck.data.length > 0) {
+              runSql(
+                `UPDATE store_products SET stock = stock + ${qty} WHERE product_id = ${numId} AND store_id = '${targetStore}'`,
+                `Intake branch PO stock ${itm.productName}`
+              );
+            } else {
+              runSql(
+                `INSERT INTO store_products (store_id, product_id, stock) VALUES ('${targetStore}', ${numId}, ${qty})`,
+                `Initialize branch PO stock ${itm.productName}`
+              );
+            }
+          }
         }
       });
     } catch (err) {
@@ -488,7 +571,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
     }
 
     runSql(
-      `UPDATE transit_purchases SET status = 'RECEIVED' WHERE id = '${po.id}'`,
+      `UPDATE transit_purchases SET status = 'RECEIVED' WHERE id = '${String(po.id).replace(/'/g, "''")}'`,
       'Mark PO Received'
     );
 
@@ -497,7 +580,10 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
     persistTablesToStorage();
     loadFinanceData();
     try { window.dispatchEvent(new Event('pos_data_updated')); } catch(e){}
-    alert(`✓ PO #${po.id} stock received and updated in Inventory Asset Valuation!`);
+    setPoFeedback({
+      type: 'success',
+      text: `✓ PO #${po.id} stock received and updated in Inventory Asset Valuation!`,
+    });
   };
 
   // Add Asset & Equity
@@ -1569,13 +1655,36 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
               </div>
 
               <button
-                onClick={() => setShowNewTransitModal(true)}
+                type="button"
+                onClick={openNewPurchaseOrderModal}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl uppercase tracking-wider flex items-center gap-1.5 cursor-pointer shadow-xs"
               >
                 <Plus size={16} />
                 <span>New Purchase Order</span>
               </button>
             </div>
+
+            {poFeedback && (
+              <div
+                className={`px-4 py-3 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
+                  poFeedback.type === 'error'
+                    ? 'bg-rose-50 border-rose-200 text-rose-800'
+                    : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <AlertCircle size={15} className="shrink-0" />
+                  <span>{poFeedback.text}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPoFeedback(null)}
+                  className="text-[10px] font-black uppercase px-2 py-0.5 rounded hover:bg-black/5 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
 
             {/* PO LIST TABLE */}
             <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
@@ -1622,12 +1731,32 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                           </td>
                           <td className="p-3 text-right">
                             {po.status !== 'RECEIVED' && (
-                              <button
-                                onClick={() => handleReceiveTransitOrder(po)}
-                                className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-[10.5px] rounded-lg uppercase tracking-wider cursor-pointer"
-                              >
-                                Intake Stock
-                              </button>
+                              confirmReceivePoId === po.id ? (
+                                <div className="inline-flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleReceiveTransitOrder(po)}
+                                    className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-[10px] rounded-lg uppercase tracking-wider cursor-pointer"
+                                  >
+                                    Confirm Intake
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmReceivePoId(null)}
+                                    className="px-2 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-[10px] rounded-lg uppercase cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmReceivePoId(po.id)}
+                                  className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-[10.5px] rounded-lg uppercase tracking-wider cursor-pointer"
+                                >
+                                  Intake Stock
+                                </button>
+                              )
                             )}
                           </td>
                         </tr>
@@ -1951,23 +2080,48 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   <span>Create Purchase Order (Goods in Transit)</span>
                 </h3>
                 <button
-                  onClick={() => setShowNewTransitModal(false)}
-                  className="p-1 rounded-full text-slate-400 hover:text-slate-600 transition-colors"
+                  type="button"
+                  onClick={() => { setShowNewTransitModal(false); setPoModalError(null); }}
+                  className="p-1 rounded-full text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
                 >
                   <X size={18} />
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {poModalError && (
+                <div className="px-3.5 py-2.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs font-bold flex items-center gap-2">
+                  <AlertCircle size={15} className="shrink-0" />
+                  <span>{poModalError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                 <div>
                   <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">Supplier Name</label>
                   <input
                     type="text"
                     placeholder="e.g. Trade Kings Distributors"
                     value={transitSupplierName}
-                    onChange={(e) => setTransitSupplierName(e.target.value)}
+                    onChange={(e) => { setTransitSupplierName(e.target.value); setPoModalError(null); }}
                     className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
                   />
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">Target Branch</label>
+                  <select
+                    value={transitStoreId}
+                    onChange={(e) => setTransitStoreId(e.target.value)}
+                    className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
+                  >
+                    {storesList.length === 0 ? (
+                      <option value={activeStore || 'MAIN'}>{activeStore ? activeStore.toUpperCase() : 'Main Branch'}</option>
+                    ) : (
+                      storesList.map((s) => (
+                        <option key={s.id} value={s.id}>{s.name}</option>
+                      ))
+                    )}
+                  </select>
                 </div>
 
                 <div>
@@ -1995,7 +2149,15 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   <div className="md:col-span-2">
                     <select
                       value={selectedTransitProduct}
-                      onChange={(e) => setSelectedTransitProduct(e.target.value)}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedTransitProduct(val);
+                        setPoModalError(null);
+                        const match = productList.find(p => String(p.id) === String(val));
+                        if (match && Number(match.cost || 0) > 0) {
+                          setTransitItemUnitPrice(String(match.cost));
+                        }
+                      }}
                       className="w-full bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
                     >
                       <option value="">Select Existing Inventory Item...</option>
@@ -2010,7 +2172,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                         type="text"
                         placeholder="Enter item name"
                         value={customTransitProductName}
-                        onChange={(e) => setCustomTransitProductName(e.target.value)}
+                        onChange={(e) => { setCustomTransitProductName(e.target.value); setPoModalError(null); }}
                         className="w-full mt-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800"
                       />
                     )}
@@ -2019,6 +2181,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   <div>
                     <input
                       type="number"
+                      min="1"
                       placeholder="Qty"
                       value={transitItemQty}
                       onChange={(e) => setTransitItemQty(e.target.value)}
@@ -2029,6 +2192,8 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   <div>
                     <input
                       type="number"
+                      step="0.01"
+                      min="0"
                       placeholder="Cost / Unit"
                       value={transitItemUnitPrice}
                       onChange={(e) => setTransitItemUnitPrice(e.target.value)}
@@ -2047,23 +2212,36 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
               </div>
 
               {/* LIST OF ADDED ITEMS */}
-              <div className="max-h-36 overflow-y-auto space-y-1.5 border-t border-b border-slate-100 py-2">
-                {transitItems.map((itm, idx) => (
-                  <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 p-2 rounded-lg">
-                    <span className="font-bold text-slate-800">{itm.productName} (x{itm.quantity})</span>
-                    <span className="font-black text-slate-900">{settings.currency}{(itm.quantity * itm.baseUnitPrice).toFixed(2)}</span>
-                  </div>
-                ))}
-              </div>
+              {transitItems.length > 0 && (
+                <div className="max-h-36 overflow-y-auto space-y-1.5 border-t border-b border-slate-100 py-2">
+                  {transitItems.map((itm, idx) => (
+                    <div key={idx} className="flex justify-between items-center text-xs bg-slate-50 p-2 rounded-lg">
+                      <span className="font-bold text-slate-800">{itm.productName} (x{itm.quantity} @ {settings.currency}{itm.baseUnitPrice.toFixed(2)})</span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-black text-slate-900">{settings.currency}{(itm.quantity * itm.baseUnitPrice).toFixed(2)}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveTransitItem(idx)}
+                          className="text-rose-500 hover:text-rose-700 cursor-pointer"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <div className="flex justify-end gap-2 pt-2">
                 <button
-                  onClick={() => setShowNewTransitModal(false)}
+                  type="button"
+                  onClick={() => { setShowNewTransitModal(false); setPoModalError(null); }}
                   className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-xs rounded-xl uppercase cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
+                  type="button"
                   onClick={handleSaveTransitOrder}
                   className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl uppercase cursor-pointer shadow-xs"
                 >

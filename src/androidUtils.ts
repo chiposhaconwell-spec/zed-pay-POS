@@ -1,13 +1,78 @@
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import type { jsPDF } from 'jspdf';
+
+export type ApkShareTarget = 'chooser' | 'bluetooth' | 'quickshare' | 'whatsapp';
+
+interface ShareApkPluginInterface {
+  getApkInfo(): Promise<{ available: boolean; sizeBytes: number; packageName: string }>;
+  shareInstalledApk(options: {
+    target?: ApkShareTarget;
+    fileName?: string;
+    title?: string;
+    message?: string;
+  }): Promise<{ shared: boolean; target: string; fileName: string; sizeBytes: number }>;
+}
+
+const ShareApk = registerPlugin<ShareApkPluginInterface>('ShareApk');
 
 /**
  * Checks if running on native Android app
  */
 export function isAndroidNative(): boolean {
   return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+}
+
+export async function getNativeApkInfo(): Promise<{ available: boolean; sizeBytes: number; packageName: string } | null> {
+  if (!isAndroidNative()) return null;
+  try {
+    return await ShareApk.getApkInfo();
+  } catch (err) {
+    console.warn('[AndroidUtils] ShareApk.getApkInfo unavailable:', err);
+    return null;
+  }
+}
+
+export async function shareNativeInstalledApk(options: {
+  target: ApkShareTarget;
+  fileName: string;
+  title: string;
+  message: string;
+}): Promise<{ shared: boolean; target?: string; error?: string }> {
+  if (!isAndroidNative()) {
+    return { shared: false, error: 'Native Android APK share requires the installed Android app.' };
+  }
+  try {
+    const res = await ShareApk.shareInstalledApk(options);
+    return { shared: Boolean(res?.shared), target: res?.target };
+  } catch (err: any) {
+    return { shared: false, error: err?.message || 'Unable to invoke Android APK share.' };
+  }
+}
+
+export function canBrowserShareApkFiles(): boolean {
+  try {
+    if (typeof navigator === 'undefined' || typeof navigator.canShare !== 'function') return false;
+    const probe = new File(['PK'], 'app-probe.apk', { type: 'application/vnd.android.package-archive' });
+    return navigator.canShare({ files: [probe] });
+  } catch {
+    return false;
+  }
+}
+
+export async function shareApkFileViaWebShare(file: File, title: string, text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      if (typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })) {
+        await navigator.share({ title, text, files: [file] });
+        return true;
+      }
+    }
+  } catch (err) {
+    console.warn('[AndroidUtils] Web Share APK file failed or cancelled:', err);
+  }
+  return false;
 }
 
 /**

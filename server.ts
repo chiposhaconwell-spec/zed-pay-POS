@@ -285,6 +285,154 @@ app.post('/api/zra/forward', async (req, res) => {
   }
 });
 
+const APK_STORAGE_DIR = '/tmp/pos_apk';
+try {
+  fs.mkdirSync(APK_STORAGE_DIR, { recursive: true });
+} catch {}
+
+function resolveHostedApk(): { filePath: string; filename: string; sizeBytes: number; updatedAt: string } | null {
+  try {
+    const metaPath = path.join(APK_STORAGE_DIR, 'apk-meta.json');
+    if (fs.existsSync(metaPath)) {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      const candidate = path.join(APK_STORAGE_DIR, String(meta?.storedName || ''));
+      if (meta?.storedName && fs.existsSync(candidate)) {
+        const stat = fs.statSync(candidate);
+        return {
+          filePath: candidate,
+          filename: String(meta.filename || meta.storedName),
+          sizeBytes: stat.size,
+          updatedAt: stat.mtime.toISOString(),
+        };
+      }
+    }
+  } catch {}
+
+  const candidatePaths: Array<{ dir: string; exact?: string }> = [
+    { dir: path.join(__dirname, 'public', 'downloads') },
+    { dir: path.join(__dirname, 'android', 'app', 'build', 'outputs', 'apk', 'release'), exact: 'app-release.apk' },
+    { dir: path.join(__dirname, 'android', 'app', 'build', 'outputs', 'apk', 'debug'), exact: 'app-debug.apk' },
+  ];
+
+  for (const item of candidatePaths) {
+    try {
+      if (!fs.existsSync(item.dir)) continue;
+      if (item.exact) {
+        const fp = path.join(item.dir, item.exact);
+        if (fs.existsSync(fp)) {
+          const stat = fs.statSync(fp);
+          return {
+            filePath: fp,
+            filename: item.exact,
+            sizeBytes: stat.size,
+            updatedAt: stat.mtime.toISOString(),
+          };
+        }
+      } else {
+        const apks = fs.readdirSync(item.dir).filter((f) => f.toLowerCase().endsWith('.apk'));
+        if (apks.length > 0) {
+          const fp = path.join(item.dir, apks[0]);
+          const stat = fs.statSync(fp);
+          return {
+            filePath: fp,
+            filename: apks[0],
+            sizeBytes: stat.size,
+            updatedAt: stat.mtime.toISOString(),
+          };
+        }
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function getRequestOrigin(req: express.Request): string {
+  const envAppUrl = process.env.APP_URL && !process.env.APP_URL.includes('MY_APP_URL')
+    ? process.env.APP_URL.replace(/\/$/, '')
+    : '';
+  const forwardedProto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0]?.trim();
+  const proto = forwardedProto || req.protocol || 'https';
+  const host = req.get('host');
+  return envAppUrl || (host ? `${proto}://${host}` : '');
+}
+
+app.get('/api/app/apk-info', (req, res) => {
+  const hosted = resolveHostedApk();
+  const origin = getRequestOrigin(req);
+  if (!hosted) {
+    return res.json({
+      hasApk: false,
+      filename: null,
+      sizeBytes: 0,
+      updatedAt: null,
+      downloadUrl: null,
+      appUrl: origin || null,
+    });
+  }
+  return res.json({
+    hasApk: true,
+    filename: hosted.filename,
+    sizeBytes: hosted.sizeBytes,
+    updatedAt: hosted.updatedAt,
+    downloadUrl: origin ? `${origin}/api/app/download-apk` : '/api/app/download-apk',
+    appUrl: origin || null,
+  });
+});
+
+app.get('/api/app/download-apk', (_req, res) => {
+  const hosted = resolveHostedApk();
+  if (!hosted) {
+    return res.status(404).json({ error: 'No Android APK package is hosted on this server yet.' });
+  }
+  const safeName = hosted.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+  res.setHeader('Cache-Control', 'no-cache');
+  return res.sendFile(hosted.filePath);
+});
+
+app.post(
+  '/api/app/upload-apk',
+  express.raw({
+    type: ['application/octet-stream', 'application/vnd.android.package-archive'],
+    limit: '80mb',
+  }),
+  (req, res) => {
+    try {
+      const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (buf.length < 100 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
+        return res.status(400).json({ error: 'Invalid APK file. Please select a valid compiled .apk package.' });
+      }
+      const rawHeaderName = String(req.headers['x-apk-filename'] || 'RetailPOS.apk');
+      let cleanName = rawHeaderName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      if (!cleanName.toLowerCase().endsWith('.apk')) {
+        cleanName += '.apk';
+      }
+
+      fs.mkdirSync(APK_STORAGE_DIR, { recursive: true });
+      const storedName = 'hosted-app.apk';
+      const targetPath = path.join(APK_STORAGE_DIR, storedName);
+      fs.writeFileSync(targetPath, buf);
+      fs.writeFileSync(
+        path.join(APK_STORAGE_DIR, 'apk-meta.json'),
+        JSON.stringify({ filename: cleanName, storedName, uploadedAt: new Date().toISOString() })
+      );
+
+      const origin = getRequestOrigin(req);
+      return res.json({
+        success: true,
+        hasApk: true,
+        filename: cleanName,
+        sizeBytes: buf.length,
+        downloadUrl: origin ? `${origin}/api/app/download-apk` : '/api/app/download-apk',
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'Failed to store APK binary on server.' });
+    }
+  }
+);
+
 // Setup Vite middleware in dev or static serving in production
 async function startServer() {
   const distPath = path.resolve(__dirname, 'dist');

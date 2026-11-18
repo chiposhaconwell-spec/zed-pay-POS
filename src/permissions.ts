@@ -17,6 +17,7 @@ export type ModulePermissionKey =
   | 'laybys'
   | 'workspace'
   | 'quotes'
+  | 'purchase_orders'
   | 'loans'
   | 'attendance'
   | 'audit'
@@ -66,6 +67,7 @@ export const ALL_MODULE_KEYS: ModulePermissionKey[] = [
   'laybys',
   'workspace',
   'quotes',
+  'purchase_orders',
   'loans',
   'attendance',
   'audit',
@@ -96,7 +98,8 @@ export const MODULE_PERMISSION_OPTIONS: Array<{
   { key: 'laybys', label: 'Layby Functions' },
   { key: 'workspace', label: 'Tasks & Operations' },
   { key: 'quotes', label: 'Quotes, Invoices & Delivery' },
-  { key: 'loans', label: 'Purchase Orders & Loans' },
+  { key: 'purchase_orders', label: 'Purchase Orders & Expenses' },
+  { key: 'loans', label: 'Credit Risk & Swept Capital' },
   { key: 'attendance', label: 'Staff & Payroll' },
   { key: 'audit', label: 'Employee Audit Trail' },
   { key: 'finance', label: 'Finance & P&L' },
@@ -126,7 +129,7 @@ export function getDefaultModulesForRole(role: string): ModulePermissionKey[] {
     return [...ALL_MODULE_KEYS];
   }
   if (norm === 'manager') {
-    return ['billing', 'inventory', 'laybys', 'workspace', 'quotes', 'loans', 'attendance', 'audit', 'finance', 'analytics'];
+    return ['billing', 'inventory', 'laybys', 'workspace', 'quotes', 'purchase_orders', 'loans', 'attendance', 'audit', 'finance', 'analytics'];
   }
   return ['billing', 'laybys', 'workspace', 'quotes'];
 }
@@ -193,7 +196,7 @@ export function buildUserPermissions(params: {
       top_customers: true,
     },
     expense: {
-      add_expense: isSupervisor || allowedModules.includes('finance') || allowedModules.includes('loans'),
+      add_expense: isSupervisor || allowedModules.includes('finance') || allowedModules.includes('purchase_orders') || allowedModules.includes('loans'),
       modify_expense: isSupervisor,
     },
     settings: {

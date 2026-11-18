@@ -47,6 +47,7 @@ import LoanDashboard from './components/LoanDashboard';
 import FinanceDashboard from './components/FinanceDashboard';
 import WorkspaceCoordinator from './components/WorkspaceCoordinator';
 import EmployeeAuditTrail from './components/EmployeeAuditTrail';
+import ShareAppApkModal from './components/ShareAppApkModal';
 
 export const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
@@ -90,6 +91,7 @@ export default function App() {
 
   // Navigation Drawer state (3-lines hamburger)
   const [showNavDrawer, setShowNavDrawer] = useState(false);
+  const [showShareAppModal, setShowShareAppModal] = useState(false);
 
   // Dynamic Enterprise & Multi-Business Gating State (100% Blank on default — no pre-seeded details, branches, or stock)
   const [isAuthenticatedSession, setIsAuthenticatedSession] = useState<boolean>(() => {
@@ -1597,6 +1599,18 @@ export default function App() {
                     <QuotationsCreator settings={settings} activeStore={activeStore} />
                   </motion.div>
                 )}
+                {activeTab === 'purchase_orders' && canViewModule('purchase_orders') && (
+                  <motion.div
+                    key={`purchase_orders_${sqlSeedTrigger}`}
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: 10 }}
+                    transition={{ duration: 0.15 }}
+                    className="flex-1 min-h-0 flex flex-col overflow-hidden"
+                  >
+                    <LoanDashboard settings={settings} userRole={userRole} activeStore={activeStore} mode="procurement" />
+                  </motion.div>
+                )}
                 {activeTab === 'loans' && canViewModule('loans') && (
                   <motion.div
                     key={`loans_${sqlSeedTrigger}`}
@@ -1606,7 +1620,7 @@ export default function App() {
                     transition={{ duration: 0.15 }}
                     className="flex-1 min-h-0 flex flex-col overflow-hidden"
                   >
-                    <LoanDashboard settings={settings} userRole={userRole} activeStore={activeStore} />
+                    <LoanDashboard settings={settings} userRole={userRole} activeStore={activeStore} mode="credit_risk" />
                   </motion.div>
                 )}
                 {activeTab === 'finance' && canViewModule('finance') && (
@@ -2026,7 +2040,7 @@ export default function App() {
                 )}
 
                 {/* Add Expense */}
-                {(normalizeRole(userRole) !== 'sales' || canViewModule('finance') || canViewModule('loans')) && (
+                {(normalizeRole(userRole) !== 'sales' || canViewModule('finance') || canViewModule('purchase_orders')) && (
                   <button
                     onClick={() => {
                       setShowNavDrawer(false);
@@ -2044,11 +2058,11 @@ export default function App() {
                 )}
 
                 {/* Purchase Orders & Outflows */}
-                {canViewModule('loans') && (
+                {canViewModule('purchase_orders') && (
                   <button
                     onClick={() => {
                       setShowNavDrawer(false);
-                      navigateToTab('loans');
+                      navigateToTab('purchase_orders');
                     }}
                     className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
                   >
@@ -2226,6 +2240,9 @@ export default function App() {
                       </div>
                       <span>Credit Risk & Swept Capital</span>
                     </div>
+                    <span className="px-2 py-0.5 bg-blue-100 text-blue-800 border border-blue-200 text-[10px] font-extrabold rounded-full font-mono">
+                      Tab
+                    </span>
                   </button>
 
                   {/* Borrower Statements */}
@@ -2266,11 +2283,12 @@ export default function App() {
                   </button>
                 )}
 
-                {/* Refer App */}
+                {/* Share the App (Direct APK via Bluetooth, WhatsApp, Quick Share) */}
                 <button
+                  type="button"
                   onClick={() => {
                     setShowNavDrawer(false);
-                    alert('Merchant referral link generated and copied to clipboard!');
+                    setShowShareAppModal(true);
                   }}
                   className="flex items-center justify-between p-2 rounded-xl hover:bg-slate-100 text-slate-800 text-xs font-bold transition-all cursor-pointer group"
                 >
@@ -2278,8 +2296,14 @@ export default function App() {
                     <div className="p-1.5 rounded-lg bg-teal-600 text-white shadow-xs group-hover:scale-105 transition-transform">
                       <Share2 size={16} />
                     </div>
-                    <span>Refer App</span>
+                    <div className="flex flex-col text-left">
+                      <span>Share the App (APK)</span>
+                      <span className="text-[9.5px] text-slate-500 font-medium">Bluetooth, WhatsApp &amp; Quick Share</span>
+                    </div>
                   </div>
+                  <span className="px-2 py-0.5 bg-teal-100 text-teal-800 border border-teal-200 text-[9px] font-extrabold rounded-full font-mono">
+                    APK
+                  </span>
                 </button>
 
                 {/* Receipts & Refunds Ledger */}
@@ -2817,6 +2841,11 @@ export default function App() {
           </motion.div>
         </div>
       )}
+      <ShareAppApkModal
+        isOpen={showShareAppModal}
+        onClose={() => setShowShareAppModal(false)}
+        storeName={settings.storeName || activeBusiness.name}
+      />
     </AndroidShell>
   );
 }

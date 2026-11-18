@@ -52,6 +52,7 @@ interface LoanDashboardProps {
   settings: StoreSettings;
   userRole: string; // 'owner' | 'manager' | 'sales'
   activeStore: string;
+  mode?: 'procurement' | 'credit_risk';
 }
 
 export interface Asset {
@@ -68,14 +69,16 @@ export interface Asset {
   linkedEquityId?: string;
 }
 
-export default function LoanDashboard({ settings, userRole, activeStore }: LoanDashboardProps) {
+export default function LoanDashboard({ settings, userRole, activeStore, mode = 'procurement' }: LoanDashboardProps) {
   // DB states Loaded live safely
   const [loans, setLoans] = useState<Loan[]>([]);
   const [amortization, setAmortization] = useState<LoanAmortizationSchedule[]>([]);
   const [deductions, setDeductions] = useState<AutomatedDeductionLog[]>([]);
 
   // Sub-navigation navigation tab state
-  const [subTab, setSubTab] = useState<'expenses' | 'transfers' | 'procurement' | 'statements' | 'loans' | 'assets_equity'>('loans');
+  const [subTab, setSubTab] = useState<'expenses' | 'transfers' | 'procurement' | 'statements' | 'loans' | 'assets_equity'>(
+    mode === 'credit_risk' ? 'loans' : 'expenses'
+  );
   const [expenseSubView, setExpenseSubView] = useState<'all' | 'operating' | 'purchase_orders'>('all');
 
   // DB tables for Expenses, Transfers and Transit Procurement
@@ -110,6 +113,9 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
 
   // Goods in Transit / Procurement Form states
   const [showNewTransitModal, setShowNewTransitModal] = useState(false);
+  const [poFeedback, setPoFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [poModalError, setPoModalError] = useState<string | null>(null);
+  const [confirmReceivePoId, setConfirmReceivePoId] = useState<string | null>(null);
   const [transitSupplierName, setTransitSupplierName] = useState('');
   const [transitStoreId, setTransitStoreId] = useState(activeStore || '');
   const [storesList, setStoresList] = useState<Array<{ id: string; name: string }>>([]);
@@ -514,6 +520,14 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
     localStorage.setItem(`pos_custom_equity_${activeStore}`, JSON.stringify(updated));
   };
 
+  useEffect(() => {
+    if (mode === 'credit_risk') {
+      setSubTab('loans');
+    } else if (subTab === 'loans') {
+      setSubTab('expenses');
+    }
+  }, [mode]);
+
   // Main loads triggers
   useEffect(() => {
     loadData();
@@ -688,8 +702,18 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   };
 
   // --- TRANSIT PROCUREMENT ENGINE ---
+  const openNewPurchaseOrderModal = () => {
+    setPoModalError(null);
+    setPoFeedback(null);
+    if (!transitStoreId) {
+      setTransitStoreId(activeStore || storesList[0]?.id || 'MAIN');
+    }
+    setShowNewTransitModal(true);
+  };
+
   const handleAddTransitItem = () => {
-    let pName = customTransitProductName;
+    setPoModalError(null);
+    let pName = customTransitProductName.trim();
     let pId: string | number = 'custom-' + Date.now();
 
     if (selectedTransitProduct) {
@@ -701,15 +725,15 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
     }
 
     if (!pName) {
-      alert('Please select a product or enter a custom item name.');
+      setPoModalError('Please select a product or enter a custom item name.');
       return;
     }
 
-    const qty = parseInt(transitItemQty);
+    const qty = parseInt(transitItemQty, 10);
     const unitPrice = parseFloat(transitItemUnitPrice);
 
     if (isNaN(qty) || qty <= 0 || isNaN(unitPrice) || unitPrice < 0) {
-      alert('Please enter valid quantity and unit price.');
+      setPoModalError('Please enter valid quantity and unit price.');
       return;
     }
 
@@ -732,61 +756,86 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
 
   const handleCreateTransitPurchase = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!transitSupplierName) {
-      alert('Please enter supplier name.');
+    setPoModalError(null);
+
+    if (!transitSupplierName.trim()) {
+      setPoModalError('Please enter the supplier name.');
       return;
     }
     if (transitItems.length === 0) {
-      alert('Please add at least one product line item.');
+      setPoModalError('Please add at least one product line item using "+ Add Item Line".');
       return;
     }
 
+    const targetBranch = transitStoreId || activeStore || storesList[0]?.id || 'MAIN';
     const totalBase = transitItems.reduce((sum, item) => sum + (item.quantity * item.baseUnitPrice), 0);
     const totalAdditional = transitAddExpenses.reduce((sum, exp) => sum + Number(exp.amount || 0), 0);
     const totalLanded = totalBase + totalAdditional;
 
     const transitId = 'pt-' + Date.now();
     const createdAt = new Date().toISOString();
+    const cleanSupplier = transitSupplierName.trim().replace(/'/g, "''");
+    const cleanNotes = transitNotes.trim().replace(/'/g, "''");
+    const cleanStore = String(targetBranch).replace(/'/g, "''");
+    const cleanPayAcc = String(transitPaymentAcc || 'acc_bank').replace(/'/g, "''");
+    const cleanPayMethod = String(transitPaymentMethod || 'BANK_TRANSFER').replace(/'/g, "''");
 
-    runSql(
-      `INSERT INTO purchases_transit VALUES ('${transitId}', '${transitSupplierName.replace(/'/g, "''")}', '${transitStoreId}', '${transitPaymentAcc}', '${transitPaymentMethod}', '${JSON.stringify(transitItems).replace(/'/g, "''")}', '${JSON.stringify(transitAddExpenses).replace(/'/g, "''")}', ${totalBase}, ${totalAdditional}, ${totalLanded}, 'IN_TRANSIT', '${transitNotes.replace(/'/g, "''")}', '${createdAt}', '${createdAt}', '', '')`,
+    const poInsertRes = runSql(
+      `INSERT INTO purchases_transit (id, supplier_name, store_id, payment_account_id, payment_method, items_json, additional_expenses_json, total_base_amount, total_additional_expenses, total_landed_cost, stage, notes, created_at, updated_at, received_at, received_by) VALUES ('${transitId}', '${cleanSupplier}', '${cleanStore}', '${cleanPayAcc}', '${cleanPayMethod}', '${JSON.stringify(transitItems).replace(/'/g, "''")}', '${JSON.stringify(transitAddExpenses).replace(/'/g, "''")}', ${totalBase}, ${totalAdditional}, ${totalLanded}, 'IN_TRANSIT', '${cleanNotes}', '${createdAt}', '${createdAt}', '', '')`,
       'Transit Procurement: Create shipment in transit'
     );
 
+    if (!poInsertRes.success) {
+      setPoModalError(poInsertRes.error || 'Could not save Purchase Order to database.');
+      return;
+    }
+
     const txId = 'tx-pt-' + Date.now();
     runSql(
-      `INSERT INTO transactions VALUES ('${txId}', 'idem-${transitId}', 'PROCUREMENT', 'PURCHASE_TRANSIT', '${transitId}', ${totalLanded}, 0, 'SUCCESS', 'Transit Purchase: ${transitSupplierName.replace(/'/g, "''")} (Landed Cost: ${settings.currency}${totalLanded.toFixed(2)})', '${createdAt}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by) VALUES ('${txId}', 'idem-${transitId}', 'PROCUREMENT', 'PURCHASE_TRANSIT', '${transitId}', ${totalLanded}, 0, 'SUCCESS', 'Transit Purchase: ${cleanSupplier} (Landed Cost: ${settings.currency}${totalLanded.toFixed(2)})', '${createdAt}', '${createdAt}', '${userRole}')`,
       'Transit Procurement: Journal'
     );
 
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-1', '${txId}', 'acc_transit', 'DEBIT', ${totalLanded}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_transit', 'DEBIT', ${totalLanded}, '${createdAt}')`,
       'Transit Ledger: Debit Goods in Transit'
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-2', '${txId}', '${transitPaymentAcc}', 'CREDIT', ${totalLanded}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-2', '${txId}', '${cleanPayAcc}', 'CREDIT', ${totalLanded}, '${createdAt}')`,
       'Transit Ledger: Credit Payment Source'
     );
 
     // Sync Purchase Order into expenses table for central audit trail
     const expId = 'exp-po-' + Date.now();
     runSql(
-      `INSERT INTO expenses (id, category, account_id, amount, description, reference_no, expense_date, store_id, created_at, created_by) VALUES ('${expId}', 'Purchase Order - Goods & Transit', '${transitPaymentAcc}', ${totalLanded}, 'PO #${transitId}: Supplier ${transitSupplierName.replace(/'/g, "''")} (${transitItems.length} items)', '${transitId}', '${createdAt.split('T')[0]}', '${transitStoreId}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO expenses (id, category, account_id, amount, description, reference_no, expense_date, store_id, created_at, created_by) VALUES ('${expId}', 'Purchase Order - Goods & Transit', '${cleanPayAcc}', ${totalLanded}, 'PO #${transitId}: Supplier ${cleanSupplier} (${transitItems.length} items)', '${transitId}', '${createdAt.split('T')[0]}', '${cleanStore}', '${createdAt}', '${userRole}')`,
       'Transit Procurement: Sync Purchase Order to Expenses'
     );
 
-    logEmployeeAudit('PURCHASE', 'Created Purchase Order', `PO #${transitId}, Supplier: ${transitSupplierName}, Items: ${transitItems.length}, Landed Cost: K${totalLanded.toFixed(2)}`, totalLanded, transitStoreId, userRole);
+    logEmployeeAudit('PURCHASE', 'Created Purchase Order', `PO #${transitId}, Supplier: ${transitSupplierName.trim()}, Items: ${transitItems.length}, Landed Cost: K${totalLanded.toFixed(2)}`, totalLanded, targetBranch, userRole);
 
+    syncAllAccountingSystems(`Purchase Order #${transitId}`);
     persistTablesToStorage();
     loadData();
     loadStatementData();
+    try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
 
     setShowNewTransitModal(false);
+    setPoModalError(null);
     setTransitSupplierName('');
     setTransitItems([]);
+    setTransitAddExpenses([
+      { name: 'Freight & Road Transport', amount: 0, category: 'Freight' },
+      { name: 'Port & Customs Clearing Fee', amount: 0, category: 'Handling' },
+      { name: 'Handling & Offloading', amount: 0, category: 'Handling' }
+    ]);
     setTransitNotes('');
+    setExpenseSubView('purchase_orders');
 
-    alert(`Transit Shipment #${transitId} recorded for ${settings.currency}${totalLanded.toFixed(2)} total landed cost.`);
+    setPoFeedback({
+      type: 'success',
+      text: `✓ Purchase Order #${transitId} recorded for ${settings.currency}${totalLanded.toFixed(2)} total landed cost.`,
+    });
   };
 
   const handleUpdateTransitStage = (transitId: string, newStage: string) => {
@@ -800,10 +849,6 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
   };
 
   const handleAcceptTransitDelivery = (po: any) => {
-    if (!confirm(`Are you sure you want to accept stock for Shipment #${po.id}? Stock quantities for ${po.store_id.toUpperCase()} branch will be increased according to final landed cost calculations.`)) {
-      return;
-    }
-
     const receivedAt = new Date().toISOString();
     let items: any[] = [];
     try { items = JSON.parse(po.items_json); } catch (e) {}
@@ -811,33 +856,62 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
     const totalBase = Number(po.total_base_amount || 0);
     const totalAdditional = Number(po.total_additional_expenses || 0);
     const overheadRatio = totalBase > 0 ? (totalAdditional / totalBase) : 0;
+    const targetBranch = String(po.store_id || activeStore || 'MAIN');
 
     runSql(
       `UPDATE purchases_transit SET stage = 'LANDED_AT_STORE', updated_at = '${receivedAt}', received_at = '${receivedAt}', received_by = '${userRole}' WHERE id = '${po.id}'`,
       'Transit Procurement: Accept stock at store'
     );
 
-    logEmployeeAudit('PURCHASE', 'Received Procurement Goods', `PO #${po.id} accepted & received into branch ${po.store_id.toUpperCase()}. Items landed: ${items.length}`, Number(po.total_landed_cost || 0), po.store_id, userRole);
+    logEmployeeAudit('PURCHASE', 'Received Procurement Goods', `PO #${po.id} accepted & received into branch ${targetBranch.toUpperCase()}. Items landed: ${items.length}`, Number(po.total_landed_cost || 0), targetBranch, userRole);
 
     items.forEach((it: any) => {
-      const landedUnitPrice = parseFloat((it.baseUnitPrice * (1 + overheadRatio)).toFixed(2));
+      const landedUnitPrice = parseFloat((Number(it.baseUnitPrice || 0) * (1 + overheadRatio)).toFixed(2));
       const qty = Number(it.quantity || 0);
+      const rawId = String(it.productId || '');
+      const isCustomItem = !rawId || rawId.startsWith('custom-') || rawId.startsWith('CUSTOM-');
+      const numericId = Number(rawId);
+      let resolvedProductId: string | number = rawId;
 
-      runSql(
-        `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${it.productId} OR id = '${it.productId}'`,
-        `Transit Stock Acceptance: Add ${qty} units to product #${it.productId}`
-      );
+      if (!isCustomItem && !Number.isNaN(numericId) && Number.isFinite(numericId)) {
+        runSql(
+          `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${numericId}`,
+          `Transit Stock Acceptance: Add ${qty} units to product #${numericId}`
+        );
+      } else {
+        const cleanName = String(it.productName || 'Imported Stock Item').replace(/'/g, "''");
+        const existingByName = runSql(`SELECT id FROM products WHERE name = '${cleanName}'`, 'Lookup product by name', true);
+        if (existingByName.success && Array.isArray(existingByName.data) && existingByName.data.length > 0) {
+          resolvedProductId = existingByName.data[0].id;
+          runSql(
+            `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${Number(resolvedProductId) || `'${String(resolvedProductId).replace(/'/g, "''")}'`}`,
+            `Transit Stock Acceptance: Add ${qty} units to ${cleanName}`
+          );
+        } else {
+          const newProdId = Math.floor(100000 + Math.random() * 900000);
+          resolvedProductId = newProdId;
+          const sellingPrice = parseFloat((landedUnitPrice * 1.3).toFixed(2));
+          let bizId = '';
+          try {
+            bizId = JSON.parse(localStorage.getItem('active_business_profile') || '{}')?.id || '';
+          } catch {}
+          runSql(
+            `INSERT INTO products (id, name, sku, category, stock, cost, price, business_id, is_service) VALUES (${newProdId}, '${cleanName}', 'PO-${newProdId}', 'Procurement', ${qty}, ${landedUnitPrice}, ${sellingPrice}, '${bizId.replace(/'/g, "''")}', 0)`,
+            `Transit Stock Acceptance: Register new product ${cleanName}`
+          );
+        }
+      }
 
-      const storeProdCheck = runSql(`SELECT * FROM store_products WHERE product_id = '${it.productId}' AND store_id = '${po.store_id}'`, 'Check store_products');
+      const storeProdCheck = runSql(`SELECT * FROM store_products WHERE product_id = '${resolvedProductId}' AND store_id = '${targetBranch.replace(/'/g, "''")}'`, 'Check store_products');
       if (storeProdCheck.success && Array.isArray(storeProdCheck.data) && storeProdCheck.data.length > 0) {
         runSql(
-          `UPDATE store_products SET stock = stock + ${qty}, price = ${landedUnitPrice * 1.3} WHERE product_id = '${it.productId}' AND store_id = '${po.store_id}'`,
-          `Transit Stock Acceptance: Update store stock for product #${it.productId}`
+          `UPDATE store_products SET stock = stock + ${qty}, price = ${(landedUnitPrice * 1.3).toFixed(2)} WHERE product_id = '${resolvedProductId}' AND store_id = '${targetBranch.replace(/'/g, "''")}'`,
+          `Transit Stock Acceptance: Update store stock for product #${resolvedProductId}`
         );
       } else {
         const spId = 'sp-' + Date.now() + '-' + Math.random().toString(36).substring(2, 5);
         runSql(
-          `INSERT INTO store_products VALUES ('${spId}', '${it.productId}', '${po.store_id}', ${qty}, ${landedUnitPrice * 1.3})`,
+          `INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES ('${spId}', '${resolvedProductId}', '${targetBranch.replace(/'/g, "''")}', ${qty}, ${(landedUnitPrice * 1.3).toFixed(2)})`,
           `Transit Stock Acceptance: Insert store product record`
         );
       }
@@ -845,23 +919,29 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
 
     const txId = 'tx-land-' + Date.now();
     runSql(
-      `INSERT INTO transactions VALUES ('${txId}', 'idem-${po.id}-landed', 'STORE-${po.store_id.toUpperCase()}', 'STOCK_LANDED', '${po.id}', ${po.total_landed_cost}, 0, 'SUCCESS', 'Stock Accepted: Order #${po.id} landed at ${po.store_id}', '${receivedAt}', '${receivedAt}', '${userRole}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by) VALUES ('${txId}', 'idem-${po.id}-landed', 'STORE-${targetBranch.toUpperCase()}', 'STOCK_LANDED', '${po.id}', ${po.total_landed_cost}, 0, 'SUCCESS', 'Stock Accepted: Order #${po.id} landed at ${targetBranch}', '${receivedAt}', '${receivedAt}', '${userRole}')`,
       'Transit Procurement: Stock landed journal'
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-1', '${txId}', 'acc_inventory', 'DEBIT', ${po.total_landed_cost}, '${receivedAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_inventory', 'DEBIT', ${po.total_landed_cost}, '${receivedAt}')`,
       'Transit Ledger: Debit Store Inventory'
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-2', '${txId}', 'acc_transit', 'CREDIT', ${po.total_landed_cost}, '${receivedAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-2', '${txId}', 'acc_transit', 'CREDIT', ${po.total_landed_cost}, '${receivedAt}')`,
       'Transit Ledger: Credit Goods in Transit'
     );
 
+    syncAllAccountingSystems(`Stock Received PO #${po.id}`);
     persistTablesToStorage();
     loadData();
     loadStatementData();
+    try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
 
-    alert(`Stock successfully received into ${po.store_id.toUpperCase()} inventory! Product cost updated to final landed price.`);
+    setConfirmReceivePoId(null);
+    setPoFeedback({
+      type: 'success',
+      text: `✓ Stock from PO #${po.id} received into ${targetBranch.toUpperCase()} inventory and product costs updated to landed price.`,
+    });
   };
 
   // Handler to request a loan
@@ -1461,83 +1541,89 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
     <div className="flex-1 flex overflow-hidden flex-col bg-slate-50 text-slate-800 p-4 md:p-6 select-text">
       
       {/* SUB-TAB COMPONENT SELECTOR */}
-      <div className="flex border-b border-slate-200 mb-5 gap-1.5 select-none pb-0.5 shrink-0 overflow-x-auto scrollbar-none">
-        <button
-          onClick={() => { setSubTab('expenses'); setExpenseSubView('all'); }}
-          className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-            subTab === 'expenses'
-              ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-              : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-          }`}
-        >
-          <DollarSign size={14} />
-          <span>Expenses & Purchase Orders</span>
-        </button>
+      {mode === 'credit_risk' ? (
+        <div className="flex border-b border-slate-200 mb-5 gap-1.5 select-none pb-0.5 shrink-0 overflow-x-auto scrollbar-none">
+          <button
+            type="button"
+            onClick={() => setSubTab('loans')}
+            className="px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap"
+          >
+            <TrendingUp size={14} />
+            <span>Credit Risk &amp; Swept Capital</span>
+          </button>
+        </div>
+      ) : (
+        <div className="flex border-b border-slate-200 mb-5 gap-1.5 select-none pb-0.5 shrink-0 overflow-x-auto scrollbar-none">
+          <button
+            type="button"
+            onClick={() => { setSubTab('expenses'); setExpenseSubView('all'); }}
+            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              subTab === 'expenses' && expenseSubView !== 'purchase_orders'
+                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
+                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
+            }`}
+          >
+            <DollarSign size={14} />
+            <span>Expenses & Purchase Orders</span>
+          </button>
 
-        <button
-          onClick={() => setSubTab('transfers')}
-          className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-            subTab === 'transfers'
-              ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-              : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-          }`}
-        >
-          <RefreshCw size={14} />
-          <span>Accounts & Transfers</span>
-        </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('transfers')}
+            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              subTab === 'transfers'
+                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
+                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
+            }`}
+          >
+            <RefreshCw size={14} />
+            <span>Accounts & Transfers</span>
+          </button>
 
-        <button
-          onClick={() => { setSubTab('expenses'); setExpenseSubView('purchase_orders'); }}
-          className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-            subTab === 'procurement' || (subTab === 'expenses' && expenseSubView === 'purchase_orders')
-              ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-              : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-          }`}
-        >
-          <Truck size={14} />
-          <span>Goods in Transit & POs</span>
-        </button>
+          <button
+            type="button"
+            onClick={() => { setSubTab('expenses'); setExpenseSubView('purchase_orders'); }}
+            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              subTab === 'procurement' || (subTab === 'expenses' && expenseSubView === 'purchase_orders')
+                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
+                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
+            }`}
+          >
+            <Truck size={14} />
+            <span>Goods in Transit & POs</span>
+          </button>
 
-        <button
-          onClick={() => setSubTab('statements')}
-          className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-            subTab === 'statements'
-              ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-              : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-          }`}
-        >
-          <FileText size={14} />
-          <span>Financial Statements</span>
-        </button>
+          <button
+            type="button"
+            onClick={() => setSubTab('statements')}
+            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              subTab === 'statements'
+                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
+                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
+            }`}
+          >
+            <FileText size={14} />
+            <span>Financial Statements</span>
+          </button>
 
-        <button
-          onClick={() => setSubTab('loans')}
-          className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-            subTab === 'loans'
-              ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-              : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-          }`}
-        >
-          <Coins size={14} />
-          <span>Advances & Sweeps</span>
-        </button>
-
-        <button
-          onClick={() => setSubTab('assets_equity')}
-          className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-            subTab === 'assets_equity'
-              ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-              : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-          }`}
-        >
-          <Layers size={14} />
-          <span>Asset & Equity Registry</span>
-        </button>
-      </div>
+          <button
+            type="button"
+            onClick={() => setSubTab('assets_equity')}
+            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              subTab === 'assets_equity'
+                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
+                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
+            }`}
+          >
+            <Layers size={14} />
+            <span>Asset & Equity Registry</span>
+          </button>
+        </div>
+      )}
 
       <AnimatePresence mode="wait">
         {/* EXPENSES SUBTAB */}
-        {subTab === 'expenses' && (
+        {mode !== 'credit_risk' && subTab === 'expenses' && (
           <motion.div
             key="expenses-tab"
             initial={{ opacity: 0, y: 5 }}
@@ -1558,7 +1644,8 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 </div>
                 <div className="flex items-center gap-3">
                   <button
-                    onClick={() => setShowNewTransitModal(true)}
+                    type="button"
+                    onClick={openNewPurchaseOrderModal}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
                   >
                     <PackagePlus size={15} />
@@ -1862,13 +1949,36 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                     </p>
                   </div>
                   <button
-                    onClick={() => setShowNewTransitModal(true)}
+                    type="button"
+                    onClick={openNewPurchaseOrderModal}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider shadow-xs transition-all cursor-pointer flex items-center gap-1.5"
                   >
                     <PackagePlus size={15} />
                     <span>+ New Purchase Order</span>
                   </button>
                 </div>
+
+                {poFeedback && (
+                  <div
+                    className={`px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between gap-2 ${
+                      poFeedback.type === 'error'
+                        ? 'bg-rose-50 border-rose-200 text-rose-800'
+                        : 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      {poFeedback.type === 'error' ? <AlertCircle size={15} className="shrink-0" /> : <CheckCircle2 size={15} className="shrink-0" />}
+                      <span>{poFeedback.text}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPoFeedback(null)}
+                      className="text-[10px] font-black uppercase px-2 py-0.5 rounded hover:bg-black/5 cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                )}
 
                 <div className="space-y-4">
                   {transitPurchasesList.map((po) => {
@@ -1904,13 +2014,34 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
 
                           <div className="flex items-center gap-2">
                             {po.stage !== 'LANDED_AT_STORE' && (
-                              <button
-                                onClick={() => handleAcceptTransitDelivery(po)}
-                                className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs uppercase tracking-wider cursor-pointer flex items-center gap-1 shadow-xs"
-                              >
-                                <PackageCheck size={14} />
-                                <span>Receive Stock</span>
-                              </button>
+                              confirmReceivePoId === po.id ? (
+                                <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
+                                  <span className="text-[10px] font-bold text-emerald-900">Receive into {(po.store_id || 'MAIN').toUpperCase()}?</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAcceptTransitDelivery(po)}
+                                    className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-[10px] rounded uppercase cursor-pointer"
+                                  >
+                                    Confirm
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmReceivePoId(null)}
+                                    className="px-2 py-0.5 bg-white border border-slate-300 text-slate-600 font-bold text-[10px] rounded uppercase cursor-pointer"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmReceivePoId(po.id)}
+                                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs uppercase tracking-wider cursor-pointer flex items-center gap-1 shadow-xs"
+                                >
+                                  <PackageCheck size={14} />
+                                  <span>Receive Stock</span>
+                                </button>
+                              )
                             )}
                           </div>
                         </div>
@@ -1962,8 +2093,9 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                         Create supplier purchase orders to track goods in transit and apportion landing freight costs into expenses.
                       </p>
                       <button
-                        onClick={() => setShowNewTransitModal(true)}
-                        className="mt-3 bg-indigo-600 text-white font-bold px-3 py-1.5 rounded-lg text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
+                        type="button"
+                        onClick={openNewPurchaseOrderModal}
+                        className="mt-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
                       >
                         <PackagePlus size={14} />
                         <span>Create First Purchase Order</span>
@@ -2252,7 +2384,8 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 </p>
               </div>
               <button
-                onClick={() => setShowNewTransitModal(true)}
+                type="button"
+                onClick={openNewPurchaseOrderModal}
                 className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs uppercase tracking-wider shadow-md hover:shadow-indigo-200 transition-all cursor-pointer flex items-center gap-2"
               >
                 <PackagePlus size={16} />
@@ -2306,13 +2439,34 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                         </div>
 
                         {po.stage !== 'LANDED_AT_STORE' && (
-                          <button
-                            onClick={() => handleAcceptTransitDelivery(po)}
-                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-2 rounded-xl text-xs uppercase tracking-wider shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
-                          >
-                            <PackageCheck size={14} />
-                            <span>Accept Stock at Store</span>
-                          </button>
+                          confirmReceivePoId === po.id ? (
+                            <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
+                              <span className="text-[10px] font-bold text-emerald-900">Confirm?</span>
+                              <button
+                                type="button"
+                                onClick={() => handleAcceptTransitDelivery(po)}
+                                className="px-2 py-0.5 bg-emerald-600 text-white font-black text-[10px] rounded uppercase cursor-pointer"
+                              >
+                                Yes
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmReceivePoId(null)}
+                                className="px-2 py-0.5 bg-white border border-slate-300 text-slate-600 font-bold text-[10px] rounded uppercase cursor-pointer"
+                              >
+                                No
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmReceivePoId(po.id)}
+                              className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-2 rounded-xl text-xs uppercase tracking-wider shadow-sm transition-all cursor-pointer flex items-center gap-1.5"
+                            >
+                              <PackageCheck size={14} />
+                              <span>Accept Stock at Store</span>
+                            </button>
+                          )
                         )}
                       </div>
                     </div>
@@ -2367,7 +2521,8 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                     Create a purchase order in transit to track goods prior to store arrival and automatically apportion freight costs to arrive at true landed prices.
                   </p>
                   <button
-                    onClick={() => setShowNewTransitModal(true)}
+                    type="button"
+                    onClick={openNewPurchaseOrderModal}
                     className="mt-4 bg-indigo-600 text-white font-bold px-4 py-2 rounded-xl text-xs uppercase tracking-wider inline-flex items-center gap-1.5 cursor-pointer"
                   >
                     <PackagePlus size={14} />
@@ -2376,217 +2531,10 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
                 </div>
               )}
             </div>
-
-            {/* NEW TRANSIT MODAL */}
-            {showNewTransitModal && (
-              <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90vh]"
-                >
-                  <div className="p-4 bg-slate-900 text-white flex justify-between items-center">
-                    <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
-                      <Truck size={18} className="text-indigo-400" />
-                      <span>New Transit Purchase & Landed Cost PO</span>
-                    </h3>
-                    <button
-                      onClick={() => setShowNewTransitModal(false)}
-                      className="text-slate-400 hover:text-white cursor-pointer"
-                    >
-                      <X size={18} />
-                    </button>
-                  </div>
-
-                  <form onSubmit={handleCreateTransitPurchase} className="p-5 overflow-y-auto space-y-4 flex-1">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs font-bold text-slate-600 mb-1">Supplier Name</label>
-                        <input
-                          type="text"
-                          placeholder="e.g. Dubai Wholesale Wholesalers"
-                          value={transitSupplierName}
-                          onChange={(e) => setTransitSupplierName(e.target.value)}
-                          required
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-xs font-bold text-slate-600 mb-1">Landing Target Branch</label>
-                        <select
-                          value={transitStoreId}
-                          onChange={(e) => setTransitStoreId(e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                        >
-                          {storesList.length === 0 ? (
-                            <option value="">No branches configured</option>
-                          ) : (
-                            storesList.map((s) => (
-                              <option key={s.id} value={s.id}>{s.name}</option>
-                            ))
-                          )}
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs font-bold text-slate-600 mb-1">Payment Account Source</label>
-                        <select
-                          value={transitPaymentAcc}
-                          onChange={(e) => setTransitPaymentAcc(e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                        >
-                          {getAllSelectableAccounts().map(acc => (
-                            <option key={acc.accountId} value={acc.accountId}>{acc.label} ({acc.accountId})</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-xs font-bold text-slate-600 mb-1">Payment Method</label>
-                        <select
-                          value={transitPaymentMethod}
-                          onChange={(e) => setTransitPaymentMethod(e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                        >
-                          <option value="BANK_TRANSFER">Bank Wire Transfer</option>
-                          <option value="CASH">Cash</option>
-                          <option value="Airtel Money">Airtel Money</option>
-                          <option value="MTN Mobile Money">MTN Mobile Money</option>
-                          {getCustomPaymentMethods(false).map(cm => (
-                            <option key={cm.id} value={cm.name}>{cm.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-
-                    {/* ADD PRODUCT ITEM SECTION */}
-                    <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-3">
-                      <span className="text-xs font-black uppercase tracking-wider text-slate-700 block">Add Product Line Items</span>
-                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
-                        <div className="sm:col-span-2">
-                          <select
-                            value={selectedTransitProduct}
-                            onChange={(e) => setSelectedTransitProduct(e.target.value)}
-                            className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                          >
-                            <option value="">-- Select Existing Product --</option>
-                            {productList.map(p => (
-                              <option key={p.id} value={p.id}>{p.name} (Cost: {settings.currency}{p.cost})</option>
-                            ))}
-                          </select>
-                        </div>
-                        <div>
-                          <input
-                            type="number"
-                            placeholder="Qty"
-                            value={transitItemQty}
-                            onChange={(e) => setTransitItemQty(e.target.value)}
-                            className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                          />
-                        </div>
-                        <div>
-                          <input
-                            type="number"
-                            step="0.01"
-                            placeholder="Base Unit Price"
-                            value={transitItemUnitPrice}
-                            onChange={(e) => setTransitItemUnitPrice(e.target.value)}
-                            className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                          />
-                        </div>
-                      </div>
-
-                      {!selectedTransitProduct && (
-                        <input
-                          type="text"
-                          placeholder="Or type custom item name if new..."
-                          value={customTransitProductName}
-                          onChange={(e) => setCustomTransitProductName(e.target.value)}
-                          className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                        />
-                      )}
-
-                      <button
-                        type="button"
-                        onClick={handleAddTransitItem}
-                        className="bg-slate-800 text-white text-xs font-bold py-1.5 px-3 rounded-lg hover:bg-slate-900 cursor-pointer"
-                      >
-                        + Add Item Line
-                      </button>
-
-                      {/* ADDED ITEMS LIST */}
-                      {transitItems.length > 0 && (
-                        <div className="space-y-1 pt-2">
-                          {transitItems.map((it, idx) => (
-                            <div key={idx} className="flex justify-between items-center bg-white p-2 rounded border text-xs">
-                              <span><strong>{it.quantity}x</strong> {it.productName} @ {settings.currency}{it.baseUnitPrice.toFixed(2)}/unit</span>
-                              <div className="flex items-center gap-2">
-                                <span className="font-bold text-slate-900">{settings.currency}{(it.quantity * it.baseUnitPrice).toFixed(2)}</span>
-                                <button
-                                  type="button"
-                                  onClick={() => handleRemoveTransitItem(idx)}
-                                  className="text-rose-500 hover:text-rose-700"
-                                >
-                                  <X size={14} />
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* ADDITION EXPENSES FOR LANDED COST */}
-                    <div className="bg-indigo-50/50 p-3.5 rounded-xl border border-indigo-100 space-y-3">
-                      <span className="text-xs font-black uppercase tracking-wider text-indigo-900 block">Landing Overhead Expenses (Transport & Customs)</span>
-                      <div className="grid grid-cols-3 gap-2">
-                        {transitAddExpenses.map((exp, idx) => (
-                          <div key={idx}>
-                            <label className="block text-[10px] font-bold text-indigo-800 mb-1">{exp.name}</label>
-                            <input
-                              type="number"
-                              step="0.01"
-                              placeholder="0.00"
-                              value={exp.amount || ''}
-                              onChange={(e) => {
-                                const val = parseFloat(e.target.value) || 0;
-                                const updated = [...transitAddExpenses];
-                                updated[idx].amount = val;
-                                setTransitAddExpenses(updated);
-                              }}
-                              className="w-full bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-900"
-                            />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="p-3 bg-slate-900 text-white rounded-xl flex justify-between items-center text-xs">
-                      <div>
-                        <span className="text-slate-400 block font-semibold">Calculated Total Landed Value</span>
-                        <span className="text-lg font-black text-emerald-400">
-                          {settings.currency}{(
-                            transitItems.reduce((s, i) => s + (i.quantity * i.baseUnitPrice), 0) +
-                            transitAddExpenses.reduce((s, e) => s + Number(e.amount || 0), 0)
-                          ).toFixed(2)}
-                        </span>
-                      </div>
-                      <button
-                        type="submit"
-                        className="bg-emerald-500 hover:bg-emerald-600 text-white font-extrabold px-4 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer"
-                      >
-                        Dispatch Shipment
-                      </button>
-                    </div>
-                  </form>
-                </motion.div>
-              </div>
-            )}
           </motion.div>
         )}
 
-        {subTab === 'loans' && (
+        {mode === 'credit_risk' && subTab === 'loans' && (
           <motion.div
             key="loans-tab"
             initial={{ opacity: 0, y: 5 }}
@@ -3419,7 +3367,7 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
 
       {/* MODAL: LOAN APPLICATION SLIDER CONTAINER */}
       <AnimatePresence>
-        {showApplyModal && (
+        {mode === 'credit_risk' && showApplyModal && (
           <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-text">
             <motion.div
               initial={{ scale: 0.95, opacity: 0 }}
@@ -3553,6 +3501,250 @@ export default function LoanDashboard({ settings, userRole, activeStore }: LoanD
           </div>
         )}
       </AnimatePresence>
+
+      {/* NEW PURCHASE ORDER / TRANSIT SHIPMENT MODAL (Accessible from all PO buttons) */}
+      {showNewTransitModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden border border-slate-200 flex flex-col max-h-[90vh]"
+          >
+            <div className="p-4 bg-slate-900 text-white flex justify-between items-center">
+              <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2">
+                <Truck size={18} className="text-indigo-400" />
+                <span>Create New Purchase Order (Goods in Transit)</span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => { setShowNewTransitModal(false); setPoModalError(null); }}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateTransitPurchase} className="p-5 overflow-y-auto space-y-4 flex-1 text-left">
+              {poModalError && (
+                <div className="px-3.5 py-2.5 rounded-xl border border-rose-200 bg-rose-50 text-rose-800 text-xs font-bold flex items-center gap-2">
+                  <AlertCircle size={15} className="shrink-0" />
+                  <span>{poModalError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Supplier Name *</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Trade Kings / Wholesale Supplier"
+                    value={transitSupplierName}
+                    onChange={(e) => { setTransitSupplierName(e.target.value); setPoModalError(null); }}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Landing Target Branch</label>
+                  <select
+                    value={transitStoreId}
+                    onChange={(e) => setTransitStoreId(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    {storesList.length === 0 ? (
+                      <option value={activeStore || 'MAIN'}>{activeStore ? activeStore.toUpperCase() : 'Main Branch'}</option>
+                    ) : (
+                      storesList.map((s) => (
+                        <option key={s.id} value={s.id}>{s.name}</option>
+                      ))
+                    )}
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Payment Account Source</label>
+                  <select
+                    value={transitPaymentAcc}
+                    onChange={(e) => setTransitPaymentAcc(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    {getAllSelectableAccounts().map(acc => (
+                      <option key={acc.accountId} value={acc.accountId}>{acc.label} ({acc.accountId})</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-600 mb-1">Payment Method</label>
+                  <select
+                    value={transitPaymentMethod}
+                    onChange={(e) => setTransitPaymentMethod(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-semibold text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    <option value="BANK_TRANSFER">Bank Wire Transfer</option>
+                    <option value="CASH">Cash</option>
+                    <option value="Airtel Money">Airtel Money</option>
+                    <option value="MTN Mobile Money">MTN Mobile Money</option>
+                    {getCustomPaymentMethods(false).map(cm => (
+                      <option key={cm.id} value={cm.name}>{cm.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* ADD PRODUCT ITEM SECTION */}
+              <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 space-y-3">
+                <span className="text-xs font-black uppercase tracking-wider text-slate-700 block">Add Product Line Items</span>
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                  <div className="sm:col-span-2">
+                    <select
+                      value={selectedTransitProduct}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setSelectedTransitProduct(val);
+                        const match = productList.find(p => String(p.id) === String(val));
+                        if (match && Number(match.cost || 0) > 0) {
+                          setTransitItemUnitPrice(String(match.cost));
+                        }
+                      }}
+                      className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-900"
+                    >
+                      <option value="">-- Select Existing Product --</option>
+                      {productList.map(p => (
+                        <option key={p.id} value={p.id}>{p.name} (Cost: {settings.currency}{Number(p.cost || 0).toFixed(2)})</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <input
+                      type="number"
+                      min="1"
+                      placeholder="Qty"
+                      value={transitItemQty}
+                      onChange={(e) => setTransitItemQty(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="Base Unit Price"
+                      value={transitItemUnitPrice}
+                      onChange={(e) => setTransitItemUnitPrice(e.target.value)}
+                      className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-900"
+                    />
+                  </div>
+                </div>
+
+                {!selectedTransitProduct && (
+                  <input
+                    type="text"
+                    placeholder="Or type custom item name if new..."
+                    value={customTransitProductName}
+                    onChange={(e) => setCustomTransitProductName(e.target.value)}
+                    className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-900"
+                  />
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleAddTransitItem}
+                  className="bg-slate-800 text-white text-xs font-bold py-1.5 px-3 rounded-lg hover:bg-slate-900 cursor-pointer"
+                >
+                  + Add Item Line
+                </button>
+
+                {/* ADDED ITEMS LIST */}
+                {transitItems.length > 0 && (
+                  <div className="space-y-1 pt-2">
+                    {transitItems.map((it, idx) => (
+                      <div key={idx} className="flex justify-between items-center bg-white p-2 rounded border text-xs text-slate-800">
+                        <span><strong>{it.quantity}x</strong> {it.productName} @ {settings.currency}{it.baseUnitPrice.toFixed(2)}/unit</span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-900">{settings.currency}{(it.quantity * it.baseUnitPrice).toFixed(2)}</span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveTransitItem(idx)}
+                            className="text-rose-500 hover:text-rose-700 cursor-pointer"
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* ADDITION EXPENSES FOR LANDED COST */}
+              <div className="bg-indigo-50/50 p-3.5 rounded-xl border border-indigo-100 space-y-3">
+                <span className="text-xs font-black uppercase tracking-wider text-indigo-900 block">Landing Overhead Expenses (Transport & Customs)</span>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {transitAddExpenses.map((exp, idx) => (
+                    <div key={idx}>
+                      <label className="block text-[10px] font-bold text-indigo-800 mb-1">{exp.name}</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        placeholder="0.00"
+                        value={exp.amount || ''}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0;
+                          const updated = [...transitAddExpenses];
+                          updated[idx] = { ...updated[idx], amount: val };
+                          setTransitAddExpenses(updated);
+                        }}
+                        className="w-full bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-900"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-600 mb-1">Order Notes (Optional)</label>
+                <input
+                  type="text"
+                  placeholder="Waybill / tracking / delivery remarks..."
+                  value={transitNotes}
+                  onChange={(e) => setTransitNotes(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-medium text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div className="p-3 bg-slate-900 text-white rounded-xl flex flex-wrap justify-between items-center gap-3 text-xs">
+                <div>
+                  <span className="text-slate-400 block font-semibold">Calculated Total Landed Value</span>
+                  <span className="text-lg font-black text-emerald-400">
+                    {settings.currency}{(
+                      transitItems.reduce((s, i) => s + (i.quantity * i.baseUnitPrice), 0) +
+                      transitAddExpenses.reduce((s, e) => s + Number(e.amount || 0), 0)
+                    ).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => { setShowNewTransitModal(false); setPoModalError(null); }}
+                    className="bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold px-3.5 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    className="bg-emerald-500 hover:bg-emerald-600 text-white font-extrabold px-4 py-2 rounded-xl text-xs uppercase tracking-wider cursor-pointer"
+                  >
+                    Create Purchase Order
+                  </button>
+                </div>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
 
     </div>
   );
