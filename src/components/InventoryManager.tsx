@@ -1659,7 +1659,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                       <tr key={prod.id} className={`${outOfStock ? 'bg-red-50/15' : lowStock ? 'bg-amber-50/15' : ''}`}>
                         <td className="px-3 sm:px-4 py-2.5">
                           <div className="flex items-start gap-2.5 sm:gap-3">
-                            <img src={prod.imageUrl} alt={prod.name} className="w-9 h-9 rounded-lg object-cover border mt-0.5 shrink-0" referrerPolicy="no-referrer" />
+                            {prod.imageUrl && prod.imageUrl.trim() ? (
+                              <img src={prod.imageUrl} alt={prod.name} className="w-9 h-9 rounded-lg object-cover border mt-0.5 shrink-0" referrerPolicy="no-referrer" />
+                            ) : (
+                              <div className="w-9 h-9 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-400 mt-0.5 shrink-0">
+                                <Package size={15} />
+                              </div>
+                            )}
                             <div className="flex-1 min-w-0 text-left">
                               <p className="font-extrabold text-slate-800 text-xs">{prod.name}</p>
                               <p className="text-[10px] font-mono font-semibold text-slate-400">SKU: {prod.sku}</p>
@@ -3382,7 +3388,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
               <form onSubmit={handleReceiveStockSubmit} className="p-5 overflow-y-auto flex flex-col gap-4 text-left">
                 
                 <div className="flex items-center gap-3 bg-slate-50 p-3 rounded-lg border border-slate-100">
-                  <img src={receiveProduct.imageUrl} alt={receiveProduct.name} className="w-12 h-12 rounded-lg object-cover border" referrerPolicy="no-referrer" />
+                  {receiveProduct.imageUrl && receiveProduct.imageUrl.trim() ? (
+                    <img src={receiveProduct.imageUrl} alt={receiveProduct.name} className="w-12 h-12 rounded-lg object-cover border shrink-0" referrerPolicy="no-referrer" />
+                  ) : (
+                    <div className="w-12 h-12 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-slate-400 shrink-0">
+                      <Package size={18} />
+                    </div>
+                  )}
                   <div>
                     <h3 className="font-extrabold text-slate-800 text-xs">{receiveProduct.name}</h3>
                     <p className="text-[10px] font-mono font-bold text-slate-400">SKU: {receiveProduct.sku}</p>

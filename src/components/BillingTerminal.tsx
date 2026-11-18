@@ -4292,8 +4292,12 @@ export default function BillingTerminal({
                       </span>
                     ) : null}
 
-                    <div className="w-20 h-20 sm:w-full sm:aspect-square rounded-lg bg-slate-100 overflow-hidden relative border shrink-0">
-                      <img src={prod.imageUrl} alt={prod.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    <div className="w-20 h-20 sm:w-full sm:aspect-square rounded-lg bg-slate-100 overflow-hidden relative border shrink-0 flex items-center justify-center text-slate-300">
+                      {prod.imageUrl && prod.imageUrl.trim() ? (
+                        <img src={prod.imageUrl} alt={prod.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                      ) : (
+                        <Tag size={22} className="text-slate-300" />
+                      )}
                     </div>
 
                     <div className="flex-1 flex flex-col justify-between select-text min-w-0">
@@ -7481,12 +7485,18 @@ export default function BillingTerminal({
                   <span className="text-[9px] text-slate-400 font-extrabold uppercase block mb-2">Live Warehouse Stock Preview (Branch: {activeStore.toUpperCase()})</span>
                   {quickSelectedProduct ? (
                     <div className="flex items-center gap-3">
-                      <img
-                        src={quickSelectedProduct.imageUrl}
-                        alt={quickSelectedProduct.name}
-                        referrerPolicy="no-referrer"
-                        className="w-12 h-12 rounded-lg object-cover border bg-white shrink-0"
-                      />
+                      {quickSelectedProduct.imageUrl && quickSelectedProduct.imageUrl.trim() ? (
+                        <img
+                          src={quickSelectedProduct.imageUrl}
+                          alt={quickSelectedProduct.name}
+                          referrerPolicy="no-referrer"
+                          className="w-12 h-12 rounded-lg object-cover border bg-white shrink-0"
+                        />
+                      ) : (
+                        <div className="w-12 h-12 rounded-lg border bg-white flex items-center justify-center text-slate-300 shrink-0">
+                          <Tag size={18} />
+                        </div>
+                      )}
                       <div className="flex-1 overflow-hidden">
                         <h4 className="text-xs font-bold text-slate-800 line-clamp-1">{quickSelectedProduct.name}</h4>
                         <p className="text-[9px] font-mono text-slate-400 uppercase">SKU: {quickSelectedProduct.sku} • {quickSelectedProduct.category}</p>

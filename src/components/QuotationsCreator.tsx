@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { runSql, persistTablesToStorage } from '../db';
+import { runSql, persistTablesToStorage, getCentralBranches } from '../db';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
 import SignaturePad from './SignaturePad';
@@ -108,11 +108,32 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   const [quotations, setQuotations] = useState<Quotation[]>([]);
   const [selectedQuote, setSelectedQuote] = useState<Quotation | null>(null);
   
-  // Create Form State (populated from business setup & billing address, no pre-seeded demo values)
+  const resolveActiveBranch = () => {
+    const branches = getCentralBranches();
+    const targetId = String(
+      activeStore ||
+      (typeof localStorage !== 'undefined' ? (localStorage.getItem('active_store_branch') || localStorage.getItem('pos_active_store') || '') : '')
+    ).trim();
+    const matched =
+      branches.find((b: any) => String(b.id || '').toLowerCase() === targetId.toLowerCase()) ||
+      branches.find((b: any) => String(b.name || '').toLowerCase() === targetId.toLowerCase()) ||
+      branches[0] ||
+      null;
+    return {
+      id: matched?.id || targetId || '',
+      name: (matched?.name || '').trim(),
+      location: (matched?.location || '').trim(),
+      phone: (matched?.phone || '').trim(),
+      email: (matched?.email || '').trim(),
+    };
+  };
+
+  // Create Form State (populated from active selected branch + business setup, no pre-seeded demo values)
   const fullBillingAddress = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
+  const [branchInfo, setBranchInfo] = useState(() => resolveActiveBranch());
   const [companyName, setCompanyName] = useState(settings.storeName || '');
   const [companyTPIN, setCompanyTPIN] = useState(settings.tpin || '');
-  const [companyAddress, setCompanyAddress] = useState(fullBillingAddress || '');
+  const [companyAddress, setCompanyAddress] = useState(() => resolveActiveBranch().location || fullBillingAddress || '');
   const [logoText, setLogoText] = useState((settings.storeName || 'POS').slice(0, 3).toUpperCase());
   const [draftDocType, setDraftDocType] = useState<'QUOTATION' | 'INVOICE' | 'DELIVERY_NOTE'>('QUOTATION');
   const [draftDate, setDraftDate] = useState<string>(() => toDateInputValue());
@@ -276,6 +297,11 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   };
 
   const loadQuotations = () => {
+    const currentBranch = resolveActiveBranch();
+    setBranchInfo(currentBranch);
+    const fallbackBilling = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
+    setCompanyAddress(currentBranch.location || fallbackBilling || '');
+
     const res = runSql('SELECT * FROM quotations ORDER BY created_at DESC', 'Quotations: Fetch active invoices');
     if (res.success && Array.isArray(res.data)) {
       setQuotations(res.data);
@@ -354,10 +380,12 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   useEffect(() => {
     setCompanyName(settings.storeName || '');
     setCompanyTPIN(settings.tpin || '');
-    const addr = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
+    const currentBranch = resolveActiveBranch();
+    setBranchInfo(currentBranch);
+    const addr = currentBranch.location || [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
     setCompanyAddress(addr || '');
     setLogoText((settings.storeName || 'POS').slice(0, 3).toUpperCase());
-  }, [settings.storeName, settings.tpin, settings.billingAddress, settings.billingCity, settings.billingCountry]);
+  }, [settings.storeName, settings.tpin, settings.billingAddress, settings.billingCity, settings.billingCountry, activeStore]);
 
   useEffect(() => {
     setWaError(null);
@@ -1135,25 +1163,51 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         }
       }
 
-      // Header Section
+      // Header Section (plain neutral styling; only the logo preserves brand color)
+      let leftHeaderY = 23;
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(18);
-      doc.setTextColor(30, 41, 59); // Slate-800
-      doc.text((companyName || settings.storeName || 'COMPANY').toUpperCase(), textStartX, 23);
+      doc.setTextColor(15, 23, 42); // Plain charcoal
+      doc.text((companyName || settings.storeName || 'COMPANY').toUpperCase(), textStartX, leftHeaderY);
+      leftHeaderY += 6;
 
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(8.5);
-      doc.setTextColor(100, 116, 139); // Slate-500
-      doc.text(`TPIN: ${companyTPIN || 'N/A'}`, textStartX, 29);
-      if (companyAddress) {
-        const addrLines = doc.splitTextToSize(companyAddress, 75);
-        doc.text(addrLines, textStartX, 34);
+      doc.setTextColor(71, 85, 105);
+      doc.text(`TPIN: ${companyTPIN || 'N/A'}`, textStartX, leftHeaderY);
+      leftHeaderY += 4.5;
+
+      const activeBranch = resolveActiveBranch();
+      const activeAddress = activeBranch.location || companyAddress;
+      if (activeBranch.name) {
+        doc.setFont('helvetica', 'bold');
+        doc.setTextColor(51, 65, 85);
+        doc.text(`Branch: ${activeBranch.name}`, textStartX, leftHeaderY);
+        leftHeaderY += 4.5;
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(71, 85, 105);
       }
 
-      // Right-side document type and metadata
+      if (activeAddress) {
+        const addrLines = doc.splitTextToSize(activeAddress, 75);
+        doc.text(addrLines, textStartX, leftHeaderY);
+        leftHeaderY += addrLines.length * 4;
+      }
+
+      const branchContactLine = [
+        activeBranch.phone ? `Tel: ${activeBranch.phone}` : '',
+        activeBranch.email ? `Email: ${activeBranch.email}` : '',
+      ].filter(Boolean).join(' • ');
+      if (branchContactLine) {
+        const contactLines = doc.splitTextToSize(branchContactLine, 75);
+        doc.text(contactLines, textStartX, leftHeaderY);
+        leftHeaderY += contactLines.length * 4;
+      }
+
+      // Right-side document type and metadata (plain charcoal/slate)
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(17);
-      doc.setTextColor(79, 70, 229); // Indigo-600
+      doc.setTextColor(15, 23, 42);
       const statusLabel = docData.status === 'QUOTATION'
         ? 'QUOTATION'
         : docData.status === 'INVOICE'
@@ -1165,25 +1219,28 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
 
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9);
-      doc.setTextColor(100, 116, 139); // Slate-500
+      doc.setTextColor(71, 85, 105);
       doc.text(`Doc ID: ${docData.id}`, 210 - margin, 29, { align: 'right' });
       doc.text(`Date: ${new Date(docData.created_at).toLocaleDateString()}`, 210 - margin, 34, { align: 'right' });
+      let rightHeaderY = 36;
       if (docData.issuedBy) {
         doc.text(`Issued By: ${docData.issuedBy}`, 210 - margin, 39, { align: 'right' });
+        rightHeaderY = 41;
       }
 
       // Horizontal Line Divider
-      doc.setDrawColor(226, 232, 240); // Slate-200
+      const headerBottomY = Math.max(43, leftHeaderY + 2, rightHeaderY + 2);
+      doc.setDrawColor(203, 213, 225); // Slate-300
       doc.setLineWidth(0.5);
-      doc.line(margin, 43, 210 - margin, 43);
+      doc.line(margin, headerBottomY, 210 - margin, headerBottomY);
 
       // Two-column layout: Customer Details & Payment Bank Details
-      const colY = 50;
+      const colY = headerBottomY + 7;
 
       // Column 1: Customer Details
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(10);
-      doc.setTextColor(79, 70, 229); // Indigo-600
+      doc.setTextColor(15, 23, 42);
       doc.text('CLIENT DETAILS', margin, colY);
 
       doc.setFont('helvetica', 'bold');
@@ -1201,7 +1258,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       const rightColX = 115;
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(10);
-      doc.setTextColor(79, 70, 229); // Indigo-600
+      doc.setTextColor(15, 23, 42);
       doc.text('PAYMENT DETAILS', rightColX, colY);
 
       doc.setFont('helvetica', 'normal');
@@ -1214,7 +1271,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       doc.text(`Sort Code: ${docData.bankSortCode || 'N/A'}`, rightColX, colY + 26);
 
       // Line Items Table Header
-      const tableY = 85;
+      const tableY = colY + 35;
       doc.setFillColor(241, 245, 249); // Slate-100
       doc.rect(margin, tableY, contentWidth, 8, 'F');
 
@@ -1309,13 +1366,13 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       doc.text(`VAT (${settings.taxRate}%):`, 125, nextTotalY);
       doc.text(`${settings.currency}${Number(docData.tax || 0).toFixed(2)}`, rightAlignX, nextTotalY, { align: 'right' });
 
-      // Grand Total Box
+      // Grand Total Box (plain neutral gray + dark slate text)
       const gTotalY = nextTotalY + 5;
-      doc.setFillColor(79, 70, 229, 0.05);
+      doc.setFillColor(241, 245, 249);
       doc.rect(120, gTotalY, 75, 8, 'F');
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(11);
-      doc.setTextColor(79, 70, 229);
+      doc.setTextColor(15, 23, 42);
       doc.text('GRAND TOTAL:', 125, gTotalY + 5.5);
       doc.text(`${settings.currency}${Number(docData.total || 0).toFixed(2)}`, rightAlignX - 2, gTotalY + 5.5, { align: 'right' });
 
@@ -1354,7 +1411,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       // Issuer Signature Box (Left)
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(8.5);
-      doc.setTextColor(79, 70, 229);
+      doc.setTextColor(30, 41, 59);
       doc.text('AUTHORIZED SIGNATURE (ISSUED BY)', margin, sigY);
 
       if (docData.issuerSignature) {
@@ -1381,7 +1438,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         const rx = 113;
         doc.setFont('helvetica', 'bold');
         doc.setFontSize(8.5);
-        doc.setTextColor(5, 150, 105);
+        doc.setTextColor(30, 41, 59);
         doc.text('RECEIVER ACCEPTANCE SIGNATURE', rx, sigY);
 
         if (docData.receiverSignature) {
@@ -3262,12 +3319,12 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       </div>
                     )}
                     
-                    {/* Visual Header Grid layout */}
-                    <div className="flex justify-between items-start flex-wrap gap-4 border-b border-indigo-100 pb-5">
+                    {/* Visual Header Grid layout — plain neutral styling with full-color logo */}
+                    <div className="flex justify-between items-start flex-wrap gap-4 border-b border-slate-200 pb-5">
                       <div className="font-sans">
-                        {/* Uploaded Company Logo or Monogram Fallback */}
+                        {/* Uploaded Company Logo or Plain Monogram Fallback */}
                         <div className="flex items-center gap-3">
-                          {settings.logoUrl ? (
+                          {settings.logoUrl && settings.logoUrl.trim() ? (
                             <img
                               src={settings.logoUrl}
                               alt={companyName || 'Company Logo'}
@@ -3275,26 +3332,34 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                               referrerPolicy="no-referrer"
                             />
                           ) : (
-                            <div className="w-11 h-11 bg-indigo-600 rounded-lg flex items-center justify-center text-white text-md font-serif font-extrabold shadow-sm shrink-0">
+                            <div className="w-11 h-11 bg-slate-900 rounded-lg flex items-center justify-center text-white text-md font-serif font-extrabold shadow-sm shrink-0">
                               {logoText}
                             </div>
                           )}
                           <div>
-                            <h2 className="text-md font-extrabold tracking-tight text-indigo-900 uppercase font-sans leading-none">{companyName}</h2>
-                            <p className="text-[10px] text-slate-400 font-bold uppercase mt-1">TPIN: {companyTPIN}</p>
+                            <h2 className="text-md font-extrabold tracking-tight text-slate-900 uppercase font-sans leading-none">{companyName}</h2>
+                            <p className="text-[10px] text-slate-500 font-bold uppercase mt-1">TPIN: {companyTPIN || 'N/A'}</p>
+                            {branchInfo.name && (
+                              <p className="text-[10px] text-slate-700 font-extrabold uppercase mt-0.5">Branch: {branchInfo.name}</p>
+                            )}
                           </div>
                         </div>
                         {companyAddress && (
-                          <p className="text-[11px] text-slate-500 mt-3 font-semibold font-sans max-w-[280px] leading-relaxed">{companyAddress}</p>
+                          <p className="text-[11px] text-slate-600 mt-3 font-semibold font-sans max-w-[300px] leading-relaxed">{companyAddress}</p>
+                        )}
+                        {(branchInfo.phone || branchInfo.email) && (
+                          <p className="text-[10px] text-slate-500 mt-0.5 font-medium font-sans max-w-[300px]">
+                            {[branchInfo.phone ? `Tel: ${branchInfo.phone}` : '', branchInfo.email ? `Email: ${branchInfo.email}` : ''].filter(Boolean).join(' • ')}
+                          </p>
                         )}
                       </div>
 
                       <div className="text-right font-sans min-w-[150px]">
-                        <h1 className="text-lg font-extrabold tracking-normal text-indigo-950 font-serif uppercase leading-tight">{activeDoc.status}</h1>
+                        <h1 className="text-lg font-extrabold tracking-normal text-slate-900 font-serif uppercase leading-tight">{activeDoc.status}</h1>
                         <p className="text-xs font-mono mt-1 font-bold text-slate-700">Doc ID: {activeDoc.id}</p>
                         <p className="text-[11px] text-slate-500 font-semibold mt-1">Date: {new Date(activeDoc.created_at).toLocaleString()}</p>
                         {activeDoc.issuedBy && (
-                          <p className="text-[11px] text-indigo-700 font-bold mt-1">Issued By: {activeDoc.issuedBy}</p>
+                          <p className="text-[11px] text-slate-700 font-bold mt-1">Issued By: {activeDoc.issuedBy}</p>
                         )}
                       </div>
                     </div>
@@ -3302,18 +3367,18 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     {/* Client invoice details */}
                     <div className="grid grid-cols-2 gap-4 border-b border-slate-100 pb-5 font-sans">
                       <div>
-                        <h4 className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest">Billed To Profile</h4>
+                        <h4 className="text-[10px] text-slate-500 font-extrabold uppercase tracking-widest">Billed To Profile</h4>
                         <p className="text-xs font-extrabold text-slate-900 mt-1.5">{activeDoc.customer_name}</p>
                         {activeDoc.customer_phone && <p className="text-[11px] text-slate-500 mt-1">Phone: {activeDoc.customer_phone}</p>}
                         {activeDoc.customer_email && <p className="text-[11px] text-slate-500 font-medium mt-0.5">Email: {activeDoc.customer_email}</p>}
                       </div>
 
                       <div>
-                        <h4 className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest">Bank Payment Details</h4>
+                        <h4 className="text-[10px] text-slate-500 font-extrabold uppercase tracking-widest">Bank Payment Details</h4>
                         <div className="text-[11px] text-slate-600 mt-1.5 space-y-1 leading-tight">
                           <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BANK NAME:</span> <strong className="text-slate-800">{activeDoc.bank_name || 'On Request'}</strong></p>
                           <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NAME:</span> <strong className="text-slate-800">{activeDoc.bankAccountName || companyName || 'On Request'}</strong></p>
-                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NUMBER:</span> <strong className="text-indigo-950 font-bold font-mono">{activeDoc.bank_account || 'On Request'}</strong></p>
+                          <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">ACCOUNT NUMBER:</span> <strong className="text-slate-900 font-bold font-mono">{activeDoc.bank_account || 'On Request'}</strong></p>
                           <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">BRANCH NAME:</span> <strong className="text-slate-800">{activeDoc.bank_branch || 'On Request'}</strong></p>
                           {activeDoc.bankSortCode && (
                             <p><span className="font-extrabold text-[8px] text-slate-400 uppercase mr-1">SORT CODE:</span> <strong className="text-slate-800 font-bold font-mono">{activeDoc.bankSortCode}</strong></p>
@@ -3363,7 +3428,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                           <span className="font-bold font-mono text-slate-800">{settings.currency}{Number(activeDoc.subtotal || 0).toFixed(2)}</span>
                         </div>
                         {Number(activeDoc.discount || 0) > 0 && (
-                          <div className="flex justify-between text-rose-600 font-bold">
+                          <div className="flex justify-between text-slate-700 font-bold">
                             <span>Discount:</span>
                             <span className="font-mono">-{settings.currency}{Number(activeDoc.discount || 0).toFixed(2)}</span>
                           </div>
@@ -3373,8 +3438,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                           <span className="font-mono text-slate-800">{settings.currency}{Number(activeDoc.tax || 0).toFixed(2)}</span>
                         </div>
                         <div className="flex justify-between text-slate-900 border-t border-slate-200 pt-2 font-black text-sm">
-                          <span className="text-indigo-900 uppercase text-[11px] tracking-wider">Grand Total:</span>
-                          <span className="font-mono text-indigo-950 bg-indigo-50/50 px-2 py-0.5 rounded border border-indigo-100">
+                          <span className="text-slate-900 uppercase text-[11px] tracking-wider">Grand Total:</span>
+                          <span className="font-mono text-slate-950 bg-slate-100 px-2 py-0.5 rounded border border-slate-300">
                             {settings.currency}{Number(activeDoc.total || 0).toFixed(2)}
                           </span>
                         </div>
@@ -3397,7 +3462,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                     <div className="border-t border-slate-200 pt-4 mt-2 grid grid-cols-1 sm:grid-cols-2 gap-6 font-sans">
                       {/* Issued By Signature */}
                       <div className="flex flex-col gap-1.5">
-                        <span className="text-[9px] font-extrabold uppercase tracking-widest text-indigo-700">
+                        <span className="text-[9px] font-extrabold uppercase tracking-widest text-slate-700">
                           Authorized Signature (Issued By)
                         </span>
                         <div className="h-14 border-b border-slate-300 flex items-end pb-1">
@@ -3422,7 +3487,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                       {/* Receiver Acceptance Signature (Delivery Note or Signed Doc) */}
                       {(activeDoc.status === 'DELIVERY_NOTE' || activeDoc.receiverSignature || activeDoc.receiverName) && (
                         <div className="flex flex-col gap-1.5">
-                          <span className="text-[9px] font-extrabold uppercase tracking-widest text-emerald-700">
+                          <span className="text-[9px] font-extrabold uppercase tracking-widest text-slate-700">
                             Receiver Acceptance Signature
                           </span>
                           <div className="h-14 border-b border-slate-300 flex items-end pb-1">
@@ -3433,7 +3498,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                                 className="max-h-12 max-w-[180px] object-contain"
                               />
                             ) : (
-                              <span className="text-[10px] italic text-amber-600 font-semibold">
+                              <span className="text-[10px] italic text-slate-400 font-semibold">
                                 Pending receiver signature upon delivery
                               </span>
                             )}

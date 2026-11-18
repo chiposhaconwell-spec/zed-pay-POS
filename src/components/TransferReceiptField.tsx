@@ -112,7 +112,7 @@ export function TransferReceiptField({
       {receipt && (
         <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 bg-emerald-50 border border-emerald-200 rounded-lg">
           <div className="flex items-center gap-2 min-w-0">
-            {receipt.mimeType.startsWith('image/') ? (
+            {receipt.mimeType.startsWith('image/') && receipt.dataUrl && receipt.dataUrl.trim() ? (
               <img
                 src={receipt.dataUrl}
                 alt="Receipt thumbnail"
@@ -217,7 +217,12 @@ export function TransferReceiptViewerModal({
         </div>
 
         <div className="p-4 overflow-auto flex-1 flex items-center justify-center bg-slate-100">
-          {isImage ? (
+          {!receipt.dataUrl || !receipt.dataUrl.trim() ? (
+            <div className="flex flex-col items-center gap-2 p-6 bg-white rounded-xl border border-slate-200 text-slate-500 text-xs font-bold">
+              <FileText size={32} className="text-slate-400" />
+              <span>Receipt preview unavailable</span>
+            </div>
+          ) : isImage ? (
             <img
               src={receipt.dataUrl}
               alt={receipt.fileName}
