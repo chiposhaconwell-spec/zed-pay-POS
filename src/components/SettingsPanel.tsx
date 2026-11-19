@@ -33,8 +33,8 @@ import {
 import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod, calculateLoyaltyPoints, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings, CustomPaymentMethod } from '../types';
-import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
-import { auth, googleProvider, backupToCloud, restoreFromCloud, getTransportSecurityStatus, registerOrSignInWithEmailPassword } from '../firebase';
+import { onAuthStateChanged, User as FirebaseUser, signInWithPopup } from 'firebase/auth';
+import { auth, googleProvider, googleSignOut, backupToCloud, restoreFromCloud, getTransportSecurityStatus, registerOrSignInWithEmailPassword } from '../firebase';
 import { getZraConfig, saveZraConfig, subscribeZraConfig, ZraConfig, ZraTaxTypeCode, ZRA_TAX_TYPES, ZRA_PACKAGING_UNITS, ZRA_QTY_UNITS } from '../zra/zraConfig';
 import { FiscalService, ZraOfflineQueueItem } from '../zra/fiscalService';
 import {
@@ -420,7 +420,7 @@ export default function SettingsPanel({
 
   const handleGoogleLogout = async () => {
     try {
-      await signOut(auth);
+      await googleSignOut();
       triggerNotify('Logged out of Firebase Auth successfully!');
     } catch (err: any) {
       console.error(err);

@@ -132,11 +132,15 @@ export default function AndroidShell({
             {/* Left Status Indicators: Time, Store, Active Tab */}
             <div className="flex items-center gap-2">
               <span className="text-white text-[11px] leading-none">{timeStr || '12:00'}</span>
-              <span className="text-[10px] px-1 text-slate-500 font-mono">|</span>
-              <span className="text-[10px] text-emerald-400 font-semibold tracking-wide flex items-center gap-1 uppercase">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block animate-pulse"></span>
-                {storeName || 'SME Retail'}
-              </span>
+              {storeName ? (
+                <>
+                  <span className="text-[10px] px-1 text-slate-500 font-mono">|</span>
+                  <span className="text-[10px] text-emerald-400 font-semibold tracking-wide flex items-center gap-1 uppercase">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block animate-pulse"></span>
+                    {storeName}
+                  </span>
+                </>
+              ) : null}
             </div>
 
             {/* Middle Logo/Status */}

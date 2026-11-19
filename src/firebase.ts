@@ -302,8 +302,19 @@ export const setCachedAccessToken = (token: string | null) => {
 
 // Sign Out from Firebase Auth
 export const googleSignOut = async () => {
-  await signOut(auth);
+  if (autoFirebaseBackupTimer) {
+    clearTimeout(autoFirebaseBackupTimer);
+    autoFirebaseBackupTimer = null;
+  }
   cachedAccessToken = null;
+  if (typeof localStorage !== 'undefined') {
+    localStorage.removeItem('pos_last_firebase_storage_backup');
+  }
+  try {
+    await signOut(auth);
+  } catch (err) {
+    console.warn('Firebase signOut notice:', err);
+  }
 };
 
 export enum OperationType {
@@ -1943,6 +1954,7 @@ let autoFirebaseBackupTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function triggerAutoFirebaseBackup(businessId?: string) {
   if (!auth.currentUser) return;
+  if (typeof localStorage !== 'undefined' && localStorage.getItem('pos_authenticated_session') !== 'true') return;
   if (autoFirebaseBackupTimer) {
     clearTimeout(autoFirebaseBackupTimer);
   }

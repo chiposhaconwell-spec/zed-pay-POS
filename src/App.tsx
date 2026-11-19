@@ -14,7 +14,7 @@ import { motion, AnimatePresence } from 'motion/react';
 
 // Database & Firebase Cloud API
 import { initializeDatabase, SeedTemplate, runSql, getCentralBranches, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getAllSelectableAccounts, syncAllAccountingSystems, seedChartOfAccountsOnly, getActiveBusinessId, getActiveStoreId, sqlEsc } from './db';
-import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud } from './firebase';
+import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud, googleSignOut } from './firebase';
 import { StoreSettings, ActiveTab } from './types';
 import {
   UserPermissions,
@@ -262,8 +262,11 @@ export default function App() {
     // 1. Provision memory SQL tables in blank mode (no preseeded stock, batches, or login accounts)
     initializeDatabase('blank');
 
-    // 2. Recover merchant preference details & sync ZRA config
-    const localConf = localStorage.getItem('android_pos_settings');
+    // 2. Recover merchant preference details & sync ZRA config ONLY if authenticated session exists
+    const isSavedAuth =
+      localStorage.getItem('pos_authenticated_session') === 'true' &&
+      Boolean(localStorage.getItem('active_business_profile'));
+    const localConf = isSavedAuth ? localStorage.getItem('android_pos_settings') : null;
     if (localConf) {
       try {
         const parsedConf = JSON.parse(localConf);
@@ -347,8 +350,12 @@ export default function App() {
         } else {
           localStorage.removeItem('active_business_profile');
           localStorage.removeItem('pos_authenticated_session');
+          localStorage.removeItem('android_pos_settings');
           clearSessionPermissionsFromStorage();
+          setSettings(DEFAULT_SETTINGS);
+          setActiveBusiness({ id: '', name: '', owner: '', email: '' });
           setIsAuthenticatedSession(false);
+          void googleSignOut();
           if (accessCheck.reason) {
             setAuthFeedback({ type: 'error', text: accessCheck.reason });
           }
@@ -356,15 +363,23 @@ export default function App() {
       } catch (e) {
         localStorage.removeItem('active_business_profile');
         localStorage.removeItem('pos_authenticated_session');
+        localStorage.removeItem('android_pos_settings');
         clearSessionPermissionsFromStorage();
+        setSettings(DEFAULT_SETTINGS);
+        setActiveBusiness({ id: '', name: '', owner: '', email: '' });
         setIsAuthenticatedSession(false);
+        void googleSignOut();
       }
     } else {
       // No authenticated session: start on Log In / Create Account screen (blank state)
       localStorage.removeItem('active_business_profile');
       localStorage.removeItem('pos_authenticated_session');
+      localStorage.removeItem('android_pos_settings');
       clearSessionPermissionsFromStorage();
+      setSettings(DEFAULT_SETTINGS);
+      setActiveBusiness({ id: '', name: '', owner: '', email: '' });
       setIsAuthenticatedSession(false);
+      void googleSignOut();
       setAuthScreenMode(existingBusinesses.length === 0 ? 'register' : 'login');
     }
 
@@ -387,7 +402,14 @@ export default function App() {
           localStorage.removeItem('pos_shift_active');
           localStorage.removeItem('logged_in_accessible_branches');
           localStorage.removeItem('logged_in_user_role');
+          localStorage.removeItem('logged_in_user_email');
+          localStorage.removeItem('logged_in_user_name');
+          localStorage.removeItem('quick_salesperson_name');
+          localStorage.removeItem('android_pos_settings');
           clearSessionPermissionsFromStorage();
+          void googleSignOut();
+          setSettings(DEFAULT_SETTINGS);
+          setActiveBusiness({ id: '', name: '', owner: '', email: '' });
           setUserRole('owner');
           setAuthenticatedRole('owner');
           setUserPermissions(buildUserPermissions({ role: 'owner' }));
@@ -990,26 +1012,39 @@ export default function App() {
     }
   };
 
-  const handleLogoutAccount = () => {
+  const handleLogoutAccount = async () => {
     localStorage.removeItem('pos_authenticated_session');
     localStorage.removeItem('active_business_profile');
     localStorage.removeItem('active_store_branch');
     localStorage.removeItem('pos_shift_active');
     localStorage.removeItem('logged_in_accessible_branches');
     localStorage.removeItem('logged_in_user_role');
+    localStorage.removeItem('logged_in_user_email');
+    localStorage.removeItem('logged_in_user_name');
+    localStorage.removeItem('quick_salesperson_name');
+    localStorage.removeItem('android_pos_settings');
     clearSessionPermissionsFromStorage();
+
+    setSettings(DEFAULT_SETTINGS);
     setActiveBusiness({ id: '', name: '', owner: '', email: '' });
     setActiveStore('');
     setStores([]);
+    setAccessibleStoreIds([]);
     setCustomersList([]);
     setStaffMembers([]);
+    setSyncLoginEmail('');
+    setSyncLoginPassword('');
+    setSyncLoginBranch('');
     setUserRole('owner');
     setAuthenticatedRole('owner');
     setUserPermissions(buildUserPermissions({ role: 'owner' }));
     setIsAuthenticatedSession(false);
     setShowBranchChoiceGate(false);
     setShowNavDrawer(false);
+    setActiveTab2('billing');
     setAuthScreenMode('login');
+
+    await googleSignOut();
   };
 
   // Switch workspace immediately and isolate branch/tenant data
@@ -1071,7 +1106,7 @@ export default function App() {
       setActiveTab={setActiveTab2}
       showSqlSplit={showSqlSplit}
       setShowSqlSplit={setShowSqlSplit}
-      storeName={settings.storeName || activeBusiness.name || 'Enterprise POS'}
+      storeName={isAuthenticatedSession && activeBusiness.id ? (settings.storeName || activeBusiness.name || '') : ''}
     >
       {!isAuthenticatedSession || !activeBusiness.id ? (
         /* FULL-SCREEN LOG IN OR CREATE ACCOUNT ONBOARDING GATE (NO PRE-SEEDED DETAILS, BRANCHES, OR STOCK) */
