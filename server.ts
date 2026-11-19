@@ -487,9 +487,90 @@ async function startServer() {
   if (!isProd) {
     const { createServer } = await import('vite');
     const vite = await createServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        watch: { ignored: ['**/*'] },
+      },
       appType: 'spa',
     });
+
+    // Serve a WebSocket-free /@vite/client module because HMR is disabled in this environment
+    // and Vite 6's default client still attempts a doomed WebSocket handshake on port 24678.
+    app.get('/@vite/client', (_req, res) => {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.send(`
+const BaseElement = typeof HTMLElement !== "undefined" ? HTMLElement : class {};
+class ErrorOverlay extends BaseElement {}
+const sheetsMap = new Map();
+if ("document" in globalThis) {
+  document.querySelectorAll("style[data-vite-dev-id]").forEach((el) => {
+    sheetsMap.set(el.getAttribute("data-vite-dev-id"), el);
+  });
+}
+const cspNonce = "document" in globalThis ? document.querySelector("meta[property=csp-nonce]")?.nonce : void 0;
+let lastInsertedStyle;
+function updateStyle(id, content) {
+  if (!("document" in globalThis)) return;
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement("style");
+    style.setAttribute("type", "text/css");
+    style.setAttribute("data-vite-dev-id", id);
+    style.textContent = content;
+    if (cspNonce) {
+      style.setAttribute("nonce", cspNonce);
+    }
+    if (!lastInsertedStyle) {
+      document.head.appendChild(style);
+      setTimeout(() => {
+        lastInsertedStyle = void 0;
+      }, 0);
+    } else {
+      lastInsertedStyle.insertAdjacentElement("afterend", style);
+    }
+    lastInsertedStyle = style;
+  } else {
+    style.textContent = content;
+  }
+  sheetsMap.set(id, style);
+}
+function removeStyle(id) {
+  if (!("document" in globalThis)) return;
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+function createHotContext() {
+  const noop = () => {};
+  return {
+    data: {},
+    accept: noop,
+    acceptExports: noop,
+    dispose: noop,
+    prune: noop,
+    decline: noop,
+    invalidate: noop,
+    on: noop,
+    off: noop,
+    send: noop,
+  };
+}
+function injectQuery(url, queryToInject) {
+  if (url[0] !== "." && url[0] !== "/") {
+    return url;
+  }
+  const pathname = url.replace(/[?#].*$/, "");
+  const { search, hash } = new URL(url, "http://vite.dev");
+  return \`\${pathname}?\${queryToInject}\${search ? "&" + search.slice(1) : ""}\${hash || ""}\`;
+}
+export { ErrorOverlay, createHotContext, injectQuery, removeStyle, updateStyle };
+`);
+    });
+
     app.use(vite.middlewares);
   } else {
     app.use(express.static(distPath));
