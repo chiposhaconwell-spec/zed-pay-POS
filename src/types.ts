@@ -107,6 +107,8 @@ export interface Loan {
   due_date: string;
   created_at: string;
   updated_at: string;
+  business_id?: string;
+  store_id?: string;
 }
 
 export interface LoanAmortizationSchedule {

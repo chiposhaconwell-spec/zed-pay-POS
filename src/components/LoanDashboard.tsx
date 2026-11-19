@@ -45,7 +45,7 @@ import {
   History,
   Save
 } from 'lucide-react';
-import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, syncAllAccountingSystems, getAllSelectableAccounts, getCustomPaymentMethods, getActiveBusinessId, getActiveStoreId, getTenantAccountBalances, sqlEsc } from '../db';
 import { StoreSettings, Loan, LoanAmortizationSchedule, AutomatedDeductionLog } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
@@ -246,8 +246,12 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   // Load physical rows
   const loadData = () => {
     try {
+      const activeBizId = getActiveBusinessId();
+      const bizWhere = activeBizId ? `WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+      const bizAnd = activeBizId ? `AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
       // 1. Load loans
-      const rxLoans = runSql("SELECT * FROM loans ORDER BY created_at DESC", 'Loans: Load merchant agreements');
+      const rxLoans = runSql(`SELECT * FROM loans ${bizWhere} ORDER BY created_at DESC`, 'Loans: Load merchant agreements');
       if (rxLoans.success && Array.isArray(rxLoans.data)) {
         setLoans(rxLoans.data as Loan[]);
         // Auto select first loan if none selected or if selected is stale
@@ -260,51 +264,52 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       }
 
       // 2. Load amortization
-      const rxAmort = runSql("SELECT * FROM loan_amortization_schedule ORDER BY installment_number ASC", 'Loans: Load calendar installments');
+      const rxAmort = runSql(`SELECT * FROM loan_amortization_schedule ${bizWhere} ORDER BY installment_number ASC`, 'Loans: Load calendar installments');
       if (rxAmort.success && Array.isArray(rxAmort.data)) {
         setAmortization(rxAmort.data as LoanAmortizationSchedule[]);
       }
 
       // 3. Load deductions sweep logs
-      const rxDeds = runSql("SELECT * FROM automated_deduction_logs ORDER BY created_at DESC", 'Loans: Load sweep deductions activity');
+      const rxDeds = runSql(`SELECT * FROM automated_deduction_logs ${bizWhere} ORDER BY created_at DESC`, 'Loans: Load sweep deductions activity');
       if (rxDeds.success && Array.isArray(rxDeds.data)) {
         setDeductions(rxDeds.data as AutomatedDeductionLog[]);
       }
 
       // 4. Load expenses
-      const rxExp = runSql("SELECT * FROM expenses ORDER BY expense_date DESC, created_at DESC", 'Expenses: Fetch expenses history');
+      const rxExp = runSql(`SELECT * FROM expenses ${bizWhere} ORDER BY expense_date DESC, created_at DESC`, 'Expenses: Fetch expenses history');
       if (rxExp.success && Array.isArray(rxExp.data)) {
         setExpensesList(rxExp.data);
       }
 
       // 5. Load internal transfers
-      const rxTrf = runSql("SELECT t.*, le.account_id, le.type, le.amount AS entry_amount FROM transactions t JOIN ledger_entries le ON t.id = le.transaction_id WHERE t.channel = 'INTERNAL_TRANSFER' ORDER BY t.created_at DESC", 'Transfers: Fetch money movements');
+      const rxTrf = runSql(`SELECT t.*, le.account_id, le.type, le.amount AS entry_amount FROM transactions t JOIN ledger_entries le ON t.id = le.transaction_id WHERE t.channel = 'INTERNAL_TRANSFER' ${activeBizId ? `AND t.business_id = '${sqlEsc(activeBizId)}' AND le.business_id = '${sqlEsc(activeBizId)}'` : ''} ORDER BY t.created_at DESC`, 'Transfers: Fetch money movements');
       if (rxTrf.success && Array.isArray(rxTrf.data)) {
         setTransfersList(rxTrf.data);
       }
 
       // 6. Load transit purchases
-      const rxPt = runSql("SELECT * FROM purchases_transit ORDER BY created_at DESC", 'Supply Management: Fetch purchase orders');
+      const rxPt = runSql(`SELECT * FROM purchases_transit ${bizWhere} ORDER BY created_at DESC`, 'Supply Management: Fetch purchase orders');
       if (rxPt.success && Array.isArray(rxPt.data)) {
         setTransitPurchasesList(rxPt.data);
       }
 
       // 7. Ensure suppliers table exists & load saved suppliers
       runSql(
-        `CREATE TABLE IF NOT EXISTS suppliers (id STRING PRIMARY KEY, name STRING, contact_person STRING, phone STRING, email STRING, address STRING, tpin STRING, payment_terms STRING, default_payment_method STRING, notes STRING, created_at STRING, updated_at STRING)`,
+        `CREATE TABLE IF NOT EXISTS suppliers (id STRING PRIMARY KEY, name STRING, contact_person STRING, phone STRING, email STRING, address STRING, tpin STRING, payment_terms STRING, default_payment_method STRING, notes STRING, created_at STRING, updated_at STRING, business_id STRING, store_id STRING)`,
         'Supply Management: Ensure suppliers table',
         true
       );
-      const rxSup = runSql("SELECT * FROM suppliers ORDER BY name ASC", 'Supply Management: Fetch saved suppliers', true);
+      const rxSup = runSql(`SELECT * FROM suppliers ${bizWhere} ORDER BY name ASC`, 'Supply Management: Fetch saved suppliers', true);
       if (rxSup.success && Array.isArray(rxSup.data)) {
         setSuppliersList(rxSup.data);
       }
 
       // 8. Load product list for selection
-      const rxProds = runSql("SELECT * FROM products ORDER BY name ASC", 'Products: Fetch available items');
+      const rxProds = runSql(`SELECT * FROM products ${bizWhere} ORDER BY name ASC`, 'Products: Fetch available items');
       if (rxProds.success && Array.isArray(rxProds.data)) {
         setProductList(rxProds.data);
       }
+      void bizAnd;
     } catch (e) {
       console.error('Error reading loans records', e);
     }
@@ -349,17 +354,21 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   // Preload Statement records from dynamic tables
   const loadStatementData = () => {
     try {
-      const ordRes = runSql("SELECT * FROM orders WHERE status = 'COMPLETED' OR status = 'SUCCESS' OR status = 'ACTIVE' OR status = 'PAID'", 'Statement: Fetch completed store orders');
+      const activeBizId = getActiveBusinessId();
+      const bizFilter = activeBizId ? `AND business_id = '${sqlEsc(activeBizId)}'` : '';
+      const bizWhere = activeBizId ? `WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+
+      const ordRes = runSql(`SELECT * FROM orders WHERE (status = 'COMPLETED' OR status = 'SUCCESS' OR status = 'ACTIVE' OR status = 'PAID') ${bizFilter}`, 'Statement: Fetch completed store orders');
       if (ordRes.success && Array.isArray(ordRes.data)) {
         setStatementOrders(ordRes.data);
       }
 
-      const itemRes = runSql("SELECT oi.*, p.cost, p.name FROM order_items oi JOIN products p ON oi.productId = p.id", 'Statement: Fetch items');
+      const itemRes = runSql(`SELECT oi.*, p.cost, p.name FROM order_items oi JOIN products p ON oi.productId = p.id ${activeBizId ? `WHERE oi.business_id = '${sqlEsc(activeBizId)}' AND p.business_id = '${sqlEsc(activeBizId)}'` : ''}`, 'Statement: Fetch items');
       if (itemRes.success && Array.isArray(itemRes.data)) {
         setStatementItems(itemRes.data);
       }
 
-      const attRes = runSql("SELECT * FROM time_attendance", 'Statement: Fetch payroll entries');
+      const attRes = runSql(`SELECT * FROM time_attendance ${bizWhere}`, 'Statement: Fetch payroll entries');
       if (attRes.success && Array.isArray(attRes.data)) {
         setStatementAttendance(attRes.data);
       }
@@ -661,24 +670,27 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     else if (expenseCategory.includes('Maintenance') || expenseCategory.includes('Repairs')) accountExpenseId = 'acc_exp_maintenance';
     else if (expenseCategory.includes('Licenses') || expenseCategory.includes('Taxes')) accountExpenseId = 'acc_exp_taxes_licensing';
 
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(expenseStoreId || activeStore, activeBizId);
+
     runSql(
-      `INSERT INTO expenses VALUES ('${expenseId}', '${expenseCategory}', '${expenseAccountId}', '${expenseAccountId}', ${amt}, '${expenseDescription.replace(/'/g, "''")}', '${expenseRef.replace(/'/g, "''")}', '${expenseDate}', '${expenseStoreId}', '${userRole}', '${createdAt}')`,
+      `INSERT INTO expenses (id, category, payment_method, account_id, amount, description, reference_no, expense_date, store_id, performed_by, created_by, created_at, business_id) VALUES ('${expenseId}', '${sqlEsc(expenseCategory)}', '${sqlEsc(expenseAccountId)}', '${sqlEsc(expenseAccountId)}', ${amt}, '${sqlEsc(expenseDescription)}', '${sqlEsc(expenseRef)}', '${sqlEsc(expenseDate)}', '${sqlEsc(resolvedStoreId)}', '${sqlEsc(userRole)}', '${sqlEsc(userRole)}', '${createdAt}', '${sqlEsc(activeBizId)}')`,
       'Expenses: Record expense entry'
     );
 
-    logEmployeeAudit('EXPENSES', 'Added Store Expense', `Category: ${expenseCategory}, Desc: ${expenseDescription}, Ref: ${expenseRef || 'N/A'}`, amt, expenseStoreId, userRole);
+    logEmployeeAudit('EXPENSES', 'Added Store Expense', `Category: ${expenseCategory}, Desc: ${expenseDescription}, Ref: ${expenseRef || 'N/A'}`, amt, resolvedStoreId, userRole);
 
     runSql(
-      `INSERT INTO transactions VALUES ('${txId}', 'idem-${expenseId}', 'POS-${expenseStoreId.toUpperCase()}', '${expenseAccountId.toUpperCase()}', '${expenseRef || 'EXP-REF'}', ${amt}, 0, 'SUCCESS', 'Expense: ${expenseCategory} - ${expenseDescription.replace(/'/g, "''")}', '${createdAt}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id) VALUES ('${txId}', 'idem-${expenseId}', 'POS-${sqlEsc(resolvedStoreId.toUpperCase())}', '${sqlEsc(expenseAccountId.toUpperCase())}', '${sqlEsc(expenseRef || 'EXP-REF')}', ${amt}, 0, 'SUCCESS', 'Expense: ${sqlEsc(expenseCategory)} - ${sqlEsc(expenseDescription)}', '${createdAt}', '${createdAt}', '${sqlEsc(userRole)}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')`,
       'Expenses: Journal transaction'
     );
 
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-1', '${txId}', '${accountExpenseId}', 'DEBIT', ${amt}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-1', '${txId}', '${accountExpenseId}', 'DEBIT', ${amt}, '${createdAt}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')`,
       'Expenses Ledger: Debit Expense Account'
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-2', '${txId}', '${expenseAccountId}', 'CREDIT', ${amt}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-2', '${txId}', '${expenseAccountId}', 'CREDIT', ${amt}, '${createdAt}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')`,
       'Expenses Ledger: Credit Source Account'
     );
 
@@ -694,7 +706,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
   const handleDeleteExpense = (id: string) => {
     if (confirm('Are you sure you want to delete this expense entry?')) {
-      runSql(`DELETE FROM expenses WHERE id = '${id}'`, 'Expenses: Delete record');
+      const activeBizId = getActiveBusinessId();
+      const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+      runSql(`DELETE FROM expenses WHERE id = '${sqlEsc(id)}'${bizAnd}`, 'Expenses: Delete record');
       persistTablesToStorage();
       loadData();
       loadStatementData();
@@ -717,6 +731,8 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     const txId = 'tx-trf-' + Date.now();
     const createdAt = new Date().toISOString();
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
 
     const accLabels: Record<string, string> = {
       'acc_cash': 'Counter Cash Drawer',
@@ -732,16 +748,16 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const narration = `Internal Transfer: ${accLabels[transferSourceAcc] || transferSourceAcc} -> ${accLabels[transferDestAcc] || transferDestAcc} (${transferRef || 'Float Movement'})`;
 
     runSql(
-      `INSERT INTO transactions VALUES ('${txId}', 'idem-${txId}', 'FINANCE-TRANSFER', 'INTERNAL_TRANSFER', '${(transferRef || 'TRF-REF').replace(/'/g, "''")}', ${amt}, 0, 'SUCCESS', '${narration.replace(/'/g, "''")}', '${createdAt}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id) VALUES ('${txId}', 'idem-${txId}', 'FINANCE-TRANSFER', 'INTERNAL_TRANSFER', '${sqlEsc(transferRef || 'TRF-REF')}', ${amt}, 0, 'SUCCESS', '${sqlEsc(narration)}', '${createdAt}', '${createdAt}', '${sqlEsc(userRole)}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')`,
       'Transfers: Record journal move'
     );
 
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-1', '${txId}', '${transferDestAcc}', 'DEBIT', ${amt}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-1', '${txId}', '${transferDestAcc}', 'DEBIT', ${amt}, '${createdAt}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')`,
       'Transfers Ledger: Debit Destination Account'
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${Date.now()}-2', '${txId}', '${transferSourceAcc}', 'CREDIT', ${amt}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-2', '${txId}', '${transferSourceAcc}', 'CREDIT', ${amt}, '${createdAt}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')`,
       'Transfers Ledger: Credit Source Account'
     );
 
@@ -765,7 +781,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   // --- SUPPLY MANAGEMENT & TRANSIT PROCUREMENT ENGINE ---
   const ensureSuppliersTableSql = () => {
     runSql(
-      `CREATE TABLE IF NOT EXISTS suppliers (id STRING PRIMARY KEY, name STRING, contact_person STRING, phone STRING, email STRING, address STRING, tpin STRING, payment_terms STRING, default_payment_method STRING, notes STRING, created_at STRING, updated_at STRING)`,
+      `CREATE TABLE IF NOT EXISTS suppliers (id STRING PRIMARY KEY, name STRING, contact_person STRING, phone STRING, email STRING, address STRING, tpin STRING, payment_terms STRING, default_payment_method STRING, notes STRING, created_at STRING, updated_at STRING, business_id STRING, store_id STRING)`,
       'Supply Management: Ensure suppliers table',
       true
     );
@@ -822,17 +838,20 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       suppliersList.find((s) => String(s.name || '').trim().toLowerCase() === cleanName.toLowerCase());
 
     const esc = (v?: string) => String(v || '').trim().replace(/'/g, "''");
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizAnd = activeBizId ? ` AND business_id = '${esc(activeBizId)}'` : '';
 
     if (existing) {
       runSql(
-        `UPDATE suppliers SET name = '${esc(cleanName)}', contact_person = '${esc(params.contactPerson)}', phone = '${esc(params.phone)}', email = '${esc(params.email)}', address = '${esc(params.address)}', tpin = '${esc(params.tpin)}', payment_terms = '${esc(params.paymentTerms || existing.payment_terms || 'Pay on Order')}', default_payment_method = '${esc(params.defaultPaymentMethod || existing.default_payment_method || 'BANK_TRANSFER')}', notes = '${esc(params.notes ?? existing.notes)}', updated_at = '${nowIso}' WHERE id = '${esc(existing.id)}'`,
+        `UPDATE suppliers SET name = '${esc(cleanName)}', contact_person = '${esc(params.contactPerson)}', phone = '${esc(params.phone)}', email = '${esc(params.email)}', address = '${esc(params.address)}', tpin = '${esc(params.tpin)}', payment_terms = '${esc(params.paymentTerms || existing.payment_terms || 'Pay on Order')}', default_payment_method = '${esc(params.defaultPaymentMethod || existing.default_payment_method || 'BANK_TRANSFER')}', notes = '${esc(params.notes ?? existing.notes)}', updated_at = '${nowIso}', business_id = '${esc(activeBizId)}', store_id = '${esc(resolvedStoreId)}' WHERE id = '${esc(existing.id)}'${bizAnd}`,
         `Supply Management: Update saved supplier ${cleanName}`
       );
       return String(existing.id);
     } else {
       const supId = 'sup-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
       runSql(
-        `INSERT INTO suppliers (id, name, contact_person, phone, email, address, tpin, payment_terms, default_payment_method, notes, created_at, updated_at) VALUES ('${supId}', '${esc(cleanName)}', '${esc(params.contactPerson)}', '${esc(params.phone)}', '${esc(params.email)}', '${esc(params.address)}', '${esc(params.tpin)}', '${esc(params.paymentTerms || 'Pay on Order')}', '${esc(params.defaultPaymentMethod || 'BANK_TRANSFER')}', '${esc(params.notes)}', '${nowIso}', '${nowIso}')`,
+        `INSERT INTO suppliers (id, name, contact_person, phone, email, address, tpin, payment_terms, default_payment_method, notes, created_at, updated_at, business_id, store_id) VALUES ('${supId}', '${esc(cleanName)}', '${esc(params.contactPerson)}', '${esc(params.phone)}', '${esc(params.email)}', '${esc(params.address)}', '${esc(params.tpin)}', '${esc(params.paymentTerms || 'Pay on Order')}', '${esc(params.defaultPaymentMethod || 'BANK_TRANSFER')}', '${esc(params.notes)}', '${nowIso}', '${nowIso}', '${esc(activeBizId)}', '${esc(resolvedStoreId)}')`,
         `Supply Management: Save supplier ${cleanName}`
       );
       return supId;
@@ -1006,7 +1025,8 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       });
     }
 
-    const targetBranch = transitStoreId || activeStore || storesList[0]?.id || 'MAIN';
+    const activeBizId = getActiveBusinessId();
+    const targetBranch = getActiveStoreId(transitStoreId || activeStore || storesList[0]?.id, activeBizId);
     const totalBase = transitItems.reduce((sum, item) => sum + (item.quantity * item.baseUnitPrice), 0);
     const totalAdditional = transitAddExpenses.reduce((sum, exp) => sum + Number(exp.amount || 0), 0);
     const totalLanded = totalBase + totalAdditional;
@@ -1020,7 +1040,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const cleanPayMethod = String(transitPaymentMethod || 'BANK_TRANSFER').replace(/'/g, "''");
 
     const poInsertRes = runSql(
-      `INSERT INTO purchases_transit (id, supplier_name, store_id, payment_account_id, payment_method, items_json, additional_expenses_json, total_base_amount, total_additional_expenses, total_landed_cost, stage, notes, created_at, updated_at, received_at, received_by) VALUES ('${transitId}', '${cleanSupplier}', '${cleanStore}', '${cleanPayAcc}', '${cleanPayMethod}', '${JSON.stringify(transitItems).replace(/'/g, "''")}', '${JSON.stringify(transitAddExpenses).replace(/'/g, "''")}', ${totalBase}, ${totalAdditional}, ${totalLanded}, 'IN_TRANSIT', '${cleanNotes}', '${createdAt}', '${createdAt}', '', '')`,
+      `INSERT INTO purchases_transit (id, supplier_name, store_id, payment_account_id, payment_method, items_json, additional_expenses_json, total_base_amount, total_additional_expenses, total_landed_cost, stage, notes, created_at, updated_at, received_at, received_by, business_id) VALUES ('${transitId}', '${cleanSupplier}', '${cleanStore}', '${cleanPayAcc}', '${cleanPayMethod}', '${JSON.stringify(transitItems).replace(/'/g, "''")}', '${JSON.stringify(transitAddExpenses).replace(/'/g, "''")}', ${totalBase}, ${totalAdditional}, ${totalLanded}, 'IN_TRANSIT', '${cleanNotes}', '${createdAt}', '${createdAt}', '', '', '${sqlEsc(activeBizId)}')`,
       'Supply Management: Create purchase order in transit'
     );
 
@@ -1031,23 +1051,23 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     const txId = 'tx-pt-' + Date.now();
     runSql(
-      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by) VALUES ('${txId}', 'idem-${transitId}', 'PROCUREMENT', 'PURCHASE_TRANSIT', '${transitId}', ${totalLanded}, 0, 'SUCCESS', 'Transit Purchase: ${cleanSupplier} (Landed Cost: ${settings.currency}${totalLanded.toFixed(2)})', '${createdAt}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id) VALUES ('${txId}', 'idem-${transitId}', 'PROCUREMENT', 'PURCHASE_TRANSIT', '${transitId}', ${totalLanded}, 0, 'SUCCESS', 'Transit Purchase: ${cleanSupplier} (Landed Cost: ${settings.currency}${totalLanded.toFixed(2)})', '${createdAt}', '${createdAt}', '${sqlEsc(userRole)}', '${sqlEsc(activeBizId)}', '${cleanStore}')`,
       'Supply Management: Journal'
     );
 
     runSql(
-      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_transit', 'DEBIT', ${totalLanded}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_transit', 'DEBIT', ${totalLanded}, '${createdAt}', '${sqlEsc(activeBizId)}', '${cleanStore}')`,
       'Supply Ledger: Debit Goods in Transit'
     );
     runSql(
-      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-2', '${txId}', '${cleanPayAcc}', 'CREDIT', ${totalLanded}, '${createdAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-2', '${txId}', '${cleanPayAcc}', 'CREDIT', ${totalLanded}, '${createdAt}', '${sqlEsc(activeBizId)}', '${cleanStore}')`,
       'Supply Ledger: Credit Payment Source'
     );
 
     // Sync Purchase Order into expenses table for central audit trail
     const expId = 'exp-po-' + Date.now();
     runSql(
-      `INSERT INTO expenses (id, category, account_id, amount, description, reference_no, expense_date, store_id, created_at, created_by) VALUES ('${expId}', 'Purchase Order - Goods & Transit', '${cleanPayAcc}', ${totalLanded}, 'PO #${transitId}: Supplier ${cleanSupplier} (${transitItems.length} items)', '${transitId}', '${createdAt.split('T')[0]}', '${cleanStore}', '${createdAt}', '${userRole}')`,
+      `INSERT INTO expenses (id, category, account_id, amount, description, reference_no, expense_date, store_id, created_at, created_by, business_id) VALUES ('${expId}', 'Purchase Order - Goods & Transit', '${cleanPayAcc}', ${totalLanded}, 'PO #${transitId}: Supplier ${cleanSupplier} (${transitItems.length} items)', '${transitId}', '${createdAt.split('T')[0]}', '${cleanStore}', '${createdAt}', '${sqlEsc(userRole)}', '${sqlEsc(activeBizId)}')`,
       'Supply Management: Sync Purchase Order to Expenses'
     );
 
@@ -1133,8 +1153,11 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const cleanStage = String(editLandingStage || 'IN_TRANSIT').replace(/'/g, "''");
     const cleanNotes = String(editLandingNotes || '').trim().replace(/'/g, "''");
 
+    const activeBizId = getActiveBusinessId(editingLandingPo.business_id);
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
     const updRes = runSql(
-      `UPDATE purchases_transit SET additional_expenses_json = '${JSON.stringify(cleanedExpenses).replace(/'/g, "''")}', total_additional_expenses = ${newAddTotal}, total_landed_cost = ${newLandedTotal}, stage = '${cleanStage}', notes = '${cleanNotes}', updated_at = '${updatedAt}' WHERE id = '${cleanPoId}'`,
+      `UPDATE purchases_transit SET additional_expenses_json = '${JSON.stringify(cleanedExpenses).replace(/'/g, "''")}', total_additional_expenses = ${newAddTotal}, total_landed_cost = ${newLandedTotal}, stage = '${cleanStage}', notes = '${cleanNotes}', updated_at = '${updatedAt}' WHERE id = '${cleanPoId}'${bizAnd}`,
       `Supply Management: Update landing cost for PO #${cleanPoId}`
     );
 
@@ -1145,11 +1168,11 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     // Keep linked expense record, transaction & ledger entries synchronized
     runSql(
-      `UPDATE expenses SET amount = ${newLandedTotal} WHERE reference_no = '${cleanPoId}' AND category = 'Purchase Order - Goods & Transit'`,
+      `UPDATE expenses SET amount = ${newLandedTotal} WHERE reference_no = '${cleanPoId}' AND category = 'Purchase Order - Goods & Transit'${bizAnd}`,
       `Supply Management: Sync updated PO landed cost to expenses`
     );
     const linkedTxRes = runSql(
-      `SELECT id FROM transactions WHERE provider_reference = '${cleanPoId}' AND channel = 'PURCHASE_TRANSIT'`,
+      `SELECT id FROM transactions WHERE provider_reference = '${cleanPoId}' AND channel = 'PURCHASE_TRANSIT'${bizAnd}`,
       'Supply Management: Lookup PO transaction',
       true
     );
@@ -1157,11 +1180,11 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       const txId = String(linkedTxRes.data[0].id).replace(/'/g, "''");
       const cleanSup = String(editingLandingPo.supplier_name || '').replace(/'/g, "''");
       runSql(
-        `UPDATE transactions SET amount = ${newLandedTotal}, narration = 'Transit Purchase: ${cleanSup} (Landed Cost: ${settings.currency}${newLandedTotal.toFixed(2)})', updated_at = '${updatedAt}' WHERE id = '${txId}'`,
+        `UPDATE transactions SET amount = ${newLandedTotal}, narration = 'Transit Purchase: ${cleanSup} (Landed Cost: ${settings.currency}${newLandedTotal.toFixed(2)})', updated_at = '${updatedAt}' WHERE id = '${txId}'${bizAnd}`,
         'Supply Management: Update PO transaction total'
       );
       runSql(
-        `UPDATE ledger_entries SET amount = ${newLandedTotal} WHERE transaction_id = '${txId}'`,
+        `UPDATE ledger_entries SET amount = ${newLandedTotal} WHERE transaction_id = '${txId}'${bizAnd}`,
         'Supply Management: Update PO ledger amounts'
       );
     }
@@ -1247,7 +1270,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   };
 
   const handleDeleteSupplier = (supId: string) => {
-    runSql(`DELETE FROM suppliers WHERE id = '${String(supId).replace(/'/g, "''")}'`, 'Supply Management: Delete supplier');
+    const activeBizId = getActiveBusinessId();
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    runSql(`DELETE FROM suppliers WHERE id = '${sqlEsc(supId)}'${bizAnd}`, 'Supply Management: Delete supplier');
     setConfirmDeleteSupplierId(null);
     persistTablesToStorage();
     loadData();
@@ -1258,8 +1283,10 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   };
 
   const handleUpdateTransitStage = (transitId: string, newStage: string) => {
+    const activeBizId = getActiveBusinessId();
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     runSql(
-      `UPDATE purchases_transit SET stage = '${newStage}', updated_at = '${new Date().toISOString()}' WHERE id = '${transitId}'`,
+      `UPDATE purchases_transit SET stage = '${sqlEsc(newStage)}', updated_at = '${new Date().toISOString()}' WHERE id = '${sqlEsc(transitId)}'${bizAnd}`,
       `Supply Management: Update stage to ${newStage}`
     );
     logEmployeeAudit('PURCHASE', 'Updated Purchase Order Stage', `PO #${transitId} stage updated to ${newStage}`, 0, activeStore || '', userRole);
@@ -1272,13 +1299,15 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     let items: any[] = [];
     try { items = JSON.parse(po.items_json); } catch (e) {}
 
+    const activeBizId = getActiveBusinessId(po.business_id);
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const totalBase = Number(po.total_base_amount || 0);
     const totalAdditional = Number(po.total_additional_expenses || 0);
     const overheadRatio = totalBase > 0 ? (totalAdditional / totalBase) : 0;
-    const targetBranch = String(po.store_id || activeStore || 'MAIN');
+    const targetBranch = getActiveStoreId(po.store_id || activeStore, activeBizId);
 
     runSql(
-      `UPDATE purchases_transit SET stage = 'LANDED_AT_STORE', updated_at = '${receivedAt}', received_at = '${receivedAt}', received_by = '${userRole}' WHERE id = '${po.id}'`,
+      `UPDATE purchases_transit SET stage = 'LANDED_AT_STORE', updated_at = '${receivedAt}', received_at = '${receivedAt}', received_by = '${sqlEsc(userRole)}' WHERE id = '${sqlEsc(po.id)}'${bizAnd}`,
       'Supply Management: Accept stock at store'
     );
 
@@ -1294,43 +1323,39 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
       if (!isCustomItem && !Number.isNaN(numericId) && Number.isFinite(numericId)) {
         runSql(
-          `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${numericId}`,
+          `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${numericId}${bizAnd}`,
           `Transit Stock Acceptance: Add ${qty} units to product #${numericId}`
         );
       } else {
         const cleanName = String(it.productName || 'Imported Stock Item').replace(/'/g, "''");
-        const existingByName = runSql(`SELECT id FROM products WHERE name = '${cleanName}'`, 'Lookup product by name', true);
+        const existingByName = runSql(`SELECT id FROM products WHERE name = '${cleanName}'${bizAnd}`, 'Lookup product by name', true);
         if (existingByName.success && Array.isArray(existingByName.data) && existingByName.data.length > 0) {
           resolvedProductId = existingByName.data[0].id;
           runSql(
-            `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${Number(resolvedProductId) || `'${String(resolvedProductId).replace(/'/g, "''")}'`}`,
+            `UPDATE products SET stock = stock + ${qty}, cost = ${landedUnitPrice} WHERE id = ${Number(resolvedProductId) || `'${String(resolvedProductId).replace(/'/g, "''")}'`}${bizAnd}`,
             `Transit Stock Acceptance: Add ${qty} units to ${cleanName}`
           );
         } else {
           const newProdId = Math.floor(100000 + Math.random() * 900000);
           resolvedProductId = newProdId;
           const sellingPrice = parseFloat((landedUnitPrice * 1.3).toFixed(2));
-          let bizId = '';
-          try {
-            bizId = JSON.parse(localStorage.getItem('active_business_profile') || '{}')?.id || '';
-          } catch {}
           runSql(
-            `INSERT INTO products (id, name, sku, category, stock, cost, price, business_id, is_service) VALUES (${newProdId}, '${cleanName}', 'PO-${newProdId}', 'Procurement', ${qty}, ${landedUnitPrice}, ${sellingPrice}, '${bizId.replace(/'/g, "''")}', 0)`,
+            `INSERT INTO products (id, name, sku, category, stock, cost, price, business_id, store_id, is_service) VALUES (${newProdId}, '${cleanName}', 'PO-${newProdId}', 'Procurement', ${qty}, ${landedUnitPrice}, ${sellingPrice}, '${sqlEsc(activeBizId)}', '${sqlEsc(targetBranch)}', 0)`,
             `Transit Stock Acceptance: Register new product ${cleanName}`
           );
         }
       }
 
-      const storeProdCheck = runSql(`SELECT * FROM store_products WHERE product_id = '${resolvedProductId}' AND store_id = '${targetBranch.replace(/'/g, "''")}'`, 'Check store_products');
+      const storeProdCheck = runSql(`SELECT * FROM store_products WHERE product_id = '${resolvedProductId}' AND store_id = '${sqlEsc(targetBranch)}'${bizAnd}`, 'Check store_products');
       if (storeProdCheck.success && Array.isArray(storeProdCheck.data) && storeProdCheck.data.length > 0) {
         runSql(
-          `UPDATE store_products SET stock = stock + ${qty}, price = ${(landedUnitPrice * 1.3).toFixed(2)} WHERE product_id = '${resolvedProductId}' AND store_id = '${targetBranch.replace(/'/g, "''")}'`,
+          `UPDATE store_products SET stock = stock + ${qty}, price = ${(landedUnitPrice * 1.3).toFixed(2)} WHERE product_id = '${resolvedProductId}' AND store_id = '${sqlEsc(targetBranch)}'${bizAnd}`,
           `Transit Stock Acceptance: Update store stock for product #${resolvedProductId}`
         );
       } else {
         const spId = 'sp-' + Date.now() + '-' + Math.random().toString(36).substring(2, 5);
         runSql(
-          `INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES ('${spId}', '${resolvedProductId}', '${targetBranch.replace(/'/g, "''")}', ${qty}, ${(landedUnitPrice * 1.3).toFixed(2)})`,
+          `INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES ('${spId}', '${resolvedProductId}', '${sqlEsc(targetBranch)}', ${qty}, ${(landedUnitPrice * 1.3).toFixed(2)}, '${sqlEsc(activeBizId)}')`,
           `Transit Stock Acceptance: Insert store product record`
         );
       }
@@ -1338,15 +1363,15 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     const txId = 'tx-land-' + Date.now();
     runSql(
-      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by) VALUES ('${txId}', 'idem-${po.id}-landed', 'STORE-${targetBranch.toUpperCase()}', 'STOCK_LANDED', '${po.id}', ${po.total_landed_cost}, 0, 'SUCCESS', 'Stock Accepted: Order #${po.id} landed at ${targetBranch}', '${receivedAt}', '${receivedAt}', '${userRole}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id) VALUES ('${txId}', 'idem-${po.id}-landed', 'STORE-${sqlEsc(targetBranch.toUpperCase())}', 'STOCK_LANDED', '${sqlEsc(po.id)}', ${po.total_landed_cost}, 0, 'SUCCESS', 'Stock Accepted: Order #${sqlEsc(po.id)} landed at ${sqlEsc(targetBranch)}', '${receivedAt}', '${receivedAt}', '${sqlEsc(userRole)}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetBranch)}')`,
       'Supply Management: Stock landed journal'
     );
     runSql(
-      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_inventory', 'DEBIT', ${po.total_landed_cost}, '${receivedAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-1', '${txId}', 'acc_inventory', 'DEBIT', ${po.total_landed_cost}, '${receivedAt}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetBranch)}')`,
       'Supply Ledger: Debit Store Inventory'
     );
     runSql(
-      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le-${Date.now()}-2', '${txId}', 'acc_transit', 'CREDIT', ${po.total_landed_cost}, '${receivedAt}')`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${Date.now()}-2', '${txId}', 'acc_transit', 'CREDIT', ${po.total_landed_cost}, '${receivedAt}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetBranch)}')`,
       'Supply Ledger: Credit Goods in Transit'
     );
 
@@ -1378,11 +1403,14 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const termMs = applyTermMonths * 30 * 24 * 60 * 60 * 1000;
     const dueDateStr = new Date(Date.now() + termMs).toISOString();
 
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
+
     // 1. Create central credit contract database record
     const insertLoanSql = `
-      INSERT INTO loans VALUES (
+      INSERT INTO loans (id, merchant_id, loan_account_id, principal_amount, interest_amount, total_repayable, daily_deduction_percentage, status, disbursed_at, due_date, created_at, updated_at, business_id, store_id) VALUES (
         '${loanIdVal}',
-        'default_biz',
+        '${sqlEsc(activeBizId)}',
         'acc_operating',
         ${applyPrincipal.toFixed(2)},
         ${interestAmt.toFixed(2)},
@@ -1392,7 +1420,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
         NULL,
         '${dueDateStr}',
         '${dateStr}',
-        '${dateStr}'
+        '${dateStr}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(resolvedStoreId)}'
       )
     `;
     const resLoan = runSql(insertLoanSql, `Loans Application: Lodged request ${loanIdVal} for review`);
@@ -1408,7 +1438,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
         const milestoneDueDate = new Date(Date.now() + (month * 30 * 24 * 60 * 60 * 1000)).toISOString();
         
         const insertMilestoneSql = `
-          INSERT INTO loan_amortization_schedule VALUES (
+          INSERT INTO loan_amortization_schedule (id, loan_id, installment_number, principal_due, interest_due, total_due, amount_paid, is_settled, due_date, settled_at, business_id, store_id) VALUES (
             '${milestoneId}',
             '${loanIdVal}',
             ${month},
@@ -1418,7 +1448,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
             0.00,
             0,
             '${milestoneDueDate}',
-            NULL
+            NULL,
+            '${sqlEsc(activeBizId)}',
+            '${sqlEsc(resolvedStoreId)}'
           )
         `;
         runSql(insertMilestoneSql, `Loans Application: Pre-registered monthly expected milestone #${month}`);
@@ -1443,7 +1475,10 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const verify = window.confirm(`Financial Commitment Guard:\nAre you sure you want to approve and disburse Loan Ref ${loanId} in full?\n\nThis will credit the cash drawer accounts instantly.`);
     if (!verify) return;
 
-    const query = runSql(`SELECT * FROM loans WHERE id = '${loanId}' AND status = 'PENDING_REVIEW'`, 'Fetch target loan status');
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const query = runSql(`SELECT * FROM loans WHERE id = '${sqlEsc(loanId)}' AND status = 'PENDING_REVIEW'${bizAnd}`, 'Fetch target loan status');
     if (!query.success || query.data.length === 0) {
       alert('State sync failure: Loan does not exist or is already active.');
       return;
@@ -1453,7 +1488,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     const nowStr = new Date().toISOString();
 
     // 1. Transition status in central contract DB
-    const updateSql = `UPDATE loans SET status = 'ACTIVE', disbursed_at = '${nowStr}', updated_at = '${nowStr}' WHERE id = '${loanId}'`;
+    const updateSql = `UPDATE loans SET status = 'ACTIVE', disbursed_at = '${nowStr}', updated_at = '${nowStr}' WHERE id = '${sqlEsc(loanId)}'${bizAnd}`;
     const updateRes = runSql(updateSql, `Loans Compliance: Set state to ACTIVE for ${loanId}`);
 
     if (updateRes.success) {
@@ -1463,19 +1498,19 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       const amountFloat = Number(ln.principal_amount);
 
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-        VALUES ('${txId}', '${idempKey}', 'POS-${activeStore.toUpperCase()}-01', 'CREDIT_ADVANCE', 'DISB-REF-${loanId}', ${amountFloat.toFixed(4)}, 0.0000, 'SUCCESS', 'Expansion capital advance disbursed for Ref #${loanId}', '${nowStr}', '${nowStr}')
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, business_id, store_id)
+        VALUES ('${txId}', '${idempKey}', 'POS-${sqlEsc(resolvedStoreId.toUpperCase())}-01', 'CREDIT_ADVANCE', 'DISB-REF-${sqlEsc(loanId)}', ${amountFloat.toFixed(4)}, 0.0000, 'SUCCESS', 'Expansion capital advance disbursed for Ref #${sqlEsc(loanId)}', '${nowStr}', '${nowStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
       `, 'Double Entry: Journal disburse event');
 
       // Asset accounts ledger
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_deb', '${txId}', 'merchant-wallet-account-uuid', 'DEBIT', ${amountFloat.toFixed(4)}, '${nowStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_deb', '${txId}', 'merchant-wallet-account-uuid', 'DEBIT', ${amountFloat.toFixed(4)}, '${nowStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
       `, 'Double Entry: Debit Merchant Wallet Asset (Refill working capital)');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cre_liability', '${txId}', 'acc_operating', 'CREDIT', ${amountFloat.toFixed(4)}, '${nowStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cre_liability', '${txId}', 'acc_operating', 'CREDIT', ${amountFloat.toFixed(4)}, '${nowStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
       `, 'Double Entry: Credit Lending Operating Liability Ledger');
 
       alert(`⚡ SUCCESS! Capital disbursed.\n\nLoan ${loanId} is now ACTIVE.\nRepayments will commence automatically at ${ln.daily_deduction_percentage}% sweep rate of all incoming POS daily checkouts.\nWorking capital added to main ledger.`);
@@ -1501,7 +1536,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       return;
     }
 
-    const updateRes = runSql(`UPDATE loans SET status = 'DEFAULTED', updated_at = '${new Date().toISOString()}' WHERE id = '${loanId}'`, `Decline loan Request ${loanId}`);
+    const activeBizId = getActiveBusinessId();
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const updateRes = runSql(`UPDATE loans SET status = 'DEFAULTED', updated_at = '${new Date().toISOString()}' WHERE id = '${sqlEsc(loanId)}'${bizAnd}`, `Decline loan Request ${loanId}`);
     if (updateRes.success) {
       alert(`✗ Loan Request ${loanId} declined successfully.\nReason logged: "${reason}"`);
       loadData();
@@ -1530,7 +1567,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       doc.setFontSize(9);
       doc.text(`CERTIFICATE REF: ADV-CERT-${ln.id}`, 20, 38);
       doc.text(`ISSUED ON: ${new Date(ln.created_at).toLocaleString()}`, 20, 43);
-      doc.text(`BORROWER ID: MERCHANT_default_biz`, 20, 48);
+      doc.text(`BORROWER ID: MERCHANT_${(ln.business_id || getActiveBusinessId() || 'LOCAL').toUpperCase()}`, 20, 48);
       doc.text(`LENDING OPERATOR: SME FINANCING LIQUIDITY ASSET POOL`, 20, 53);
       
       // Box design for principal details
@@ -1664,32 +1701,31 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   // A. Assets
   let ledgersCash = 0;
   const balanceAccounts: any[] = [];
-  const balanceQuery = runSql("SELECT * FROM view_account_balances", 'Balance Sheet: Calculate Account Balances', true);
-  if (balanceQuery.success && Array.isArray(balanceQuery.data)) {
-    balanceQuery.data.forEach((acc: any) => {
-      const bal = Number(acc.current_balance || 0);
-      balanceAccounts.push({
-        id: acc.account_id,
-        name: acc.account_name,
-        balance: bal
-      });
-      if (
-        acc.account_id === 'acc_cash' ||
-        acc.account_id === 'acc_airtel' ||
-        acc.account_id === 'acc_mtn' ||
-        acc.account_id === 'acc_momo' ||
-        acc.account_id === 'acc_bank' ||
-        String(acc.account_id || '').startsWith('acc_pm_')
-      ) {
-        ledgersCash += bal;
-      }
+  const activeBizIdForBal = getActiveBusinessId();
+  const tenantBalances = getTenantAccountBalances(activeBizIdForBal);
+  tenantBalances.forEach((acc) => {
+    const bal = Number(acc.current_balance || 0);
+    balanceAccounts.push({
+      id: acc.account_id,
+      name: acc.account_name,
+      balance: bal
     });
-  }
+    if (
+      acc.account_id === 'acc_cash' ||
+      acc.account_id === 'acc_airtel' ||
+      acc.account_id === 'acc_mtn' ||
+      acc.account_id === 'acc_momo' ||
+      acc.account_id === 'acc_bank' ||
+      String(acc.account_id || '').startsWith('acc_pm_')
+    ) {
+      ledgersCash += bal;
+    }
+  });
 
   const computedCash = ledgersCash;
 
   // Inventory Value
-  const prodRes = runSql("SELECT SUM(stock * cost) AS stock_value FROM products", 'Balance Sheet: Inventory pricing', true);
+  const prodRes = runSql(`SELECT SUM(stock * cost) AS stock_value FROM products ${activeBizIdForBal ? `WHERE business_id = '${sqlEsc(activeBizIdForBal)}'` : ''}`, 'Balance Sheet: Inventory pricing', true);
   const inventoryValuation = prodRes.success && prodRes.data[0]?.stock_value ? Number(prodRes.data[0].stock_value) : 0;
 
   // Custom Assets registries using Net Book Value (NBV = cost - accumulated depreciation)
@@ -2339,32 +2375,33 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
             </div>
 
             {/* LIVE ACCOUNTS CARDS */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
-                <div className="p-3 bg-emerald-50 text-emerald-600 rounded-xl">
-                  <Wallet size={24} />
-                </div>
-                <div>
-                  <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Counter Cash Drawer</span>
-                  <span className="text-lg font-black text-slate-900">
-                    {settings.currency}{Number(
-                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_cash'", 'Check cash balance', true).data?.[0]?.current_balance ?? 0
-                    ).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                  </span>
-                  <span className="text-[10px] text-slate-400 block mt-0.5">Account ID: acc_cash</span>
-                </div>
-              </div>
+            {(() => {
+              const balById = new Map(tenantBalances.map((b) => [b.account_id, Number(b.current_balance || 0)]));
+              const cashBal = balById.get('acc_cash') ?? 0;
+              const airtelBal = balById.get('acc_airtel') ?? 0;
+              const mtnBal = balById.get('acc_mtn') ?? 0;
+              const legacyMomoBal = balById.get('acc_momo') ?? 0;
+              const totalMomoBal = airtelBal + mtnBal + legacyMomoBal;
+              const bankBal = balById.get('acc_bank') ?? 0;
+              return (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
+                    <div className="p-3 bg-emerald-50 text-emerald-600 rounded-xl">
+                      <Wallet size={24} />
+                    </div>
+                    <div>
+                      <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Counter Cash Drawer</span>
+                      <span className="text-lg font-black text-slate-900">
+                        {settings.currency}{cashBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">Account ID: acc_cash</span>
+                    </div>
+                  </div>
 
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
-                <div className="p-3 bg-indigo-50 text-indigo-600 rounded-xl">
-                  <CreditCard size={24} />
-                </div>
-                {(() => {
-                  const airtelBal = Number(runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_airtel'", 'Check airtel balance', true).data?.[0]?.current_balance ?? 0);
-                  const mtnBal = Number(runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_mtn'", 'Check mtn balance', true).data?.[0]?.current_balance ?? 0);
-                  const legacyMomoBal = Number(runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_momo'", 'Check momo balance', true).data?.[0]?.current_balance ?? 0);
-                  const totalMomoBal = airtelBal + mtnBal + legacyMomoBal;
-                  return (
+                  <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
+                    <div className="p-3 bg-indigo-50 text-indigo-600 rounded-xl">
+                      <CreditCard size={24} />
+                    </div>
                     <div>
                       <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Mobile Money Wallets</span>
                       <span className="text-lg font-black text-slate-900">
@@ -2374,25 +2411,23 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                         Airtel: {settings.currency}{airtelBal.toFixed(2)} | MTN: {settings.currency}{mtnBal.toFixed(2)}
                       </span>
                     </div>
-                  );
-                })()}
-              </div>
+                  </div>
 
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
-                <div className="p-3 bg-blue-50 text-blue-600 rounded-xl">
-                  <Building2 size={24} />
+                  <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center gap-4">
+                    <div className="p-3 bg-blue-50 text-blue-600 rounded-xl">
+                      <Building2 size={24} />
+                    </div>
+                    <div>
+                      <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Commercial Bank Account</span>
+                      <span className="text-lg font-black text-slate-900">
+                        {settings.currency}{bankBal.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">Zambia National Commercial Bank</span>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <span className="text-xs text-slate-400 font-bold block uppercase tracking-wider">Commercial Bank Account</span>
-                  <span className="text-lg font-black text-slate-900">
-                    {settings.currency}{Number(
-                      runSql("SELECT current_balance FROM view_account_balances WHERE account_id = 'acc_bank'", 'Check bank balance', true).data?.[0]?.current_balance ?? 0
-                    ).toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                  </span>
-                  <span className="text-[10px] text-slate-400 block mt-0.5">Zambia National Commercial Bank</span>
-                </div>
-              </div>
-            </div>
+              );
+            })()}
 
             {/* FORM + LOGS */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

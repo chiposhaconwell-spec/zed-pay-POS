@@ -12,8 +12,13 @@ import {
 } from 'firebase/auth';
 import {
   getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  persistentSingleTabManager,
   doc,
   getDoc,
+  getDocFromCache,
   getDocFromServer,
   setDoc,
   getDocs,
@@ -21,6 +26,8 @@ import {
   query,
   where,
   serverTimestamp,
+  enableNetwork,
+  disableNetwork,
 } from 'firebase/firestore';
 import {
   getStorage,
@@ -29,13 +36,49 @@ import {
   getBytes,
 } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json';
-import { runSql, persistTablesToStorage, syncAllAccountingSystems, rehydrateAlasqlFromRecords } from './db';
+import {
+  runSql,
+  persistTablesToStorage,
+  syncAllAccountingSystems,
+  rehydrateAlasqlFromRecords,
+  sqlEsc,
+  getActiveStoreId,
+} from './db';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(
-  app,
-  (firebaseConfig as any).firestoreDatabaseId || 'ai-studio-32ea9ad7-3a6b-4977-b7b9-ef484b98c7f4'
-);
+const firestoreDatabaseId =
+  (firebaseConfig as any).firestoreDatabaseId || 'ai-studio-32ea9ad7-3a6b-4977-b7b9-ef484b98c7f4';
+
+function createPersistentFirestore() {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        localCache: persistentLocalCache({
+          tabManager: persistentMultipleTabManager(),
+        }),
+      },
+      firestoreDatabaseId
+    );
+  } catch {
+    try {
+      return initializeFirestore(
+        app,
+        {
+          localCache: persistentLocalCache({
+            tabManager: persistentSingleTabManager({ forceOwnership: false }),
+          }),
+        },
+        firestoreDatabaseId
+      );
+    } catch {
+      return getFirestore(app, firestoreDatabaseId);
+    }
+  }
+}
+
+export const db = createPersistentFirestore();
+export const isFirestoreOfflinePersistenceEnabled = true;
 export const auth = getAuth(app);
 export const storage = getStorage(
   app,
@@ -62,9 +105,70 @@ function normalizeFirebasePassword(rawPassword: string): string {
   return trimmed.padEnd(6, '0');
 }
 
+let isFirestoreNetworkDisabled = false;
+let lastAuthNetworkFailureAt = 0;
+const AUTH_NETWORK_RETRY_COOLDOWN_MS = 30000;
+
+function isNetworkOrOfflineAuthError(err: any): boolean {
+  const code = String(err?.code || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    code.includes('network-request-failed') ||
+    code === 'unavailable' ||
+    msg.includes('network-request-failed') ||
+    msg.includes('the client is offline') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('could not reach cloud firestore backend')
+  );
+}
+
+async function setFirestoreOfflineMode(): Promise<void> {
+  if (isFirestoreNetworkDisabled) return;
+  isFirestoreNetworkDisabled = true;
+  try {
+    await disableNetwork(db);
+  } catch {
+    // ignore
+  }
+}
+
+async function ensureFirestoreOnlineIfReachable(): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    await setFirestoreOfflineMode();
+    return false;
+  }
+
+  if (lastAuthNetworkFailureAt > 0 && Date.now() - lastAuthNetworkFailureAt < AUTH_NETWORK_RETRY_COOLDOWN_MS) {
+    await setFirestoreOfflineMode();
+    return false;
+  }
+
+  try {
+    await auth.authStateReady();
+    if (auth.currentUser) {
+      await auth.currentUser.getIdToken(false);
+    }
+    lastAuthNetworkFailureAt = 0;
+    if (isFirestoreNetworkDisabled) {
+      isFirestoreNetworkDisabled = false;
+      await enableNetwork(db);
+    }
+    return true;
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+      return false;
+    }
+    return true;
+  }
+}
+
 // Sync authenticated Firebase user with backend Cloud SQL users table
 export async function syncFirebaseUserWithBackend(user: User | null) {
   if (!user) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
   try {
     const idToken = await user.getIdToken();
     await fetch('/api/auth/sync', {
@@ -74,7 +178,12 @@ export async function syncFirebaseUserWithBackend(user: User | null) {
         Authorization: `Bearer ${idToken}`,
       },
     });
-  } catch (err) {
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      void setFirestoreOfflineMode();
+      return;
+    }
     console.warn('Backend user token sync notice:', err);
   }
 }
@@ -246,15 +355,27 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 // Connection test primitive required by Firebase integration
 export async function testConnection() {
   try {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    const reachable = await ensureFirestoreOnlineIfReachable();
+    if (!reachable) {
       return;
     }
     const checkPromise = getDocFromServer(doc(db, 'test', 'connection'));
+    checkPromise.catch((err) => {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        void setFirestoreOfflineMode();
+      }
+    });
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('timeout')), 2500)
     );
     await Promise.race([checkPromise, timeoutPromise]);
-  } catch (error) {
+  } catch (error: any) {
+    if (isNetworkOrOfflineAuthError(error)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+      return;
+    }
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');
     }
@@ -262,7 +383,10 @@ export async function testConnection() {
 }
 
 if (typeof window !== 'undefined') {
-  testConnection();
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    void setFirestoreOfflineMode();
+  }
+  void testConnection();
 }
 
 export function getTransportSecurityStatus() {
@@ -484,6 +608,172 @@ export function isCurrentUserAuthorizedBusinessOwner(businessId: string): boolea
   return true;
 }
 
+// Non-blocking Firestore write helper so offline checkouts persist immediately into IndexedDB
+// without hanging on unacknowledged server Promises while offline.
+async function writeDocOfflineAware(
+  docRef: any,
+  data: Record<string, any>,
+  path: string,
+  isOnline: boolean
+): Promise<boolean> {
+  if (!isOnline || isFirestoreNetworkDisabled) {
+    await setFirestoreOfflineMode();
+    void setDoc(docRef, data).catch((err) => {
+      console.warn(`[Firestore Offline Queue] Deferred write notice (${path}):`, err?.message || err);
+    });
+    return false;
+  }
+  try {
+    await setDoc(docRef, data);
+    return true;
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+      void setDoc(docRef, data).catch(() => {});
+      return false;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Queues a POS checkout (order, line items, and stock/customer updates) directly into Firestore
+ * with IndexedDB offline persistence. Never blocks checkout UI when offline.
+ */
+export function syncSaleToFirestoreOfflineSafe(params: {
+  businessId: string;
+  storeId: string;
+  order: {
+    id: string;
+    customerId?: number | null;
+    orderDate: string;
+    subtotal: number;
+    tax: number;
+    discount: number;
+    total: number;
+    paymentMethod: string;
+    status: string;
+    performed_by: string;
+  };
+  items: Array<{
+    id: string;
+    productId: number;
+    quantity: number;
+    unitPrice: number;
+  }>;
+  updatedProducts?: Array<{
+    id: number;
+    name: string;
+    description?: string;
+    sku?: string;
+    category?: string;
+    price: number;
+    cost: number;
+    stock: number;
+    imageUrl?: string;
+    is_service?: number;
+    batch_number?: string;
+    expiry_date?: string;
+  }>;
+}) {
+  try {
+    if (!auth.currentUser) return;
+    const rawBizId = String(params.businessId || '').trim();
+    if (!rawBizId || rawBizId === 'default_biz') return;
+    if (!isCurrentUserAuthorizedBusinessOwner(rawBizId)) return;
+
+    const shouldUseOfflineMode =
+      (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+      (lastAuthNetworkFailureAt > 0 && Date.now() - lastAuthNetworkFailureAt < AUTH_NETWORK_RETRY_COOLDOWN_MS);
+    if (shouldUseOfflineMode) {
+      void setFirestoreOfflineMode();
+    }
+
+    const safeBizId = sanitizeIdForFirestore(rawBizId, 'biz');
+    const safeStoreId = sanitizeIdForFirestore(params.storeId || getActiveStoreId(undefined, rawBizId), 'store');
+    const safeOrderId = sanitizeIdForFirestore(params.order.id, 'ord');
+    const currentUid = auth.currentUser.uid;
+
+    const orderPayload = {
+      id: safeOrderId,
+      business_id: safeBizId,
+      store_id: safeStoreId,
+      ownerUid: currentUid,
+      customerId: params.order.customerId ? parseInt(params.order.customerId as any, 10) : null,
+      orderDate: String(params.order.orderDate || new Date().toISOString()).slice(0, 100),
+      subtotal: Math.max(0, parseFloat(params.order.subtotal as any) || 0.0),
+      tax: Math.max(0, parseFloat(params.order.tax as any) || 0.0),
+      discount: Math.max(0, parseFloat(params.order.discount as any) || 0.0),
+      total: Math.max(0, parseFloat(params.order.total as any) || 0.0),
+      paymentMethod: String(params.order.paymentMethod || 'CASH').slice(0, 50),
+      status: String(params.order.status || 'Completed').slice(0, 50),
+      performed_by: String(params.order.performed_by || 'owner').slice(0, 100),
+    };
+
+    void setDoc(doc(db, 'businesses', safeBizId, 'orders', safeOrderId), orderPayload).catch((err) => {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        void setFirestoreOfflineMode();
+        return;
+      }
+      console.warn('[Firestore Offline Order Sync]', err?.message || err);
+    });
+
+    for (const item of params.items || []) {
+      const safeItemId = sanitizeIdForFirestore(item.id, 'item');
+      void setDoc(doc(db, 'businesses', safeBizId, 'order_items', safeItemId), {
+        id: safeItemId,
+        business_id: safeBizId,
+        store_id: safeStoreId,
+        ownerUid: currentUid,
+        orderId: safeOrderId,
+        productId: parseInt(item.productId as any, 10) || 0,
+        quantity: Math.max(1, parseInt(item.quantity as any, 10) || 1),
+        unitPrice: Math.max(0, parseFloat(item.unitPrice as any) || 0.0),
+      }).catch((err) => {
+        if (isNetworkOrOfflineAuthError(err)) {
+          lastAuthNetworkFailureAt = Date.now();
+          void setFirestoreOfflineMode();
+          return;
+        }
+        console.warn('[Firestore Offline OrderItem Sync]', err?.message || err);
+      });
+    }
+
+    for (const prod of params.updatedProducts || []) {
+      const prodIdNum = parseInt(prod.id as any, 10) || 1;
+      const prodDocId = sanitizeIdForFirestore(prodIdNum, 'prod');
+      void setDoc(doc(db, 'businesses', safeBizId, 'products', prodDocId), {
+        id: prodIdNum,
+        business_id: safeBizId,
+        store_id: safeStoreId,
+        ownerUid: currentUid,
+        name: String(prod.name || 'Item').slice(0, 250),
+        description: String(prod.description || '').slice(0, 4000),
+        sku: String(prod.sku || `SKU-${prodIdNum}`).slice(0, 100),
+        category: String(prod.category || 'General').slice(0, 100),
+        price: Math.max(0, parseFloat(prod.price as any) || 0.0),
+        cost: Math.max(0, parseFloat(prod.cost as any) || 0.0),
+        stock: parseInt(prod.stock as any, 10) || 0,
+        imageUrl: String(prod.imageUrl || '').slice(0, 290000),
+        is_service: parseInt(prod.is_service as any, 10) || 0,
+        batch_number: String(prod.batch_number || '').slice(0, 100),
+        expiry_date: String(prod.expiry_date || '').slice(0, 100),
+      }).catch((err) => {
+        if (isNetworkOrOfflineAuthError(err)) {
+          lastAuthNetworkFailureAt = Date.now();
+          void setFirestoreOfflineMode();
+          return;
+        }
+        console.warn('[Firestore Offline Product Sync]', err?.message || err);
+      });
+    }
+  } catch (err) {
+    console.warn('[Firestore Offline Checkout Hook]', err);
+  }
+}
+
 // ============================================================================
 // CLOUD BACKUP (AlaSQL Local -> Firestore Relational + Firebase Storage)
 // ============================================================================
@@ -503,24 +793,25 @@ export async function backupToCloud(
     throw new Error(msg);
   }
 
+  let isOnline = await ensureFirestoreOnlineIfReachable();
+
   // Ensure all double-entry accounting ledgers are up to date before backing up
   syncAllAccountingSystems('Firebase Cloud Backup');
 
   const safeBizId = sanitizeIdForFirestore(businessId, 'biz');
+  const cleanBizId = sqlEsc(businessId);
   const currentUid = auth.currentUser.uid;
+  const primaryStoreId = sanitizeIdForFirestore(getActiveStoreId(undefined, businessId), 'store');
 
   // 1. Fetch current business profile locally
   const localBizRes = runSql(
-    `SELECT * FROM businesses WHERE id = '${businessId}'`,
+    `SELECT * FROM businesses WHERE id = '${cleanBizId}'`,
     'Cloud Sync: Read local profile',
     true
   );
-  const allBizRes = runSql(`SELECT * FROM businesses`, 'Cloud Sync: Fallback business read', true);
   const biz =
     localBizRes.success && Array.isArray(localBizRes.data) && localBizRes.data.length > 0
       ? localBizRes.data[0]
-      : allBizRes.success && Array.isArray(allBizRes.data) && allBizRes.data.length > 0
-      ? allBizRes.data[0]
       : {
           id: safeBizId,
           name: 'POS Enterprise',
@@ -528,39 +819,69 @@ export async function backupToCloud(
           email: auth.currentUser.email || 'owner@pos.app',
         };
 
-  // Upsert primary Business document (preserving createdAt if already created)
+  // Upsert primary Business document (preserving createdAt if already created; offline-safe via cache)
   const bizPath = `businesses/${safeBizId}`;
   try {
     const bizRef = doc(db, 'businesses', safeBizId);
-    const existingSnap = await getDoc(bizRef);
+    let existingSnap: any = null;
+    if (isOnline) {
+      try {
+        existingSnap = await getDoc(bizRef);
+      } catch {
+        existingSnap = await getDocFromCache(bizRef).catch(() => null);
+      }
+    } else {
+      existingSnap = await getDocFromCache(bizRef).catch(() => null);
+    }
+
     const cleanName = String(biz.name || 'POS Business').slice(0, 200);
     const cleanOwner = String(biz.owner || auth.currentUser.displayName || 'Owner').slice(0, 200);
     const cleanEmail = String(biz.email || auth.currentUser.email || 'owner@pos.app').slice(0, 200);
 
-    if (existingSnap.exists()) {
+    if (existingSnap && existingSnap.exists()) {
       const existingData = existingSnap.data();
-      await setDoc(bizRef, {
-        id: safeBizId,
-        name: cleanName,
-        owner: cleanOwner,
-        email: cleanEmail,
-        ownerUid: existingData.ownerUid || currentUid,
-        createdAt: existingData.createdAt || serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      isOnline = await writeDocOfflineAware(
+        bizRef,
+        {
+          id: safeBizId,
+          business_id: safeBizId,
+          store_id: String(biz.store_id || primaryStoreId).slice(0, 128),
+          name: cleanName,
+          owner: cleanOwner,
+          email: cleanEmail,
+          ownerUid: existingData.ownerUid || currentUid,
+          createdAt: existingData.createdAt || serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        bizPath,
+        isOnline
+      );
     } else {
-      await setDoc(bizRef, {
-        id: safeBizId,
-        name: cleanName,
-        owner: cleanOwner,
-        email: cleanEmail,
-        ownerUid: currentUid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      isOnline = await writeDocOfflineAware(
+        bizRef,
+        {
+          id: safeBizId,
+          business_id: safeBizId,
+          store_id: String(biz.store_id || primaryStoreId).slice(0, 128),
+          name: cleanName,
+          owner: cleanOwner,
+          email: cleanEmail,
+          ownerUid: currentUid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        bizPath,
+        isOnline
+      );
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, bizPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+      isOnline = false;
+    } else if (isOnline) {
+      handleFirestoreError(err, OperationType.WRITE, bizPath);
+    }
   }
 
   let totalStoresSynced = 0;
@@ -570,9 +891,9 @@ export async function backupToCloud(
   let totalOrderItemsSynced = 0;
   let totalLedgersSynced = 0;
 
-  // 2. Fetch and backup Store outlets
+  // 2. Fetch and backup Store outlets strictly scoped to this business_id
   const storesRes = runSql(
-    `SELECT * FROM stores WHERE business_id = '${businessId}'`,
+    `SELECT * FROM stores WHERE business_id = '${cleanBizId}'`,
     'Cloud Sync: Fetch local stores',
     true
   );
@@ -581,26 +902,38 @@ export async function backupToCloud(
     const safeStoreId = sanitizeIdForFirestore(store.id, 'store');
     const storePath = `businesses/${safeBizId}/stores/${safeStoreId}`;
     try {
-      await setDoc(doc(db, 'businesses', safeBizId, 'stores', safeStoreId), {
-        id: safeStoreId,
-        business_id: safeBizId,
-        ownerUid: currentUid,
-        name: String(store.name || safeStoreId).slice(0, 200),
-        location: String(store.location || 'Main').slice(0, 200),
-        allow_discounts: parseInt(store.allow_discounts as any, 10) || 0,
-        allow_refunds: parseInt(store.allow_refunds as any, 10) || 0,
-        allow_laybys: parseInt(store.allow_laybys as any, 10) || 0,
-        require_manager_discount: parseInt(store.require_manager_discount as any, 10) || 0,
-      });
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'stores', safeStoreId),
+        {
+          id: safeStoreId,
+          business_id: safeBizId,
+          store_id: safeStoreId,
+          ownerUid: currentUid,
+          name: String(store.name || safeStoreId).slice(0, 200),
+          location: String(store.location || 'Main').slice(0, 200),
+          allow_discounts: parseInt(store.allow_discounts as any, 10) || 0,
+          allow_refunds: parseInt(store.allow_refunds as any, 10) || 0,
+          allow_laybys: parseInt(store.allow_laybys as any, 10) || 0,
+          require_manager_discount: parseInt(store.require_manager_discount as any, 10) || 0,
+        },
+        storePath,
+        isOnline
+      );
       totalStoresSynced++;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, storePath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else if (isOnline) {
+        handleFirestoreError(err, OperationType.WRITE, storePath);
+      }
     }
   }
 
-  // 3. Fetch and backup Products catalog & batches
+  // 3. Fetch and backup Products strictly scoped to this business_id
   const productsRes = runSql(
-    `SELECT * FROM products WHERE business_id = '${businessId}' OR business_id IS NULL OR business_id = 'default_biz'`,
+    `SELECT * FROM products WHERE business_id = '${cleanBizId}'`,
     'Cloud Sync: Fetch local products',
     true
   );
@@ -609,32 +942,45 @@ export async function backupToCloud(
     const prodIdNum = parseInt(prod.id as any, 10) || 1;
     const prodDocId = sanitizeIdForFirestore(prodIdNum, 'prod');
     const prodPath = `businesses/${safeBizId}/products/${prodDocId}`;
+    const prodStoreId = sanitizeIdForFirestore(prod.store_id || storeRows[0]?.id || primaryStoreId, 'store');
     try {
-      await setDoc(doc(db, 'businesses', safeBizId, 'products', prodDocId), {
-        id: prodIdNum,
-        business_id: safeBizId,
-        ownerUid: currentUid,
-        name: String(prod.name || 'Item').slice(0, 250),
-        description: String(prod.description || '').slice(0, 4000),
-        sku: String(prod.sku || `SKU-${prodIdNum}`).slice(0, 100),
-        category: String(prod.category || 'General').slice(0, 100),
-        price: Math.max(0, parseFloat(prod.price as any) || 0.0),
-        cost: Math.max(0, parseFloat(prod.cost as any) || 0.0),
-        stock: parseInt(prod.stock as any, 10) || 0,
-        imageUrl: String(prod.imageUrl || '').slice(0, 290000),
-        is_service: parseInt(prod.is_service as any, 10) || 0,
-        batch_number: String(prod.batch_number || '').slice(0, 100),
-        expiry_date: String(prod.expiry_date || '').slice(0, 100),
-      });
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'products', prodDocId),
+        {
+          id: prodIdNum,
+          business_id: safeBizId,
+          store_id: prodStoreId,
+          ownerUid: currentUid,
+          name: String(prod.name || 'Item').slice(0, 250),
+          description: String(prod.description || '').slice(0, 4000),
+          sku: String(prod.sku || `SKU-${prodIdNum}`).slice(0, 100),
+          category: String(prod.category || 'General').slice(0, 100),
+          price: Math.max(0, parseFloat(prod.price as any) || 0.0),
+          cost: Math.max(0, parseFloat(prod.cost as any) || 0.0),
+          stock: parseInt(prod.stock as any, 10) || 0,
+          imageUrl: String(prod.imageUrl || '').slice(0, 290000),
+          is_service: parseInt(prod.is_service as any, 10) || 0,
+          batch_number: String(prod.batch_number || '').slice(0, 100),
+          expiry_date: String(prod.expiry_date || '').slice(0, 100),
+        },
+        prodPath,
+        isOnline
+      );
       totalProductsSynced++;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, prodPath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else if (isOnline) {
+        handleFirestoreError(err, OperationType.WRITE, prodPath);
+      }
     }
   }
 
-  // 4. Fetch and backup Clients / Customer CRM list
+  // 4. Fetch and backup Clients strictly scoped to this business_id
   const customersRes = runSql(
-    `SELECT * FROM customers WHERE business_id = '${businessId}' OR business_id IS NULL OR business_id = 'default_biz'`,
+    `SELECT * FROM customers WHERE business_id = '${cleanBizId}'`,
     'Cloud Sync: Fetch local customers',
     true
   );
@@ -643,77 +989,129 @@ export async function backupToCloud(
     const custIdNum = parseInt(cust.id as any, 10) || 1;
     const custDocId = sanitizeIdForFirestore(custIdNum, 'cust');
     const custPath = `businesses/${safeBizId}/customers/${custDocId}`;
+    const custStoreId = sanitizeIdForFirestore(cust.store_id || storeRows[0]?.id || primaryStoreId, 'store');
     try {
-      await setDoc(doc(db, 'businesses', safeBizId, 'customers', custDocId), {
-        id: custIdNum,
-        business_id: safeBizId,
-        ownerUid: currentUid,
-        name: String(cust.name || 'Walk-in Client').slice(0, 200),
-        phone: String(cust.phone || '').slice(0, 50),
-        email: String(cust.email || '').slice(0, 200),
-        loyalPoints: Math.max(0, parseInt(cust.loyalPoints as any, 10) || 0),
-        tpin: String(cust.tpin || '').slice(0, 100),
-        zra_connected: parseInt(cust.zra_connected as any, 10) || 0,
-        tax_band: String(cust.tax_band || 'A - Standard Rate (16%)').slice(0, 100),
-      });
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'customers', custDocId),
+        {
+          id: custIdNum,
+          business_id: safeBizId,
+          store_id: custStoreId,
+          ownerUid: currentUid,
+          name: String(cust.name || 'Walk-in Client').slice(0, 200),
+          phone: String(cust.phone || '').slice(0, 50),
+          email: String(cust.email || '').slice(0, 200),
+          loyalPoints: Math.max(0, parseInt(cust.loyalPoints as any, 10) || 0),
+          tpin: String(cust.tpin || '').slice(0, 100),
+          zra_connected: parseInt(cust.zra_connected as any, 10) || 0,
+          tax_band: String(cust.tax_band || 'A - Standard Rate (16%)').slice(0, 100),
+        },
+        custPath,
+        isOnline
+      );
       totalCustomersSynced++;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, custPath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else if (isOnline) {
+        handleFirestoreError(err, OperationType.WRITE, custPath);
+      }
     }
   }
 
-  // 5. Fetch and backup Orders (Sales & Refund Transactions)
-  const ordersRes = runSql(`SELECT * FROM orders`, 'Cloud Sync: Fetch local orders', true);
+  // 5. Fetch and backup Orders strictly scoped to this business_id
+  const ordersRes = runSql(
+    `SELECT * FROM orders WHERE business_id = '${cleanBizId}'`,
+    'Cloud Sync: Fetch local orders',
+    true
+  );
   const orderRows = ordersRes.success && Array.isArray(ordersRes.data) ? ordersRes.data : [];
+  const orderStoreMap = new Map<string, string>();
   for (const order of orderRows) {
     const safeOrderId = sanitizeIdForFirestore(order.id, 'ord');
+    const orderStoreId = sanitizeIdForFirestore(order.store_id || storeRows[0]?.id || primaryStoreId, 'store');
+    orderStoreMap.set(safeOrderId, orderStoreId);
     const orderPath = `businesses/${safeBizId}/orders/${safeOrderId}`;
     try {
-      await setDoc(doc(db, 'businesses', safeBizId, 'orders', safeOrderId), {
-        id: safeOrderId,
-        business_id: safeBizId,
-        ownerUid: currentUid,
-        customerId: order.customerId ? parseInt(order.customerId as any, 10) : null,
-        orderDate: String(order.orderDate || new Date().toISOString()).slice(0, 100),
-        subtotal: Math.max(0, parseFloat(order.subtotal as any) || 0.0),
-        tax: Math.max(0, parseFloat(order.tax as any) || 0.0),
-        discount: Math.max(0, parseFloat(order.discount as any) || 0.0),
-        total: Math.max(0, parseFloat(order.total as any) || 0.0),
-        paymentMethod: String(order.paymentMethod || 'CASH').slice(0, 50),
-        status: String(order.status || 'Completed').slice(0, 50),
-        store_id: String(order.store_id || storeRows[0]?.id || 'main').slice(0, 128),
-        performed_by: String(order.performed_by || 'owner').slice(0, 100),
-      });
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'orders', safeOrderId),
+        {
+          id: safeOrderId,
+          business_id: safeBizId,
+          store_id: orderStoreId,
+          ownerUid: currentUid,
+          customerId: order.customerId ? parseInt(order.customerId as any, 10) : null,
+          orderDate: String(order.orderDate || new Date().toISOString()).slice(0, 100),
+          subtotal: Math.max(0, parseFloat(order.subtotal as any) || 0.0),
+          tax: Math.max(0, parseFloat(order.tax as any) || 0.0),
+          discount: Math.max(0, parseFloat(order.discount as any) || 0.0),
+          total: Math.max(0, parseFloat(order.total as any) || 0.0),
+          paymentMethod: String(order.paymentMethod || 'CASH').slice(0, 50),
+          status: String(order.status || 'Completed').slice(0, 50),
+          performed_by: String(order.performed_by || 'owner').slice(0, 100),
+        },
+        orderPath,
+        isOnline
+      );
       totalOrdersSynced++;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, orderPath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else if (isOnline) {
+        handleFirestoreError(err, OperationType.WRITE, orderPath);
+      }
     }
   }
 
-  // 6. Fetch and backup Order Items (Relational line items linking Orders <-> Products)
-  const orderItemsRes = runSql(`SELECT * FROM order_items`, 'Cloud Sync: Fetch local order_items', true);
+  // 6. Fetch and backup Order Items strictly scoped to this business_id
+  const orderItemsRes = runSql(
+    `SELECT * FROM order_items WHERE business_id = '${cleanBizId}'`,
+    'Cloud Sync: Fetch local order_items',
+    true
+  );
   const orderItemRows =
     orderItemsRes.success && Array.isArray(orderItemsRes.data) ? orderItemsRes.data : [];
   for (const item of orderItemRows) {
     const safeItemId = sanitizeIdForFirestore(item.id, 'item');
+    const safeOrderId = sanitizeIdForFirestore(item.orderId, 'ord');
+    const itemStoreId = sanitizeIdForFirestore(
+      item.store_id || orderStoreMap.get(safeOrderId) || storeRows[0]?.id || primaryStoreId,
+      'store'
+    );
     const itemPath = `businesses/${safeBizId}/order_items/${safeItemId}`;
     try {
-      await setDoc(doc(db, 'businesses', safeBizId, 'order_items', safeItemId), {
-        id: safeItemId,
-        business_id: safeBizId,
-        ownerUid: currentUid,
-        orderId: sanitizeIdForFirestore(item.orderId, 'ord'),
-        productId: parseInt(item.productId as any, 10) || 0,
-        quantity: Math.max(1, parseInt(item.quantity as any, 10) || 1),
-        unitPrice: Math.max(0, parseFloat(item.unitPrice as any) || 0.0),
-      });
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'order_items', safeItemId),
+        {
+          id: safeItemId,
+          business_id: safeBizId,
+          store_id: itemStoreId,
+          ownerUid: currentUid,
+          orderId: safeOrderId,
+          productId: parseInt(item.productId as any, 10) || 0,
+          quantity: Math.max(1, parseInt(item.quantity as any, 10) || 1),
+          unitPrice: Math.max(0, parseFloat(item.unitPrice as any) || 0.0),
+        },
+        itemPath,
+        isOnline
+      );
       totalOrderItemsSynced++;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, itemPath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else if (isOnline) {
+        handleFirestoreError(err, OperationType.WRITE, itemPath);
+      }
     }
   }
 
-  // 7. Fetch and backup Double-Entry Accounting & Client Relational Ledgers
+  // 7. Fetch and backup Double-Entry Accounting & Client Relational Ledgers strictly scoped to business_id
   const ledgerTablesToSync = [
     'double_entry_journal',
     'receipt_refund_ledger',
@@ -727,6 +1125,8 @@ export async function backupToCloud(
     'expenses',
     'purchases_transit',
     'suppliers',
+    'assets',
+    'equity',
     'staff',
     'store_products',
     'payment_methods',
@@ -737,8 +1137,16 @@ export async function backupToCloud(
   const ledgerMapForStorage: Record<string, any[]> = {};
 
   for (const tableName of ledgerTablesToSync) {
-    const tRes = runSql(`SELECT * FROM ${tableName}`, `Cloud Sync: Read ${tableName}`, true);
-    const rawRows = tRes.success && Array.isArray(tRes.data) ? tRes.data : [];
+    const tRes = runSql(
+      `SELECT * FROM ${tableName} WHERE business_id = '${cleanBizId}'`,
+      `Cloud Sync: Read ${tableName}`,
+      true
+    );
+    const rawRows = (tRes.success && Array.isArray(tRes.data) ? tRes.data : []).map((r: any) => ({
+      ...r,
+      business_id: safeBizId,
+      store_id: String(r?.store_id || primaryStoreId),
+    }));
     ledgerMapForStorage[tableName] = rawRows;
 
     const boundedRecords = rawRows.slice(0, 500).map(sanitizeRecordMap);
@@ -746,44 +1154,61 @@ export async function backupToCloud(
     const ledgerPath = `businesses/${safeBizId}/ledgers/${ledgerDocId}`;
 
     try {
-      await setDoc(doc(db, 'businesses', safeBizId, 'ledgers', ledgerDocId), {
-        id: ledgerDocId,
-        business_id: safeBizId,
-        ownerUid: currentUid,
-        ledger_type: tableName,
-        record_count: boundedRecords.length,
-        records: boundedRecords,
-        updatedAt: serverTimestamp(),
-      });
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'ledgers', ledgerDocId),
+        {
+          id: ledgerDocId,
+          business_id: safeBizId,
+          store_id: primaryStoreId,
+          ownerUid: currentUid,
+          ledger_type: tableName,
+          record_count: boundedRecords.length,
+          records: boundedRecords,
+          updatedAt: serverTimestamp(),
+        },
+        ledgerPath,
+        isOnline
+      );
       totalLedgersSynced++;
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, ledgerPath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else if (isOnline) {
+        handleFirestoreError(err, OperationType.WRITE, ledgerPath);
+      }
     }
   }
 
-  // 8. Also upload default backups for Clients Data & Transactions to Firebase Cloud Storage
+  // 8. When online, also upload default backups to Firebase Cloud Storage
   let settingsObj: any = null;
   try {
     const rawS = localStorage.getItem('android_pos_settings');
     if (rawS) settingsObj = JSON.parse(rawS);
   } catch {}
 
-  const storageResult = await backupClientsAndTransactionsToStorage(safeBizId, {
-    business: biz,
-    stores: storeRows,
-    products: productRows,
-    customers: customerRows,
-    laybys: ledgerMapForStorage['laybys'] || [],
-    laybyInstallments: ledgerMapForStorage['layby_installments'] || [],
-    quotations: ledgerMapForStorage['quotations'] || [],
-    orders: orderRows,
-    orderItems: orderItemRows,
-    ledgers: ledgerMapForStorage,
-    settings: settingsObj,
-  });
+  const storageResult =
+    isOnline && !isFirestoreNetworkDisabled
+      ? await backupClientsAndTransactionsToStorage(safeBizId, {
+          business: biz,
+          stores: storeRows,
+          products: productRows,
+          customers: customerRows,
+          laybys: ledgerMapForStorage['laybys'] || [],
+          laybyInstallments: ledgerMapForStorage['layby_installments'] || [],
+          quotations: ledgerMapForStorage['quotations'] || [],
+          orders: orderRows,
+          orderItems: orderItemRows,
+          ledgers: ledgerMapForStorage,
+          settings: settingsObj,
+        })
+      : { storageSynced: false, filesUploaded: [] };
 
   const storageNote = storageResult.storageSynced
     ? ` + Firebase Storage (${storageResult.filesUploaded.length} archive files)`
+    : !isOnline || isFirestoreNetworkDisabled
+    ? ' (queued offline in Firestore IndexedDB — will auto-sync on reconnect)'
     : '';
 
   return {
@@ -800,6 +1225,7 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
     throw new Error('You must be signed in (Email/Password or Google) to restore from Firebase Cloud.');
   }
 
+  const isOnline = await ensureFirestoreOnlineIfReachable();
   const currentUid = auth.currentUser.uid;
   let targetBizId = businessId && businessId !== 'default_biz' ? sanitizeIdForFirestore(businessId, 'biz') : '';
   let bizData: any = null;
@@ -812,8 +1238,15 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
       if (bizDocSnap.exists()) {
         bizData = bizDocSnap.data();
       }
-    } catch (err) {
-      handleFirestoreError(err, OperationType.GET, bizPath);
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        const cachedSnap = await getDocFromCache(doc(db, 'businesses', targetBizId)).catch(() => null);
+        if (cachedSnap?.exists()) bizData = cachedSnap.data();
+      } else {
+        handleFirestoreError(err, OperationType.GET, bizPath);
+      }
     }
   }
 
@@ -827,25 +1260,37 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         targetBizId = firstDoc.id;
         bizData = firstDoc.data();
       }
-    } catch (err) {
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        throw new Error('Firebase Cloud is currently unreachable (offline). Local database data remains active.');
+      }
       handleFirestoreError(err, OperationType.LIST, bizListPath);
     }
   }
 
   if (!bizData || !targetBizId) {
-    throw new Error('No business backup found in Firebase Cloud for this account yet.');
+    throw new Error(
+      !isOnline
+        ? 'No offline cached business backup found while offline.'
+        : 'No business backup found in Firebase Cloud for this account yet.'
+    );
   }
 
   // Save/Restore local Business Profile
-  runSql(`DELETE FROM businesses WHERE id = '${targetBizId}'`, 'Restore: Clean old business row', true);
+  runSql(`DELETE FROM businesses WHERE id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old business row', true);
+  const restoredPrimaryStoreId = sanitizeIdForFirestore(bizData.store_id || 'main', 'store');
   runSql(
-    `INSERT INTO businesses (id, name, owner, email, password, created_at) VALUES (
-      '${targetBizId}', 
-      '${String(bizData.name || 'Business').replace(/'/g, "''")}', 
-      '${String(bizData.owner || 'Owner').replace(/'/g, "''")}', 
-      '${String(bizData.email || auth.currentUser.email || '').replace(/'/g, "''")}', 
+    `INSERT INTO businesses (id, name, owner, email, password, created_at, business_id, store_id) VALUES (
+      '${sqlEsc(targetBizId)}', 
+      '${sqlEsc(bizData.name || 'Business')}', 
+      '${sqlEsc(bizData.owner || 'Owner')}', 
+      '${sqlEsc(bizData.email || auth.currentUser.email || '')}', 
       'cloud_recovered', 
-      '${new Date().toISOString()}'
+      '${new Date().toISOString()}',
+      '${sqlEsc(targetBizId)}',
+      '${sqlEsc(restoredPrimaryStoreId)}'
     )`,
     'Restore: Insert backed up business workspace',
     true
@@ -870,26 +1315,31 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
   let totalOrderItemsRestored = 0;
   let totalLedgersRestored = 0;
 
-  // 2. Pull Store outlets (using ownerUid filter to satisfy cost-optimized allow list rule)
+  // 2. Pull Store outlets (using ownerUid + business_id filters for strict tenant isolation)
   const storesPath = `businesses/${targetBizId}/stores`;
   try {
     const sSnap = await getDocs(
-      query(collection(db, 'businesses', targetBizId, 'stores'), where('ownerUid', '==', currentUid))
+      query(
+        collection(db, 'businesses', targetBizId, 'stores'),
+        where('ownerUid', '==', currentUid),
+        where('business_id', '==', targetBizId)
+      )
     );
     if (!sSnap.empty) {
-      runSql(`DELETE FROM stores WHERE business_id = '${targetBizId}'`, 'Restore: Clean old stores', true);
+      runSql(`DELETE FROM stores WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old stores', true);
       sSnap.forEach((docSnap) => {
         const d = docSnap.data();
         runSql(
-          `INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
-            '${docSnap.id}', 
-            '${targetBizId}', 
-            '${String(d.name || docSnap.id).replace(/'/g, "''")}', 
-            '${String(d.location || 'Main').replace(/'/g, "''")}', 
+          `INSERT INTO stores (id, business_id, name, location, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
+            '${sqlEsc(docSnap.id)}', 
+            '${sqlEsc(targetBizId)}', 
+            '${sqlEsc(d.name || docSnap.id)}', 
+            '${sqlEsc(d.location || 'Main')}', 
             ${d.allow_discounts || 0}, 
             ${d.allow_refunds || 0}, 
             ${d.allow_laybys || 0}, 
-            ${d.require_manager_discount || 0}
+            ${d.require_manager_discount || 0},
+            '${sqlEsc(d.store_id || docSnap.id)}'
           )`,
           'Restore: Sink branch outlets',
           true
@@ -897,39 +1347,50 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         totalStoresRestored++;
       });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, storesPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+    } else {
+      handleFirestoreError(err, OperationType.LIST, storesPath);
+    }
   }
 
   // 3. Pull Products catalog & batches
   const productsPath = `businesses/${targetBizId}/products`;
   try {
     const pSnap = await getDocs(
-      query(collection(db, 'businesses', targetBizId, 'products'), where('ownerUid', '==', currentUid))
+      query(
+        collection(db, 'businesses', targetBizId, 'products'),
+        where('ownerUid', '==', currentUid),
+        where('business_id', '==', targetBizId)
+      )
     );
     if (!pSnap.empty) {
-      runSql(`DELETE FROM products WHERE business_id = '${targetBizId}'`, 'Restore: Clean old products', true);
+      runSql(`DELETE FROM products WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old products', true);
       pSnap.forEach((docSnap) => {
         const d = docSnap.data();
-        const cleanImgUrl = d.imageUrl ? String(d.imageUrl).replace(/'/g, "''") : '';
-        const cleanDesc = d.description ? String(d.description).replace(/'/g, "''") : '';
-        const cleanBatch = d.batch_number ? String(d.batch_number).replace(/'/g, "''") : '';
-        const cleanExpiry = d.expiry_date ? String(d.expiry_date).replace(/'/g, "''") : '';
+        const cleanImgUrl = d.imageUrl ? sqlEsc(d.imageUrl) : '';
+        const cleanDesc = d.description ? sqlEsc(d.description) : '';
+        const cleanBatch = d.batch_number ? sqlEsc(d.batch_number) : '';
+        const cleanExpiry = d.expiry_date ? sqlEsc(d.expiry_date) : '';
+        const cleanStore = sqlEsc(d.store_id || restoredPrimaryStoreId);
         runSql(
-          `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
+          `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, store_id) VALUES (
             ${d.id}, 
-            '${String(d.name || 'Item').replace(/'/g, "''")}', 
+            '${sqlEsc(d.name || 'Item')}', 
             '${cleanDesc}', 
-            '${String(d.sku || '').replace(/'/g, "''")}', 
-            '${String(d.category || 'General').replace(/'/g, "''")}', 
+            '${sqlEsc(d.sku || '')}', 
+            '${sqlEsc(d.category || 'General')}', 
             ${d.price || 0.0}, 
             ${d.cost || 0.0}, 
             ${d.stock || 0}, 
             '${cleanImgUrl}', 
-            '${targetBizId}',
+            '${sqlEsc(targetBizId)}',
             ${d.is_service || 0},
             '${cleanBatch}',
-            '${cleanExpiry}'
+            '${cleanExpiry}',
+            '${cleanStore}'
           )`,
           'Restore: Sink catalog products',
           true
@@ -937,31 +1398,42 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         totalProductsRestored++;
       });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, productsPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+    } else {
+      handleFirestoreError(err, OperationType.LIST, productsPath);
+    }
   }
 
   // 4. Pull Client CRM list
   const customersPath = `businesses/${targetBizId}/customers`;
   try {
     const cSnap = await getDocs(
-      query(collection(db, 'businesses', targetBizId, 'customers'), where('ownerUid', '==', currentUid))
+      query(
+        collection(db, 'businesses', targetBizId, 'customers'),
+        where('ownerUid', '==', currentUid),
+        where('business_id', '==', targetBizId)
+      )
     );
     if (!cSnap.empty) {
-      runSql(`DELETE FROM customers WHERE business_id = '${targetBizId}'`, 'Restore: Clean old customers', true);
+      runSql(`DELETE FROM customers WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old customers', true);
       cSnap.forEach((docSnap) => {
         const d = docSnap.data();
+        const cleanStore = sqlEsc(d.store_id || restoredPrimaryStoreId);
         runSql(
-          `INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id) VALUES (
+          `INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id) VALUES (
             ${d.id}, 
-            '${String(d.name || 'Client').replace(/'/g, "''")}', 
-            '${String(d.phone || '').replace(/'/g, "''")}', 
-            '${String(d.email || '').replace(/'/g, "''")}', 
+            '${sqlEsc(d.name || 'Client')}', 
+            '${sqlEsc(d.phone || '')}', 
+            '${sqlEsc(d.email || '')}', 
             ${d.loyalPoints || 0}, 
-            '${String(d.tpin || '').replace(/'/g, "''")}', 
+            '${sqlEsc(d.tpin || '')}', 
             ${d.zra_connected || 0}, 
-            '${String(d.tax_band || 'A - Standard Rate (16%)').replace(/'/g, "''")}', 
-            '${targetBizId}'
+            '${sqlEsc(d.tax_band || 'A - Standard Rate (16%)')}', 
+            '${sqlEsc(targetBizId)}',
+            '${cleanStore}'
           )`,
           'Restore: Sink customer CRM registry',
           true
@@ -969,34 +1441,44 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         totalCustomersRestored++;
       });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, customersPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+    } else {
+      handleFirestoreError(err, OperationType.LIST, customersPath);
+    }
   }
 
-  // 5. Pull Order invoices
+  // 5. Pull Order invoices (scoped to targetBizId)
   const ordersPath = `businesses/${targetBizId}/orders`;
   try {
     const oSnap = await getDocs(
-      query(collection(db, 'businesses', targetBizId, 'orders'), where('ownerUid', '==', currentUid))
+      query(
+        collection(db, 'businesses', targetBizId, 'orders'),
+        where('ownerUid', '==', currentUid),
+        where('business_id', '==', targetBizId)
+      )
     );
     if (!oSnap.empty) {
-      runSql(`DELETE FROM orders`, 'Restore: Clean old orders data', true);
+      runSql(`DELETE FROM orders WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old orders data', true);
       oSnap.forEach((docSnap) => {
         const d = docSnap.data();
         const custVal = d.customerId ? d.customerId : 'NULL';
         runSql(
-          `INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
-            '${d.id}', 
+          `INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
+            '${sqlEsc(d.id)}', 
             ${custVal}, 
-            '${d.orderDate}', 
+            '${sqlEsc(d.orderDate)}', 
             ${d.subtotal || 0}, 
             ${d.tax || 0}, 
             ${d.discount || 0}, 
             ${d.total || 0}, 
-            '${String(d.paymentMethod || 'CASH').replace(/'/g, "''")}', 
-            '${String(d.status || 'Completed').replace(/'/g, "''")}', 
-            '${String(d.store_id || 'main').replace(/'/g, "''")}', 
-            '${String(d.performed_by || 'owner').replace(/'/g, "''")}'
+            '${sqlEsc(d.paymentMethod || 'CASH')}', 
+            '${sqlEsc(d.status || 'Completed')}', 
+            '${sqlEsc(d.store_id || restoredPrimaryStoreId)}', 
+            '${sqlEsc(d.performed_by || 'owner')}',
+            '${sqlEsc(targetBizId)}'
           )`,
           'Restore: Sink invoice receipt elements',
           true
@@ -1004,27 +1486,38 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         totalOrdersRestored++;
       });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, ordersPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+    } else {
+      handleFirestoreError(err, OperationType.LIST, ordersPath);
+    }
   }
 
-  // 6. Pull Order Line Items
+  // 6. Pull Order Line Items (scoped to targetBizId)
   const orderItemsPath = `businesses/${targetBizId}/order_items`;
   try {
     const oiSnap = await getDocs(
-      query(collection(db, 'businesses', targetBizId, 'order_items'), where('ownerUid', '==', currentUid))
+      query(
+        collection(db, 'businesses', targetBizId, 'order_items'),
+        where('ownerUid', '==', currentUid),
+        where('business_id', '==', targetBizId)
+      )
     );
     if (!oiSnap.empty) {
-      runSql(`DELETE FROM order_items`, 'Restore: Clean old order_items', true);
+      runSql(`DELETE FROM order_items WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old order_items', true);
       oiSnap.forEach((docSnap) => {
         const d = docSnap.data();
         runSql(
-          `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice) VALUES (
-            '${d.id}',
-            '${d.orderId}',
+          `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
+            '${sqlEsc(d.id)}',
+            '${sqlEsc(d.orderId)}',
             ${d.productId || 0},
             ${d.quantity || 1},
-            ${d.unitPrice || 0}
+            ${d.unitPrice || 0},
+            '${sqlEsc(targetBizId)}',
+            '${sqlEsc(d.store_id || restoredPrimaryStoreId)}'
           )`,
           'Restore: Sink order line item',
           true
@@ -1032,15 +1525,24 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         totalOrderItemsRestored++;
       });
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, orderItemsPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+    } else {
+      handleFirestoreError(err, OperationType.LIST, orderItemsPath);
+    }
   }
 
   // 7. Pull Accounting & Client Relational Ledgers (including quotations)
   const ledgersPath = `businesses/${targetBizId}/ledgers`;
   try {
     const lSnap = await getDocs(
-      query(collection(db, 'businesses', targetBizId, 'ledgers'), where('ownerUid', '==', currentUid))
+      query(
+        collection(db, 'businesses', targetBizId, 'ledgers'),
+        where('ownerUid', '==', currentUid),
+        where('business_id', '==', targetBizId)
+      )
     );
     if (!lSnap.empty) {
       const restoredLedgers: Record<string, any[]> = {};
@@ -1049,44 +1551,59 @@ export async function restoreFromCloud(businessId?: string): Promise<{ success: 
         const tableName = String(d.ledger_type || docSnap.id);
         const rows = Array.isArray(d.records) ? d.records : [];
         if (rows.length > 0) {
-          restoredLedgers[tableName] = rows;
+          restoredLedgers[tableName] = rows.map((r: any) => ({
+            ...r,
+            business_id: targetBizId,
+            store_id: String(r?.store_id || d.store_id || restoredPrimaryStoreId),
+          }));
           totalLedgersRestored++;
         }
       });
       if (Object.keys(restoredLedgers).length > 0) {
-        rehydrateAlasqlFromRecords(restoredLedgers);
+        rehydrateAlasqlFromRecords(restoredLedgers, {
+          businessId: targetBizId,
+          storeId: restoredPrimaryStoreId,
+          preserveOtherBusinesses: true,
+        });
       }
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, ledgersPath);
+  } catch (err: any) {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+    } else {
+      handleFirestoreError(err, OperationType.LIST, ledgersPath);
+    }
   }
 
-  // 8. Also check Firebase Cloud Storage archive for full untruncated quotations & settings
-  try {
-    const clientsRef = storageRef(storage, `backups/${targetBizId}/clients_data.json`);
-    const cBytes = await getBytes(clientsRef);
-    const cText = new TextDecoder().decode(cBytes);
-    const cParsed = JSON.parse(cText);
-    if (cParsed?.clients && Array.isArray(cParsed.clients.quotations) && cParsed.clients.quotations.length > 0) {
-      rehydrateAlasqlFromRecords({ quotations: cParsed.clients.quotations });
+  // 8. When online, also check Firebase Cloud Storage archive for full untruncated quotations & settings
+  if (isOnline && !isFirestoreNetworkDisabled) {
+    try {
+      const clientsRef = storageRef(storage, `backups/${targetBizId}/clients_data.json`);
+      const cBytes = await getBytes(clientsRef);
+      const cText = new TextDecoder().decode(cBytes);
+      const cParsed = JSON.parse(cText);
+      if (cParsed?.clients && Array.isArray(cParsed.clients.quotations) && cParsed.clients.quotations.length > 0) {
+        rehydrateAlasqlFromRecords({ quotations: cParsed.clients.quotations });
+      }
+    } catch {
+      // Clients archive optional
     }
-  } catch {
-    // Clients archive optional
-  }
 
-  try {
-    const fullRef = storageRef(storage, `backups/${targetBizId}/full_workspace_backup.json`);
-    const bytes = await getBytes(fullRef);
-    const text = new TextDecoder().decode(bytes);
-    const parsed = JSON.parse(text);
-    if (parsed && parsed.settings && typeof localStorage !== 'undefined') {
-      localStorage.setItem('android_pos_settings', JSON.stringify(parsed.settings));
+    try {
+      const fullRef = storageRef(storage, `backups/${targetBizId}/full_workspace_backup.json`);
+      const bytes = await getBytes(fullRef);
+      const text = new TextDecoder().decode(bytes);
+      const parsed = JSON.parse(text);
+      if (parsed && parsed.settings && typeof localStorage !== 'undefined') {
+        localStorage.setItem('android_pos_settings', JSON.stringify(parsed.settings));
+      }
+      if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
+        rehydrateAlasqlFromRecords({ quotations: parsed.quotations });
+      }
+    } catch {
+      // Storage archive optional on restore if Firestore succeeded
     }
-    if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
-      rehydrateAlasqlFromRecords({ quotations: parsed.quotations });
-    }
-  } catch {
-    // Storage archive optional on restore if Firestore succeeded
   }
 
   syncAllAccountingSystems('Firebase Cloud Restore');
@@ -1141,10 +1658,21 @@ export function triggerAutoFirebaseBackup(businessId?: string) {
 }
 
 if (typeof window !== 'undefined') {
+  window.addEventListener('offline', () => {
+    void setFirestoreOfflineMode();
+  });
   window.addEventListener('pos_data_updated', () => {
     triggerAutoFirebaseBackup();
   });
   window.addEventListener('pos_sync_status_changed', () => {
     triggerAutoFirebaseBackup();
+  });
+  window.addEventListener('online', () => {
+    lastAuthNetworkFailureAt = 0;
+    void ensureFirestoreOnlineIfReachable().then((online) => {
+      if (online) {
+        triggerAutoFirebaseBackup();
+      }
+    });
   });
 }

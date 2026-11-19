@@ -52,7 +52,7 @@ SELECT * FROM view_account_balances;`,
   },
   {
     label: 'Add New Custom Product',
-    sql: "INSERT INTO products VALUES (10, 'Fresh Matcha Cookies', 'FOD-105', 'Desserts', 3.75, 1.00, 30, 'https://images.unsplash.com/photo-1558961309-dbdf000302f6?w=150');",
+    sql: "INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, store_id) VALUES (10, 'Fresh Matcha Cookies', 'FOD-105', 'Desserts', 3.75, 1.00, 30, 'https://images.unsplash.com/photo-1558961309-dbdf000302f6?w=150', 'my_biz_id', 'main');",
     desc: 'Insert custom stock into PRODUCTS table directly via statement'
   }
 ];

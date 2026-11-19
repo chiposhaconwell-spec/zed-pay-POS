@@ -30,7 +30,7 @@ import {
   Ban,
   UserCheck
 } from 'lucide-react';
-import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod, calculateLoyaltyPoints } from '../db';
+import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod, calculateLoyaltyPoints, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings, CustomPaymentMethod } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
@@ -267,8 +267,10 @@ export default function SettingsPanel({
   }, [settings]);
 
   const loadUsersList = () => {
+    const activeBizId = getActiveBusinessId();
+    const staffWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
     // 1. Fetch standard staff profiles
-    const staffRes = runSql('SELECT * FROM staff', 'Load staff directory for accounts management');
+    const staffRes = runSql(`SELECT * FROM staff${staffWhere}`, 'Load staff directory for accounts management');
     let mappedStaff: any[] = [];
     if (staffRes.success && Array.isArray(staffRes.data)) {
       mappedStaff = staffRes.data.map(st => {
@@ -308,8 +310,11 @@ export default function SettingsPanel({
       });
     }
 
-    // 2. Fetch business owners (deduplicated by id)
-    const bizRes = runSql('SELECT * FROM businesses', 'Load corporate directory for accounts management');
+    // 2. Fetch business owners (deduplicated by id, scoped to active business)
+    const bizWhere = activeBizId
+      ? ` WHERE id = '${sqlEsc(activeBizId)}' OR business_id = '${sqlEsc(activeBizId)}'`
+      : '';
+    const bizRes = runSql(`SELECT * FROM businesses${bizWhere}`, 'Load corporate directory for accounts management');
     let mappedBiz: any[] = [];
     if (bizRes.success && Array.isArray(bizRes.data)) {
       const seenBizIds = new Set<string>();
@@ -349,9 +354,11 @@ export default function SettingsPanel({
   };
 
   const loadStoresList = () => {
-    const central = getCentralBranches(getActiveBusinessId() || undefined);
+    const activeBizId = getActiveBusinessId();
+    const central = getCentralBranches(activeBizId || undefined);
     setStoresList(central);
-    const pRes = runSql('SELECT COUNT(*) AS cnt FROM products', 'Count products');
+    const prodWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+    const pRes = runSql(`SELECT COUNT(*) AS cnt FROM products${prodWhere}`, 'Count products');
     if (pRes.success && Array.isArray(pRes.data) && pRes.data[0]) {
       setProductsCount(Number(pRes.data[0].cnt || 0));
     }
@@ -368,16 +375,6 @@ export default function SettingsPanel({
     });
     return () => unsubscribe();
   }, []);
-
-  const getActiveBusinessId = () => {
-    try {
-      const saved = localStorage.getItem('active_business_profile');
-      if (saved) {
-        return JSON.parse(saved).id || 'default_biz';
-      }
-    } catch (e) {}
-    return 'default_biz';
-  };
 
   const handleGoogleLogin = async () => {
     try {
@@ -473,7 +470,7 @@ export default function SettingsPanel({
     setSyncError(null);
     try {
       const bizId = getActiveBusinessId();
-      const sqlPull = await pullDatabaseFromServer(bizId !== 'default_biz' ? bizId : undefined);
+      const sqlPull = await pullDatabaseFromServer(bizId || undefined);
       if (sqlPull.success && sqlPull.found) {
         if (sqlPull.settings) {
           setSettings(sqlPull.settings);
@@ -575,7 +572,7 @@ export default function SettingsPanel({
             tpin = '${tpin.trim().replace(/'/g, "''")}',
             currency = '${currency.trim().replace(/'/g, "''")}',
             tax_rate = ${parseFloat(taxRate as any) || 0}
-        WHERE id = '${activeBizId}'
+        WHERE id = '${sqlEsc(activeBizId)}'
       `, 'SettingsPanel: Sync business & billing address details');
       try {
         const saved = localStorage.getItem('active_business_profile');
@@ -604,7 +601,7 @@ export default function SettingsPanel({
     }
     const activeBizId = getActiveBusinessId();
     const centralStores = getCentralBranches(activeBizId || undefined);
-    const targetStore = quickProdStoreId || activeStore || (centralStores[0]?.id ?? '');
+    const targetStore = quickProdStoreId || activeStore || getActiveStoreId(undefined, activeBizId) || (centralStores[0]?.id ?? 'main');
 
     const prodId = Math.floor(10000 + Math.random() * 90000);
     const sku = quickProdBarcode.trim() || `SKU-${prodId}`;
@@ -617,20 +614,21 @@ export default function SettingsPanel({
     const imgUrl = 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=150';
 
     runSql(`
-      INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (
+      INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, store_id, is_service, batch_number, expiry_date) VALUES (
         ${prodId},
-        '${quickProdName.trim().replace(/'/g, "''")}',
-        '${quickProdDescription.trim().replace(/'/g, "''")}',
-        '${sku.replace(/'/g, "''")}',
-        '${category.replace(/'/g, "''")}',
+        '${sqlEsc(quickProdName.trim())}',
+        '${sqlEsc(quickProdDescription.trim())}',
+        '${sqlEsc(sku)}',
+        '${sqlEsc(category)}',
         ${price},
         ${cost},
         ${qty},
         '${imgUrl}',
-        '${activeBizId.replace(/'/g, "''")}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(targetStore)}',
         0,
-        '${batchNum.replace(/'/g, "''")}',
-        '${expiry}'
+        '${sqlEsc(batchNum)}',
+        '${sqlEsc(expiry)}'
       )
     `, `SettingsPanel: Create stock item [${quickProdName.trim()}]`);
 
@@ -640,8 +638,8 @@ export default function SettingsPanel({
       const spId = `sp_${prodId}_${stId}`;
       const branchQty = stId === targetStore ? qty : 0;
       runSql(`
-        INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES (
-          '${spId}', ${prodId}, '${stId}', ${branchQty}, ${price}
+        INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
+          '${sqlEsc(spId)}', ${prodId}, '${sqlEsc(stId)}', ${branchQty}, ${price}, '${sqlEsc(activeBizId)}'
         )
       `, `SettingsPanel: Allocate stock for [${quickProdName.trim()}] to branch [${stId}]`);
     });
@@ -650,20 +648,22 @@ export default function SettingsPanel({
       const refId = `stock_init_${prodId}_${Date.now()}`;
       const nowStr = new Date().toISOString();
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
         VALUES (
           '${refId}',
           'idem_${refId}',
-          '${targetStore.toUpperCase()}',
+          '${sqlEsc(targetStore.toUpperCase())}',
           'RECEIVE',
           'CATALOG_INIT',
           ${(qty * cost).toFixed(2)},
           0.00,
           'SUCCESS',
-          'Initial catalog creation for ${quickProdName.trim().replace(/'/g, "''")}: +${qty} units [Batch: ${batchNum || 'N/A'}]',
+          'Initial catalog creation for ${sqlEsc(quickProdName.trim())}: +${qty} units [Batch: ${sqlEsc(batchNum || 'N/A')}]',
           '${nowStr}',
           '${nowStr}',
-          'owner'
+          'owner',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(targetStore)}'
         )
       `, 'SettingsPanel: Log initial stock creation transaction');
     }
@@ -697,20 +697,21 @@ export default function SettingsPanel({
     }
     const activeBizId = getActiveBusinessId();
     const finalId = newBranchCode.trim().toLowerCase().replace(/\s+/g, '_') || ('store_' + Math.floor(1000 + Math.random() * 9000));
-    const dup = runSql(`SELECT * FROM stores WHERE id = '${finalId}'`);
+    const dup = runSql(`SELECT * FROM stores WHERE id = '${sqlEsc(finalId)}'${activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : ''}`);
     if (dup.success && Array.isArray(dup.data) && dup.data.length > 0) {
       alert(`A store branch with code [${finalId}] already exists.`);
       return;
     }
     runSql(`
-      INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency)
+      INSERT INTO stores (id, business_id, store_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, stocktake_frequency)
       VALUES (
-        '${finalId}',
-        '${activeBizId}',
-        '${newBranchName.trim().replace(/'/g, "''")}',
-        '${newBranchLocation.trim().replace(/'/g, "''")}',
-        '${newBranchPhone.trim().replace(/'/g, "''")}',
-        '${newBranchEmail.trim().replace(/'/g, "''")}',
+        '${sqlEsc(finalId)}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(finalId)}',
+        '${sqlEsc(newBranchName.trim())}',
+        '${sqlEsc(newBranchLocation.trim())}',
+        '${sqlEsc(newBranchPhone.trim())}',
+        '${sqlEsc(newBranchEmail.trim())}',
         ${newBranchDiscounts ? 1 : 0},
         ${newBranchRefunds ? 1 : 0},
         ${newBranchLaybys ? 1 : 0},
@@ -719,10 +720,11 @@ export default function SettingsPanel({
       )
     `, `SettingsPanel: Create store branch [${newBranchName}]`);
 
-    const prodsRes = runSql(`SELECT * FROM products`);
+    const prodQuery = activeBizId ? `SELECT * FROM products WHERE business_id = '${sqlEsc(activeBizId)}'` : `SELECT * FROM products`;
+    const prodsRes = runSql(prodQuery);
     if (prodsRes.success && Array.isArray(prodsRes.data)) {
       prodsRes.data.forEach((p: any) => {
-        runSql(`INSERT INTO store_products VALUES ('sp_${p.id}_${finalId}', ${p.id}, '${finalId}', 0, ${p.price || 0})`);
+        runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES ('sp_${p.id}_${sqlEsc(finalId)}', ${p.id}, '${sqlEsc(finalId)}', 0, ${p.price || 0}, '${sqlEsc(activeBizId)}')`);
       });
     }
     if (!activeStore && setActiveStore) {
@@ -751,13 +753,14 @@ export default function SettingsPanel({
       return;
     }
     const activeBizId = getActiveBusinessId();
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     runSql(`
       UPDATE stores
-      SET name = '${editBranchName.trim().replace(/'/g, "''")}',
-          location = '${editBranchLocation.trim().replace(/'/g, "''")}',
-          phone = '${editBranchPhone.trim().replace(/'/g, "''")}',
-          email = '${editBranchEmail.trim().replace(/'/g, "''")}'
-      WHERE id = '${storeId}'
+      SET name = '${sqlEsc(editBranchName.trim())}',
+          location = '${sqlEsc(editBranchLocation.trim())}',
+          phone = '${sqlEsc(editBranchPhone.trim())}',
+          email = '${sqlEsc(editBranchEmail.trim())}'
+      WHERE id = '${sqlEsc(storeId)}'${bizAnd}
     `, `SettingsPanel: Update branch [${editBranchName.trim()}] contact details`);
     setEditingBranchId(null);
     loadStoresList();
@@ -772,8 +775,10 @@ export default function SettingsPanel({
 
   const handleDeleteBranchInSettings = (storeId: string, branchName: string) => {
     if (!window.confirm(`Delete store branch "${branchName}"?`)) return;
-    runSql(`DELETE FROM stores WHERE id = '${storeId}'`, `SettingsPanel: Delete store ${storeId}`);
-    runSql(`DELETE FROM store_products WHERE store_id = '${storeId}'`, `SettingsPanel: Delete store_products for ${storeId}`);
+    const activeBizId = getActiveBusinessId();
+    const bizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    runSql(`DELETE FROM stores WHERE id = '${sqlEsc(storeId)}'${bizAnd}`, `SettingsPanel: Delete store ${storeId}`);
+    runSql(`DELETE FROM store_products WHERE store_id = '${sqlEsc(storeId)}'${bizAnd}`, `SettingsPanel: Delete store_products for ${storeId}`);
     loadStoresList();
     persistTablesToStorage();
     window.dispatchEvent(new Event('pos_data_updated'));
@@ -842,14 +847,17 @@ export default function SettingsPanel({
     try {
       const settingsStr = localStorage.getItem('android_pos_settings') || JSON.stringify(settings);
       const bizProfile = localStorage.getItem('active_business_profile') || '';
+      const activeBizId = getActiveBusinessId();
+      const bizWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+      const bizSelfWhere = activeBizId ? ` WHERE id = '${sqlEsc(activeBizId)}' OR business_id = '${sqlEsc(activeBizId)}'` : '';
       
-      const prodRes = runSql('SELECT * FROM products');
-      const custRes = runSql('SELECT * FROM customers');
-      const orderRes = runSql('SELECT * FROM orders');
-      const oItemRes = runSql('SELECT * FROM order_items');
-      const storeRes = runSql('SELECT * FROM stores');
-      const bizRes = runSql('SELECT * FROM businesses');
-      const staffRes = runSql('SELECT * FROM staff');
+      const prodRes = runSql(`SELECT * FROM products${bizWhere}`);
+      const custRes = runSql(`SELECT * FROM customers${bizWhere}`);
+      const orderRes = runSql(`SELECT * FROM orders${bizWhere}`);
+      const oItemRes = runSql(`SELECT * FROM order_items${bizWhere}`);
+      const storeRes = runSql(`SELECT * FROM stores${bizWhere}`);
+      const bizRes = runSql(`SELECT * FROM businesses${bizSelfWhere}`);
+      const staffRes = runSql(`SELECT * FROM staff${bizWhere}`);
       
       const appBundle = {
         app_version: "2.5.0-portable",
@@ -901,29 +909,41 @@ export default function SettingsPanel({
           localStorage.setItem('active_business_profile', JSON.stringify(bundle.business_profile));
         }
 
+        const targetBizId = String(bundle.business_profile?.id || getActiveBusinessId() || '').trim();
+        const fallbackStoreId = String(activeStore || getActiveStoreId(undefined, targetBizId) || 'main').trim();
+        const delWhere = targetBizId ? ` WHERE business_id = '${sqlEsc(targetBizId)}'` : '';
+
         if (bundle.database) {
           if (Array.isArray(bundle.database.products) && bundle.database.products.length > 0) {
-            runSql('DELETE FROM products');
+            runSql(`DELETE FROM products${delWhere}`);
             bundle.database.products.forEach((p: any) => {
-              runSql(`INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl) VALUES (${p.id}, '${(p.name||'').replace(/'/g, "''")}', '${(p.description||'').replace(/'/g, "''")}', '${(p.sku||'').replace(/'/g, "''")}', '${(p.category||'').replace(/'/g, "''")}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${(p.imageUrl||'').replace(/'/g, "''")}')`);
+              const rowBiz = sqlEsc(p.business_id || targetBizId);
+              const rowStore = sqlEsc(p.store_id || fallbackStoreId);
+              runSql(`INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, store_id, is_service, batch_number, expiry_date) VALUES (${p.id}, '${sqlEsc(p.name||'')}', '${sqlEsc(p.description||'')}', '${sqlEsc(p.sku||'')}', '${sqlEsc(p.category||'')}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${sqlEsc(p.imageUrl||'')}', '${rowBiz}', '${rowStore}', ${p.is_service||0}, '${sqlEsc(p.batch_number||'')}', '${sqlEsc(p.expiry_date||'')}')`);
             });
           }
           if (Array.isArray(bundle.database.customers) && bundle.database.customers.length > 0) {
-            runSql('DELETE FROM customers');
+            runSql(`DELETE FROM customers${delWhere}`);
             bundle.database.customers.forEach((c: any) => {
-              runSql(`INSERT INTO customers VALUES (${c.id}, '${(c.name||'').replace(/'/g, "''")}', '${c.phone||''}', '${c.email||''}', ${c.loyalPoints||0}, '${c.tpin||''}', ${c.zra_connected||0}, '${c.tax_band||''}')`);
+              const rowBiz = sqlEsc(c.business_id || targetBizId);
+              const rowStore = sqlEsc(c.store_id || fallbackStoreId);
+              runSql(`INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id) VALUES (${c.id}, '${sqlEsc(c.name||'')}', '${sqlEsc(c.phone||'')}', '${sqlEsc(c.email||'')}', ${c.loyalPoints||0}, '${sqlEsc(c.tpin||'')}', ${c.zra_connected||0}, '${sqlEsc(c.tax_band||'')}', '${rowBiz}', '${rowStore}')`);
             });
           }
           if (Array.isArray(bundle.database.orders) && bundle.database.orders.length > 0) {
-            runSql('DELETE FROM orders');
+            runSql(`DELETE FROM orders${delWhere}`);
             bundle.database.orders.forEach((o: any) => {
-              runSql(`INSERT INTO orders VALUES ('${o.id}', ${o.customerId||'NULL'}, '${o.orderDate||''}', ${o.subtotal||0}, ${o.tax||0}, ${o.discount||0}, ${o.total||0}, '${o.paymentMethod||''}', '${o.status||''}', '${o.store_id||activeStore||''}')`);
+              const rowBiz = sqlEsc(o.business_id || targetBizId);
+              const rowStore = sqlEsc(o.store_id || fallbackStoreId);
+              runSql(`INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, split_cash, split_momo, status, store_id, performed_by, business_id) VALUES ('${sqlEsc(o.id)}', ${o.customerId||'NULL'}, '${sqlEsc(o.orderDate||'')}', ${o.subtotal||0}, ${o.tax||0}, ${o.discount||0}, ${o.total||0}, '${sqlEsc(o.paymentMethod||'')}', ${o.split_cash||0}, ${o.split_momo||0}, '${sqlEsc(o.status||'')}', '${rowStore}', '${sqlEsc(o.performed_by||'owner')}', '${rowBiz}')`);
             });
           }
           if (Array.isArray(bundle.database.order_items) && bundle.database.order_items.length > 0) {
-            runSql('DELETE FROM order_items');
+            runSql(`DELETE FROM order_items${delWhere}`);
             bundle.database.order_items.forEach((oi: any) => {
-              runSql(`INSERT INTO order_items VALUES ('${oi.id}', '${oi.orderId}', ${oi.productId}, ${oi.quantity}, ${oi.unitPrice})`);
+              const rowBiz = sqlEsc(oi.business_id || targetBizId);
+              const rowStore = sqlEsc(oi.store_id || fallbackStoreId);
+              runSql(`INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES ('${sqlEsc(oi.id)}', '${sqlEsc(oi.orderId)}', ${oi.productId}, ${oi.quantity}, ${oi.unitPrice}, '${rowBiz}', '${rowStore}')`);
             });
           }
         }
@@ -941,49 +961,49 @@ export default function SettingsPanel({
 
   const handleGenerateSqlDump = () => {
     setGeneratedSqlDump('');
-    let dump = `-- ANDROID POS SQL SCHEMA & TRANSACTION DATA DUMP\n-- Generated on: ${new Date().toLocaleString()}\n-- Database engine: alasql_wasm_bridge\n\n`;
+    const activeBizId = getActiveBusinessId();
+    const fallbackStore = activeStore || getActiveStoreId(undefined, activeBizId) || 'main';
+    const bizWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+    let dump = `-- ANDROID POS SQL SCHEMA & TRANSACTION DATA DUMP\n-- Generated on: ${new Date().toLocaleString()}\n-- Business Tenant: ${activeBizId || 'ALL'}\n-- Database engine: alasql_wasm_bridge\n\n`;
 
     // 1. Dump Products
     dump += `-- ==========================================\n-- TABLE: products\n-- ==========================================\n`;
-    dump += `CREATE TABLE products (\n  id INT PRIMARY KEY,\n  name VARCHAR(255),\n  description TEXT,\n  sku VARCHAR(50) UNIQUE,\n  category VARCHAR(100),\n  price NUMERIC(10,2),\n  cost NUMERIC(10,2),\n  stock INT,\n  imageUrl TEXT\n);\n\n`;
-    const prodRes = runSql('SELECT * FROM products', 'Dump: Extract products');
+    dump += `CREATE TABLE products (\n  id INT PRIMARY KEY,\n  name VARCHAR(255),\n  description TEXT,\n  sku VARCHAR(50) UNIQUE,\n  category VARCHAR(100),\n  price NUMERIC(10,2),\n  cost NUMERIC(10,2),\n  stock INT,\n  imageUrl TEXT,\n  business_id VARCHAR(100),\n  store_id VARCHAR(100)\n);\n\n`;
+    const prodRes = runSql(`SELECT * FROM products${bizWhere}`, 'Dump: Extract products');
     if (prodRes.success && Array.isArray(prodRes.data)) {
       prodRes.data.forEach((p: any) => {
-        dump += `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl) VALUES (${p.id}, '${(p.name||'').replace(/'/g, "''")}', '${(p.description||'').replace(/'/g, "''")}', '${p.sku||''}', '${p.category||''}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${p.imageUrl||''}');\n`;
+        dump += `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, store_id) VALUES (${p.id}, '${sqlEsc(p.name||'')}', '${sqlEsc(p.description||'')}', '${sqlEsc(p.sku||'')}', '${sqlEsc(p.category||'')}', ${p.price||0}, ${p.cost||0}, ${p.stock||0}, '${sqlEsc(p.imageUrl||'')}', '${sqlEsc(p.business_id||activeBizId)}', '${sqlEsc(p.store_id||fallbackStore)}');\n`;
       });
     }
 
     // 2. Dump Customers
     dump += `\n-- ==========================================\n-- TABLE: customers\n-- ==========================================\n`;
-    dump += `CREATE TABLE customers (\n  id INT PRIMARY KEY,\n  name VARCHAR(255),\n  phone VARCHAR(50),\n  email VARCHAR(100),\n  loyalPoints INT\n);\n\n`;
-    const custRes = runSql('SELECT * FROM customers', 'Dump: Extract customers');
+    dump += `CREATE TABLE customers (\n  id INT PRIMARY KEY,\n  name VARCHAR(255),\n  phone VARCHAR(50),\n  email VARCHAR(100),\n  loyalPoints INT,\n  tpin VARCHAR(50),\n  zra_connected INT,\n  tax_band VARCHAR(100),\n  business_id VARCHAR(100),\n  store_id VARCHAR(100)\n);\n\n`;
+    const custRes = runSql(`SELECT * FROM customers${bizWhere}`, 'Dump: Extract customers');
     if (custRes.success && Array.isArray(custRes.data)) {
       custRes.data.forEach((c: any) => {
-        const escapeName = c.name ? c.name.replace(/'/g, "''") : '';
-        const escapeTpin = c.tpin ? c.tpin.replace(/'/g, "''") : '';
-        const escapeBand = c.tax_band ? c.tax_band.replace(/'/g, "''") : '';
-        dump += `INSERT INTO customers VALUES (${c.id}, '${escapeName}', '${c.phone || ''}', '${c.email || ''}', ${c.loyalPoints || 0}, '${escapeTpin}', ${c.zra_connected || 0}, '${escapeBand}');\n`;
+        dump += `INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id) VALUES (${c.id}, '${sqlEsc(c.name||'')}', '${sqlEsc(c.phone || '')}', '${sqlEsc(c.email || '')}', ${c.loyalPoints || 0}, '${sqlEsc(c.tpin||'')}', ${c.zra_connected || 0}, '${sqlEsc(c.tax_band||'')}', '${sqlEsc(c.business_id||activeBizId)}', '${sqlEsc(c.store_id||fallbackStore)}');\n`;
       });
     }
 
     // 3. Dump Orders & items
     dump += `\n-- ==========================================\n-- TABLE: orders\n-- ==========================================\n`;
-    dump += `CREATE TABLE orders (\n  id VARCHAR(50) PRIMARY KEY,\n  customerId INT,\n  orderDate VARCHAR(100),\n  subtotal NUMERIC(10,2),\n  tax NUMERIC(10,2),\n  discount NUMERIC(10,2),\n  total NUMERIC(10,2),\n  paymentMethod VARCHAR(50),\n  status VARCHAR(20),\n  store_id VARCHAR(50)\n);\n\n`;
-    const orderRes = runSql('SELECT * FROM orders', 'Dump: Extract historical invoices');
+    dump += `CREATE TABLE orders (\n  id VARCHAR(50) PRIMARY KEY,\n  customerId INT,\n  orderDate VARCHAR(100),\n  subtotal NUMERIC(10,2),\n  tax NUMERIC(10,2),\n  discount NUMERIC(10,2),\n  total NUMERIC(10,2),\n  paymentMethod VARCHAR(50),\n  status VARCHAR(20),\n  store_id VARCHAR(50),\n  business_id VARCHAR(100)\n);\n\n`;
+    const orderRes = runSql(`SELECT * FROM orders${bizWhere}`, 'Dump: Extract historical invoices');
     if (orderRes.success && Array.isArray(orderRes.data)) {
       orderRes.data.forEach((o: any) => {
         const custVal = o.customerId === null ? 'NULL' : o.customerId;
-        const storeVal = o.store_id ? `'${o.store_id}'` : `'${activeStore || ''}'`;
-        dump += `INSERT INTO orders VALUES ('${o.id}', ${custVal}, '${o.orderDate}', ${o.subtotal}, ${o.tax}, ${o.discount}, ${o.total}, '${o.paymentMethod}', '${o.status}', ${storeVal});\n`;
+        const storeVal = `'${sqlEsc(o.store_id || fallbackStore)}'`;
+        dump += `INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, business_id) VALUES ('${sqlEsc(o.id)}', ${custVal}, '${sqlEsc(o.orderDate)}', ${o.subtotal}, ${o.tax}, ${o.discount}, ${o.total}, '${sqlEsc(o.paymentMethod)}', '${sqlEsc(o.status)}', ${storeVal}, '${sqlEsc(o.business_id||activeBizId)}');\n`;
       });
     }
 
     dump += `\n-- ==========================================\n-- TABLE: order_items\n-- ==========================================\n`;
-    dump += `CREATE TABLE order_items (\n  id VARCHAR(50) PRIMARY KEY,\n  orderId VARCHAR(50),\n  productId INT,\n  quantity INT,\n  unitPrice NUMERIC(10,2)\n);\n\n`;
-    const oItemRes = runSql('SELECT * FROM order_items', 'Dump: Extract invoice details list');
+    dump += `CREATE TABLE order_items (\n  id VARCHAR(50) PRIMARY KEY,\n  orderId VARCHAR(50),\n  productId INT,\n  quantity INT,\n  unitPrice NUMERIC(10,2),\n  business_id VARCHAR(100),\n  store_id VARCHAR(100)\n);\n\n`;
+    const oItemRes = runSql(`SELECT * FROM order_items${bizWhere}`, 'Dump: Extract invoice details list');
     if (oItemRes.success && Array.isArray(oItemRes.data)) {
       oItemRes.data.forEach((oi: any) => {
-        dump += `INSERT INTO order_items VALUES ('${oi.id}', '${oi.orderId}', ${oi.productId}, ${oi.quantity}, ${oi.unitPrice});\n`;
+        dump += `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES ('${sqlEsc(oi.id)}', '${sqlEsc(oi.orderId)}', ${oi.productId}, ${oi.quantity}, ${oi.unitPrice}, '${sqlEsc(oi.business_id||activeBizId)}', '${sqlEsc(oi.store_id||fallbackStore)}');\n`;
       });
     }
 
@@ -993,35 +1013,35 @@ export default function SettingsPanel({
     const accountsRes = runSql('SELECT * FROM accounts', 'Dump: Extract double-entry accounts list');
     if (accountsRes.success && Array.isArray(accountsRes.data)) {
       accountsRes.data.forEach((acc: any) => {
-        const merchVal = acc.merchant_id ? `'${acc.merchant_id}'` : 'NULL';
-        dump += `INSERT INTO accounts VALUES ('${acc.id}', '${acc.name.replace(/'/g, "''")}', '${acc.type}', '${acc.currency}', ${merchVal}, '${acc.created_at}', '${acc.updated_at}');\n`;
+        const merchVal = `'${sqlEsc(activeBizId || acc.merchant_id || 'ALL')}'`;
+        dump += `INSERT INTO accounts (id, name, type, currency, merchant_id, created_at, updated_at) VALUES ('${sqlEsc(acc.id)}', '${sqlEsc(acc.name)}', '${sqlEsc(acc.type)}', '${sqlEsc(acc.currency)}', ${merchVal}, '${sqlEsc(acc.created_at)}', '${sqlEsc(acc.updated_at)}');\n`;
       });
     }
 
     // 5. Dump Transactions journal schema
     dump += `\n-- ==========================================\n-- TABLE: transactions (Double-Entry Journal)\n-- ==========================================\n`;
-    dump += `CREATE TABLE transactions (\n  id VARCHAR(100) PRIMARY KEY,\n  idempotency_key VARCHAR(100) UNIQUE NOT NULL,\n  pos_terminal_id VARCHAR(100) NOT NULL,\n  channel VARCHAR(50) NOT NULL,\n  provider_reference VARCHAR(100),\n  amount NUMERIC(15,4) NOT NULL,\n  fee_amount NUMERIC(15,4) DEFAULT 0.0000,\n  status VARCHAR(50) DEFAULT 'PENDING',\n  narration TEXT,\n  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,\n  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP\n);\n\n`;
-    const txsRes = runSql('SELECT * FROM transactions', 'Dump: Extract transaction journals');
+    dump += `CREATE TABLE transactions (\n  id VARCHAR(100) PRIMARY KEY,\n  idempotency_key VARCHAR(100) UNIQUE NOT NULL,\n  pos_terminal_id VARCHAR(100) NOT NULL,\n  channel VARCHAR(50) NOT NULL,\n  provider_reference VARCHAR(100),\n  amount NUMERIC(15,4) NOT NULL,\n  fee_amount NUMERIC(15,4) DEFAULT 0.0000,\n  status VARCHAR(50) DEFAULT 'PENDING',\n  narration TEXT,\n  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,\n  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,\n  business_id VARCHAR(100),\n  store_id VARCHAR(100)\n);\n\n`;
+    const txsRes = runSql(`SELECT * FROM transactions${bizWhere}`, 'Dump: Extract transaction journals');
     if (txsRes.success && Array.isArray(txsRes.data)) {
       txsRes.data.forEach((tx: any) => {
-        const provVal = tx.provider_reference ? `'${tx.provider_reference}'` : 'NULL';
-        dump += `INSERT INTO transactions VALUES ('${tx.id}', '${tx.idempotency_key}', '${tx.pos_terminal_id}', '${tx.channel}', ${provVal}, ${tx.amount}, ${tx.fee_amount}, '${tx.status}', '${tx.narration.replace(/'/g, "''")}', '${tx.created_at}', '${tx.updated_at}');\n`;
+        const provVal = tx.provider_reference ? `'${sqlEsc(tx.provider_reference)}'` : 'NULL';
+        dump += `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, business_id, store_id) VALUES ('${sqlEsc(tx.id)}', '${sqlEsc(tx.idempotency_key)}', '${sqlEsc(tx.pos_terminal_id)}', '${sqlEsc(tx.channel)}', ${provVal}, ${tx.amount}, ${tx.fee_amount}, '${sqlEsc(tx.status)}', '${sqlEsc(tx.narration||'')}', '${sqlEsc(tx.created_at)}', '${sqlEsc(tx.updated_at)}', '${sqlEsc(tx.business_id||activeBizId)}', '${sqlEsc(tx.store_id||fallbackStore)}');\n`;
       });
     }
 
     // 6. Dump Ledger Entries matching schema
     dump += `\n-- ==========================================\n-- TABLE: ledger_entries (Double-Entry Mappings)\n-- ==========================================\n`;
-    dump += `CREATE TABLE ledger_entries (\n  id VARCHAR(100) PRIMARY KEY,\n  transaction_id VARCHAR(100) NOT NULL,\n  account_id VARCHAR(100) NOT NULL,\n  type VARCHAR(50) NOT NULL,\n  amount NUMERIC(15,4) NOT NULL,\n  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP\n);\n\n`;
-    const leRes = runSql('SELECT * FROM ledger_entries', 'Dump: Extract double-entry ledger mappings');
+    dump += `CREATE TABLE ledger_entries (\n  id VARCHAR(100) PRIMARY KEY,\n  transaction_id VARCHAR(100) NOT NULL,\n  account_id VARCHAR(100) NOT NULL,\n  type VARCHAR(50) NOT NULL,\n  amount NUMERIC(15,4) NOT NULL,\n  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,\n  business_id VARCHAR(100),\n  store_id VARCHAR(100)\n);\n\n`;
+    const leRes = runSql(`SELECT * FROM ledger_entries${bizWhere}`, 'Dump: Extract double-entry ledger mappings');
     if (leRes.success && Array.isArray(leRes.data)) {
       leRes.data.forEach((le: any) => {
-        dump += `INSERT INTO ledger_entries VALUES ('${le.id}', '${le.transaction_id}', '${le.account_id}', '${le.type}', ${le.amount}, '${le.created_at}');\n`;
+        dump += `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('${sqlEsc(le.id)}', '${sqlEsc(le.transaction_id)}', '${sqlEsc(le.account_id)}', '${sqlEsc(le.type)}', ${le.amount}, '${sqlEsc(le.created_at)}', '${sqlEsc(le.business_id||activeBizId)}', '${sqlEsc(le.store_id||fallbackStore)}');\n`;
       });
     }
 
-    // 7. Dump aggregate balancing View
-    dump += `\n-- ==========================================\n-- VIEW: view_account_balances (Absolute Balances)\n-- ==========================================\n`;
-    dump += `CREATE VIEW view_account_balances AS\nSELECT \n    a.id AS account_id,\n    a.name AS account_name,\n    a.currency,\n    SUM(\n        CASE \n            WHEN (a.type = 'ASSET' OR a.type = 'EXPENSE') AND le.type = 'DEBIT' THEN le.amount\n            WHEN (a.type = 'ASSET' OR a.type = 'EXPENSE') AND le.type = 'CREDIT' THEN -le.amount\n            WHEN (a.type = 'LIABILITY' OR a.type = 'REVENUE' OR a.type = 'EQUITY') AND le.type = 'CREDIT' THEN le.amount\n            WHEN (a.type = 'LIABILITY' OR a.type = 'REVENUE' OR a.type = 'EQUITY') AND le.type = 'DEBIT' THEN -le.amount\n            ELSE 0\n        END\n    ) AS current_balance\nFROM accounts a\nLEFT JOIN ledger_entries le ON a.id = le.account_id\nGROUP BY a.id, a.name, a.currency;\n`;
+    // 7. Dump tenant-scoped balance aggregation summary
+    dump += `\n-- ==========================================\n-- QUERY: Account Balances (Tenant-Scoped)\n-- ==========================================\n`;
+    dump += `SELECT \n    a.id AS account_id,\n    a.name AS account_name,\n    a.currency,\n    SUM(\n        CASE \n            WHEN (a.type = 'ASSET' OR a.type = 'EXPENSE') AND le.type = 'DEBIT' THEN le.amount\n            WHEN (a.type = 'ASSET' OR a.type = 'EXPENSE') AND le.type = 'CREDIT' THEN -le.amount\n            WHEN (a.type = 'LIABILITY' OR a.type = 'REVENUE' OR a.type = 'EQUITY') AND le.type = 'CREDIT' THEN le.amount\n            WHEN (a.type = 'LIABILITY' OR a.type = 'REVENUE' OR a.type = 'EQUITY') AND le.type = 'DEBIT' THEN -le.amount\n            ELSE 0\n        END\n    ) AS current_balance\nFROM accounts a\nLEFT JOIN ledger_entries le ON a.id = le.account_id${activeBizId ? ` AND le.business_id = '${sqlEsc(activeBizId)}'` : ''}\nGROUP BY a.id, a.name, a.currency;\n`;
 
     setGeneratedSqlDump(dump);
     triggerNotify('Compiled fully complete raw SQL file script text backup dumper!');
@@ -1047,9 +1067,6 @@ export default function SettingsPanel({
     const activeBizRow = businessesList.find((b: any) => String(b.id) === String(activeBizId)) || businessesList[0];
     const primaryOwnerEmail = String(activeBizRow?.email || '').trim().toLowerCase();
 
-    if (usr.id === 'default_biz') {
-      return `Primary Business Owner profiles cannot be ${actionLabel === 'revoke' ? 'revoked' : 'suspended'}. Edit credentials instead.`;
-    }
     if (currentLoggedEmail && usrEmailLower && currentLoggedEmail === usrEmailLower) {
       return `You cannot ${actionLabel} your own currently active session.`;
     }
@@ -1086,40 +1103,44 @@ export default function SettingsPanel({
     const permissionsString = JSON.stringify(basicPermissions);
 
     // 2. Decide if Owner or Staff
+    const activeBizId = getActiveBusinessId();
+    const fallbackStoreId = activeStore || getActiveStoreId(undefined, activeBizId) || (storesList[0]?.id ?? 'main');
     if (userRole === 'owner') {
-      if (editingUserId && editingUserId !== 'default_biz') {
+      if (editingUserId) {
         const sql = `
           UPDATE businesses
-          SET owner = '${userFirstName.trim().replace(/'/g, "''")} ${userSurname.trim().replace(/'/g, "''")}',
-              email = '${emailLower.replace(/'/g, "''")}',
-              password = '${userPassword.trim().replace(/'/g, "''")}'
-          WHERE id = '${String(editingUserId).replace(/'/g, "''")}'
+          SET owner = '${sqlEsc(userFirstName.trim())} ${sqlEsc(userSurname.trim())}',
+              email = '${sqlEsc(emailLower)}',
+              password = '${sqlEsc(userPassword.trim())}'
+          WHERE id = '${sqlEsc(String(editingUserId))}'
         `;
         runSql(sql, `SettingsPanel: Update Corporate Owner profile`);
       } else {
-        const newBizId = editingUserId || `biz_${Math.floor(100000 + Math.random() * 900000)}`;
-        const existsRes = runSql(`SELECT * FROM businesses WHERE id = '${String(newBizId).replace(/'/g, "''")}'`);
+        const newBizId = `biz_${Math.floor(100000 + Math.random() * 900000)}`;
+        const existsRes = runSql(`SELECT * FROM businesses WHERE id = '${sqlEsc(String(newBizId))}'`);
         const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
 
         if (alreadyExists) {
           const sql = `
             UPDATE businesses
-            SET owner = '${userFirstName.trim().replace(/'/g, "''")} ${userSurname.trim().replace(/'/g, "''")}',
-                email = '${emailLower.replace(/'/g, "''")}',
-                password = '${userPassword.trim().replace(/'/g, "''")}'
-            WHERE id = '${String(newBizId).replace(/'/g, "''")}'
+            SET owner = '${sqlEsc(userFirstName.trim())} ${sqlEsc(userSurname.trim())}',
+                email = '${sqlEsc(emailLower)}',
+                password = '${sqlEsc(userPassword.trim())}'
+            WHERE id = '${sqlEsc(String(newBizId))}'
           `;
           runSql(sql, `SettingsPanel: Update Corporate Owner`);
         } else {
           const sql = `
-            INSERT INTO businesses (id, name, owner, email, password, created_at)
+            INSERT INTO businesses (id, name, owner, email, password, created_at, business_id, store_id)
             VALUES (
-              '${newBizId}',
-              '${storeName.replace(/'/g, "''")} HQ',
-              '${userFirstName.trim().replace(/'/g, "''")} ${userSurname.trim().replace(/'/g, "''")}',
-              '${emailLower.replace(/'/g, "''")}',
-              '${userPassword.trim().replace(/'/g, "''")}',
-              '${new Date().toISOString()}'
+              '${sqlEsc(newBizId)}',
+              '${sqlEsc(storeName)} HQ',
+              '${sqlEsc(userFirstName.trim())} ${sqlEsc(userSurname.trim())}',
+              '${sqlEsc(emailLower)}',
+              '${sqlEsc(userPassword.trim())}',
+              '${new Date().toISOString()}',
+              '${sqlEsc(activeBizId || newBizId)}',
+              '${sqlEsc(fallbackStoreId)}'
             )
           `;
           runSql(sql, `SettingsPanel: Register secondary Corporate Owner account`);
@@ -1127,53 +1148,53 @@ export default function SettingsPanel({
       }
     } else {
       const salaryNum = parseFloat(userSalary) || 0;
-      const targetStaffId = editingUserId && editingUserId !== 'default_biz' ? editingUserId : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
+      const targetStaffId = editingUserId ? editingUserId : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
       const fullStaffName = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
-      const primaryStore = selectedBranches[0] || activeStore || (storesList[0]?.id ?? '');
+      const primaryStore = selectedBranches[0] || fallbackStoreId;
       const idWhereClause = buildSqlIdWhereClause(targetStaffId);
+      const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
       
-      const existsRes = runSql(`SELECT * FROM staff WHERE ${idWhereClause}`);
+      const existsRes = runSql(`SELECT * FROM staff WHERE ${idWhereClause}${staffBizAnd}`);
       const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
 
       if (alreadyExists) {
         const sql = `
           UPDATE staff
-          SET name = '${fullStaffName.replace(/'/g, "''")}',
-              first_name = '${userFirstName.trim().replace(/'/g, "''")}',
-              surname = '${userSurname.trim().replace(/'/g, "''")}',
-              role = '${userRole}',
-              pin = '${userPassword.trim().slice(0, 6).replace(/'/g, "''")}',
-              store_id = '${primaryStore.replace(/'/g, "''")}',
-              contact = '${userContact.trim().replace(/'/g, "''")}',
-              email = '${emailLower.replace(/'/g, "''")}',
+          SET name = '${sqlEsc(fullStaffName)}',
+              first_name = '${sqlEsc(userFirstName.trim())}',
+              surname = '${sqlEsc(userSurname.trim())}',
+              role = '${sqlEsc(userRole)}',
+              pin = '${sqlEsc(userPassword.trim().slice(0, 6))}',
+              store_id = '${sqlEsc(primaryStore)}',
+              contact = '${sqlEsc(userContact.trim())}',
+              email = '${sqlEsc(emailLower)}',
               basic_salary = ${salaryNum},
-              permissions_json = '${permissionsString.replace(/'/g, "''")}',
-              password = '${userPassword.trim().replace(/'/g, "''")}'
-          WHERE ${idWhereClause}
+              permissions_json = '${sqlEsc(permissionsString)}',
+              password = '${sqlEsc(userPassword.trim())}'
+          WHERE ${idWhereClause}${staffBizAnd}
         `;
         runSql(sql, `SettingsPanel: Modify staff profile ${targetStaffId}`);
       } else {
-        const activeBizId = getActiveBusinessId();
         const sql = `
           INSERT INTO staff (id, name, role, hourly_rate, pin, store_id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password)
           VALUES (
-            '${String(targetStaffId).replace(/'/g, "''")}',
-            '${fullStaffName.replace(/'/g, "''")}',
-            '${userRole}',
+            '${sqlEsc(String(targetStaffId))}',
+            '${sqlEsc(fullStaffName)}',
+            '${sqlEsc(userRole)}',
             0,
-            '${userPassword.trim().slice(0, 6).replace(/'/g, "''")}',
-            '${primaryStore.replace(/'/g, "''")}',
-            '${userFirstName.trim().replace(/'/g, "''")}',
-            '${userSurname.trim().replace(/'/g, "''")}',
-            '${userContact.trim().replace(/'/g, "''")}',
-            '${emailLower.replace(/'/g, "''")}',
-            '${(billingCity || billingAddress || '').replace(/'/g, "''")}',
+            '${sqlEsc(userPassword.trim().slice(0, 6))}',
+            '${sqlEsc(primaryStore)}',
+            '${sqlEsc(userFirstName.trim())}',
+            '${sqlEsc(userSurname.trim())}',
+            '${sqlEsc(userContact.trim())}',
+            '${sqlEsc(emailLower)}',
+            '${sqlEsc(billingCity || billingAddress || '')}',
             '${new Date().toISOString().substring(0, 10)}',
             '', '', '', '',
             ${salaryNum},
-            '${permissionsString.replace(/'/g, "''")}',
-            '${activeBizId.replace(/'/g, "''")}',
-            '${userPassword.trim().replace(/'/g, "''")}'
+            '${sqlEsc(permissionsString)}',
+            '${sqlEsc(activeBizId)}',
+            '${sqlEsc(userPassword.trim())}'
           )
         `;
         runSql(sql, `SettingsPanel: Register new staff profile ${targetStaffId}`);
@@ -1190,7 +1211,6 @@ export default function SettingsPanel({
 
     const savedLabel = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
     const isNowSuspended = userRole !== 'owner' && userSuspended;
-    const activeBizId = getActiveBusinessId();
     handleResetUserForm();
     loadUsersList();
     persistTablesToStorage();
@@ -1263,16 +1283,18 @@ export default function SettingsPanel({
       return;
     }
 
+    const activeBizId = getActiveBusinessId();
+    const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     if (usr.is_owner) {
-      const safeId = String(usr.id).replace(/'/g, "''");
+      const safeId = sqlEsc(String(usr.id));
       runSql(`DELETE FROM businesses WHERE id = '${safeId}'`, `SettingsPanel: Revoke secondary owner account ${usr.id}`);
       if (usr.email) {
-        const safeEmail = String(usr.email).trim().toLowerCase().replace(/'/g, "''");
-        runSql(`DELETE FROM staff WHERE LOWER(email) = '${safeEmail}'`, `SettingsPanel: Clean secondary owner staff link`);
+        const safeEmail = sqlEsc(String(usr.email).trim().toLowerCase());
+        runSql(`DELETE FROM staff WHERE LOWER(email) = '${safeEmail}'${staffBizAnd}`, `SettingsPanel: Clean secondary owner staff link`);
       }
     } else {
       const idWhereClause = buildSqlIdWhereClause(usr.id);
-      runSql(`DELETE FROM staff WHERE ${idWhereClause}`, `SettingsPanel: Revoke staff account ${usr.id}`);
+      runSql(`DELETE FROM staff WHERE ${idWhereClause}${staffBizAnd}`, `SettingsPanel: Revoke staff account ${usr.id}`);
     }
 
     if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
@@ -1280,7 +1302,6 @@ export default function SettingsPanel({
     }
 
     setConfirmRevokeUserKey(null);
-    const activeBizId = getActiveBusinessId();
     loadUsersList();
     persistTablesToStorage();
     pushDatabaseToServer(activeBizId).catch(() => {});
@@ -1317,10 +1338,12 @@ export default function SettingsPanel({
       suspendedAt: nextSuspended ? new Date().toISOString() : null,
     });
 
-    const permsJsonEscaped = JSON.stringify(updatedPerms).replace(/'/g, "''");
+    const permsJsonEscaped = sqlEsc(JSON.stringify(updatedPerms));
     const idWhereClause = buildSqlIdWhereClause(usr.id);
+    const activeBizId = getActiveBusinessId();
+    const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const res = runSql(
-      `UPDATE staff SET permissions_json = '${permsJsonEscaped}' WHERE ${idWhereClause}`,
+      `UPDATE staff SET permissions_json = '${permsJsonEscaped}' WHERE ${idWhereClause}${staffBizAnd}`,
       `SettingsPanel: ${nextSuspended ? 'Suspend' : 'Reactivate'} staff account ${usr.id}`
     );
 
@@ -1333,7 +1356,6 @@ export default function SettingsPanel({
       setUserSuspended(nextSuspended);
     }
 
-    const activeBizId = getActiveBusinessId();
     loadUsersList();
     persistTablesToStorage();
     pushDatabaseToServer(activeBizId).catch(() => {});
@@ -3540,7 +3562,7 @@ export default function SettingsPanel({
                 required
                 type="email"
                 value={userEmail}
-                disabled={editingUserId === 'default_biz'}
+                disabled={Boolean(editingUserId && String(editingUserId) === String(getActiveBusinessId()))}
                 onChange={(e) => setUserEmail(e.target.value)}
                 placeholder="e.g. lkapambwe@pos.zm"
                 className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:border-indigo-505 focus:outline-hidden text-xs rounded-lg font-semibold text-slate-800 disabled:opacity-50"
@@ -3589,7 +3611,7 @@ export default function SettingsPanel({
                     setSelectedBranches([]); // Implicit all branches
                   }
                 }}
-                disabled={editingUserId === 'default_biz'}
+                disabled={Boolean(editingUserId && String(editingUserId) === String(getActiveBusinessId()))}
                 className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 focus:bg-white focus:outline-hidden text-xs font-bold rounded-lg text-slate-700 cursor-pointer disabled:opacity-50"
               >
                 <option value="sales">💼 Cashier (Sales terminal only)</option>

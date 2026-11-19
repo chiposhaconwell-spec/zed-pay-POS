@@ -40,7 +40,7 @@ import {
   AlertTriangle,
   Zap
 } from 'lucide-react';
-import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider, calculateLoyaltyPoints, isWalkInCustomerName } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider, calculateLoyaltyPoints, isWalkInCustomerName, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { Product, Customer, StoreSettings, CustomPaymentMethod } from '../types';
 import {
   UserPermissions,
@@ -54,7 +54,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
-import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud } from '../firebase';
+import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud, syncSaleToFirestoreOfflineSafe, triggerAutoFirebaseBackup } from '../firebase';
 import { FiscalService, ZraFiscalReceiptData } from '../zra/fiscalService';
 import { getZraConfig, subscribeZraConfig, ZraConfig } from '../zra/zraConfig';
 
@@ -80,6 +80,7 @@ interface CartItem {
 
 interface OfflineOrder {
   orderId: string;
+  business_id?: string;
   customerId: string | null;
   items: CartItem[];
   dateStr: string;
@@ -94,6 +95,7 @@ interface OfflineOrder {
   salesperson?: string;
   type: 'standard' | 'quicksale';
   loyaltyAwarded?: boolean;
+  alreadyCommittedLocally?: boolean;
 }
 
 export default function BillingTerminal({ 
@@ -179,7 +181,10 @@ export default function BillingTerminal({
   const [offlineQueue, setOfflineQueue] = useState<OfflineOrder[]>(() => {
     try {
       const saved = localStorage.getItem('pos_offline_queue');
-      return saved ? JSON.parse(saved) : [];
+      const parsed = saved ? JSON.parse(saved) : [];
+      const curBiz = getActiveBusinessId();
+      if (!Array.isArray(parsed)) return [];
+      return curBiz ? parsed.filter((q: any) => !q?.business_id || q.business_id === curBiz) : parsed;
     } catch {
       return [];
     }
@@ -200,74 +205,137 @@ export default function BillingTerminal({
 
   // Synchronize queued transactions
   const syncOfflineQueue = async () => {
-    let currentQueue: OfflineOrder[] = [];
+    let allSavedQueue: OfflineOrder[] = [];
     try {
       const saved = localStorage.getItem('pos_offline_queue');
-      currentQueue = saved ? JSON.parse(saved) : [];
+      allSavedQueue = saved ? JSON.parse(saved) : [];
+      if (!Array.isArray(allSavedQueue)) allSavedQueue = [];
     } catch {
-      currentQueue = [];
+      allSavedQueue = [];
     }
+
+    const currentBizId = getActiveBusinessId();
+    const currentQueue = currentBizId
+      ? allSavedQueue.filter((q) => !q?.business_id || q.business_id === currentBizId)
+      : allSavedQueue;
 
     if (currentQueue.length === 0) return;
     setIsSyncing(true);
 
     let successCount = 0;
+    const syncedOrderIds = new Set<string>();
     const itemsToSync = [...currentQueue];
 
     for (const trx of itemsToSync) {
       try {
+        const trxBizId = trx.business_id || currentBizId || '';
+        const trxStoreId = getActiveStoreId(trx.activeStore, trxBizId);
+
+        // Check if this order was already persisted locally during offline checkout (via IndexedDB/SQLite)
+        const existingCheck = runSql(
+          `SELECT id FROM orders WHERE id = '${sqlEsc(trx.orderId)}'${trxBizId ? ` AND business_id = '${sqlEsc(trxBizId)}'` : ''} LIMIT 1`,
+          `Sync: Check local commit for ${trx.orderId}`,
+          true
+        );
+        const alreadyInLocalDb = Boolean(
+          trx.alreadyCommittedLocally ||
+          (existingCheck.success && Array.isArray(existingCheck.data) && existingCheck.data.length > 0)
+        );
+
         if (trx.type === 'quicksale') {
-          // Sync quicksale
           const qpName = trx.salesperson || 'Default Cashier';
-          const orderInsertSql = `
-            INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
-              '${trx.orderId}', 
-              NULL, 
-              '${trx.dateStr}', 
-              ${trx.subtotal.toFixed(2)}, 
-              ${trx.taxAmount.toFixed(2)}, 
-              0.00, 
-              ${trx.totalAmount.toFixed(2)}, 
-              '${trx.paymentMethod}', 
-              'Completed',
-              '${trx.activeStore}',
-              '${qpName.replace(/'/g, "''")}'
-            )
-          `;
-          const resOrder = runSql(orderInsertSql, `Sync: Post quick order ${trx.orderId}`);
-          
-          if (resOrder.success) {
-            // Post line items
-            trx.items.forEach((item, index) => {
-              const itemInsertSql = `
-                INSERT INTO order_items VALUES (
-                  '${trx.orderId}_item_${index + 1}', 
-                  '${trx.orderId}', 
-                  ${item.product.id}, 
-                  ${item.quantity}, 
-                  ${item.product.price}
-                )
-              `;
-              runSql(itemInsertSql, `Sync: Post quick sales transaction lines`);
-
-              // Decrement branch specific stock and baseline catalog stock if not a service
-              if (item.product.is_service !== 1) {
-                runSql(`
-                  UPDATE store_products 
-                  SET stock = stock - ${item.quantity} 
-                  WHERE product_id = ${item.product.id} AND store_id = '${trx.activeStore}'
-                `, `Sync: Decrement quicksale stock unit from ${trx.activeStore.toUpperCase()}`);
-                runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id}`, 'Sync: Decrement quicksale baseline stock');
+          let committedNow = alreadyInLocalDb;
+          if (!alreadyInLocalDb) {
+            const orderInsertSql = `
+              INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
+                '${sqlEsc(trx.orderId)}',
+                NULL,
+                '${sqlEsc(trx.dateStr)}',
+                ${trx.subtotal.toFixed(2)},
+                ${trx.taxAmount.toFixed(2)},
+                0.00,
+                ${trx.totalAmount.toFixed(2)},
+                '${sqlEsc(trx.paymentMethod)}',
+                'Completed',
+                '${sqlEsc(trxStoreId)}',
+                '${sqlEsc(qpName)}',
+                '${sqlEsc(trxBizId)}'
+              )
+            `;
+            const resOrder = runSql(orderInsertSql, `Sync: Post quick order ${trx.orderId}`);
+            committedNow = Boolean(resOrder.success);
+            if (resOrder.success) {
+              trx.items.forEach((item, index) => {
+                runSql(
+                  `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
+                    '${sqlEsc(trx.orderId)}_item_${index + 1}',
+                    '${sqlEsc(trx.orderId)}',
+                    ${item.product.id},
+                    ${item.quantity},
+                    ${item.product.price},
+                    '${sqlEsc(trxBizId)}',
+                    '${sqlEsc(trxStoreId)}'
+                  )`,
+                  `Sync: Post quick sales transaction lines`
+                );
+                if (item.product.is_service !== 1) {
+                  runSql(`UPDATE store_products SET stock = stock - ${item.quantity} WHERE product_id = ${item.product.id} AND store_id = '${sqlEsc(trxStoreId)}'`, `Sync: Decrement quicksale stock unit`);
+                  runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id}`, 'Sync: Decrement quicksale baseline stock');
+                }
+              });
+              try {
+                triggerLoanSweep(trx.orderId, trx.totalAmount);
+              } catch (err) {
+                console.error('Offline sweep failed:', err);
               }
-            });
-
-            // Automated credit sweep
-            try {
-              triggerLoanSweep(trx.orderId, trx.totalAmount);
-            } catch (err) {
-              console.error('Offline sweep failed:', err);
             }
+          }
 
+          if (committedNow) {
+            syncSaleToFirestoreOfflineSafe({
+              businessId: trxBizId,
+              storeId: trxStoreId,
+              order: {
+                id: trx.orderId,
+                customerId: trx.customerId ? Number(trx.customerId) : null,
+                orderDate: trx.dateStr,
+                subtotal: trx.subtotal,
+                tax: trx.taxAmount,
+                discount: 0,
+                total: trx.totalAmount,
+                paymentMethod: trx.paymentMethod,
+                status: 'Completed',
+                performed_by: qpName,
+              },
+              items: (trx.items || []).map((it, idx) => ({
+                id: `${trx.orderId}_item_${idx + 1}`,
+                productId: it.product.id,
+                quantity: it.quantity,
+                unitPrice: it.product.price,
+              })),
+            });
+            try {
+              await FiscalService.submitInvoice({
+                orderId: trx.orderId,
+                salesDateIso: trx.dateStr,
+                items: (trx.items || []).map((it) => ({
+                  productId: it.product.id,
+                  itemNm: it.product.name,
+                  itemCd: it.product.sku,
+                  itemClsCd: it.product.item_cls_cd,
+                  taxTyCd: it.product.tax_ty_cd,
+                  qty: it.quantity,
+                  prc: it.product.price,
+                  isService: it.product.is_service === 1,
+                })),
+                totalAmount: trx.totalAmount,
+                discountAmount: trx.discountAmount,
+                paymentMethod: trx.paymentMethod,
+                cashierName: qpName,
+                currencyTyCd: settings.currency,
+              });
+            } catch {}
+            syncedOrderIds.add(trx.orderId);
             successCount++;
           }
         } else {
@@ -276,161 +344,161 @@ export default function BillingTerminal({
           const isSplit = String(trx.paymentMethod || '').toLowerCase().startsWith('split');
           const splitCashStored = isSplit ? Number(trx.splitCash ?? (trx.totalAmount / 2)) : 0;
           const splitMobileStored = isSplit ? Number(trx.splitMobile ?? Math.max(0, trx.totalAmount - splitCashStored)) : 0;
-          const orderInsertSql = `
-            INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo) VALUES (
-              '${trx.orderId}', 
-              ${customerIdVal}, 
-              '${trx.dateStr}', 
-              ${trx.subtotal.toFixed(2)}, 
-              ${trx.taxAmount.toFixed(2)}, 
-              ${trx.discountAmount.toFixed(2)}, 
-              ${trx.totalAmount.toFixed(2)}, 
-              '${trx.paymentMethod}', 
-              'Completed',
-              '${trx.activeStore}',
-              '${(trx.salesperson || 'Default Cashier').replace(/'/g, "''")}',
-              ${splitCashStored.toFixed(2)},
-              ${splitMobileStored.toFixed(2)}
-            )
-          `;
-          const resOrder = runSql(orderInsertSql, `Sync: Post standard order ${trx.orderId}`);
+          let committedNow = alreadyInLocalDb;
 
-          if (resOrder.success) {
-            // Insert items and decrement branch specific stock layers
-            trx.items.forEach((item, index) => {
-              const orderItemId = `${trx.orderId}_${index + 1}`;
-              const itemInsertSql = `
-                INSERT INTO order_items VALUES (
-                  '${orderItemId}', 
-                  '${trx.orderId}', 
-                  ${item.product.id}, 
-                  ${item.quantity}, 
-                  ${item.product.price}
-                )
-              `;
-              runSql(itemInsertSql, `Sync: Post sales transaction lines`);
+          if (!alreadyInLocalDb) {
+            const orderInsertSql = `
+              INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo, business_id) VALUES (
+                '${sqlEsc(trx.orderId)}',
+                ${customerIdVal},
+                '${sqlEsc(trx.dateStr)}',
+                ${trx.subtotal.toFixed(2)},
+                ${trx.taxAmount.toFixed(2)},
+                ${trx.discountAmount.toFixed(2)},
+                ${trx.totalAmount.toFixed(2)},
+                '${sqlEsc(trx.paymentMethod)}',
+                'Completed',
+                '${sqlEsc(trxStoreId)}',
+                '${sqlEsc(trx.salesperson || 'Default Cashier')}',
+                ${splitCashStored.toFixed(2)},
+                ${splitMobileStored.toFixed(2)},
+                '${sqlEsc(trxBizId)}'
+              )
+            `;
+            const resOrder = runSql(orderInsertSql, `Sync: Post standard order ${trx.orderId}`);
+            committedNow = Boolean(resOrder.success);
 
-              // Decrement store_products and baseline products if not a service
-              if (item.product.is_service !== 1) {
-                const checkOverride = runSql(`SELECT * FROM store_products WHERE product_id = ${item.product.id} AND store_id = '${trx.activeStore}'`, 'Verify location state');
-                if (checkOverride.success && Array.isArray(checkOverride.data) && checkOverride.data.length > 0) {
-                  runSql(`
-                    UPDATE store_products 
-                    SET stock = stock - ${item.quantity} 
-                    WHERE product_id = ${item.product.id} AND store_id = '${trx.activeStore}'
-                  `, `Sync: Demobilize -${item.quantity} units from branch ${trx.activeStore}`);
-                } else {
-                  const spId = `sp_${item.product.id}_${trx.activeStore}`;
-                  runSql(`
-                    INSERT INTO store_products VALUES (
-                      '${spId}',
-                      ${item.product.id},
-                      '${trx.activeStore}',
-                      ${item.product.stock - item.quantity},
-                      ${item.product.price}
-                    )
-                  `, `Sync: Provision missing branch rows`);
+            if (resOrder.success) {
+              trx.items.forEach((item, index) => {
+                const orderItemId = `${trx.orderId}_${index + 1}`;
+                runSql(
+                  `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
+                    '${sqlEsc(orderItemId)}',
+                    '${sqlEsc(trx.orderId)}',
+                    ${item.product.id},
+                    ${item.quantity},
+                    ${item.product.price},
+                    '${sqlEsc(trxBizId)}',
+                    '${sqlEsc(trxStoreId)}'
+                  )`,
+                  `Sync: Post sales transaction lines`
+                );
+
+                if (item.product.is_service !== 1) {
+                  const checkOverride = runSql(`SELECT * FROM store_products WHERE product_id = ${item.product.id} AND store_id = '${sqlEsc(trxStoreId)}' AND business_id = '${sqlEsc(trxBizId)}'`, 'Verify location state');
+                  if (checkOverride.success && Array.isArray(checkOverride.data) && checkOverride.data.length > 0) {
+                    runSql(`UPDATE store_products SET stock = stock - ${item.quantity} WHERE product_id = ${item.product.id} AND store_id = '${sqlEsc(trxStoreId)}' AND business_id = '${sqlEsc(trxBizId)}'`, `Sync: Demobilize -${item.quantity} units`);
+                  } else {
+                    const spId = `sp_${item.product.id}_${trxStoreId}`;
+                    runSql(
+                      `INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
+                        '${sqlEsc(spId)}',
+                        ${item.product.id},
+                        '${sqlEsc(trxStoreId)}',
+                        ${item.product.stock - item.quantity},
+                        ${item.product.price},
+                        '${sqlEsc(trxBizId)}'
+                      )`,
+                      `Sync: Provision missing branch rows`
+                    );
+                  }
+                  runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id} AND business_id = '${sqlEsc(trxBizId)}'`, 'Sync: baseline totals');
                 }
+              });
 
-                // Decrement baseline stock
-                runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id}`, 'Sync: baseline totals');
+              const txId = `tx_${trx.orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
+              const idempotencyKey = `idemp_${txId}`;
+              const calculatedFeeRate = trx.paymentMethod === 'Cash' ? 0.0 : 0.015;
+              const feeAmount = parseFloat((trx.totalAmount * calculatedFeeRate).toFixed(4));
+              const netSettlement = trx.totalAmount - feeAmount;
+
+              if (isSplit) {
+                const momoResolved = resolveSplitMobileProvider(trx.paymentMethod);
+                const splitFee = parseFloat((splitMobileStored * 0.015).toFixed(4));
+                const splitNet = trx.totalAmount - splitFee;
+                runSql(`
+                  INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+                  VALUES ('${txId}', '${idempotencyKey}', 'POS-${trxStoreId.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${splitFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${trxStoreId.toUpperCase()} order Split Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}', '${sqlEsc(trx.salesperson || 'Default Cashier')}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')
+                `, 'Double Entry: Journal base transaction entry (Offline Split)');
+                if (splitCashStored > 0) {
+                  runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_deb_cash', '${txId}', 'cash-clearing-account-uuid', 'DEBIT', ${splitCashStored.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Debit Cash Clearing');
+                  runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_cash_asset', '${txId}', 'acc_cash', 'DEBIT', ${splitCashStored.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Debit Cash Account');
+                }
+                if (splitMobileStored > 0) {
+                  runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_deb_momo', '${txId}', '${momoResolved.clearingAccountId}', 'DEBIT', ${splitMobileStored.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Debit Mobile Clearing');
+                  runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_momo_asset', '${txId}', '${momoResolved.accountId}', 'DEBIT', ${splitMobileStored.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, `Double Entry: Debit ${momoResolved.bucket} Account`);
+                }
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${splitNet.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Credit Merchant Wallet');
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Credit Sales Revenue');
+              } else {
+                const resolvedOff = resolvePaymentMethodBucket(trx.paymentMethod);
+                const clearingAccountId = resolvedOff.clearingAccountId;
+                const targetAccountId = resolvedOff.accountId;
+                let channel = 'CASH';
+                if (targetAccountId === 'acc_airtel') channel = 'AIRTEL_MONEY';
+                else if (targetAccountId === 'acc_mtn') channel = 'MTN_MOMO';
+                else if (targetAccountId === 'acc_bank') channel = 'CARD_VISA';
+                else if (targetAccountId.startsWith('acc_pm_')) channel = `CUSTOM_${resolvedOff.bucket.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+
+                runSql(`
+                  INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+                  VALUES ('${txId}', '${idempotencyKey}', 'POS-${trxStoreId.toUpperCase()}-01', '${channel}', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'POS Branch ${trxStoreId.toUpperCase()} order Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}', '${sqlEsc(trx.salesperson || 'Default Cashier')}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')
+                `, 'Double Entry: Journal base transaction entry');
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Debit Clearing Asset account');
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, `Double Entry: Debit ${targetAccountId} Account`);
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Credit Merchant Wallet');
+                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Credit Gross Sales Revenue');
               }
+
+              if (trx.customerId && !trx.loyaltyAwarded) {
+                const awardPts = calculateLoyaltyPoints(trx.totalAmount);
+                if (awardPts > 0) {
+                  runSql(`UPDATE customers SET loyalPoints = loyalPoints + ${awardPts} WHERE id = ${trx.customerId}`, 'Loyalty: Accrue pts');
+                }
+              }
+
+              try {
+                const sweepRes = triggerLoanSweep(trx.orderId, trx.totalAmount);
+                if (sweepRes.status === 'SUCCESS' && sweepRes.deducted > 0) {
+                  const sweepTxId = `tx_sweep_${trx.orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
+                  const sweepIdemp = `idemp_${sweepTxId}`;
+                  runSql(`
+                    INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, business_id, store_id)
+                    VALUES ('${sweepTxId}', '${sweepIdemp}', 'POS-${trxStoreId.toUpperCase()}-01', 'SWEEP_DEDUCTION', 'SWEEP-REF-${trx.orderId}', ${sweepRes.deducted.toFixed(4)}, 0.0000, 'SUCCESS', 'Automated revenue deduction for active capital advance repayment #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')
+                  `, 'Double Entry: Sweep deduction capital advance ticket log');
+                  runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${sweepTxId}_deb', '${sweepTxId}', 'merchant-wallet-account-uuid', 'DEBIT', ${sweepRes.deducted.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Debit Merchant Wallet (Outward Sweep)');
+                  runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${sweepTxId}_cre', '${sweepTxId}', 'loan-clearing-account-uuid', 'CREDIT', ${sweepRes.deducted.toFixed(4)}, '${trx.dateStr}', '${sqlEsc(trxBizId)}', '${sqlEsc(trxStoreId)}')`, 'Double Entry: Credit Loan Asset Account (Repayment settled)');
+                }
+              } catch (sweepErr) {
+                console.error('Offline credit sweep failed:', sweepErr);
+              }
+            }
+          }
+
+          if (committedNow) {
+            syncSaleToFirestoreOfflineSafe({
+              businessId: trxBizId,
+              storeId: trxStoreId,
+              order: {
+                id: trx.orderId,
+                customerId: trx.customerId ? Number(trx.customerId) : null,
+                orderDate: trx.dateStr,
+                subtotal: trx.subtotal,
+                tax: trx.taxAmount,
+                discount: trx.discountAmount,
+                total: trx.totalAmount,
+                paymentMethod: trx.paymentMethod,
+                status: 'Completed',
+                performed_by: trx.salesperson || 'Cashier',
+              },
+              items: (trx.items || []).map((it, idx) => ({
+                id: `${trx.orderId}_${idx + 1}`,
+                productId: it.product.id,
+                quantity: it.quantity,
+                unitPrice: it.product.price,
+              })),
             });
 
-            // Double entry clearing entry
-            const txId = `tx_${trx.orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
-            const idempotencyKey = `idemp_${txId}`;
-            const calculatedFeeRate = trx.paymentMethod === 'Cash' ? 0.0 : 0.015;
-            const feeAmount = parseFloat((trx.totalAmount * calculatedFeeRate).toFixed(4));
-            const netSettlement = trx.totalAmount - feeAmount;
-
-            if (isSplit) {
-              const momoResolved = resolveSplitMobileProvider(trx.paymentMethod);
-              const splitFee = parseFloat((splitMobileStored * 0.015).toFixed(4));
-              const splitNet = trx.totalAmount - splitFee;
-              runSql(`
-                INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-                VALUES ('${txId}', '${idempotencyKey}', 'POS-${trx.activeStore.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${splitFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${trx.activeStore.toUpperCase()} order Split Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}')
-              `, 'Double Entry: Journal base transaction entry (Offline Split)');
-              if (splitCashStored > 0) {
-                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_deb_cash', '${txId}', 'cash-clearing-account-uuid', 'DEBIT', ${splitCashStored.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Debit Cash Clearing');
-                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_cash_asset', '${txId}', 'acc_cash', 'DEBIT', ${splitCashStored.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Debit Cash Account');
-              }
-              if (splitMobileStored > 0) {
-                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_deb_momo', '${txId}', '${momoResolved.clearingAccountId}', 'DEBIT', ${splitMobileStored.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Debit Mobile Clearing');
-                runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_momo_asset', '${txId}', '${momoResolved.accountId}', 'DEBIT', ${splitMobileStored.toFixed(4)}, '${trx.dateStr}')`, `Double Entry: Debit ${momoResolved.bucket} Account`);
-              }
-              runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${splitNet.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Credit Merchant Wallet');
-              runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at) VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')`, 'Double Entry: Credit Sales Revenue');
-            } else {
-              const resolvedOff = resolvePaymentMethodBucket(trx.paymentMethod);
-              const clearingAccountId = resolvedOff.clearingAccountId;
-              const targetAccountId = resolvedOff.accountId;
-              let channel = 'CASH';
-              if (targetAccountId === 'acc_airtel') channel = 'AIRTEL_MONEY';
-              else if (targetAccountId === 'acc_mtn') channel = 'MTN_MOMO';
-              else if (targetAccountId === 'acc_bank') channel = 'CARD_VISA';
-              else if (targetAccountId.startsWith('acc_pm_')) channel = `CUSTOM_${resolvedOff.bucket.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
-
-              runSql(`
-                INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-                VALUES ('${txId}', '${idempotencyKey}', 'POS-${trx.activeStore.toUpperCase()}-01', '${channel}', 'POS-REF-${trx.orderId}', ${trx.totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'POS Branch ${trx.activeStore.toUpperCase()} order Checkout #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}')
-              `, 'Double Entry: Journal base transaction entry');
-
-              runSql(`
-                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-                VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
-              `, 'Double Entry: Debit Clearing Asset account');
-
-              runSql(`
-                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-                VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
-              `, `Double Entry: Debit ${targetAccountId} Account`);
-
-              runSql(`
-                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-                VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${trx.dateStr}')
-              `, 'Double Entry: Credit Merchant Wallet');
-
-              runSql(`
-                INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-                VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${trx.totalAmount.toFixed(4)}, '${trx.dateStr}')
-              `, 'Double Entry: Credit Gross Sales Revenue');
-            }
-
-            if (trx.customerId && !trx.loyaltyAwarded) {
-              const awardPts = calculateLoyaltyPoints(trx.totalAmount);
-              if (awardPts > 0) {
-                runSql(`UPDATE customers SET loyalPoints = loyalPoints + ${awardPts} WHERE id = ${trx.customerId}`, 'Loyalty: Accrue pts');
-              }
-            }
-
-            // Automated credit sweep
-            try {
-              const sweepRes = triggerLoanSweep(trx.orderId, trx.totalAmount);
-              if (sweepRes.status === 'SUCCESS' && sweepRes.deducted > 0) {
-                const sweepTxId = `tx_sweep_${trx.orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
-                const sweepIdemp = `idemp_${sweepTxId}`;
-                runSql(`
-                  INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-                  VALUES ('${sweepTxId}', '${sweepIdemp}', 'POS-${trx.activeStore.toUpperCase()}-01', 'SWEEP_DEDUCTION', 'SWEEP-REF-${trx.orderId}', ${sweepRes.deducted.toFixed(4)}, 0.0000, 'SUCCESS', 'Automated revenue deduction for active capital advance repayment #${trx.orderId}', '${trx.dateStr}', '${trx.dateStr}')
-                `, 'Double Entry: Sweep deduction capital advance ticket log');
-                
-                runSql(`
-                  INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-                  VALUES ('le_${sweepTxId}_deb', '${sweepTxId}', 'merchant-wallet-account-uuid', 'DEBIT', ${sweepRes.deducted.toFixed(4)}, '${trx.dateStr}')
-                `, 'Double Entry: Debit Merchant Wallet (Outward Sweep)');
-                
-                runSql(`
-                  INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-                  VALUES ('le_${sweepTxId}_cre', '${sweepTxId}', 'loan-clearing-account-uuid', 'CREDIT', ${sweepRes.deducted.toFixed(4)}, '${trx.dateStr}')
-                `, 'Double Entry: Credit Loan Asset Account (Repayment settled)');
-              }
-            } catch (sweepErr) {
-              console.error('Offline credit sweep failed:', sweepErr);
-            }
-
-            // Submit offline-synced order to ZRA VSDC if ZRA is enabled
             try {
               await FiscalService.submitInvoice({
                 orderId: trx.orderId,
@@ -453,6 +521,7 @@ export default function BillingTerminal({
               });
             } catch {}
 
+            syncedOrderIds.add(trx.orderId);
             successCount++;
           }
         }
@@ -461,13 +530,22 @@ export default function BillingTerminal({
       }
     }
 
-    const remainingQueue = currentQueue.slice(successCount);
-    setOfflineQueue(remainingQueue);
-    localStorage.setItem('pos_offline_queue', JSON.stringify(remainingQueue));
+    const updatedAllSaved = allSavedQueue.filter((q) => !syncedOrderIds.has(q.orderId));
+    const remainingForBiz = currentBizId
+      ? updatedAllSaved.filter((q) => !q?.business_id || q.business_id === currentBizId)
+      : updatedAllSaved;
+    setOfflineQueue(remainingForBiz);
+    localStorage.setItem('pos_offline_queue', JSON.stringify(updatedAllSaved));
     setIsSyncing(false);
 
-    alert(`⚡ Reconnect Synchronization Success!\n\nSuccessfully uploaded ${successCount} queued offline POS checkout invoices. Main ledger journals, stock valuations, and co-signed credit sweeps are now fully updated!`);
-    
+    if (successCount > 0) {
+      if (currentBizId) {
+        pushDatabaseToServer(currentBizId).catch(() => {});
+        triggerAutoFirebaseBackup(currentBizId);
+      }
+      alert(`⚡ Reconnect Synchronization Success!\n\nSuccessfully synchronized ${successCount} offline POS checkout invoice(s) to Cloud & ZRA. Main ledger journals, stock valuations, and co-signed credit sweeps are up to date!`);
+    }
+
     onCartCheckedOut();
     syncAllAccountingSystems('Offline Queue Reconnect Sync');
     refreshDbData();
@@ -717,9 +795,13 @@ export default function BillingTerminal({
     '0.10': 0,
   });
 
-  // Fetch previous EOD reconciliation logs from the SQLite table cash_ups (scoped to branch)
+  // Fetch previous EOD reconciliation logs from the SQLite table cash_ups (scoped to business and branch)
   const loadReconciliationHistory = () => {
-    const res = runSql(`SELECT * FROM cash_ups ORDER BY created_at DESC`, 'Retrieve reconciliation ledger history');
+    const activeBizId = getActiveBusinessId();
+    const res = runSql(
+      `SELECT * FROM cash_ups${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''} ORDER BY created_at DESC`,
+      'Retrieve reconciliation ledger history'
+    );
     if (res.success && Array.isArray(res.data)) {
       const targetBranch = cashUpStore || activeStore || 'all';
       const filtered = targetBranch === 'all'
@@ -775,11 +857,13 @@ export default function BillingTerminal({
     };
   };
 
-  // Sync state with SQL database (strictly separated by activeStore)
+  // Sync state with SQL database (strictly separated by activeBusiness and activeStore)
   const refreshDbData = () => {
-    const spAllRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Register: Check branch stock map', true);
+    const activeBizId = getActiveBusinessId();
+    const bizWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+    const spAllRes = runSql(`SELECT product_id, store_id, stock, price FROM store_products${bizWhere}`, 'Register: Check branch stock map', true);
     const spList = (spAllRes.success && Array.isArray(spAllRes.data)) ? spAllRes.data : [];
-    const prodResult = runSql('SELECT * FROM products', `Register: Retrieve product listings for store [${(activeStore || 'MAIN').toUpperCase()}]`);
+    const prodResult = runSql(`SELECT * FROM products${bizWhere}`, `Register: Retrieve product listings for store [${(activeStore || 'MAIN').toUpperCase()}]`);
     if (prodResult.success && Array.isArray(prodResult.data)) {
       const branchProds = prodResult.data.map((p: any) => {
         const override = spList.find((sp: any) => Number(sp.product_id) === Number(p.id) && String(sp.store_id) === String(activeStore));
@@ -793,8 +877,8 @@ export default function BillingTerminal({
       setProducts(branchProds);
     }
 
-    // Read customers using SELECT query
-    const custResult = runSql('SELECT * FROM customers', 'Register: Retrieve customer profiles database');
+    // Read customers using SELECT query scoped by active business
+    const custResult = runSql(`SELECT * FROM customers${bizWhere}`, 'Register: Retrieve customer profiles database');
     if (custResult.success && Array.isArray(custResult.data)) {
       setCustomers(custResult.data);
     }
@@ -807,12 +891,17 @@ export default function BillingTerminal({
   };
 
   const loadInvoices = (overrideStoreFilter?: string) => {
-    // Select orders for the chosen store filter (strictly scoped to branch when not 'all')
+    // Select orders for the active business and chosen store filter
+    const activeBizId = getActiveBusinessId();
     const filterToUse = overrideStoreFilter !== undefined ? overrideStoreFilter : (historyStoreFilter || activeStore || 'all');
-    let whereClause = '';
-    if (filterToUse && filterToUse !== 'all') {
-      whereClause = `WHERE LOWER(store_id) = '${filterToUse.toLowerCase()}'`;
+    const orderClauses: string[] = [];
+    if (activeBizId) {
+      orderClauses.push(`business_id = '${sqlEsc(activeBizId)}'`);
     }
+    if (filterToUse && filterToUse !== 'all') {
+      orderClauses.push(`LOWER(store_id) = '${sqlEsc(filterToUse.toLowerCase())}'`);
+    }
+    const whereClause = orderClauses.length > 0 ? `WHERE ${orderClauses.join(' AND ')}` : '';
 
     // Query orders directly without fragile LEFT JOIN on NULL customerId in AlaSQL
     const res = runSql(`
@@ -824,7 +913,7 @@ export default function BillingTerminal({
     let combinedList: any[] = [];
 
     // Create customer name lookup map from customers table
-    const custRes = runSql('SELECT id, name FROM customers');
+    const custRes = runSql(`SELECT id, name FROM customers${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''}`);
     const custMap = new Map();
     if (custRes.success && Array.isArray(custRes.data)) {
       custRes.data.forEach((c: any) => {
@@ -849,10 +938,14 @@ export default function BillingTerminal({
     }
 
     // Load Layby transactions (both active credit deposits and finished/completed laybys)
-    let laybyWhere = '';
-    if (filterToUse && filterToUse !== 'all') {
-      laybyWhere = `WHERE (LOWER(store_id) = '${filterToUse.toLowerCase()}' OR store_id IS NULL OR store_id = '')`;
+    const laybyClauses: string[] = [];
+    if (activeBizId) {
+      laybyClauses.push(`business_id = '${sqlEsc(activeBizId)}'`);
     }
+    if (filterToUse && filterToUse !== 'all') {
+      laybyClauses.push(`(LOWER(store_id) = '${sqlEsc(filterToUse.toLowerCase())}' OR store_id IS NULL OR store_id = '')`);
+    }
+    const laybyWhere = laybyClauses.length > 0 ? `WHERE ${laybyClauses.join(' AND ')}` : '';
     const laybyRes = runSql(`SELECT * FROM laybys ${laybyWhere} ORDER BY created_at DESC`, 'Invoice History: Load Layby transactions');
     if (laybyRes.success && Array.isArray(laybyRes.data)) {
       laybyRes.data.forEach((l: any) => {
@@ -940,7 +1033,8 @@ export default function BillingTerminal({
     let custTpin = 'N/A';
     let custEmail = 'N/A';
     if (inv.customerId) {
-      const cRes = runSql(`SELECT * FROM customers WHERE id = ${inv.customerId}`, 'Reprint: Lookup customer contact', true);
+      const reprintBizId = getActiveBusinessId();
+      const cRes = runSql(`SELECT * FROM customers WHERE id = ${inv.customerId}${reprintBizId ? ` AND business_id = '${sqlEsc(reprintBizId)}'` : ''}`, 'Reprint: Lookup customer contact', true);
       if (cRes.success && Array.isArray(cRes.data) && cRes.data.length > 0) {
         custPhone = cRes.data[0].phone || 'N/A';
         custTpin = cRes.data[0].tpin || 'N/A';
@@ -1900,9 +1994,11 @@ export default function BillingTerminal({
     const checkedTpin = customerTpin.trim() || '';
     const checkedEmail = customerAddress.trim() || 'N/A';
 
+    const activeBizId = getActiveBusinessId();
+    const activeStId = getActiveStoreId(activeStore, activeBizId);
     const insertSql = `
-      INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id)
-      VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 0, '${checkedTpin}', 0, 'A - Standard Rate (16%)', 'default_biz')
+      INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id)
+      VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 0, '${checkedTpin}', 0, 'A - Standard Rate (16%)', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
     `;
 
     const res = runSql(insertSql, `Registry Checkout Action: Directly save client [${cleanName}]`);
@@ -1910,7 +2006,7 @@ export default function BillingTerminal({
       alert(`✓ Customer "${cleanName}" is successfully registered in your Database!\n\nThis client has been added to the master Loyal Members Registry and will earn ${Number(settings.loyaltyRatio || 0)} pts per ${settings.currency || '$'}1 on checkout.`);
       
       // Refresh list
-      const custResult = runSql('SELECT * FROM customers', 'Register: Refresh customer profiles database action');
+      const custResult = runSql(`SELECT * FROM customers${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''}`, 'Register: Refresh customer profiles database action');
       if (custResult.success && Array.isArray(custResult.data)) {
         setCustomers(custResult.data);
         const newlyCreated = custResult.data.find(x => x.id === newCustId);
@@ -1975,15 +2071,17 @@ export default function BillingTerminal({
         const checkedTpin = customerTpin.trim() || '';
         const checkedEmail = customerAddress.trim() || 'N/A';
 
+        const activeBizId = getActiveBusinessId();
+        const activeStId = getActiveStoreId(activeStore, activeBizId);
         const insertSql = `
-          INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id)
-          VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 0, '${checkedTpin}', 0, 'A - Standard Rate (16%)', 'default_biz')
+          INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id)
+          VALUES (${newCustId}, '${cleanName.replace(/'/g, "''")}', '${checkedPhone.replace(/'/g, "''")}', '${checkedEmail.replace(/'/g, "''")}', 0, '${checkedTpin}', 0, 'A - Standard Rate (16%)', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `;
 
         const res = runSql(insertSql, `Auto-Registry On: Automatically save client [${cleanName}]`);
         if (res.success) {
           // Refresh list
-          const custResult = runSql('SELECT * FROM customers', 'Register: Refresh customer profiles database action');
+          const custResult = runSql(`SELECT * FROM customers${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''}`, 'Register: Refresh customer profiles database action');
           if (custResult.success && Array.isArray(custResult.data)) {
             setCustomers(custResult.data);
             const newlyCreated = custResult.data.find(x => x.id === newCustId);
@@ -2156,9 +2254,11 @@ export default function BillingTerminal({
       return perfLower.includes(tCashierLower) || tCashierLower.includes(perfLower);
     };
 
-    // Direct queries without fragile AlaSQL JOINs on NULL customerId or nonexistent columns
-    const allOrdersRes = runSql('SELECT * FROM orders ORDER BY orderDate DESC', 'EOD Cash Up: Query orders table', true);
-    const custRes = runSql('SELECT id, name FROM customers', 'EOD Cash Up: Load customer names', true);
+    // Direct queries scoped strictly to active business
+    const activeBizId = getActiveBusinessId();
+    const bizWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+    const allOrdersRes = runSql(`SELECT * FROM orders${bizWhere} ORDER BY orderDate DESC`, 'EOD Cash Up: Query orders table', true);
+    const custRes = runSql(`SELECT id, name FROM customers${bizWhere}`, 'EOD Cash Up: Load customer names', true);
     const custMap = new Map<string, string>();
     if (custRes.success && Array.isArray(custRes.data)) {
       custRes.data.forEach((c: any) => {
@@ -2166,8 +2266,8 @@ export default function BillingTerminal({
       });
     }
 
-    const laybyInstRes = runSql('SELECT * FROM layby_installments ORDER BY created_at DESC', 'EOD Cash Up: Query layby payments', true);
-    const laybyAllRes = runSql('SELECT id, store_id, customer_name FROM laybys', 'EOD Cash Up: Load layby branch map', true);
+    const laybyInstRes = runSql(`SELECT * FROM layby_installments${bizWhere} ORDER BY created_at DESC`, 'EOD Cash Up: Query layby payments', true);
+    const laybyAllRes = runSql(`SELECT id, store_id, customer_name FROM laybys${bizWhere}`, 'EOD Cash Up: Load layby branch map', true);
     const laybyMap = new Map<string, any>();
     if (laybyAllRes.success && Array.isArray(laybyAllRes.data)) {
       laybyAllRes.data.forEach((l: any) => {
@@ -2175,9 +2275,9 @@ export default function BillingTerminal({
       });
     }
 
-    const expensesRes = runSql('SELECT * FROM expenses ORDER BY created_at DESC', 'EOD Cash Up: Query expenses', true);
-    const txAllRes = runSql('SELECT id, provider_reference FROM transactions', 'EOD Cash Up: Load transaction refs', true);
-    const leAllRes = runSql('SELECT transaction_id, account_id, type, amount FROM ledger_entries', 'EOD Cash Up: Load ledger entries', true);
+    const expensesRes = runSql(`SELECT * FROM expenses${bizWhere} ORDER BY created_at DESC`, 'EOD Cash Up: Query expenses', true);
+    const txAllRes = runSql(`SELECT id, provider_reference FROM transactions${bizWhere}`, 'EOD Cash Up: Load transaction refs', true);
+    const leAllRes = runSql(`SELECT transaction_id, account_id, type, amount FROM ledger_entries${bizWhere}`, 'EOD Cash Up: Load ledger entries', true);
 
     const resolveSplitForOrder = (ord: any, tot: number): { splitCash: number; splitMomo: number } => {
       const explicitCash = Number(ord.split_cash || 0);
@@ -2391,6 +2491,7 @@ export default function BillingTerminal({
 
     if (Array.isArray(savedQueue)) {
       savedQueue.forEach((offOrd: OfflineOrder) => {
+        if (activeBizId && offOrd.business_id && offOrd.business_id !== activeBizId) return;
         if (processedTxIds.has(offOrd.orderId)) return;
         if (!isTargetDate(offOrd.dateStr)) return;
         if (!isTargetStore(offOrd.activeStore)) return;
@@ -2599,8 +2700,9 @@ export default function BillingTerminal({
       setSupervisorNameInput('');
       setSupervisorPasswordInput('');
 
-      // Fetch registered supervisors/staff from database
-      const staffRes = runSql('SELECT * FROM staff', 'EOD Cashup: Load supervisors list');
+      // Fetch registered supervisors/staff from database scoped to active business
+      const bizIdStaff = getActiveBusinessId();
+      const staffRes = runSql(`SELECT * FROM staff${bizIdStaff ? ` WHERE business_id = '${sqlEsc(bizIdStaff)}'` : ''}`, 'EOD Cashup: Load supervisors list');
       if (staffRes.success && Array.isArray(staffRes.data)) {
         setSupervisors(staffRes.data);
         if (staffRes.data.length > 0) {
@@ -2686,11 +2788,13 @@ export default function BillingTerminal({
     const timestamp = new Date().toISOString();
     const fullNotes = `Date: ${cashUpDate} | Store: ${cashUpStore} | Cashier: ${cashUpCashier} | Approved by Supervisor: ${supervisorNameInput.trim()} | Airtel Exp/Counted: ${settings.currency}${expectedAirtel.toFixed(2)}/${settings.currency}${actualAirtel.toFixed(2)} | MTN Exp/Counted: ${settings.currency}${expectedMtn.toFixed(2)}/${settings.currency}${actualMtn.toFixed(2)}${customNotes ? ` | Custom: ${customNotes}` : ''} | Notes: ${cashUpNotes}`;
 
+    const activeBizId = getActiveBusinessId();
+    const resolvedCashUpStore = getActiveStoreId(cashUpStore === 'all' ? activeStore : cashUpStore, activeBizId);
     const insertSql = `
-      INSERT INTO cash_ups VALUES (
+      INSERT INTO cash_ups (id, date, store_id, cashier_name, sum_cash_expected, sum_cash_actual, sum_card_expected, sum_card_actual, sum_momo_expected, sum_momo_actual, variance, notes, created_at, business_id) VALUES (
         '${cashUpId}',
         '${cashUpDate}',
-        '${cashUpStore}',
+        '${sqlEsc(resolvedCashUpStore)}',
         'Cashier: ${cashUpCashier} (Approved: ${supervisorNameInput.trim().replace(/'/g, "''")})',
         ${expectedCash},
         ${actualCash},
@@ -2700,7 +2804,8 @@ export default function BillingTerminal({
         ${actualMomoTotal},
         ${cashDiff},
         '${fullNotes.replace(/'/g, "''")}',
-        '${timestamp}'
+        '${timestamp}',
+        '${sqlEsc(activeBizId)}'
       )
     `;
 
@@ -2789,7 +2894,8 @@ export default function BillingTerminal({
     
     if (res.success) {
       // Re-fetch profiles
-      const refreshedCustRes = runSql('SELECT * FROM customers', 'ZRA: Re-fetch customer listings');
+      const activeBizId = getActiveBusinessId();
+      const refreshedCustRes = runSql(`SELECT * FROM customers${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''}`, 'ZRA: Re-fetch customer listings');
       if (refreshedCustRes.success && Array.isArray(refreshedCustRes.data)) {
         setCustomers(refreshedCustRes.data);
         const updated = refreshedCustRes.data.find((c: any) => c.id === selectedCustomer.id);
@@ -2879,6 +2985,8 @@ export default function BillingTerminal({
     const taxAmountQS = subtotalAmt * (activeTaxRate / 100);
     const totalAmountQS = subtotalAmt + taxAmountQS;
 
+    const activeBizId = getActiveBusinessId();
+    const activeStId = getActiveStoreId(activeStore, activeBizId);
     const quickCustomer = quickSelectedCustomerId
       ? customers.find(c => String(c.id) === String(quickSelectedCustomerId)) || null
       : null;
@@ -2896,155 +3004,15 @@ export default function BillingTerminal({
         tpin: quickCustomer.tpin,
         loyalPointsDelta: quickAwardPts
       }) || quickCustomer;
-      const custRes = runSql('SELECT * FROM customers ORDER BY name ASC', 'Quick Sale: Refresh customer points');
+      const custRes = runSql(`SELECT * FROM customers${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''} ORDER BY name ASC`, 'Quick Sale: Refresh customer points');
       if (custRes.success && Array.isArray(custRes.data)) {
         setCustomers(custRes.data);
       }
     }
 
-    // If offline, store standard parameters in offlineQueue
-    if (!isDeviceOnline) {
-      const newOfflineQS: OfflineOrder = {
-        orderId,
-        customerId: syncedQuickCustomer ? String(syncedQuickCustomer.id) : null,
-        items: [{ product: quickSelectedProduct, quantity: qty }],
-        dateStr,
-        subtotal: subtotalAmt,
-        taxAmount: taxAmountQS,
-        discountAmount: 0,
-        totalAmount: totalAmountQS,
-        paymentMethod: quickPaymentMethod,
-        activeStore,
-        salesperson,
-        type: 'quicksale',
-        loyaltyAwarded: quickIsNamedCust
-      };
-
-      const updatedQueue = [...offlineQueue, newOfflineQS];
-      setOfflineQueue(updatedQueue);
-      localStorage.setItem('pos_offline_queue', JSON.stringify(updatedQueue));
-
-      // Generate & Download POS Thermal receipt in offline mode
-      try {
-        const branchInfo = getBranchReceiptDetails(activeStore);
-        const doc = new jsPDF({ format: [80, 165] });
-        let qsY = 8;
-        const logoToUse = settings.logoUrl || DEFAULT_COMPANY_LOGO;
-        if (logoToUse) {
-          try {
-            doc.addImage(logoToUse, 'PNG', 33, qsY, 14, 14);
-            qsY += 17;
-          } catch {}
-        }
-        
-        doc.setFont('times', 'bold');
-        doc.setFontSize(10);
-        doc.text(settings.storeName.toUpperCase(), 40, qsY, { align: 'center' });
-        qsY += 4;
-        doc.setFontSize(7.5);
-        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 40, qsY, { align: 'center' });
-        qsY += 3.5;
-        doc.setFont('times', 'normal');
-        doc.setFontSize(6);
-        if (branchInfo.location) {
-          doc.text(branchInfo.location, 40, qsY, { align: 'center' });
-          qsY += 3.2;
-        }
-        if (branchInfo.phone) {
-          doc.text(`Tel: ${branchInfo.phone}`, 40, qsY, { align: 'center' });
-          qsY += 3.2;
-        }
-        if (branchInfo.email) {
-          doc.text(`Email: ${branchInfo.email}`, 40, qsY, { align: 'center' });
-          qsY += 3.2;
-        }
-        
-        doc.setLineWidth(0.1);
-        doc.line(4, qsY, 76, qsY);
-        qsY += 4;
-        
-        doc.setFont('times', 'bold');
-        doc.setFontSize(7);
-        doc.text('SALESPERSON QUICK RECEIPT (OFFLINE)', 40, qsY, { align: 'center' });
-        qsY += 5;
-        
-        doc.setFont('times', 'normal');
-        doc.setFontSize(6);
-        doc.text(`TICKET NO: ${orderId}`, 4, qsY); qsY += 4;
-        doc.text(`BRANCH: ${branchInfo.name.toUpperCase()}`, 4, qsY); qsY += 4;
-        doc.text(`DATE/TIME: ${new Date(dateStr).toLocaleString()}`, 4, qsY); qsY += 4;
-        doc.text(`SALESPERSON: ${salesperson.toUpperCase()}`, 4, qsY); qsY += 4;
-        doc.text(`PAYMENT: ${quickPaymentMethod}`, 4, qsY); qsY += 2;
-        
-        doc.line(4, qsY, 76, qsY);
-        qsY += 5;
-        
-        doc.setFont('helvetica', 'bold');
-        doc.text('ITEM DESCRIPTION', 4, qsY);
-        doc.text('QTY', 52, qsY, { align: 'right' });
-        doc.text('TOTAL', 76, qsY, { align: 'right' });
-        qsY += 5;
-        
-        doc.setFont('helvetica', 'normal');
-        const itemName = quickSelectedProduct.name.length > 25 ? quickSelectedProduct.name.substring(0, 22) + '...' : quickSelectedProduct.name;
-        doc.text(`${itemName} (${quickSelectedProduct.sku})`, 4, qsY);
-        qsY += 4;
-        doc.text(`${qty}x ${settings.currency}${quickSelectedProduct.price.toFixed(2)}`, 4, qsY);
-        doc.text(`${qty}`, 52, qsY, { align: 'right' });
-        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, qsY, { align: 'right' });
-        qsY += 4;
-        
-        doc.line(4, qsY, 76, qsY);
-        qsY += 5;
-        
-        doc.text('Subtotal:', 52, qsY, { align: 'right' });
-        doc.text(`${settings.currency}${subtotalAmt.toFixed(2)}`, 76, qsY, { align: 'right' });
-        qsY += 4;
-        
-        doc.text(`VAT (${activeTaxRate}%):`, 52, qsY, { align: 'right' });
-        doc.text(`${settings.currency}${taxAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
-        qsY += 5;
-        
-        doc.setFont('helvetica', 'bold');
-        doc.text('GRAND TOTAL AMOUNT:', 52, qsY, { align: 'right' });
-        doc.text(`${settings.currency}${totalAmountQS.toFixed(2)}`, 76, qsY, { align: 'right' });
-        qsY += 5;
-
-        if (quickIsNamedCust && syncedQuickCustomer) {
-          doc.setFont('helvetica', 'normal');
-          doc.setFontSize(5.5);
-          doc.text(`Customer: ${syncedQuickCustomer.name}`, 4, qsY); qsY += 3.5;
-          doc.text(`Loyalty Earned: +${quickAwardPts} PTS (Bal: ${syncedQuickCustomer.loyalPoints ?? 0} PTS)`, 4, qsY); qsY += 4;
-        } else {
-          qsY += 3;
-        }
-        
-        doc.setFont('helvetica', 'normal');
-        doc.setFontSize(5);
-        doc.text('⚠️ ISSUED IN HIGH-AVAILABILITY OFFLINE RESERVE', 40, qsY, { align: 'center' });
-        qsY += 3;
-        doc.text(settings.receiptFooter, 40, qsY, { align: 'center' });
-        
-        const safePrefix = (settings.storeName || 'POS').replace(/[^A-Za-z0-9]+/g, '_');
-        exportAndSharePdf(`${safePrefix}_QUICK_SALE_OFFLINE_${orderId}.pdf`, doc);
-      } catch (pdfErr) {
-        console.error('Failed generating quick sale offline PDF:', pdfErr);
-      }
-
-      alert(`✓ Quick Sale Offline Queued!\n\nTicket Ref: ${orderId}\nInvoice value: ${settings.currency}${totalAmountQS.toFixed(2)}\nSalesperson: ${salesperson}${quickIsNamedCust && syncedQuickCustomer ? `\nCustomer: ${syncedQuickCustomer.name} (+${quickAwardPts} PTS)` : ''}\n\nPDF Receipt has been generated & downloaded! It has been successfully saved to your local offline queue.`);
-
-      setQuickSearchQuery('');
-      setQuickSelectedProduct(null);
-      setQuickSaleQty('1');
-      setQuickSelectedCustomerId('');
-      setShowQuickSaleModal(false);
-      persistTablesToStorage();
-      return;
-    }
-
-    // 1. Post to Orders SQL with all 11 columns
+    // 1. Always persist the sale immediately into local SQLite/AlaSQL + Firestore offline cache (never block offline checkouts)
     const orderInsertSql = `
-      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
+      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
         '${orderId}', 
         ${syncedQuickCustomer ? syncedQuickCustomer.id : 'NULL'}, 
         '${dateStr}', 
@@ -3052,41 +3020,60 @@ export default function BillingTerminal({
         ${taxAmountQS.toFixed(2)}, 
         0.00, 
         ${totalAmountQS.toFixed(2)}, 
-        '${quickPaymentMethod}', 
+        '${sqlEsc(quickPaymentMethod)}', 
         'Completed',
-        '${activeStore}',
-        '${salesperson.replace(/'/g, "''")}'
+        '${sqlEsc(activeStId)}',
+        '${sqlEsc(salesperson)}',
+        '${sqlEsc(activeBizId)}'
       )
     `;
     const resOrder = runSql(orderInsertSql, `Quick Sale: Logging cashier order header metadata`);
 
-    logEmployeeAudit('SALES', 'Completed Quick Sale', `Invoice #${orderId}, Item: ${quickSelectedProduct.name} x${qty}, Payment: ${quickPaymentMethod}`, totalAmountQS, activeStore, salesperson);
+    logEmployeeAudit('SALES', 'Completed Quick Sale', `Invoice #${orderId}, Item: ${quickSelectedProduct.name} x${qty}, Payment: ${quickPaymentMethod}`, totalAmountQS, activeStId, salesperson);
 
     if (resOrder.success) {
       // 2. Post line item
       const itemInsertSql = `
-        INSERT INTO order_items VALUES (
+        INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
           '${orderId}_item_1', 
           '${orderId}', 
           ${quickSelectedProduct.id}, 
           ${qty}, 
-          ${quickSelectedProduct.price}
+          ${quickSelectedProduct.price},
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(activeStId)}'
         )
       `;
       runSql(itemInsertSql, `Quick Sale: Logging cashier order items mapped metadata`);
 
       // 3. Decrease branch specific and catalog stock level
-      runSql(`
-        UPDATE store_products 
-        SET stock = stock - ${qty} 
-        WHERE product_id = ${quickSelectedProduct.id} AND store_id = '${activeStore}'
-      `, `Quick Sale: Decrement stock units from ${activeStore.toUpperCase()}`);
+      if (quickSelectedProduct.is_service !== 1) {
+        const spCheckQs = runSql(`SELECT id FROM store_products WHERE product_id = ${quickSelectedProduct.id} AND store_id = '${sqlEsc(activeStId)}'`, 'Quick Sale: Verify branch stock row', true);
+        if (spCheckQs.success && Array.isArray(spCheckQs.data) && spCheckQs.data.length > 0) {
+          runSql(`
+            UPDATE store_products 
+            SET stock = stock - ${qty} 
+            WHERE product_id = ${quickSelectedProduct.id} AND store_id = '${sqlEsc(activeStId)}'
+          `, `Quick Sale: Decrement stock units from ${activeStId.toUpperCase()}`);
+        } else {
+          runSql(`
+            INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
+              'sp_${quickSelectedProduct.id}_${sqlEsc(activeStId)}',
+              ${quickSelectedProduct.id},
+              '${sqlEsc(activeStId)}',
+              ${Math.max(0, Number(quickSelectedProduct.stock || 0) - qty)},
+              ${Number(quickSelectedProduct.price || 0)},
+              '${sqlEsc(activeBizId)}'
+            )
+          `, `Quick Sale: Create branch stock row`);
+        }
 
-      runSql(`
-        UPDATE products
-        SET stock = stock - ${qty}
-        WHERE id = ${quickSelectedProduct.id}
-      `, `Quick Sale: Decrement catalog stock`);
+        runSql(`
+          UPDATE products
+          SET stock = stock - ${qty}
+          WHERE id = ${quickSelectedProduct.id}
+        `, `Quick Sale: Decrement catalog stock`);
+      }
 
       // 4. Post Double-Entry Clearing and Asset Ledger records
       const txId = `tx_qs_${orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
@@ -3110,28 +3097,28 @@ export default function BillingTerminal({
       }
 
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStore.toUpperCase()}-01', '${channel}', 'POS-REF-${orderId}', ${totalAmountQS.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'Quick Sale #${orderId} - ${quickSelectedProduct.name.replace(/'/g, "''")} x${qty}', '${dateStr}', '${dateStr}', '${salesperson.replace(/'/g, "''")}')
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStId.toUpperCase()}-01', '${channel}', 'POS-REF-${orderId}', ${totalAmountQS.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'Quick Sale #${orderId} - ${quickSelectedProduct.name.replace(/'/g, "''")} x${qty}', '${dateStr}', '${dateStr}', '${sqlEsc(salesperson)}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Quick Sale: Journal base transaction entry');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${totalAmountQS.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${totalAmountQS.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Quick Sale: Debit Clearing Asset account');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${totalAmountQS.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${totalAmountQS.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, `Quick Sale: Debit ${targetAccountId} Account`);
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Quick Sale: Credit Merchant Wallet');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${totalAmountQS.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${totalAmountQS.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Quick Sale: Credit Gross Sales Revenue');
 
       // Post COGS & Inventory decrement in ledger
@@ -3139,17 +3126,86 @@ export default function BillingTerminal({
       const totalCogs = unitCost * qty;
       if (totalCogs > 0) {
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_cogs', '${txId}', 'acc_cost_of_goods', 'DEBIT', ${totalCogs.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${txId}_cogs', '${txId}', 'acc_cost_of_goods', 'DEBIT', ${totalCogs.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Quick Sale: Debit Cost of Goods Sold');
 
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_inv', '${txId}', 'acc_inventory', 'CREDIT', ${totalCogs.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${txId}_inv', '${txId}', 'acc_inventory', 'CREDIT', ${totalCogs.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Quick Sale: Credit Inventory Asset Valuation');
       }
 
-      // 5. Submit Quick Sale to ZRA Smart Invoice FiscalService
+      // Persist immediately to Firestore offline cache (queues seamlessly if offline, syncs on reconnect)
+      syncSaleToFirestoreOfflineSafe({
+        businessId: activeBizId,
+        storeId: activeStId,
+        order: {
+          id: orderId,
+          customerId: syncedQuickCustomer ? Number(syncedQuickCustomer.id) : null,
+          orderDate: dateStr,
+          subtotal: subtotalAmt,
+          tax: taxAmountQS,
+          discount: 0,
+          total: totalAmountQS,
+          paymentMethod: quickPaymentMethod,
+          status: 'Completed',
+          performed_by: salesperson,
+        },
+        items: [{
+          id: `${orderId}_item_1`,
+          productId: quickSelectedProduct.id,
+          quantity: qty,
+          unitPrice: quickSelectedProduct.price,
+        }],
+        updatedProducts: quickSelectedProduct.is_service === 1 ? [] : [{
+          id: quickSelectedProduct.id,
+          name: quickSelectedProduct.name,
+          description: quickSelectedProduct.description,
+          sku: quickSelectedProduct.sku,
+          category: quickSelectedProduct.category,
+          price: quickSelectedProduct.price,
+          cost: quickSelectedProduct.cost,
+          stock: Math.max(0, Number(quickSelectedProduct.stock || 0) - qty),
+          imageUrl: quickSelectedProduct.imageUrl,
+          is_service: quickSelectedProduct.is_service,
+          batch_number: quickSelectedProduct.batch_number,
+          expiry_date: quickSelectedProduct.expiry_date,
+        }],
+      });
+
+      if (!isDeviceOnline) {
+        let existingAllQ: OfflineOrder[] = [];
+        try {
+          const rawQ = localStorage.getItem('pos_offline_queue');
+          existingAllQ = rawQ ? JSON.parse(rawQ) : [];
+          if (!Array.isArray(existingAllQ)) existingAllQ = [];
+        } catch {
+          existingAllQ = [];
+        }
+        const newOfflineQS: OfflineOrder = {
+          orderId,
+          business_id: activeBizId,
+          customerId: syncedQuickCustomer ? String(syncedQuickCustomer.id) : null,
+          items: [{ product: quickSelectedProduct, quantity: qty }],
+          dateStr,
+          subtotal: subtotalAmt,
+          taxAmount: taxAmountQS,
+          discountAmount: 0,
+          totalAmount: totalAmountQS,
+          paymentMethod: quickPaymentMethod,
+          activeStore: activeStId,
+          salesperson,
+          type: 'quicksale',
+          loyaltyAwarded: quickIsNamedCust,
+          alreadyCommittedLocally: true,
+        };
+        const nextAllQ = [...existingAllQ, newOfflineQS];
+        localStorage.setItem('pos_offline_queue', JSON.stringify(nextAllQ));
+        setOfflineQueue(activeBizId ? nextAllQ.filter((q) => !q.business_id || q.business_id === activeBizId) : nextAllQ);
+      }
+
+      // 5. Submit Quick Sale to ZRA Smart Invoice FiscalService (auto-queues offline if VSDC unreachable)
       const qsZraResult = await FiscalService.submitInvoice({
         orderId,
         salesDateIso: dateStr,
@@ -3359,6 +3415,8 @@ export default function BillingTerminal({
   const handleCompletePayment = async () => {
     const orderId = 'TXN-' + Math.floor(1000 + Math.random() * 9000);
     const dateStr = new Date().toISOString();
+    const activeBizId = getActiveBusinessId();
+    const activeStId = getActiveStoreId(activeStore, activeBizId);
 
     // Resolve dynamic customer auto-save & central CRM synchronization on checkout!
     let activeCustomerId: number | 'NULL' = 'NULL';
@@ -3381,7 +3439,7 @@ export default function BillingTerminal({
         activeCustomerId = synced.id;
         localSavedCustomer = synced;
         // Refresh customer list in state
-        const custResult = runSql('SELECT * FROM customers ORDER BY name ASC', 'Register: Refresh customer list during checkout');
+        const custResult = runSql(`SELECT * FROM customers${activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : ''} ORDER BY name ASC`, 'Register: Refresh customer list during checkout');
         if (custResult.success && Array.isArray(custResult.data)) {
           setCustomers(custResult.data);
         }
@@ -3402,93 +3460,15 @@ export default function BillingTerminal({
     const isSplitMethod = paymentMethod === 'Split';
     const finalPaymentMethod = isSplitMethod ? `Split (Cash + ${splitMobileProvider})` : paymentMethod;
 
-    // If offline, store standard parameters in offlineQueue
-    if (!isDeviceOnline) {
-      const splitCashValOffline = isSplitMethod ? (parseFloat(splitCashAmount) || 0) : 0;
-      const splitMobileValOffline = isSplitMethod ? (parseFloat(splitMobileAmount) || 0) : 0;
-      const splitChangeOffline = isSplitMethod ? Math.max(0, (splitCashValOffline + splitMobileValOffline) - totalAmount) : 0;
-      const actualCashKeptOffline = isSplitMethod ? Math.max(0, splitCashValOffline - splitChangeOffline) : 0;
-      const cashierNameOffline = localStorage.getItem('logged_in_user_name') || 'Default Cashier';
-
-      const newOfflineStd: OfflineOrder = {
-        orderId,
-        customerId: activeCustomerId !== 'NULL' ? String(activeCustomerId) : null,
-        items: [...cart],
-        dateStr,
-        subtotal,
-        taxAmount,
-        discountAmount,
-        totalAmount,
-        paymentMethod: finalPaymentMethod,
-        splitCash: isSplitMethod ? actualCashKeptOffline : 0,
-        splitMobile: isSplitMethod ? splitMobileValOffline : 0,
-        activeStore,
-        salesperson: cashierNameOffline,
-        type: 'standard',
-        loyaltyAwarded: isNamedCustomer
-      };
-
-      const updatedQueue = [...offlineQueue, newOfflineStd];
-      setOfflineQueue(updatedQueue);
-      localStorage.setItem('pos_offline_queue', JSON.stringify(updatedQueue));
-
-      setActiveReceipt({
-        id: orderId,
-        store_id: activeStore,
-        performed_by: cashierNameOffline,
-        date: new Date(dateStr).toLocaleString(),
-        paymentMethod: finalPaymentMethod,
-        subtotal,
-        tax: taxAmount,
-        taxRate: settings.taxRate,
-        discount: discountAmount,
-        total: totalAmount,
-        cashReceived: paymentMethod === 'Cash' 
-          ? (parseFloat(receivedCash) || 0) 
-          : (isSplitMethod ? (parseFloat(splitCashAmount) || 0) : totalAmount),
-        change: paymentMethod === 'Cash' 
-          ? Math.max(0, (parseFloat(receivedCash) || 0) - totalAmount) 
-          : splitChangeOffline,
-        splitBreakdown: isSplitMethod ? {
-          cash: splitCashValOffline,
-          mobile: splitMobileValOffline,
-          provider: splitMobileProvider
-        } : null,
-        customer: receiptCustomer,
-        loyaltyPointsEarned: awardPts,
-        customerTotalPoints: localSavedCustomer ? Number(localSavedCustomer.loyalPoints ?? 0) : null,
-        isLoyaltyMember: isNamedCustomer,
-        items: [...cart],
-        offlinePending: true
-      });
-
-      alert(`✓ [OFFLINE SAVED] Standard Order ${orderId} Saved Offline!\n\nThis transaction has been successfully queued due to a connectivity drop. Once connection is restored, we will synchronize the ledger entries, update central inventory, and co-sign loan sweeps.`);
-
-      setCart([]);
-      setSelectedCustomer(null);
-      setCustomerName('');
-      setCustomerPhone('');
-      setCustomerTpin('');
-      setCustomerAddress('');
-      setDiscountValue(0);
-      setShowPaymentModal(false);
-      onCartCheckedOut();
-      refreshDbData();
-      loadInvoices(historyStoreFilter || activeStore || 'all');
-      handleTriggerCashUp(undefined, undefined, undefined, false, true);
-      persistTablesToStorage();
-      return;
-    }
-
     const activeCashierName = localStorage.getItem('logged_in_user_name') || 'Default Cashier';
     const splitCashInput = isSplitMethod ? (parseFloat(splitCashAmount) || 0) : 0;
     const splitMobileInput = isSplitMethod ? (parseFloat(splitMobileAmount) || 0) : 0;
     const splitChangeAmt = isSplitMethod ? Math.max(0, (splitCashInput + splitMobileInput) - totalAmount) : 0;
     const splitCashKept = isSplitMethod ? Math.max(0, splitCashInput - splitChangeAmt) : 0;
 
-    // 1. Insert order details to Orders SQL Database with store identifier and split breakdown
+    // 1. Always commit order immediately into SQLite/AlaSQL (even if offline!) with business_id & store_id
     const orderInsertSql = `
-      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo) VALUES (
+      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo, business_id) VALUES (
         '${orderId}', 
         ${customerIdVal}, 
         '${dateStr}', 
@@ -3496,58 +3476,88 @@ export default function BillingTerminal({
         ${taxAmount.toFixed(2)}, 
         ${discountAmount.toFixed(2)}, 
         ${totalAmount.toFixed(2)}, 
-        '${finalPaymentMethod.replace(/'/g, "''")}', 
+        '${sqlEsc(finalPaymentMethod)}', 
         'Completed',
-        '${activeStore}',
-        '${activeCashierName.replace(/'/g, "''")}',
+        '${sqlEsc(activeStId)}',
+        '${sqlEsc(activeCashierName)}',
         ${splitCashKept.toFixed(2)},
-        ${splitMobileInput.toFixed(2)}
+        ${splitMobileInput.toFixed(2)},
+        '${sqlEsc(activeBizId)}'
       )
     `;
-    runSql(orderInsertSql, `Billing: Post order ticket details to SQLite for store ${activeStore.toUpperCase()}`);
+    runSql(orderInsertSql, `Billing: Post order ticket details to SQLite for store ${activeStId.toUpperCase()}`);
 
-    logEmployeeAudit('SALES', 'Completed POS Cart Sale', `Invoice #${orderId}, Items: ${cart.length}, Customer: ${selectedCustomer ? selectedCustomer.name : 'Walk-in'}, Payment: ${finalPaymentMethod}`, totalAmount, activeStore);
+    logEmployeeAudit('SALES', 'Completed POS Cart Sale', `Invoice #${orderId}, Items: ${cart.length}, Customer: ${selectedCustomer ? selectedCustomer.name : 'Walk-in'}, Payment: ${finalPaymentMethod}`, totalAmount, activeStId);
 
     // 2. Insert items and decrement branch specific stock layers!
+    const updatedProductsForFirestore: Array<{
+      id: number;
+      name: string;
+      description?: string;
+      sku?: string;
+      category?: string;
+      price: number;
+      cost: number;
+      stock: number;
+      imageUrl?: string;
+      is_service?: number;
+      batch_number?: string;
+      expiry_date?: string;
+    }> = [];
+
     cart.forEach((item, index) => {
       const orderItemId = `${orderId}_${index + 1}`;
       const itemInsertSql = `
-        INSERT INTO order_items VALUES (
+        INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
           '${orderItemId}', 
           '${orderId}', 
           ${item.product.id}, 
           ${item.quantity}, 
-          ${item.product.price}
+          ${item.product.price},
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(activeStId)}'
         )
       `;
       runSql(itemInsertSql, `Billing: Post sales transaction lines`);
 
-      // Decrement the physical stock specifically inside that branch's store_products ledger if not a service!
       if (item.product.is_service !== 1) {
-        const checkOverride = runSql(`SELECT * FROM store_products WHERE product_id = ${item.product.id} AND store_id = '${activeStore}'`, 'Verify location state');
+        const checkOverride = runSql(`SELECT * FROM store_products WHERE product_id = ${item.product.id} AND store_id = '${sqlEsc(activeStId)}' AND business_id = '${sqlEsc(activeBizId)}'`, 'Verify location state');
         
         if (checkOverride.success && Array.isArray(checkOverride.data) && checkOverride.data.length > 0) {
           runSql(`
             UPDATE store_products 
             SET stock = stock - ${item.quantity} 
-            WHERE product_id = ${item.product.id} AND store_id = '${activeStore}'
-          `, `Inventory: Demobilize -${item.quantity} units from branch ${activeStore}`);
+            WHERE product_id = ${item.product.id} AND store_id = '${sqlEsc(activeStId)}' AND business_id = '${sqlEsc(activeBizId)}'
+          `, `Inventory: Demobilize -${item.quantity} units from branch ${activeStId}`);
         } else {
-          // Fallback or create row
-          const spId = `sp_${item.product.id}_${activeStore}`;
+          const spId = `sp_${item.product.id}_${activeStId}`;
           runSql(`
-            INSERT INTO store_products VALUES (
-              '${spId}',
+            INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
+              '${sqlEsc(spId)}',
               ${item.product.id},
-              '${activeStore}',
+              '${sqlEsc(activeStId)}',
               ${item.product.stock - item.quantity},
-              ${item.product.price}
+              ${item.product.price},
+              '${sqlEsc(activeBizId)}'
             )
           `, `Inventory: Provision missing branch rows`);
         }
 
-        // Decrement the global products baseline catalog stock to maintain parity
-        runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id}`, 'Inventory: Sync fallback totals');
+        runSql(`UPDATE products SET stock = stock - ${item.quantity} WHERE id = ${item.product.id} AND business_id = '${sqlEsc(activeBizId)}'`, 'Inventory: Sync fallback totals');
+        updatedProductsForFirestore.push({
+          id: item.product.id,
+          name: item.product.name,
+          description: item.product.description,
+          sku: item.product.sku,
+          category: item.product.category,
+          price: item.product.price,
+          cost: item.product.cost,
+          stock: Math.max(0, Number(item.product.stock || 0) - item.quantity),
+          imageUrl: item.product.imageUrl,
+          is_service: item.product.is_service,
+          batch_number: item.product.batch_number,
+          expiry_date: item.product.expiry_date,
+        });
       }
     });
 
@@ -3566,42 +3576,42 @@ export default function BillingTerminal({
       const momoResolved = resolvePaymentMethodBucket(splitMobileProvider);
 
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStore.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${calculatedMobileFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${activeStore.toUpperCase()} order Split Checkout #${orderId} (${splitMobileProvider})', '${dateStr}', '${dateStr}', '${(localStorage.getItem('logged_in_user_name') || 'Default Cashier').replace(/'/g, "''")}')
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStId.toUpperCase()}-01', 'SPLIT_CASH_MOBILE', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${calculatedMobileFee.toFixed(4)}, 'SUCCESS', 'POS Branch ${activeStId.toUpperCase()} order Split Checkout #${orderId} (${splitMobileProvider})', '${dateStr}', '${dateStr}', '${sqlEsc(activeCashierName)}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Journal base transaction entry for split');
 
       if (actualCashKept > 0) {
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_deb_cash', '${txId}', 'cash-clearing-account-uuid', 'DEBIT', ${actualCashKept.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${txId}_deb_cash', '${txId}', 'cash-clearing-account-uuid', 'DEBIT', ${actualCashKept.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Double Entry: Debit Cash Clearing Asset account (Split)');
 
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_cash_asset', '${txId}', 'acc_cash', 'DEBIT', ${actualCashKept.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${txId}_cash_asset', '${txId}', 'acc_cash', 'DEBIT', ${actualCashKept.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Double Entry: Debit Counter Cash Drawer (Split)');
       }
 
       if (splitMobileVal > 0) {
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_deb_momo', '${txId}', '${momoResolved.clearingAccountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${txId}_deb_momo', '${txId}', '${momoResolved.clearingAccountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, `Double Entry: Debit ${momoResolved.bucket} Clearing Asset account (Split)`);
 
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${txId}_momo_asset', '${txId}', '${momoResolved.accountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${txId}_momo_asset', '${txId}', '${momoResolved.accountId}', 'DEBIT', ${splitMobileVal.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, `Double Entry: Debit ${momoResolved.bucket} Account (Split)`);
       }
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Credit Merchant Wallet (Split Combined)');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${totalAmount.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${totalAmount.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Credit Gross Sales Revenue');
 
     } else {
@@ -3624,28 +3634,28 @@ export default function BillingTerminal({
       }
 
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStore.toUpperCase()}-01', '${channel}', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'POS Branch ${activeStore.toUpperCase()} order Checkout #${orderId}', '${dateStr}', '${dateStr}', '${(localStorage.getItem('logged_in_user_name') || 'Default Cashier').replace(/'/g, "''")}')
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+        VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStId.toUpperCase()}-01', '${channel}', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'POS Branch ${activeStId.toUpperCase()} order Checkout #${orderId}', '${dateStr}', '${dateStr}', '${sqlEsc(activeCashierName)}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Journal base transaction entry');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${totalAmount.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${totalAmount.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Debit Clearing Asset account');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${totalAmount.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_asset', '${txId}', '${targetAccountId}', 'DEBIT', ${totalAmount.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, `Double Entry: Debit ${targetAccountId} Account`);
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Credit Merchant Wallet');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${totalAmount.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_rev', '${txId}', 'acc_sales_revenue', 'CREDIT', ${totalAmount.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Credit Gross Sales Revenue');
     }
 
@@ -3657,17 +3667,15 @@ export default function BillingTerminal({
 
     if (totalCogs > 0) {
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cogs', '${txId}', 'acc_cost_of_goods', 'DEBIT', ${totalCogs.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cogs', '${txId}', 'acc_cost_of_goods', 'DEBIT', ${totalCogs.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Debit Cost of Goods Sold');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_inv', '${txId}', 'acc_inventory', 'CREDIT', ${totalCogs.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_inv', '${txId}', 'acc_inventory', 'CREDIT', ${totalCogs.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
       `, 'Double Entry: Credit Inventory Asset Valuation');
     }
-
-    // Loyalty points were already credited once above via upsertCustomerSync when isNamedCustomer is true.
 
     // Try to run automated credit sweep
     let sweepMessage = '';
@@ -3676,33 +3684,90 @@ export default function BillingTerminal({
       if (sweepRes.status === 'SUCCESS' && sweepRes.deducted > 0) {
         sweepMessage = `\n\n⚡ Automated Loan Sweep:\nDeduced ${settings.currency}${sweepRes.deducted.toFixed(2)} (${settings.currency}${totalAmount.toFixed(2)} * percentage) automatically applied towards Loan ${sweepRes.loanId}.`;
         
-        // Post double-entry ledger entry for financing payment
         const sweepTxId = `tx_sweep_${orderId.toLowerCase()}_${Math.floor(100 + Math.random() * 900)}`;
         const sweepIdemp = `idemp_${sweepTxId}`;
         runSql(`
-          INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-          VALUES ('${sweepTxId}', '${sweepIdemp}', 'POS-${activeStore.toUpperCase()}-01', 'SWEEP_DEDUCTION', 'SWEEP-REF-${orderId}', ${sweepRes.deducted.toFixed(4)}, 0.0000, 'SUCCESS', 'Automated revenue deduction for active capital advance repayment #${orderId}', '${dateStr}', '${dateStr}')
+          INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, business_id, store_id)
+          VALUES ('${sweepTxId}', '${sweepIdemp}', 'POS-${activeStId.toUpperCase()}-01', 'SWEEP_DEDUCTION', 'SWEEP-REF-${orderId}', ${sweepRes.deducted.toFixed(4)}, 0.0000, 'SUCCESS', 'Automated revenue deduction for active capital advance repayment #${orderId}', '${dateStr}', '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Double Entry: Sweep deduction capital advance ticket log');
         
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${sweepTxId}_deb', '${sweepTxId}', 'merchant-wallet-account-uuid', 'DEBIT', ${sweepRes.deducted.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${sweepTxId}_deb', '${sweepTxId}', 'merchant-wallet-account-uuid', 'DEBIT', ${sweepRes.deducted.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Double Entry: Debit Merchant Wallet (Outward Sweep)');
         
         runSql(`
-          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-          VALUES ('le_${sweepTxId}_cre', '${sweepTxId}', 'loan-clearing-account-uuid', 'CREDIT', ${sweepRes.deducted.toFixed(4)}, '${dateStr}')
+          INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+          VALUES ('le_${sweepTxId}_cre', '${sweepTxId}', 'loan-clearing-account-uuid', 'CREDIT', ${sweepRes.deducted.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStId)}')
         `, 'Double Entry: Credit Loan Asset Account (Repayment settled)');
       }
     } catch (sweepErr) {
       console.error('Sweep processing failed:', sweepErr);
     }
 
+    // Write immediately to Firestore IndexedDB offline cache (never blocks when offline; auto-syncs on reconnect)
+    syncSaleToFirestoreOfflineSafe({
+      businessId: activeBizId,
+      storeId: activeStId,
+      order: {
+        id: orderId,
+        customerId: activeCustomerId !== 'NULL' ? Number(activeCustomerId) : null,
+        orderDate: dateStr,
+        subtotal,
+        tax: taxAmount,
+        discount: discountAmount,
+        total: totalAmount,
+        paymentMethod: finalPaymentMethod,
+        status: 'Completed',
+        performed_by: activeCashierName,
+      },
+      items: cart.map((it, idx) => ({
+        id: `${orderId}_${idx + 1}`,
+        productId: it.product.id,
+        quantity: it.quantity,
+        unitPrice: it.product.price,
+      })),
+      updatedProducts: updatedProductsForFirestore,
+    });
+
+    if (!isDeviceOnline) {
+      let existingAllQ: OfflineOrder[] = [];
+      try {
+        const rawQ = localStorage.getItem('pos_offline_queue');
+        existingAllQ = rawQ ? JSON.parse(rawQ) : [];
+        if (!Array.isArray(existingAllQ)) existingAllQ = [];
+      } catch {
+        existingAllQ = [];
+      }
+      const newOfflineStd: OfflineOrder = {
+        orderId,
+        business_id: activeBizId,
+        customerId: activeCustomerId !== 'NULL' ? String(activeCustomerId) : null,
+        items: [...cart],
+        dateStr,
+        subtotal,
+        taxAmount,
+        discountAmount,
+        totalAmount,
+        paymentMethod: finalPaymentMethod,
+        splitCash: isSplitMethod ? splitCashKept : 0,
+        splitMobile: isSplitMethod ? splitMobileInput : 0,
+        activeStore: activeStId,
+        salesperson: activeCashierName,
+        type: 'standard',
+        loyaltyAwarded: isNamedCustomer,
+        alreadyCommittedLocally: true,
+      };
+      const nextAllQ = [...existingAllQ, newOfflineStd];
+      localStorage.setItem('pos_offline_queue', JSON.stringify(nextAllQ));
+      setOfflineQueue(activeBizId ? nextAllQ.filter((q) => !q.business_id || q.business_id === activeBizId) : nextAllQ);
+    }
+
     if (sweepMessage) {
       alert(`✓ Order ${orderId} Checkout Successful!${sweepMessage}`);
     }
 
-    // Submit invoice to ZRA Smart Invoice FiscalService (returns LOCAL_ONLY immediately if toggled OFF)
+    // Submit invoice to ZRA Smart Invoice FiscalService (returns LOCAL_ONLY if OFF, or QUEUED_OFFLINE if offline)
     const zraResult = await FiscalService.submitInvoice({
       orderId,
       salesDateIso: dateStr,
@@ -3729,7 +3794,7 @@ export default function BillingTerminal({
     // Capture receipt details with ZRA Fiscal parameters & transacting branch
     setActiveReceipt({
       id: orderId,
-      store_id: activeStore,
+      store_id: activeStId,
       performed_by: activeCashierName,
       date: new Date(dateStr).toLocaleString(),
       paymentMethod: finalPaymentMethod,
@@ -3756,6 +3821,7 @@ export default function BillingTerminal({
       customerTotalPoints: localSavedCustomer ? Number(localSavedCustomer.loyalPoints ?? 0) : null,
       isLoyaltyMember: isNamedCustomer,
       items: [...cart],
+      offlinePending: !isDeviceOnline,
       fiscalStatus: zraResult.fiscalStatus,
       zra: zraResult.zraData,
     });
@@ -3922,7 +3988,9 @@ export default function BillingTerminal({
                     let fullName = 'Cashier';
                     let permissionsFound: UserPermissions = buildUserPermissions({ role: 'sales' });
 
-                    const bizRes = runSql('SELECT * FROM businesses', 'Auth: Retrieve businesses');
+                    const activeShiftBizId = getActiveBusinessId();
+                    const bizAuthWhere = activeShiftBizId ? ` WHERE id = '${sqlEsc(activeShiftBizId)}' OR business_id = '${sqlEsc(activeShiftBizId)}'` : '';
+                    const bizRes = runSql(`SELECT * FROM businesses${bizAuthWhere}`, 'Auth: Retrieve businesses');
                     if (bizRes.success && Array.isArray(bizRes.data)) {
                       const matchBiz = bizRes.data.find(b => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
                       if (matchBiz && (!matchBiz.password || matchBiz.password === targetPassword)) {
@@ -3934,7 +4002,8 @@ export default function BillingTerminal({
                     }
 
                     if (!foundUser) {
-                      const staffRes = runSql('SELECT * FROM staff', 'Auth: Retrieve staff');
+                      const staffAuthWhere = activeShiftBizId ? ` WHERE business_id = '${sqlEsc(activeShiftBizId)}'` : '';
+                      const staffRes = runSql(`SELECT * FROM staff${staffAuthWhere}`, 'Auth: Retrieve staff');
                       if (staffRes.success && Array.isArray(staffRes.data)) {
                         const matchStaff = staffRes.data.find(s => s.email && s.email.trim().toLowerCase() === targetEmail.toLowerCase());
                         if (matchStaff) {
@@ -7034,7 +7103,8 @@ export default function BillingTerminal({
                       type="button"
                       onClick={() => {
                         if (window.confirm('Are you sure you want to completely Purge reconciliation reports? This will reset EOD sales records.')) {
-                          runSql('DELETE FROM cash_ups', 'Administration: Empty cash reconciliations');
+                          const curBiz = getActiveBusinessId();
+                          runSql(`DELETE FROM cash_ups${curBiz ? ` WHERE business_id = '${sqlEsc(curBiz)}'` : ''}`, 'Administration: Empty cash reconciliations');
                           loadReconciliationHistory();
                         }
                       }}
@@ -7396,8 +7466,9 @@ export default function BillingTerminal({
                                       return;
                                     }
 
-                                    // Let's query staff or do fallback
-                                    const staffRes = runSql('SELECT * FROM staff', 'Refund: Auth supervisors list');
+                                    // Let's query staff scoped to active business
+                                    const curBizAuth = getActiveBusinessId();
+                                    const staffRes = runSql(`SELECT * FROM staff${curBizAuth ? ` WHERE business_id = '${sqlEsc(curBizAuth)}'` : ''}`, 'Refund: Auth supervisors list');
                                     let isApproved = false;
 
                                     if (staffRes.success && Array.isArray(staffRes.data) && staffRes.data.length > 0) {
@@ -7454,8 +7525,9 @@ export default function BillingTerminal({
                             <button
                               type="button"
                               onClick={() => {
-                                // Load supervisor candidates from staff if any, and prefill
-                                const staffRes = runSql("SELECT * FROM staff WHERE role = 'supervisor' OR role = 'manager'", 'Load managers');
+                                // Load supervisor candidates from staff scoped to active business
+                                const curBizSup = getActiveBusinessId();
+                                const staffRes = runSql(`SELECT * FROM staff WHERE (role = 'supervisor' OR role = 'manager')${curBizSup ? ` AND business_id = '${sqlEsc(curBizSup)}'` : ''}`, 'Load managers');
                                 if (staffRes.success && Array.isArray(staffRes.data) && staffRes.data.length > 0) {
                                   setRefundSupervisorName(`${staffRes.data[0].first_name} ${staffRes.data[0].surname}`);
                                 }

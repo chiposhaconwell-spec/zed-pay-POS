@@ -6,7 +6,7 @@ import {
   ChevronLeft, ChevronRight, ArrowUpDown, ArrowUp, ArrowDown, ArrowRight,
   Maximize2, Minimize2, Copy, Check, SlidersHorizontal, ArrowLeftRight, Landmark
 } from 'lucide-react';
-import { runSql, getCentralBranches, persistTablesToStorage } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, getActiveBusinessId, sqlEsc } from '../db';
 import { exportAndShareCsv } from '../androidUtils';
 import { StoreSettings } from '../types';
 
@@ -83,7 +83,9 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
         'system',
       ]);
 
-      const staffRes = runSql('SELECT * FROM staff ORDER BY id ASC', 'Audit Trail: Query registered staff accounts');
+      const activeBizId = getActiveBusinessId();
+      const bizWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+      const staffRes = runSql(`SELECT * FROM staff${bizWhere} ORDER BY id ASC`, 'Audit Trail: Query registered staff accounts');
       const staffProfiles: Array<{ displayName: string; matchKeys: Set<string> }> = [];
       const keyToDisplayName = new Map<string, string>();
       const registeredStaffNames: string[] = [];
@@ -138,8 +140,8 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
         return null;
       };
 
-      // 1. Fetch from audit_logs table
-      const auditRes = runSql('SELECT * FROM audit_logs ORDER BY created_at DESC', 'Audit Trail: Query audit_logs table');
+      // 1. Fetch from audit_logs table scoped by business_id
+      const auditRes = runSql(`SELECT * FROM audit_logs${bizWhere} ORDER BY created_at DESC`, 'Audit Trail: Query audit_logs table');
       let combined: AuditLogItem[] = [];
 
       if (auditRes.success && Array.isArray(auditRes.data)) {
@@ -154,8 +156,9 @@ export default function EmployeeAuditTrail({ settings, activeStore, userRole }: 
       }
 
       // 2. Fetch fallback records from transactions table if audit_logs has fewer entries
+      const txBizClause = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
       const txRes = runSql(
-        "SELECT * FROM transactions WHERE pos_terminal_id = 'AUDIT_TRAIL' OR channel IN ('SALES', 'LAYBY', 'PURCHASE', 'EXPENSES', 'STOCK', 'MANUAL_EDIT', 'RECEIVE', 'FINANCE', 'TRANSFER', 'LOAN') ORDER BY created_at DESC", 
+        `SELECT * FROM transactions WHERE (pos_terminal_id = 'AUDIT_TRAIL' OR channel IN ('SALES', 'LAYBY', 'PURCHASE', 'EXPENSES', 'STOCK', 'MANUAL_EDIT', 'RECEIVE', 'FINANCE', 'TRANSFER', 'LOAN'))${txBizClause} ORDER BY created_at DESC`, 
         'Audit Trail: Query transactions fallback'
       );
       

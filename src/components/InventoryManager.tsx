@@ -27,7 +27,7 @@ import {
   FileText,
   Tag
 } from 'lucide-react';
-import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit } from '../db';
+import { runSql, getCentralBranches, persistTablesToStorage, logEmployeeAudit, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { Product, StoreSettings } from '../types';
 import { motion, AnimatePresence, useDragControls } from 'motion/react';
 import { ZRA_TAX_TYPES } from '../zra/zraConfig';
@@ -108,10 +108,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   // Load stock levels dynamically for transferFromStore when modal is open
   useEffect(() => {
     if (showTransferModal) {
+      const activeBizId = getActiveBusinessId();
+      const bizCond = activeBizId ? `p.business_id = '${sqlEsc(activeBizId)}'` : `(p.business_id IS NULL OR p.business_id = '')`;
       const res = runSql(`
         SELECT p.id, COALESCE(sp.stock, p.stock) AS stock 
         FROM products p
-        LEFT JOIN store_products sp ON p.id = sp.product_id AND sp.store_id = '${transferFromStore}'
+        LEFT JOIN store_products sp ON p.id = sp.product_id AND sp.store_id = '${sqlEsc(transferFromStore)}'${activeBizId ? ` AND sp.business_id = '${sqlEsc(activeBizId)}'` : ''}
+        WHERE ${bizCond}
       `, 'Transfer: Load stock levels for source branch');
       if (res.success && Array.isArray(res.data)) {
         const stocks: Record<number, number> = {};
@@ -253,14 +256,16 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   };
 
   const loadMatrixData = () => {
-    // 1. Get all products from products table
-    const prodRes = runSql('SELECT * FROM products ORDER BY name ASC', 'Matrix: Get all goods', true);
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    // 1. Get all products from products table for active business
+    const prodRes = runSql(`SELECT * FROM products WHERE ${bizCond} ORDER BY name ASC`, 'Matrix: Get all goods', true);
     if (!prodRes.success || !Array.isArray(prodRes.data)) return [];
 
     const rawProds = prodRes.data;
 
     // 2. Get all store overrides from store_products table to map them by product_id
-    const spRes = runSql('SELECT * FROM store_products', 'Matrix: Get all overrides', true);
+    const spRes = runSql(`SELECT * FROM store_products WHERE ${bizCond}`, 'Matrix: Get all overrides', true);
     const spList = (spRes.success && Array.isArray(spRes.data)) ? spRes.data : [];
 
     // Map override rows by product_id
@@ -329,6 +334,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   };
 
   const loadInventoryHistory = () => {
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    const oBizCond = activeBizId ? `o.business_id = '${sqlEsc(activeBizId)}'` : `(o.business_id IS NULL OR o.business_id = '')`;
+    const stBizCond = activeBizId ? `st.business_id = '${sqlEsc(activeBizId)}'` : `(st.business_id IS NULL OR st.business_id = '')`;
     const historyList: any[] = [];
 
     // 1. Load Sales Order Line Items (POS Checkout Movements)
@@ -349,6 +358,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       JOIN orders o ON oi.orderId = o.id
       LEFT JOIN products p ON oi.productId = p.id
       LEFT JOIN customers c ON o.customerId = c.id
+      WHERE ${oBizCond}
       ORDER BY o.orderDate DESC
     `, 'Inventory History: Load sales order items', true);
 
@@ -376,6 +386,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     // 2. Load Transactions table records (Stock Receives, Adjustments, Manual Edits)
     const txRes = runSql(`
       SELECT * FROM transactions 
+      WHERE ${bizCond}
       ORDER BY created_at DESC
     `, 'Inventory History: Load transaction logs', true);
 
@@ -451,6 +462,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       FROM stock_take_items sti
       JOIN stock_takes st ON sti.stock_take_id = st.id
       LEFT JOIN products p ON sti.product_id = p.id
+      WHERE ${stBizCond}
       ORDER BY st.created_at DESC
     `, 'Inventory History: Load stock take items', true);
 
@@ -479,6 +491,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       SELECT st.*, p.name AS product_name, p.sku AS product_sku
       FROM stock_transfers st
       LEFT JOIN products p ON st.product_id = p.id
+      WHERE ${stBizCond}
       ORDER BY st.created_at DESC
     `, 'Inventory History: Load transfers', true);
 
@@ -513,10 +526,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
   };
 
   const loadRawData = () => {
-    // Load branch-specific price and stock strictly separated by activeStore
-    const spAllRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Inventory: Fetch all branch stock overrides', true);
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    const stBizCond = activeBizId ? `st.business_id = '${sqlEsc(activeBizId)}'` : `(st.business_id IS NULL OR st.business_id = '')`;
+    // Load branch-specific price and stock strictly separated by activeStore and business_id
+    const spAllRes = runSql(`SELECT product_id, store_id, stock, price FROM store_products WHERE ${bizCond}`, 'Inventory: Fetch all branch stock overrides', true);
     const spList = (spAllRes.success && Array.isArray(spAllRes.data)) ? spAllRes.data : [];
-    const prodRes = runSql('SELECT * FROM products', `Inventory: Fetch base catalog for branch [${(activeStore || 'MAIN').toUpperCase()}]`);
+    const prodRes = runSql(`SELECT * FROM products WHERE ${bizCond}`, `Inventory: Fetch base catalog for branch [${(activeStore || 'MAIN').toUpperCase()}]`);
     if (prodRes.success && Array.isArray(prodRes.data)) {
       const branchScopedProducts = prodRes.data.map((p: any) => {
         const override = spList.find((sp: any) => Number(sp.product_id) === Number(p.id) && String(sp.store_id) === String(activeStore));
@@ -535,6 +551,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       SELECT st.*, p.name AS product_name 
       FROM stock_transfers st
       LEFT JOIN products p ON st.product_id = p.id
+      WHERE ${stBizCond}
       ORDER BY st.created_at DESC
     `, 'Inventory: Fetch stock transfers ledger');
     if (transfersRes.success && Array.isArray(transfersRes.data)) {
@@ -542,7 +559,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     }
 
     // Load active store's assigned stocktake interval
-    const storeRes = runSql(`SELECT stocktake_frequency FROM stores WHERE id = '${activeStore}'`, 'Load store frequency');
+    const storeRes = runSql(`SELECT stocktake_frequency FROM stores WHERE id = '${sqlEsc(activeStore)}' AND ${bizCond}`, 'Load store frequency');
     if (storeRes.success && Array.isArray(storeRes.data) && storeRes.data.length > 0) {
       setStocktakeFreq(storeRes.data[0].stocktake_frequency || 'weekly');
     }
@@ -589,26 +606,29 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const descToSave = (editDescription || '').trim();
     const skuToSave = (editSku || targetProd?.sku || `SKU-${id}`).trim();
 
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const targetBranch = getActiveStoreId(activeStore, activeBizId);
+
     // 1. Update the default primary products table
-    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', description = '${descToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}', item_cls_cd = '${editItemClsCd.replace(/'/g, "''")}', tax_ty_cd = '${editTaxTyCd.replace(/'/g, "''")}' WHERE id = ${id}`;
+    const updateGlobalSql = `UPDATE products SET name = '${nameToSave.replace(/'/g, "''")}', description = '${descToSave.replace(/'/g, "''")}', sku = '${skuToSave.replace(/'/g, "''")}', category = '${catToSave.replace(/'/g, "''")}', price = ${editPrice}, cost = ${editCost}, stock = ${editStock}, batch_number = '${editBatchNumber.replace(/'/g, "''")}', expiry_date = '${editExpiryDate}', item_cls_cd = '${editItemClsCd.replace(/'/g, "''")}', tax_ty_cd = '${editTaxTyCd.replace(/'/g, "''")}' WHERE id = ${id}${bizMatch}`;
     runSql(updateGlobalSql, `Inventory: Sync baseline pricing and category for Product ID #${id}`);
 
     // 2. Update or insert the store_products row for active branch store!
-    const targetBranch = activeStore || 'main';
-    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${id} AND store_id = '${targetBranch}'`, 'Override Guard');
+    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${id} AND store_id = '${sqlEsc(targetBranch)}'${bizMatch}`, 'Override Guard');
     
     if (selectCheck.success && Array.isArray(selectCheck.data) && selectCheck.data.length > 0) {
       const updateBranchSql = `
         UPDATE store_products 
         SET price = ${editPrice}, stock = ${editStock} 
-        WHERE product_id = ${id} AND store_id = '${targetBranch}'
+        WHERE product_id = ${id} AND store_id = '${sqlEsc(targetBranch)}'${bizMatch}
       `;
       runSql(updateBranchSql, `Inventory: Alter specific override price to ${editPrice} on branch ${targetBranch}`);
     } else {
       const spId = `sp_${id}_${targetBranch}`;
       const insertBranchSql = `
-        INSERT INTO store_products (id, product_id, store_id, stock, price)
-        VALUES ('${spId}', ${id}, '${targetBranch}', ${editStock}, ${editPrice})
+        INSERT INTO store_products (id, product_id, store_id, stock, price, business_id)
+        VALUES ('${spId}', ${id}, '${sqlEsc(targetBranch)}', ${editStock}, ${editPrice}, '${sqlEsc(activeBizId)}')
       `;
       runSql(insertBranchSql, `Inventory: Create specific override price for product in branch ${targetBranch}`);
     }
@@ -619,7 +639,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       const nowStr = new Date().toISOString();
       const valueImpact = Math.abs(stockDiff * editCost);
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
         VALUES (
           '${refId}',
           'idem_${refId}',
@@ -632,7 +652,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
           'Manual stock edit for ${nameToSave.replace(/'/g, "''")}: ${stockDiff > 0 ? '+' : ''}${stockDiff} units (New level: ${editStock})',
           '${nowStr}',
           '${nowStr}',
-          '${userRole}'
+          '${userRole}',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(targetBranch)}'
         )
       `, 'Log manual stock edit transaction');
     }
@@ -656,9 +678,11 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
 
-    runSql(`DELETE FROM order_items WHERE productId = ${id}`, `Cascade Delete: Detaching orders`);
-    runSql(`DELETE FROM store_products WHERE product_id = ${id}`, `Cascade Delete: Detaching branch stocks`);
-    runSql(`DELETE FROM products WHERE id = ${id}`, `Inventory: Deleting product ${name}`);
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    runSql(`DELETE FROM order_items WHERE productId = ${id}${bizMatch}`, `Cascade Delete: Detaching orders`);
+    runSql(`DELETE FROM store_products WHERE product_id = ${id}${bizMatch}`, `Cascade Delete: Detaching branch stocks`);
+    runSql(`DELETE FROM products WHERE id = ${id}${bizMatch}`, `Inventory: Deleting product ${name}`);
 
     logEmployeeAudit('STOCK', 'Deleted Product', `Deleted Product #${id} (${name}) and detached store records`, 0, activeStore);
 
@@ -694,18 +718,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const stockNum = newIsService ? 0 : (parseInt(newStock) || 0);
     const imgUrl = newImg || 'https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=150';
 
-    let activeBizId = 'default_biz';
-    try {
-      const savedBiz = localStorage.getItem('active_business_profile');
-      if (savedBiz) {
-        const parsedBiz = JSON.parse(savedBiz);
-        if (parsedBiz?.id) activeBizId = parsedBiz.id;
-      }
-    } catch {}
+    const activeBizId = getActiveBusinessId();
+    const availableStores = getStoresList();
+    const targetBranch = newTargetBranch || activeStore || getActiveStoreId(undefined, activeBizId);
 
-    // Insert baseline primary with column specifiers to support optional/default is_service
+    // Insert baseline primary with column specifiers including business_id and store_id
     runSql(`
-      INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, item_cls_cd, tax_ty_cd) VALUES (
+      INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, store_id, is_service, batch_number, expiry_date, item_cls_cd, tax_ty_cd) VALUES (
         ${nextId}, 
         '${cleanName.replace(/'/g, "''")}', 
         '${newDescription.trim().replace(/'/g, "''")}', 
@@ -715,7 +734,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         ${costNum}, 
         ${stockNum}, 
         '${imgUrl}',
-        '${activeBizId.replace(/'/g, "''")}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(targetBranch)}',
         ${newIsService ? 1 : 0},
         '${newBatchNumber.replace(/'/g, "''")}',
         '${newExpiryDate}',
@@ -725,18 +745,17 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     `, `Catalog: Add global model ${cleanName}`);
 
     // Add store override values ONLY for configured branches in the central stores database (do not auto-create any branch in advance)
-    const availableStores = getStoresList();
-    const targetBranch = newTargetBranch || activeStore || (availableStores[0]?.id ?? '');
     const storeCodes = Array.from(new Set([...availableStores.map(s => s.id), targetBranch, activeStore].filter(Boolean)));
     storeCodes.forEach(code => {
       const branchStock = code === targetBranch ? stockNum : 0;
       runSql(`
-        INSERT INTO store_products VALUES (
-          'sp_${nextId}_${code}',
+        INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
+          'sp_${nextId}_${sqlEsc(code)}',
           ${nextId},
-          '${code}',
+          '${sqlEsc(code)}',
           ${branchStock},
-          ${priceNum}
+          ${priceNum},
+          '${sqlEsc(activeBizId)}'
         )
       `, `Catalog: Seed overrides in ${code}`);
     });
@@ -745,7 +764,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       const refId = `stock_init_${nextId}_${Date.now()}`;
       const nowStr = new Date().toISOString();
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
         VALUES (
           '${refId}',
           'idem_${refId}',
@@ -758,7 +777,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
           'Initial catalog creation for ${cleanName.replace(/'/g, "''")} (${targetBranch.toUpperCase()}): +${stockNum} units [Batch: ${newBatchNumber || 'N/A'}]',
           '${nowStr}',
           '${nowStr}',
-          '${userRole}'
+          '${userRole}',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(targetBranch)}'
         )
       `, 'Log initial stock creation transaction');
     }
@@ -796,7 +817,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
     
-    const targetBranch = receiveTargetBranch || activeStore || (getStoresList()[0]?.id ?? 'main');
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const targetBranch = receiveTargetBranch || activeStore || getActiveStoreId(undefined, activeBizId);
     
     // Update products table with quantity, batch, and expiry
     const updatePrimary = `
@@ -804,22 +827,22 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       SET stock = stock + ${parsedAdd},
           batch_number = '${receiveBatch.replace(/'/g, "''")}',
           expiry_date = '${receiveExpiry}'
-      WHERE id = ${receiveProduct.id}
+      WHERE id = ${receiveProduct.id}${bizMatch}
     `;
     runSql(updatePrimary, `Inventory Receive: Increase stock, set batch '${receiveBatch}', expiry '${receiveExpiry}' for Product ID #${receiveProduct.id}`);
     
     // Update store override for the selected targetBranch
-    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${receiveProduct.id} AND store_id = '${targetBranch}'`, 'Override Guard');
+    const selectCheck = runSql(`SELECT * FROM store_products WHERE product_id = ${receiveProduct.id} AND store_id = '${sqlEsc(targetBranch)}'${bizMatch}`, 'Override Guard');
     if (selectCheck.success && Array.isArray(selectCheck.data) && selectCheck.data.length > 0) {
       runSql(`
         UPDATE store_products 
         SET stock = stock + ${parsedAdd} 
-        WHERE product_id = ${receiveProduct.id} AND store_id = '${targetBranch}'
+        WHERE product_id = ${receiveProduct.id} AND store_id = '${sqlEsc(targetBranch)}'${bizMatch}
       `, `Inventory Receive: Increase override stock for branch ${targetBranch}`);
     } else {
       runSql(`
-        INSERT INTO store_products (id, product_id, store_id, stock, price)
-        VALUES ('sp_${receiveProduct.id}_${targetBranch}', ${receiveProduct.id}, '${targetBranch}', ${parsedAdd}, ${receiveProduct.price})
+        INSERT INTO store_products (id, product_id, store_id, stock, price, business_id)
+        VALUES ('sp_${receiveProduct.id}_${sqlEsc(targetBranch)}', ${receiveProduct.id}, '${sqlEsc(targetBranch)}', ${parsedAdd}, ${receiveProduct.price}, '${sqlEsc(activeBizId)}')
       `, `Inventory Receive: Seed override stock for branch ${targetBranch}`);
     }
     
@@ -828,8 +851,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const nowStr = new Date().toISOString();
     const valueImpact = parsedAdd * receiveProduct.cost;
     runSql(`
-      INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-      VALUES ('${refId}', 'idem_${refId}', '${targetBranch.toUpperCase()}', 'RECEIVE', 'BATCH-ADD', ${valueImpact}, 0.00, 'SUCCESS', 'Received +${parsedAdd} units of ${receiveProduct.name.replace(/'/g, "''")} into branch ${targetBranch.toUpperCase()} [Batch: ${receiveBatch || 'N/A'}]', '${nowStr}', '${nowStr}', '${userRole}')
+      INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+      VALUES ('${refId}', 'idem_${refId}', '${targetBranch.toUpperCase()}', 'RECEIVE', 'BATCH-ADD', ${valueImpact}, 0.00, 'SUCCESS', 'Received +${parsedAdd} units of ${receiveProduct.name.replace(/'/g, "''")} into branch ${targetBranch.toUpperCase()} [Batch: ${receiveBatch || 'N/A'}]', '${nowStr}', '${nowStr}', '${userRole}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetBranch)}')
     `, `Log quick stock receive transaction`);
 
     logEmployeeAudit('STOCK', 'Received Stock Batch', `Received +${parsedAdd} units of ${receiveProduct.name} into branch ${targetBranch.toUpperCase()} [Batch: ${receiveBatch || 'N/A'}]`, valueImpact, targetBranch);
@@ -867,9 +890,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     }
 
     // Check source store stock
+    const activeBizId = getActiveBusinessId();
     const sourceRes = runSql(`
       SELECT stock FROM store_products 
-      WHERE product_id = ${pId} AND store_id = '${transferFromStore}'
+      WHERE product_id = ${pId} AND store_id = '${sqlEsc(transferFromStore)}' AND business_id = '${sqlEsc(activeBizId)}'
     `, 'Stock Transfer Cart Check: Query Source balance');
 
     if (!sourceRes.success || !Array.isArray(sourceRes.data) || sourceRes.data.length === 0) {
@@ -922,11 +946,13 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
 
+    const activeBizId = getActiveBusinessId();
+
     // Verify all items in transferCart still have enough stock in source store
     for (const item of transferCart) {
       const sourceRes = runSql(`
         SELECT stock FROM store_products 
-        WHERE product_id = ${item.productId} AND store_id = '${transferFromStore}'
+        WHERE product_id = ${item.productId} AND store_id = '${sqlEsc(transferFromStore)}' AND business_id = '${sqlEsc(activeBizId)}'
       `, 'Stock Transfer: Query Source balance');
 
       if (!sourceRes.success || !Array.isArray(sourceRes.data) || sourceRes.data.length === 0) {
@@ -949,22 +975,22 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
     transferCart.forEach((item, index) => {
       // 1. Decrement sender branch stock immediately.
-      const decSql = `UPDATE store_products SET stock = stock - ${item.quantity} WHERE product_id = ${item.productId} AND store_id = '${transferFromStore}'`;
+      const decSql = `UPDATE store_products SET stock = stock - ${item.quantity} WHERE product_id = ${item.productId} AND store_id = '${sqlEsc(transferFromStore)}' AND business_id = '${sqlEsc(activeBizId)}'`;
       const decRes = runSql(decSql, `Transfer: Debit -${item.quantity} units of ${item.productName} from ${transferFromStore.toUpperCase()} branch`);
 
       if (decRes.success) {
         // Record inside stock_transfers log table with 'PENDING' status
         const transferId = `${transferBaseId}-${index + 1}`;
         const insertRes = runSql(`
-          INSERT INTO stock_transfers (id, product_id, from_store, to_store, quantity, status, created_at, rejection_reason)
-          VALUES ('${transferId}', ${item.productId}, '${transferFromStore}', '${transferToStore}', ${item.quantity}, 'PENDING', '${dateStr}', '')
+          INSERT INTO stock_transfers (id, product_id, from_store, to_store, quantity, status, created_at, rejection_reason, business_id, store_id)
+          VALUES ('${sqlEsc(transferId)}', ${item.productId}, '${sqlEsc(transferFromStore)}', '${sqlEsc(transferToStore)}', ${item.quantity}, 'PENDING', '${dateStr}', '', '${sqlEsc(activeBizId)}', '${sqlEsc(transferFromStore)}')
         `, `Transfer Journal: Log pending transfer note ${transferId}`);
 
         if (insertRes.success) {
           successCount++;
         } else {
           // If insert failed, attempt to revert the stock debit
-          runSql(`UPDATE store_products SET stock = stock + ${item.quantity} WHERE product_id = ${item.productId} AND store_id = '${transferFromStore}'`, `Transfer Revert Debit`);
+          runSql(`UPDATE store_products SET stock = stock + ${item.quantity} WHERE product_id = ${item.productId} AND store_id = '${sqlEsc(transferFromStore)}' AND business_id = '${sqlEsc(activeBizId)}'`, `Transfer Revert Debit`);
           failedItems.push(item.productName);
         }
       } else {
@@ -997,40 +1023,44 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
 
+    const activeBizId = getActiveBusinessId();
+
     // 1. Credit recipient store stock
-    const checkSp = runSql(`SELECT * FROM store_products WHERE product_id = ${st.product_id} AND store_id = '${st.to_store}'`, 'Check target override');
+    const checkSp = runSql(`SELECT * FROM store_products WHERE product_id = ${st.product_id} AND store_id = '${sqlEsc(st.to_store)}' AND business_id = '${sqlEsc(activeBizId)}'`, 'Check target override');
     let incRes;
     if (checkSp.success && Array.isArray(checkSp.data) && checkSp.data.length > 0) {
-      incRes = runSql(`UPDATE store_products SET stock = stock + ${st.quantity} WHERE product_id = ${st.product_id} AND store_id = '${st.to_store}'`, `Approved Credit: +${st.quantity} units to ${st.to_store.toUpperCase()}`);
+      incRes = runSql(`UPDATE store_products SET stock = stock + ${st.quantity} WHERE product_id = ${st.product_id} AND store_id = '${sqlEsc(st.to_store)}' AND business_id = '${sqlEsc(activeBizId)}'`, `Approved Credit: +${st.quantity} units to ${st.to_store.toUpperCase()}`);
     } else {
       const spId = `sp_${st.product_id}_${st.to_store}`;
-      const getPrice = runSql(`SELECT price FROM products WHERE id = ${st.product_id}`, 'Fetch product pricing');
+      const getPrice = runSql(`SELECT price FROM products WHERE id = ${st.product_id} AND business_id = '${sqlEsc(activeBizId)}'`, 'Fetch product pricing');
       const baselinePrice = (getPrice.success && getPrice.data.length > 0) ? getPrice.data[0].price : 0;
-      incRes = runSql(`INSERT INTO store_products VALUES ('${spId}', ${st.product_id}, '${st.to_store}', ${st.quantity}, ${baselinePrice})`, `Approved Seed Credit`);
+      incRes = runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES ('${sqlEsc(spId)}', ${st.product_id}, '${sqlEsc(st.to_store)}', ${st.quantity}, ${baselinePrice}, '${sqlEsc(activeBizId)}')`, `Approved Seed Credit`);
     }
 
     if (incRes.success) {
       // 2. Change status in DB
-      runSql(`UPDATE stock_transfers SET status = 'APPROVED' WHERE id = '${st.id}'`, `Approved transfer ${st.id}`);
+      runSql(`UPDATE stock_transfers SET status = 'APPROVED' WHERE id = '${sqlEsc(st.id)}' AND business_id = '${sqlEsc(activeBizId)}'`, `Approved transfer ${st.id}`);
       
       // Log transaction
       const refId = `tr_appr_${st.id}_${Date.now()}`;
       const nowStr = new Date().toISOString();
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
         VALUES (
           '${refId}',
           'idem_${refId}',
-          '${st.to_store.toUpperCase()}',
+          '${sqlEsc(st.to_store.toUpperCase())}',
           'TRANSFER',
-          '${st.id}',
+          '${sqlEsc(st.id)}',
           0.00,
           0.00,
           'SUCCESS',
-          'Branch transfer approved: +${st.quantity} units of ${st.product_name || 'Item'} received at ${st.to_store.toUpperCase()} from ${st.from_store.toUpperCase()}',
+          'Branch transfer approved: +${st.quantity} units of ${sqlEsc(st.product_name || 'Item')} received at ${sqlEsc(st.to_store.toUpperCase())} from ${sqlEsc(st.from_store.toUpperCase())}',
           '${nowStr}',
           '${nowStr}',
-          '${userRole}'
+          '${sqlEsc(userRole)}',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(st.to_store)}'
         )
       `, 'Log transfer approval transaction');
       
@@ -1107,40 +1137,45 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
 
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
     // 1. Credit sending store stock back
-    const checkSp = runSql(`SELECT * FROM store_products WHERE product_id = ${st.product_id} AND store_id = '${st.from_store}'`, 'Check source override');
+    const checkSp = runSql(`SELECT * FROM store_products WHERE product_id = ${st.product_id} AND store_id = '${sqlEsc(st.from_store)}'${bizMatch}`, 'Check source override');
     let restoreRes;
     if (checkSp.success && Array.isArray(checkSp.data) && checkSp.data.length > 0) {
-      restoreRes = runSql(`UPDATE store_products SET stock = stock + ${st.quantity} WHERE product_id = ${st.product_id} AND store_id = '${st.from_store}'`, `Rejected Refund: Restore +${st.quantity} units to ${st.from_store.toUpperCase()}`);
+      restoreRes = runSql(`UPDATE store_products SET stock = stock + ${st.quantity} WHERE product_id = ${st.product_id} AND store_id = '${sqlEsc(st.from_store)}'${bizMatch}`, `Rejected Refund: Restore +${st.quantity} units to ${st.from_store.toUpperCase()}`);
     } else {
       const spId = `sp_${st.product_id}_${st.from_store}`;
-      const getPrice = runSql(`SELECT price FROM products WHERE id = ${st.product_id}`, 'Fetch product pricing');
+      const getPrice = runSql(`SELECT price FROM products WHERE id = ${st.product_id}${bizMatch}`, 'Fetch product pricing');
       const baselinePrice = (getPrice.success && getPrice.data.length > 0) ? getPrice.data[0].price : 0;
-      restoreRes = runSql(`INSERT INTO store_products VALUES ('${spId}', ${st.product_id}, '${st.from_store}', ${st.quantity}, ${baselinePrice})`, `Restore back overrides`);
+      restoreRes = runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES ('${sqlEsc(spId)}', ${st.product_id}, '${sqlEsc(st.from_store)}', ${st.quantity}, ${baselinePrice}, '${sqlEsc(activeBizId)}')`, `Restore back overrides`);
     }
 
     if (restoreRes.success) {
       // 2. Set Status in DB with rejection reason
       const reasonEscaped = reason.replace(/'/g, "''");
-      runSql(`UPDATE stock_transfers SET status = 'REJECTED', rejection_reason = '${reasonEscaped}' WHERE id = '${st.id}'`, `Rejected transfer ${st.id}`);
+      runSql(`UPDATE stock_transfers SET status = 'REJECTED', rejection_reason = '${reasonEscaped}' WHERE id = '${sqlEsc(st.id)}'${bizMatch}`, `Rejected transfer ${st.id}`);
       
       const refId = `tr_rej_${st.id}_${Date.now()}`;
       const nowStr = new Date().toISOString();
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
         VALUES (
           '${refId}',
           'idem_${refId}',
           '${st.from_store.toUpperCase()}',
           'TRANSFER',
-          '${st.id}',
+          '${sqlEsc(st.id)}',
           0.00,
           0.00,
           'REJECTED',
           'Branch transfer rejected (${reasonEscaped}): ${st.quantity} units returned to ${st.from_store.toUpperCase()}',
           '${nowStr}',
           '${nowStr}',
-          '${userRole}'
+          '${userRole}',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(st.from_store)}'
         )
       `, 'Log transfer rejection transaction');
 
@@ -1160,6 +1195,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       return;
     }
 
+    const activeBizId = getActiveBusinessId();
+    const targetStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const performer = stocktakePersonnel.trim() || (userRole === 'owner' ? 'Chiposha Conwell (Owner)' : 'Store Manager');
     const notesStr = stocktakeNotes.trim() || 'Regular Physical Inventory Audit Reconciliation';
 
@@ -1168,9 +1206,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     const nowStr = new Date().toISOString();
 
     runSql(`
-      INSERT INTO stock_takes (id, store_id, taken_at, performed_by, notes)
-      VALUES ('${stocktakeId}', '${activeStore}', '${nowStr}', '${performer.replace(/'/g, "''")}', '${notesStr.replace(/'/g, "''")}')
-    `, `Audit Logging: Initialize Stocktake Sheet ${stocktakeId} for ${activeStore.toUpperCase()}`);
+      INSERT INTO stock_takes (id, store_id, taken_at, performed_by, notes, business_id)
+      VALUES ('${stocktakeId}', '${sqlEsc(targetStoreId)}', '${nowStr}', '${performer.replace(/'/g, "''")}', '${notesStr.replace(/'/g, "''")}', '${sqlEsc(activeBizId)}')
+    `, `Audit Logging: Initialize Stocktake Sheet ${stocktakeId} for ${targetStoreId.toUpperCase()}`);
 
     // Track total variations to report in summary
     let surplusCount = 0;
@@ -1189,8 +1227,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
       // Save record item
       runSql(`
-        INSERT INTO stock_take_items (id, stock_take_id, product_id, recorded_qty, counted_qty, variance)
-        VALUES ('${itemId}', '${stocktakeId}', ${prod.id}, ${liveVirtualStock}, ${physicalCount}, ${variance})
+        INSERT INTO stock_take_items (id, stock_take_id, product_id, recorded_qty, counted_qty, variance, business_id, store_id)
+        VALUES ('${itemId}', '${stocktakeId}', ${prod.id}, ${liveVirtualStock}, ${physicalCount}, ${variance}, '${sqlEsc(activeBizId)}', '${sqlEsc(targetStoreId)}')
       `, `Audit: Logging item count discrepancy`);
 
       if (variance !== 0) {
@@ -1201,7 +1239,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         runSql(`
           UPDATE store_products 
           SET stock = ${physicalCount}
-          WHERE product_id = ${prod.id} AND store_id = '${activeStore}'
+          WHERE product_id = ${prod.id} AND store_id = '${sqlEsc(targetStoreId)}'${bizMatch}
         `, `Reconciliation: Adjusting stock level on active store`);
 
         // Insert double-entry journal entry to track capital variance of inventory shrinkage/surplus!
@@ -1212,7 +1250,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
 
         // Insert transaction record
         runSql(`
-          INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
+          INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
           VALUES (
             '${refId}', 
             'idem_${refId}', 
@@ -1225,7 +1263,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
             '${narration.replace(/'/g, "''")}', 
             '${nowStr}', 
             '${nowStr}',
-            '${performer.replace(/'/g, "''")}'
+            '${performer.replace(/'/g, "''")}',
+            '${sqlEsc(activeBizId)}',
+            '${sqlEsc(targetStoreId)}'
           )
         `, `Audit: Logging financial variance on transaction ledger`);
 
@@ -1233,8 +1273,8 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
         const debitAct = variance > 0 ? 'gains_inventory' : 'losses_shrinkage';
         const creditAct = 'asset_inventory';
         
-        runSql(`INSERT INTO ledger_entries VALUES ('le_${refId}_dr', '${refId}', '${debitAct}', 'DEBIT', ${valueImpact}, '${nowStr}')`, 'Double-entry post debit');
-        runSql(`INSERT INTO ledger_entries VALUES ('le_${refId}_cr', '${refId}', '${creditAct}', 'CREDIT', ${valueImpact}, '${nowStr}')`, 'Double-entry post credit');
+        runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${refId}_dr', '${refId}', '${debitAct}', 'DEBIT', ${valueImpact}, '${nowStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetStoreId)}')`, 'Double-entry post debit');
+        runSql(`INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le_${refId}_cr', '${refId}', '${creditAct}', 'CREDIT', ${valueImpact}, '${nowStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetStoreId)}')`, 'Double-entry post credit');
       }
     });
 
@@ -1947,9 +1987,11 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                     `Change category for "${prod.name}":\n(Choose existing: ${allCategoriesList.join(', ')} or type a new name)`,
                                     prod.category || 'General'
                                   );
-                                  if (custom !== null && custom.trim() !== '') {
-                                    const cleanCat = custom.trim();
-                                    runSql(`UPDATE products SET category = '${cleanCat.replace(/'/g, "''")}' WHERE id = ${prod.id}`, 'Quick edit product category');
+                                    if (custom !== null && custom.trim() !== '') {
+                                      const cleanCat = custom.trim();
+                                      const activeBizId = getActiveBusinessId();
+                                      const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+                                      runSql(`UPDATE products SET category = '${cleanCat.replace(/'/g, "''")}' WHERE id = ${prod.id}${bizMatch}`, 'Quick edit product category');
                                     if (!allCategoriesList.includes(cleanCat)) {
                                       saveCustomCategories([...customCategories, cleanCat]);
                                     }
@@ -2210,7 +2252,9 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                       onChange={(e) => {
                         const newFreq = e.target.value as any;
                         setStocktakeFreq(newFreq);
-                        runSql(`UPDATE stores SET stocktake_frequency = '${newFreq}' WHERE id = '${activeStore}'`, `Update stocktake frequency to ${newFreq}`);
+                        const activeBizId = getActiveBusinessId();
+                        const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+                        runSql(`UPDATE stores SET stocktake_frequency = '${newFreq}' WHERE id = '${sqlEsc(activeStore)}'${bizMatch}`, `Update stocktake frequency to ${newFreq}`);
                         alert(`✓ Admin Configuration Saved:\n\nSet stocktake balancing schedules for store branch [${activeStore.toUpperCase()}] to a [${newFreq.toUpperCase()}] compliance interval.`);
                         persistTablesToStorage();
                       }}
@@ -3591,8 +3635,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                             onClick={() => {
                               const newCat = editingCatNewName.trim();
                               if (newCat && newCat !== catName) {
+                                const activeBizId = getActiveBusinessId();
+                                const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
                                 runSql(
-                                  `UPDATE products SET category = '${newCat.replace(/'/g, "''")}' WHERE category = '${catName.replace(/'/g, "''")}'`,
+                                  `UPDATE products SET category = '${newCat.replace(/'/g, "''")}' WHERE category = '${catName.replace(/'/g, "''")}'${bizMatch}`,
                                   'Rename Category'
                                 );
                                 const updated = customCategories.map(c => c === catName ? newCat : c);
@@ -3642,8 +3688,10 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                               <button
                                 onClick={() => {
                                   if (window.confirm(`Reassign all ${count} items in "${catName}" to "General"?`)) {
+                                    const activeBizId = getActiveBusinessId();
+                                    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
                                     runSql(
-                                      `UPDATE products SET category = 'General' WHERE category = '${catName.replace(/'/g, "''")}'`,
+                                      `UPDATE products SET category = 'General' WHERE category = '${catName.replace(/'/g, "''")}'${bizMatch}`,
                                       'Reassign deleted category'
                                     );
                                     saveCustomCategories(customCategories.filter(c => c !== catName));

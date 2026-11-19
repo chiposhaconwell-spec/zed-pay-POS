@@ -64,7 +64,9 @@ CREATE TABLE IF NOT EXISTS businesses (
   owner TEXT,
   email TEXT,
   password TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stores (
@@ -76,7 +78,8 @@ CREATE TABLE IF NOT EXISTS stores (
   allow_refunds INTEGER,
   allow_laybys INTEGER,
   require_manager_discount INTEGER,
-  stocktake_frequency TEXT
+  stocktake_frequency TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -94,7 +97,8 @@ CREATE TABLE IF NOT EXISTS products (
   batch_number TEXT,
   expiry_date TEXT,
   item_cls_cd TEXT,
-  tax_ty_cd TEXT
+  tax_ty_cd TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -106,7 +110,8 @@ CREATE TABLE IF NOT EXISTS customers (
   tpin TEXT,
   zra_connected INTEGER,
   tax_band TEXT,
-  business_id TEXT
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -122,7 +127,8 @@ CREATE TABLE IF NOT EXISTS orders (
   split_momo REAL,
   status TEXT,
   store_id TEXT,
-  performed_by TEXT
+  performed_by TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -130,7 +136,9 @@ CREATE TABLE IF NOT EXISTS order_items (
   orderId TEXT,
   productId INTEGER,
   quantity INTEGER,
-  unitPrice REAL
+  unitPrice REAL,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -140,7 +148,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   currency TEXT DEFAULT 'ZMW',
   merchant_id TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -155,7 +165,9 @@ CREATE TABLE IF NOT EXISTS transactions (
   narration TEXT,
   created_at TEXT,
   updated_at TEXT,
-  performed_by TEXT
+  performed_by TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ledger_entries (
@@ -164,7 +176,9 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   account_id TEXT,
   type TEXT,
   amount REAL,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS laybys (
@@ -180,7 +194,8 @@ CREATE TABLE IF NOT EXISTS laybys (
   status TEXT,
   items_json TEXT,
   created_at TEXT,
-  store_id TEXT
+  store_id TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS layby_installments (
@@ -189,7 +204,9 @@ CREATE TABLE IF NOT EXISTS layby_installments (
   amount REAL,
   payment_method TEXT,
   received_by TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS time_attendance (
@@ -202,11 +219,18 @@ CREATE TABLE IF NOT EXISTS time_attendance (
   hours_worked REAL,
   hourly_rate REAL,
   gross_payment REAL,
-  status TEXT
+  status TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS staff (
   id TEXT PRIMARY KEY,
+  name TEXT,
+  role TEXT,
+  hourly_rate REAL,
+  pin TEXT,
+  store_id TEXT,
   first_name TEXT,
   surname TEXT,
   contact TEXT,
@@ -228,7 +252,8 @@ CREATE TABLE IF NOT EXISTS store_products (
   product_id INTEGER,
   store_id TEXT,
   stock INTEGER,
-  price REAL
+  price REAL,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stock_transfers (
@@ -239,7 +264,9 @@ CREATE TABLE IF NOT EXISTS stock_transfers (
   quantity INTEGER,
   status TEXT,
   created_at TEXT,
-  rejection_reason TEXT
+  rejection_reason TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cash_ups (
@@ -255,7 +282,8 @@ CREATE TABLE IF NOT EXISTS cash_ups (
   sum_momo_actual REAL,
   variance REAL,
   notes TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS quotations (
@@ -274,7 +302,9 @@ CREATE TABLE IF NOT EXISTS quotations (
   status TEXT,
   created_at TEXT,
   updated_at TEXT,
-  extra_json TEXT
+  extra_json TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS loans (
@@ -289,7 +319,9 @@ CREATE TABLE IF NOT EXISTS loans (
   disbursed_at TEXT,
   due_date TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS loan_amortization_schedule (
@@ -302,7 +334,9 @@ CREATE TABLE IF NOT EXISTS loan_amortization_schedule (
   amount_paid REAL,
   is_settled INTEGER,
   due_date TEXT,
-  settled_at TEXT
+  settled_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS automated_deduction_logs (
@@ -312,7 +346,9 @@ CREATE TABLE IF NOT EXISTS automated_deduction_logs (
   amount_deducted REAL,
   status TEXT,
   failure_reason TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stock_takes (
@@ -320,7 +356,8 @@ CREATE TABLE IF NOT EXISTS stock_takes (
   store_id TEXT,
   taken_at TEXT,
   performed_by TEXT,
-  status TEXT
+  status TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stock_take_items (
@@ -329,7 +366,9 @@ CREATE TABLE IF NOT EXISTS stock_take_items (
   product_id INTEGER,
   recorded_stock INTEGER,
   counted_stock INTEGER,
-  variance INTEGER
+  variance INTEGER,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS expenses (
@@ -345,7 +384,8 @@ CREATE TABLE IF NOT EXISTS expenses (
   store_id TEXT,
   performed_by TEXT,
   created_by TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS purchases_transit (
@@ -364,7 +404,8 @@ CREATE TABLE IF NOT EXISTS purchases_transit (
   created_at TEXT,
   updated_at TEXT,
   received_at TEXT,
-  received_by TEXT
+  received_by TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transit_purchases (
@@ -383,7 +424,8 @@ CREATE TABLE IF NOT EXISTS transit_purchases (
   created_at TEXT,
   updated_at TEXT,
   received_at TEXT,
-  received_by TEXT
+  received_by TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS suppliers (
@@ -398,7 +440,9 @@ CREATE TABLE IF NOT EXISTS suppliers (
   default_payment_method TEXT,
   notes TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS money_transfers (
@@ -409,7 +453,9 @@ CREATE TABLE IF NOT EXISTS money_transfers (
   reference_no TEXT,
   transfer_date TEXT,
   performed_by TEXT,
-  notes TEXT
+  notes TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS assets (
@@ -423,14 +469,34 @@ CREATE TABLE IF NOT EXISTS assets (
   depreciation_rate REAL,
   status TEXT,
   notes TEXT,
-  linked_equity_id TEXT
+  linked_equity_id TEXT,
+  business_id TEXT,
+  store_id TEXT,
+  asset_tag TEXT,
+  serial_number TEXT,
+  useful_life_years REAL,
+  salvage_value REAL,
+  funding_source TEXT,
+  disposal_date TEXT,
+  disposal_proceeds REAL,
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS equity (
   id TEXT PRIMARY KEY,
   name TEXT,
   value REAL,
-  linked_asset_id TEXT
+  linked_asset_id TEXT,
+  business_id TEXT,
+  store_id TEXT,
+  equity_type TEXT,
+  shareholder_name TEXT,
+  contribution_date TEXT,
+  account_id TEXT,
+  reference_no TEXT,
+  notes TEXT,
+  status TEXT,
+  created_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS double_entry_journal (
@@ -441,7 +507,9 @@ CREATE TABLE IF NOT EXISTS double_entry_journal (
   account_debit TEXT,
   account_credit TEXT,
   amount REAL,
-  currency TEXT
+  currency TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -452,7 +520,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   amount REAL,
   store_id TEXT,
   performed_by TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS receipt_refund_ledger (
@@ -473,7 +542,8 @@ CREATE TABLE IF NOT EXISTS receipt_refund_ledger (
   performed_by TEXT,
   journal_ref TEXT,
   status TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cash_flow_ledger (
@@ -491,7 +561,8 @@ CREATE TABLE IF NOT EXISTS cash_flow_ledger (
   reference_id TEXT,
   description TEXT,
   performed_by TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payment_method_ledger (
@@ -507,7 +578,8 @@ CREATE TABLE IF NOT EXISTS payment_method_ledger (
   transfers_out REAL,
   net_balance REAL,
   transaction_count INTEGER,
-  updated_at TEXT
+  updated_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS financial_statements_ledger (
@@ -543,7 +615,8 @@ CREATE TABLE IF NOT EXISTS financial_statements_ledger (
   investing_cash_flow REAL,
   financing_cash_flow REAL,
   net_cash_flow REAL,
-  updated_at TEXT
+  updated_at TEXT,
+  business_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS payment_methods (
@@ -553,7 +626,9 @@ CREATE TABLE IF NOT EXISTS payment_methods (
   account_id TEXT,
   is_active INTEGER,
   created_by TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS zra_invoices (
@@ -573,7 +648,9 @@ CREATE TABLE IF NOT EXISTS zra_invoices (
   payload_json TEXT,
   record_json TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS zra_sync_queue (
@@ -584,7 +661,9 @@ CREATE TABLE IF NOT EXISTS zra_sync_queue (
   sale_json TEXT,
   retry_count INTEGER,
   last_error TEXT,
-  created_at TEXT
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
 );
 `;
 
@@ -627,6 +706,31 @@ export async function initSqliteStorage(): Promise<boolean> {
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN item_cls_cd TEXT;'); } catch {}
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN tax_ty_cd TEXT;'); } catch {}
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN description TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN name TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN role TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN hourly_rate REAL;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN pin TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN store_id TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN asset_tag TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN serial_number TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN useful_life_years REAL;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN salvage_value REAL;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN funding_source TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN disposal_date TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN disposal_proceeds REAL;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN updated_at TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN equity_type TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN shareholder_name TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN contribution_date TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN account_id TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN reference_no TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN notes TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN status TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN created_at TEXT;'); } catch {}
+      for (const tbl of ALL_TABLE_NAMES) {
+        try { await dbConnection.execute(`ALTER TABLE ${tbl} ADD COLUMN business_id TEXT;`); } catch {}
+        try { await dbConnection.execute(`ALTER TABLE ${tbl} ADD COLUMN store_id TEXT;`); } catch {}
+      }
       console.log('[SqliteStorage] SQLite schema verified');
       isSqliteReady = true;
     }
@@ -805,7 +909,7 @@ export async function loadTablesFromPersistentStorage(): Promise<Record<string, 
         }
       }
 
-      if (foundAny && result['products'] && result['products'].length > 0) {
+      if (foundAny && ((result['businesses'] && result['businesses'].length > 0) || (result['products'] && result['products'].length > 0) || (result['orders'] && result['orders'].length > 0))) {
         console.log('[SqliteStorage] Successfully recovered data from native SQLite database');
         return result;
       }

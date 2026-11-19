@@ -161,10 +161,66 @@ function scrubCloudSnapshotTables(rawTables: Record<string, any[]>): Record<stri
   return t;
 }
 
+function scopeTablesToBusiness(
+  rawTables: Record<string, any[]>,
+  bizId: string
+): { tables: Record<string, any[]>; primaryStoreId: string } {
+  const cleaned = scrubCloudSnapshotTables(rawTables);
+  const isSpecificBiz = Boolean(bizId && bizId !== '__global__' && bizId !== '__latest__');
+
+  const rawStores = Array.isArray(cleaned.stores) ? cleaned.stores : [];
+  const filteredStores = isSpecificBiz
+    ? rawStores.filter((s: any) => !s?.business_id || String(s.business_id) === bizId)
+    : rawStores;
+  const primaryStoreId = String(filteredStores[0]?.id || 'main');
+
+  const scoped: Record<string, any[]> = {};
+  for (const [tableName, rows] of Object.entries(cleaned)) {
+    if (!Array.isArray(rows)) continue;
+    if (tableName === 'businesses') {
+      const filteredBiz = isSpecificBiz
+        ? rows.filter((b: any) => String(b?.id || '') === bizId || String(b?.business_id || '') === bizId)
+        : rows;
+      scoped[tableName] = filteredBiz.map((b: any) => ({
+        ...b,
+        business_id: String(b?.business_id || b?.id || bizId),
+        store_id: String(b?.store_id || primaryStoreId),
+      }));
+    } else if (tableName === 'stores') {
+      scoped[tableName] = filteredStores.map((s: any) => ({
+        ...s,
+        business_id: String(s?.business_id || bizId),
+        store_id: String(s?.store_id || s?.id || primaryStoreId),
+      }));
+    } else if (tableName === 'accounts') {
+      scoped[tableName] = rows.map((r: any) => ({ ...r }));
+    } else {
+      const filteredRows = isSpecificBiz
+        ? rows.filter((r: any) => {
+            if (!r || typeof r !== 'object') return false;
+            const rowBiz = String(r.business_id || (tableName === 'loans' ? r.merchant_id : '') || '').trim();
+            return !rowBiz || rowBiz === bizId;
+          })
+        : rows;
+      scoped[tableName] = filteredRows.map((r: any) => ({
+        ...r,
+        business_id: String(r?.business_id || bizId),
+        store_id: String(r?.store_id || primaryStoreId),
+      }));
+    }
+  }
+  return { tables: scoped, primaryStoreId };
+}
+
+function namespaceKey(bizId: string, rawKey: string): string {
+  const prefix = `${bizId}::`;
+  return rawKey.startsWith(prefix) ? rawKey : `${prefix}${rawKey}`;
+}
+
 export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
   const nowIso = new Date().toISOString();
   const bizId = (payload.businessId || '__global__').trim();
-  const tables = scrubCloudSnapshotTables(payload.tables || {});
+  const { tables, primaryStoreId } = scopeTablesToBusiness(payload.tables || {}, bizId);
   const tablesJsonStr = JSON.stringify(tables);
   const settingsJsonStr = payload.settings ? JSON.stringify(payload.settings) : null;
 
@@ -173,7 +229,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
   const bizName = payload.businessName || matchingBiz?.name || 'Synced Business';
   const ownerEmail = (payload.ownerEmail || matchingBiz?.email || '').toLowerCase().trim();
 
-  // 1. Upsert primary business snapshot (and '__latest__' pointer in a single round-trip)
+  // 1. Upsert isolated per-business snapshot ONLY (never overwrite a shared global '__latest__' row)
   try {
     const snapRows = [
       {
@@ -185,17 +241,6 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         updatedAt: nowIso,
       },
     ];
-
-    if (bizId !== '__latest__') {
-      snapRows.push({
-        businessId: '__latest__',
-        businessName: bizName,
-        ownerEmail,
-        tablesJson: tablesJsonStr,
-        settingsJson: settingsJsonStr,
-        updatedAt: nowIso,
-      });
-    }
 
     await db
       .insert(posSyncSnapshots)
@@ -217,7 +262,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
     });
   }
 
-  // 2. Synchronize relational tables in Cloud SQL using batched upserts
+  // 2. Synchronize relational tables in Cloud SQL strictly scoped to this business
   try {
     const cleanBusinesses = dedupeByKey(
       bizRows.filter((b: any) => b && b.id),
@@ -289,28 +334,27 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
     const cleanProducts = dedupeByKey(
       prodRows.filter((p: any) => p && p.id !== undefined && p.id !== null),
       (p: any) => Number(p.id)
-    )
-      .map((p: any) => {
-        let skuVal = String(p.sku || `SKU-${p.id}`).trim() || `SKU-${p.id}`;
-        if (seenSkus.has(skuVal)) {
-          skuVal = `${skuVal}-${p.id}`;
-        }
-        seenSkus.add(skuVal);
-        return {
-          id: Number(p.id),
-          name: String(p.name || 'Product'),
-          sku: skuVal,
-          category: String(p.category || 'General'),
-          price: String(Number(p.price || 0).toFixed(2)),
-          cost: String(Number(p.cost || 0).toFixed(2)),
-          stock: Number(p.stock || 0),
-          imageUrl: String(p.imageUrl || ''),
-          businessId: String(p.business_id || bizId),
-          isService: Number(p.is_service || 0),
-          batchNumber: String(p.batch_number || ''),
-          expiryDate: String(p.expiry_date || ''),
-        };
-      });
+    ).map((p: any) => {
+      let skuVal = String(p.sku || `SKU-${p.id}`).trim() || `SKU-${p.id}`;
+      if (seenSkus.has(skuVal)) {
+        skuVal = `${skuVal}-${p.id}`;
+      }
+      seenSkus.add(skuVal);
+      return {
+        id: Number(p.id),
+        name: String(p.name || 'Product'),
+        sku: skuVal,
+        category: String(p.category || 'General'),
+        price: String(Number(p.price || 0).toFixed(2)),
+        cost: String(Number(p.cost || 0).toFixed(2)),
+        stock: Number(p.stock || 0),
+        imageUrl: String(p.imageUrl || ''),
+        businessId: String(p.business_id || bizId),
+        isService: Number(p.is_service || 0),
+        batchNumber: String(p.batch_number || ''),
+        expiryDate: String(p.expiry_date || ''),
+      };
+    });
 
     if (cleanProducts.length > 0) {
       await db
@@ -383,7 +427,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       total: String(Number(o.total || 0).toFixed(2)),
       paymentMethod: String(o.paymentMethod || 'Cash'),
       status: String(o.status || 'Completed'),
-      storeId: String(o.store_id || ''),
+      storeId: String(o.store_id || primaryStoreId),
       performedBy: String(o.performed_by || 'owner'),
     }));
 
@@ -397,6 +441,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
             status: sql`excluded."status"`,
             total: sql`excluded."total"`,
             paymentMethod: sql`excluded."payment_method"`,
+            storeId: sql`excluded."store_id"`,
           },
         });
     }
@@ -417,12 +462,14 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       await db.insert(orderItems).values(cleanOrderItems).onConflictDoNothing();
     }
 
+    const bizPrefix = `${bizId}::`;
+
     const journalRows = Array.isArray(tables.double_entry_journal) ? tables.double_entry_journal : [];
     const cleanJournal = dedupeByKey(
       journalRows.filter((j: any) => j && j.id),
-      (j: any) => j.id
+      (j: any) => namespaceKey(bizId, String(j.id))
     ).map((j: any) => ({
-      id: String(j.id),
+      id: namespaceKey(bizId, String(j.id)),
       entryDate: String(j.date || nowIso),
       referenceId: String(j.reference || ''),
       module: 'POS_LEDGER',
@@ -430,11 +477,11 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       debitAccount: String(j.account_debit || ''),
       creditAccount: String(j.account_credit || ''),
       amount: String(Number(j.amount || 0).toFixed(2)),
-      storeId: 'all',
-      performedBy: 'system',
+      storeId: String(j.store_id || primaryStoreId),
+      performedBy: String(j.performed_by || 'system'),
     }));
 
-    await db.delete(doubleEntryJournal);
+    await db.delete(doubleEntryJournal).where(sql`LEFT(${doubleEntryJournal.id}, ${bizPrefix.length}) = ${bizPrefix}`);
     if (cleanJournal.length > 0) {
       await db
         .insert(doubleEntryJournal)
@@ -444,6 +491,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
           set: {
             amount: sql`excluded."amount"`,
             description: sql`excluded."description"`,
+            storeId: sql`excluded."store_id"`,
           },
         });
     }
@@ -451,9 +499,9 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
     const rrRows = Array.isArray(tables.receipt_refund_ledger) ? tables.receipt_refund_ledger : [];
     const cleanRR = dedupeByKey(
       rrRows.filter((r: any) => r && r.id),
-      (r: any) => r.id
+      (r: any) => namespaceKey(bizId, String(r.id))
     ).map((r: any) => ({
-      id: String(r.id),
+      id: namespaceKey(bizId, String(r.id)),
       entryDate: String(r.date || nowIso),
       txType: String(r.entry_type || 'RECEIPT'),
       referenceId: String(r.order_id || ''),
@@ -464,13 +512,13 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       discountAmount: String(Number(r.discount || 0).toFixed(2)),
       netRevenue: String(Number(r.net_revenue_impact || 0).toFixed(2)),
       cogsAmount: String(Number(r.cogs_amount || 0).toFixed(2)),
-      storeId: String(r.store_id || ''),
+      storeId: String(r.store_id || primaryStoreId),
       performedBy: String(r.performed_by || ''),
       status: String(r.status || 'Posted'),
       notes: String(r.journal_ref || ''),
     }));
 
-    await db.delete(receiptRefundLedger);
+    await db.delete(receiptRefundLedger).where(sql`LEFT(${receiptRefundLedger.id}, ${bizPrefix.length}) = ${bizPrefix}`);
     if (cleanRR.length > 0) {
       await db
         .insert(receiptRefundLedger)
@@ -480,6 +528,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
           set: {
             status: sql`excluded."status"`,
             grossAmount: sql`excluded."gross_amount"`,
+            storeId: sql`excluded."store_id"`,
           },
         });
     }
@@ -487,11 +536,11 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
     const cfRows = Array.isArray(tables.cash_flow_ledger) ? tables.cash_flow_ledger : [];
     const cleanCF = dedupeByKey(
       cfRows.filter((cf: any) => cf && cf.id),
-      (cf: any) => cf.id
+      (cf: any) => namespaceKey(bizId, String(cf.id))
     ).map((cf: any) => {
       const netVal = Number(cf.net_cash_change || 0);
       return {
-        id: String(cf.id),
+        id: namespaceKey(bizId, String(cf.id)),
         entryDate: String(cf.date || nowIso),
         activityCategory: String(cf.activity_type || 'OPERATING'),
         direction: String(cf.direction || 'INFLOW'),
@@ -500,12 +549,12 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         description: String(cf.description || ''),
         amount: String(Math.abs(netVal).toFixed(2)),
         signedAmount: String(netVal.toFixed(2)),
-        storeId: String(cf.store_id || ''),
+        storeId: String(cf.store_id || primaryStoreId),
         performedBy: String(cf.performed_by || ''),
       };
     });
 
-    await db.delete(cashFlowLedger);
+    await db.delete(cashFlowLedger).where(sql`LEFT(${cashFlowLedger.id}, ${bizPrefix.length}) = ${bizPrefix}`);
     if (cleanCF.length > 0) {
       await db
         .insert(cashFlowLedger)
@@ -515,6 +564,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
           set: {
             signedAmount: sql`excluded."signed_amount"`,
             amount: sql`excluded."amount"`,
+            storeId: sql`excluded."store_id"`,
           },
         });
     }
@@ -522,10 +572,10 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
     const pmRows = Array.isArray(tables.payment_method_ledger) ? tables.payment_method_ledger : [];
     const cleanPM = dedupeByKey(
       pmRows.filter((pm: any) => pm && pm.id),
-      (pm: any) => pm.id
+      (pm: any) => namespaceKey(bizId, String(pm.id))
     ).map((pm: any) => ({
-      methodKey: String(pm.id),
-      methodLabel: `${pm.payment_method} (${pm.store_id})`,
+      methodKey: namespaceKey(bizId, String(pm.id)),
+      methodLabel: `${pm.payment_method} (${pm.store_id || primaryStoreId})`,
       accountCode: String(pm.account_id || 'acc_cash'),
       grossInflows: String(Number((pm.gross_receipts || 0) + (pm.layby_receipts || 0)).toFixed(2)),
       refundOutflows: String(Number(pm.refunds_out || 0).toFixed(2)),
@@ -535,7 +585,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       updatedAt: nowIso,
     }));
 
-    await db.delete(paymentMethodLedger);
+    await db.delete(paymentMethodLedger).where(sql`LEFT(${paymentMethodLedger.methodKey}, ${bizPrefix.length}) = ${bizPrefix}`);
     if (cleanPM.length > 0) {
       await db
         .insert(paymentMethodLedger)
@@ -559,7 +609,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (cu: any) => cu.id
     ).map((cu: any) => ({
       id: String(cu.id),
-      storeId: String(cu.store_id || ''),
+      storeId: String(cu.store_id || primaryStoreId),
       date: String(cu.date || nowIso.split('T')[0]),
       expectedCash: String(Number(cu.sum_cash_expected || 0).toFixed(2)),
       actualCash: String(Number(cu.sum_cash_actual || 0).toFixed(2)),
@@ -592,18 +642,18 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
     const fsRows = Array.isArray(tables.financial_statements_ledger) ? tables.financial_statements_ledger : [];
     const cleanFS = dedupeByKey(
       fsRows.filter((fs: any) => fs && fs.id),
-      (fs: any) => fs.id
+      (fs: any) => namespaceKey(bizId, String(fs.id))
     ).map((fs: any) => ({
-      statementKey: String(fs.id),
+      statementKey: namespaceKey(bizId, String(fs.id)),
       statementType: 'FULL_STATEMENT_SNAPSHOT',
-      section: String(fs.store_id || 'all'),
+      section: String(fs.store_id || primaryStoreId),
       lineItem: `Net Income: ${fs.net_operating_income || 0} | Total Assets: ${fs.total_assets || 0} | Net Cash Flow: ${fs.net_cash_flow || 0}`,
       amount: String(Number(fs.net_operating_income || 0).toFixed(2)),
-      storeId: String(fs.store_id || 'all'),
+      storeId: String(fs.store_id || primaryStoreId),
       updatedAt: nowIso,
     }));
 
-    await db.delete(financialStatementsLedger);
+    await db.delete(financialStatementsLedger).where(sql`LEFT(${financialStatementsLedger.statementKey}, ${bizPrefix.length}) = ${bizPrefix}`);
     if (cleanFS.length > 0) {
       await db
         .insert(financialStatementsLedger)
@@ -613,6 +663,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
           set: {
             lineItem: sql`excluded."line_item"`,
             amount: sql`excluded."amount"`,
+            storeId: sql`excluded."store_id"`,
             updatedAt: sql`excluded."updated_at"`,
           },
         });
@@ -628,7 +679,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       action: String(al.action || ''),
       details: String(al.details || ''),
       amount: String(Number(al.amount || 0).toFixed(2)),
-      storeId: String(al.store_id || ''),
+      storeId: String(al.store_id || primaryStoreId),
       performedBy: String(al.performed_by || ''),
       createdAt: String(al.created_at || nowIso),
     }));
@@ -662,44 +713,58 @@ export async function pullPosSyncFromCloudSql(businessId?: string, email?: strin
     });
   }
 
-  const availableBusinesses = allSnapshots
-    .filter((s) => s.businessId !== '__latest__' && s.businessId !== '__global__')
-    .map((s) => ({
-      businessId: s.businessId,
-      businessName: s.businessName || s.businessId,
-      ownerEmail: s.ownerEmail || '',
-      updatedAt: s.updatedAt,
-    }));
+  const realBusinessSnapshots = allSnapshots.filter(
+    (s) => s.businessId !== '__latest__' && s.businessId !== '__global__'
+  );
 
-  let targetSnap = null;
-  if (businessId && businessId.trim()) {
-    targetSnap = allSnapshots.find((s) => s.businessId === businessId.trim());
+  const availableBusinesses = realBusinessSnapshots.map((s) => ({
+    businessId: s.businessId,
+    businessName: s.businessName || s.businessId,
+    ownerEmail: s.ownerEmail || '',
+    updatedAt: s.updatedAt,
+  }));
+
+  const cleanBizId = businessId ? businessId.trim() : '';
+  const cleanEmail = email ? email.trim().toLowerCase() : '';
+  const hasExplicitSelector = Boolean(cleanBizId || cleanEmail);
+
+  let targetSnap: (typeof posSyncSnapshots.$inferSelect) | null = null;
+  if (cleanBizId) {
+    targetSnap = realBusinessSnapshots.find((s) => s.businessId === cleanBizId) || null;
   }
-  if (!targetSnap && email && email.trim()) {
-    const cleanEmail = email.trim().toLowerCase();
-    targetSnap = allSnapshots.find(
-      (s) => s.businessId !== '__latest__' && (s.ownerEmail || '').toLowerCase() === cleanEmail
-    );
-  }
-  if (!targetSnap) {
+  if (!targetSnap && cleanEmail) {
     targetSnap =
-      allSnapshots.find((s) => s.businessId !== '__latest__' && s.businessId !== '__global__') ||
-      allSnapshots.find((s) => s.businessId === '__latest__') ||
-      allSnapshots[0] ||
+      realBusinessSnapshots.find((s) => (s.ownerEmail || '').toLowerCase() === cleanEmail) ||
+      realBusinessSnapshots.find((s) => {
+        try {
+          const parsed = JSON.parse(s.tablesJson);
+          const staffList = Array.isArray(parsed?.staff) ? parsed.staff : [];
+          return staffList.some(
+            (st: any) => st?.email && String(st.email).trim().toLowerCase() === cleanEmail
+          );
+        } catch {
+          return false;
+        }
+      }) ||
       null;
+  }
+
+  // Only allow generic lookup when caller did NOT pass any businessId or email (e.g. /api/sync/status)
+  if (!targetSnap && !hasExplicitSelector) {
+    targetSnap = realBusinessSnapshots[0] || null;
   }
 
   if (!targetSnap) {
     return {
       found: false,
-      availableBusinesses: [],
+      availableBusinesses,
     };
   }
 
   let parsedTables: Record<string, any[]> = {};
   let parsedSettings: Record<string, any> | null = null;
   try {
-    parsedTables = scrubCloudSnapshotTables(JSON.parse(targetSnap.tablesJson));
+    parsedTables = scopeTablesToBusiness(JSON.parse(targetSnap.tablesJson), targetSnap.businessId).tables;
   } catch {
     parsedTables = {};
   }

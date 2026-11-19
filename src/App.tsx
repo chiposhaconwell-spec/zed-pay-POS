@@ -13,7 +13,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 
 // Database & Firebase Cloud API
-import { initializeDatabase, SeedTemplate, runSql, getCentralBranches, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getAllSelectableAccounts, syncAllAccountingSystems } from './db';
+import { initializeDatabase, SeedTemplate, runSql, getCentralBranches, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getAllSelectableAccounts, syncAllAccountingSystems, seedChartOfAccountsOnly, getActiveBusinessId, getActiveStoreId, sqlEsc } from './db';
 import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud } from './firebase';
 import { StoreSettings, ActiveTab } from './types';
 import {
@@ -215,7 +215,9 @@ export default function App() {
 
   const fetchCustomersList = () => {
     try {
-      const cRes = runSql('SELECT * FROM customers ORDER BY name ASC', 'CRM: Query central customers database');
+      const bizId = getActiveBusinessId(activeBusiness?.id);
+      const bizWhere = bizId ? ` WHERE business_id = '${sqlEsc(bizId)}'` : '';
+      const cRes = runSql(`SELECT * FROM customers${bizWhere} ORDER BY name ASC`, 'CRM: Query central customers database');
       if (cRes.success && Array.isArray(cRes.data)) {
         setCustomersList(cRes.data);
       }
@@ -225,20 +227,22 @@ export default function App() {
     }
   };
 
-  // Update badge counts from DB (scoped to activeStore when selected, strictly 0 when empty)
+  // Update badge counts from DB (scoped strictly to activeBusiness & activeStore)
   const updateBadgeCounts = () => {
     try {
+      const bizId = getActiveBusinessId(activeBusiness?.id);
+      const bizFilter = bizId ? `business_id = '${sqlEsc(bizId)}'` : '';
       const pRes = activeStore
-        ? runSql(`SELECT COUNT(*) as cnt FROM store_products WHERE store_id = '${activeStore}' AND stock > 0`, 'Query branch product count')
-        : runSql(`SELECT COUNT(*) as cnt FROM products`, 'Query product count');
+        ? runSql(`SELECT COUNT(*) as cnt FROM store_products WHERE store_id = '${sqlEsc(activeStore)}' AND stock > 0${bizFilter ? ` AND ${bizFilter}` : ''}`, 'Query branch product count')
+        : runSql(`SELECT COUNT(*) as cnt FROM products${bizFilter ? ` WHERE ${bizFilter}` : ''}`, 'Query product count');
       const prodCnt = (pRes.success && pRes.data?.[0]?.cnt !== undefined) ? pRes.data[0].cnt : 0;
 
-      const cRes = runSql(`SELECT COUNT(*) as cnt FROM customers`, 'Query customer count');
+      const cRes = runSql(`SELECT COUNT(*) as cnt FROM customers${bizFilter ? ` WHERE ${bizFilter}` : ''}`, 'Query customer count');
       const custCnt = (cRes.success && cRes.data?.[0]?.cnt !== undefined) ? cRes.data[0].cnt : 0;
 
       const sRes = activeStore
-        ? runSql(`SELECT COUNT(*) as cnt FROM staff WHERE store_id = '${activeStore}' OR store_id = '' OR store_id IS NULL`, 'Query branch staff count')
-        : runSql(`SELECT COUNT(*) as cnt FROM staff`, 'Query staff count');
+        ? runSql(`SELECT COUNT(*) as cnt FROM staff WHERE (store_id = '${sqlEsc(activeStore)}' OR store_id = '' OR store_id IS NULL)${bizFilter ? ` AND ${bizFilter}` : ''}`, 'Query branch staff count')
+        : runSql(`SELECT COUNT(*) as cnt FROM staff${bizFilter ? ` WHERE ${bizFilter}` : ''}`, 'Query staff count');
       const staffCnt = (sRes.success && sRes.data?.[0]?.cnt !== undefined) ? sRes.data[0].cnt : 0;
 
       setBadgeCounts({
@@ -294,7 +298,8 @@ export default function App() {
       if (bizEmail && loggedEmail === bizEmail) {
         return { valid: true };
       }
-      const stCheckRes = runSql(`SELECT * FROM staff`, 'Session check: Verify staff status');
+      const staffBizFilter = bizCandidate?.id ? ` WHERE business_id = '${sqlEsc(bizCandidate.id)}'` : '';
+      const stCheckRes = runSql(`SELECT * FROM staff${staffBizFilter}`, 'Session check: Verify staff status');
       const stRows = (stCheckRes.success && Array.isArray(stCheckRes.data)) ? stCheckRes.data : [];
       const matchedStaffRow = stRows.find(
         (u: any) =>
@@ -472,8 +477,11 @@ export default function App() {
     const bizRows = (bResult.success && Array.isArray(bResult.data)) ? bResult.data : [];
     setBusinesses(bizRows);
 
-    // Also load staff members for Admin Setup view
-    const staffRes = runSql(`SELECT * FROM staff ORDER BY id ASC`, 'App: Query staff accounts');
+    // Scope staff members strictly to active business
+    const targetBizId = getActiveBusinessId(activeBusiness?.id);
+    const staffRes = targetBizId
+      ? runSql(`SELECT * FROM staff WHERE business_id = '${sqlEsc(targetBizId)}' ORDER BY id ASC`, 'App: Query staff accounts')
+      : { success: true, data: [] };
     if (staffRes.success && Array.isArray(staffRes.data)) {
       setStaffMembers(staffRes.data);
     } else {
@@ -564,8 +572,16 @@ export default function App() {
           setLastHeaderSyncMsg('Sync Retry');
         }
       } else {
-        const pullRes = await pullDatabaseFromServer();
-        let restored = pullRes.success && pullRes.found;
+        const sessionEmail = (
+          localStorage.getItem('logged_in_user_email') ||
+          auth.currentUser?.email ||
+          ''
+        ).trim().toLowerCase();
+        let restored = false;
+        if (sessionEmail) {
+          const pullRes = await pullDatabaseFromServer(undefined, sessionEmail);
+          restored = pullRes.success && pullRes.found;
+        }
         if (!restored && auth.currentUser) {
           try {
             const fbPull = await restoreFromCloud();
@@ -622,7 +638,7 @@ export default function App() {
     runSql(`
       INSERT INTO businesses (
         id, name, owner, email, password, billing_address, billing_city, billing_country,
-        billing_phone, billing_email, tpin, currency, tax_rate, admin_role, created_at
+        billing_phone, billing_email, tpin, currency, tax_rate, admin_role, created_at, business_id, store_id
       ) VALUES (
         '${bizId}',
         '${newBizName.trim().replace(/'/g, "''")}',
@@ -638,39 +654,45 @@ export default function App() {
         '${resolvedCurrency.replace(/'/g, "''")}',
         ${resolvedTaxRate},
         'admin',
-        '${nowStr}'
+        '${nowStr}',
+        '${bizId}',
+        '${storeId || 'main'}'
       )
     `, `Registration: Create blank enterprise account [${newBizName}] with Admin privileges`);
+
+    // Provision isolated chart of accounts for this business
+    seedChartOfAccountsOnly(bizId);
 
     // 3. Provision primary store outlet ONLY if the admin specified a branch name during setup (no pre-seeded branch)
     if (hasInitialStore && storeId) {
       runSql(`
-        INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount) VALUES (
+        INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
           '${storeId}',
           '${bizId}',
           '${rawStoreName.replace(/'/g, "''")}',
           '${rawLocation.replace(/'/g, "''")}',
           '${newBizBillingPhone.trim().replace(/'/g, "''")}',
           '${(newBizBillingEmail.trim() || newBizEmail.trim()).replace(/'/g, "''")}',
-          1, 1, 1, 0
+          1, 1, 1, 0, '${storeId}'
         )
       `, `Registration: Provision initial store outlet [${rawStoreName}]`);
     }
 
     // 4. Automatically register the first account as the Admin user in the STAFF table
-    const existingStaffRes = runSql(`SELECT * FROM staff WHERE email = '${newBizEmail.trim().replace(/'/g, "''")}'`, 'Registration: Check admin staff entry');
+    const existingStaffRes = runSql(`SELECT * FROM staff WHERE email = '${newBizEmail.trim().replace(/'/g, "''")}' AND business_id = '${bizId}'`, 'Registration: Check admin staff entry');
     if (!existingStaffRes.data || existingStaffRes.data.length === 0) {
       const nextStaffId = Date.now() % 1000000;
       runSql(`
-        INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id) VALUES (
-          ${nextStaffId},
+        INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id, business_id) VALUES (
+          '${nextStaffId}',
           '${newBizOwner.trim().replace(/'/g, "''")}',
           'owner',
           0,
           '0000',
           '${newBizEmail.trim().replace(/'/g, "''")}',
           '${newBizPassword.replace(/'/g, "''")}',
-          '${storeId}'
+          '${storeId}',
+          '${bizId}'
         )
       `, `Registration: Provision first account [${newBizOwner.trim()}] as Admin (owner)`);
     }
@@ -969,10 +991,16 @@ export default function App() {
   const handleLogoutAccount = () => {
     localStorage.removeItem('pos_authenticated_session');
     localStorage.removeItem('active_business_profile');
+    localStorage.removeItem('active_store_branch');
     localStorage.removeItem('pos_shift_active');
     localStorage.removeItem('logged_in_accessible_branches');
     localStorage.removeItem('logged_in_user_role');
     clearSessionPermissionsFromStorage();
+    setActiveBusiness({ id: '', name: '', owner: '', email: '' });
+    setActiveStore('');
+    setStores([]);
+    setCustomersList([]);
+    setStaffMembers([]);
     setUserRole('owner');
     setAuthenticatedRole('owner');
     setUserPermissions(buildUserPermissions({ role: 'owner' }));
@@ -982,11 +1010,34 @@ export default function App() {
     setAuthScreenMode('login');
   };
 
-  // Switch workspace immediately
+  // Switch workspace immediately and isolate branch/tenant data
   const handleSelectBusinessWorkspace = (biz: any) => {
     setActiveBusiness(biz);
     localStorage.setItem('active_business_profile', JSON.stringify(biz));
+    const bizBranches = getCentralBranches(biz?.id);
+    const nextBranch = bizBranches.length > 0 ? String(bizBranches[0].id) : '';
+    setStores(bizBranches);
+    setActiveStore(nextBranch);
+    if (nextBranch) {
+      localStorage.setItem('active_store_branch', nextBranch);
+    } else {
+      localStorage.removeItem('active_store_branch');
+    }
+    if (biz?.name) {
+      setSettings(prev => {
+        const next = {
+          ...prev,
+          storeName: biz.name,
+          currency: biz.currency || prev.currency,
+          taxRate: biz.tax_rate !== undefined ? Number(biz.tax_rate) : prev.taxRate,
+          tpin: biz.tpin || prev.tpin,
+        };
+        localStorage.setItem('android_pos_settings', JSON.stringify(next));
+        return next;
+      });
+    }
     setSqlSeedTrigger(prev => prev + 1);
+    window.dispatchEvent(new Event('pos_data_updated'));
   };
 
   // Compute branches accessible to the currently logged-in account
@@ -2515,8 +2566,10 @@ export default function App() {
                 const matchedAcc = allAccounts.find(a => a.accountId === expenseAccountId);
                 const chosenMethodLabel = matchedAcc?.label || 'Cash';
 
+                const activeBizId = getActiveBusinessId(activeBusiness?.id);
+                const resolvedTargetBranch = getActiveStoreId(targetBranch, activeBizId);
                 runSql(`
-                  INSERT INTO expenses (id, category, payment_method, account_id, amount, description, ref_number, expense_date, store_id, performed_by, created_by, created_at)
+                  INSERT INTO expenses (id, category, payment_method, account_id, amount, description, ref_number, expense_date, store_id, performed_by, created_by, created_at, business_id)
                   VALUES (
                     '${expId}',
                     '${expenseCategory.replace(/'/g, "''")}',
@@ -2526,23 +2579,26 @@ export default function App() {
                     '${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
                     '${expId}',
                     '${nowIso.split('T')[0]}',
-                    '${targetBranch.replace(/'/g, "''")}',
+                    '${sqlEsc(resolvedTargetBranch)}',
                     '${(localStorage.getItem('logged_in_user_name') || userRole).replace(/'/g, "''")}',
                     '${userRole}',
-                    '${nowIso}'
+                    '${nowIso}',
+                    '${sqlEsc(activeBizId)}'
                   )
                 `, 'Record branch operating expense');
 
                 runSql(`
-                  INSERT INTO double_entry_journal (id, date, reference, description, account_debit, account_credit, amount, currency) VALUES (
+                  INSERT INTO double_entry_journal (id, date, reference, description, account_debit, account_credit, amount, currency, business_id, store_id) VALUES (
                     'exp_${Date.now()}',
                     '${nowIso}',
                     '${expId}',
-                    '[Branch: ${targetBranch}] ${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
+                    '[Branch: ${sqlEsc(resolvedTargetBranch)}] ${(expenseNotes || 'Store Expense').replace(/'/g, "''")}',
                     'Operating Expenses',
                     '${chosenMethodLabel.replace(/'/g, "''")}',
                     ${amt},
-                    '${settings.currency}'
+                    '${settings.currency}',
+                    '${sqlEsc(activeBizId)}',
+                    '${sqlEsc(resolvedTargetBranch)}'
                   )
                 `, 'Record expense journal entry');
 

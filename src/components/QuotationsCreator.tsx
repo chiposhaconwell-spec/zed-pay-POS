@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { runSql, persistTablesToStorage, getCentralBranches } from '../db';
+import { runSql, persistTablesToStorage, getCentralBranches, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
 import SignaturePad from './SignaturePad';
@@ -297,19 +297,21 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   };
 
   const loadQuotations = () => {
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
     const currentBranch = resolveActiveBranch();
     setBranchInfo(currentBranch);
     const fallbackBilling = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
     setCompanyAddress(currentBranch.location || fallbackBilling || '');
 
-    const res = runSql('SELECT * FROM quotations ORDER BY created_at DESC', 'Quotations: Fetch active invoices');
+    const res = runSql(`SELECT * FROM quotations WHERE ${bizCond} ORDER BY created_at DESC`, 'Quotations: Fetch active invoices');
     if (res.success && Array.isArray(res.data)) {
       setQuotations(res.data);
     }
 
-    const spRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Quotations: Fetch branch stock', true);
+    const spRes = runSql(`SELECT product_id, store_id, stock, price FROM store_products WHERE ${bizCond}`, 'Quotations: Fetch branch stock', true);
     const spRows = (spRes.success && Array.isArray(spRes.data)) ? spRes.data : [];
-    const prodRes = runSql('SELECT * FROM products', 'Quotations: Fetch catalog reference');
+    const prodRes = runSql(`SELECT * FROM products WHERE ${bizCond}`, 'Quotations: Fetch catalog reference');
     if (prodRes.success && Array.isArray(prodRes.data)) {
       const enriched = prodRes.data.map((p: any) => {
         if (!activeStore) return p;
@@ -323,13 +325,13 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       setAllProducts(enriched);
     }
 
-    const custRes = runSql('SELECT id, name, phone, email FROM customers ORDER BY name ASC', 'Quotations: Fetch customers', true);
+    const custRes = runSql(`SELECT id, name, phone, email FROM customers WHERE ${bizCond} ORDER BY name ASC`, 'Quotations: Fetch customers', true);
     if (custRes.success && Array.isArray(custRes.data)) {
       setExistingCustomers(custRes.data);
     }
 
     if (selectedQuote) {
-      const qRes = runSql(`SELECT * FROM quotations WHERE id = '${selectedQuote.id}'`, 'Quotations: Fetch active');
+      const qRes = runSql(`SELECT * FROM quotations WHERE id = '${sqlEsc(selectedQuote.id)}' AND ${bizCond}`, 'Quotations: Fetch active');
       if (qRes.success && Array.isArray(qRes.data) && qRes.data.length > 0) {
         setSelectedQuote(qRes.data[0]);
       }
@@ -657,8 +659,12 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
     const escapedBankAccountNumber = (bankAccountNumber || '').trim().replace(/'/g, "''");
     const escapedBankBranchName = (bankBranchName || '').trim().replace(/'/g, "''");
 
+    const activeBizId = getActiveBusinessId();
+    const activeStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
     const qry = `
-      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json)
+      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json, business_id, store_id)
       VALUES (
         '${qId}',
         '${escapedCName}',
@@ -675,7 +681,9 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         '${draftDocType}',
         '${dateStr}',
         '${nowIso}',
-        '${extraJson.replace(/'/g, "''")}'
+        '${extraJson.replace(/'/g, "''")}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(activeStoreId)}'
       )
     `;
     const res = runSql(qry, `Docs: File new ${draftDocType} document ${qId}`);
@@ -693,7 +701,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       setDraftDate(toDateInputValue());
       setActiveFormTab('client_bank');
 
-      const qRes = runSql(`SELECT * FROM quotations WHERE id = '${qId}'`, 'Quotations: Retrieve just created doc');
+      const qRes = runSql(`SELECT * FROM quotations WHERE id = '${qId}'${bizMatch}`, 'Quotations: Retrieve just created doc');
       if (qRes.success && Array.isArray(qRes.data) && qRes.data.length > 0) {
         setSelectedQuote(qRes.data[0]);
         setEditItems(parseQuoteItems(qRes.data[0].items_json));
@@ -714,7 +722,10 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
 
   // Non-destructive Conversion: Keeps Quotation record intact and creates a linked Invoice record
   const handleConvertToInvoice = (quoteId: string) => {
-    const srcRes = runSql(`SELECT * FROM quotations WHERE id = '${quoteId}'`, `Docs: Load Quotation ${quoteId} for Invoice`);
+    const activeBizId = getActiveBusinessId();
+    const activeStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const srcRes = runSql(`SELECT * FROM quotations WHERE id = '${sqlEsc(quoteId)}'${bizMatch}`, `Docs: Load Quotation ${quoteId} for Invoice`);
     const src: Quotation | null = (srcRes.success && Array.isArray(srcRes.data) && srcRes.data[0]) ? srcRes.data[0] : selectedQuote;
     if (!src) return;
 
@@ -734,7 +745,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
     const updatedSrcExtraJson = persistQuoteExtra(quoteId, updatedSrcExtra);
 
     const insertInvSql = `
-      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json)
+      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json, business_id, store_id)
       VALUES (
         '${invId}',
         '${String(src.customer_name || '').replace(/'/g, "''")}',
@@ -751,17 +762,19 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         'INVOICE',
         '${nowIso}',
         '${nowIso}',
-        '${invExtraJson.replace(/'/g, "''")}'
+        '${invExtraJson.replace(/'/g, "''")}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(activeStoreId)}'
       )
     `;
     const res = runSql(insertInvSql, `Docs: Issue Invoice ${invId} from Quotation ${quoteId}`);
     if (res.success) {
       runSql(
-        `UPDATE quotations SET extra_json = '${updatedSrcExtraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${quoteId}'`,
+        `UPDATE quotations SET extra_json = '${updatedSrcExtraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${sqlEsc(quoteId)}'${bizMatch}`,
         `Docs: Link Quotation ${quoteId} -> ${invId}`,
         true
       );
-      const invRes = runSql(`SELECT * FROM quotations WHERE id = '${invId}'`, 'Docs: Select new Invoice');
+      const invRes = runSql(`SELECT * FROM quotations WHERE id = '${invId}'${bizMatch}`, 'Docs: Select new Invoice');
       if (invRes.success && Array.isArray(invRes.data) && invRes.data[0]) {
         setSelectedQuote(invRes.data[0]);
         setEditItems(parseQuoteItems(invRes.data[0].items_json));
@@ -778,7 +791,10 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
 
   // Non-destructive Conversion: Keeps Invoice record intact and creates a linked Delivery Note record
   const handleConvertToDeliveryNote = (invoiceId: string) => {
-    const srcRes = runSql(`SELECT * FROM quotations WHERE id = '${invoiceId}'`, `Docs: Load Invoice ${invoiceId} for Delivery Note`);
+    const activeBizId = getActiveBusinessId();
+    const activeStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const srcRes = runSql(`SELECT * FROM quotations WHERE id = '${sqlEsc(invoiceId)}'${bizMatch}`, `Docs: Load Invoice ${invoiceId} for Delivery Note`);
     const src: Quotation | null = (srcRes.success && Array.isArray(srcRes.data) && srcRes.data[0]) ? srcRes.data[0] : selectedQuote;
     if (!src) return;
 
@@ -801,7 +817,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
     const updatedSrcExtraJson = persistQuoteExtra(invoiceId, updatedSrcExtra);
 
     const insertDnSql = `
-      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json)
+      INSERT INTO quotations (id, customer_name, customer_phone, customer_email, items_json, subtotal, tax, discount, total, bank_name, bank_account, bank_branch, status, created_at, updated_at, extra_json, business_id, store_id)
       VALUES (
         '${dnId}',
         '${String(src.customer_name || '').replace(/'/g, "''")}',
@@ -818,17 +834,19 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         'DELIVERY_NOTE',
         '${nowIso}',
         '${nowIso}',
-        '${dnExtraJson.replace(/'/g, "''")}'
+        '${dnExtraJson.replace(/'/g, "''")}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(activeStoreId)}'
       )
     `;
     const res = runSql(insertDnSql, `Docs: Issue Delivery Note ${dnId} from ${invoiceId}`);
     if (res.success) {
       runSql(
-        `UPDATE quotations SET extra_json = '${updatedSrcExtraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${invoiceId}'`,
+        `UPDATE quotations SET extra_json = '${updatedSrcExtraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${sqlEsc(invoiceId)}'${bizMatch}`,
         `Docs: Link Invoice ${invoiceId} -> ${dnId}`,
         true
       );
-      const dnRes = runSql(`SELECT * FROM quotations WHERE id = '${dnId}'`, 'Docs: Select new Delivery Note');
+      const dnRes = runSql(`SELECT * FROM quotations WHERE id = '${dnId}'${bizMatch}`, 'Docs: Select new Delivery Note');
       if (dnRes.success && Array.isArray(dnRes.data) && dnRes.data[0]) {
         setSelectedQuote(dnRes.data[0]);
         setEditItems(parseQuoteItems(dnRes.data[0].items_json));
@@ -879,6 +897,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
     const nextCreatedAt = applyDateInputToIso(deliveryDateInput, selectedQuote.created_at);
     const nowIso = new Date().toISOString();
 
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const itemsJson = JSON.stringify(editItems);
     const qry = `
       UPDATE quotations 
@@ -889,7 +909,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         total = ${tot.toFixed(2)},
         created_at = '${nextCreatedAt}',
         updated_at = '${nowIso}'
-      WHERE id = '${selectedQuote.id}'
+      WHERE id = '${sqlEsc(selectedQuote.id)}'${bizMatch}
     `;
     const res = runSql(qry, `Docs: Update quantities/prices/date on Delivery Note ${selectedQuote.id}`);
     if (res.success) {
@@ -918,9 +938,11 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       receiverSignature: deliveryReceiverSig,
       acceptedAt: nowIso
     };
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const extraJson = persistQuoteExtra(selectedQuote.id, updatedExtra);
     runSql(
-      `UPDATE quotations SET extra_json = '${extraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${selectedQuote.id}'`,
+      `UPDATE quotations SET extra_json = '${extraJson.replace(/'/g, "''")}', updated_at = '${nowIso}' WHERE id = '${sqlEsc(selectedQuote.id)}'${bizMatch}`,
       `Docs: Save receiver signature on ${selectedQuote.id}`,
       true
     );
@@ -1032,6 +1054,8 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
       issuedBy: editIssuedBy.trim() || existingExtra.issuedBy || issuerName,
       issuerSignature: editIssuerSignature || existingExtra.issuerSignature || ''
     };
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const extraJson = persistQuoteExtra(selectedQuote.id, extra);
 
     const qry = `
@@ -1051,7 +1075,7 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
         created_at = '${nextCreatedAt}',
         updated_at = '${nowIso}',
         extra_json = '${extraJson.replace(/'/g, "''")}'
-      WHERE id = '${selectedQuote.id}'
+      WHERE id = '${sqlEsc(selectedQuote.id)}'${bizMatch}
     `;
 
     const res = runSql(qry, `Docs: Update ${selectedQuote.status} ${selectedQuote.id}`);
@@ -1068,7 +1092,9 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
   };
 
   const handleDeleteDocument = (docId: string) => {
-    const res = runSql(`DELETE FROM quotations WHERE id = '${docId}'`, `Docs: Delete document ${docId}`);
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const res = runSql(`DELETE FROM quotations WHERE id = '${sqlEsc(docId)}'${bizMatch}`, `Docs: Delete document ${docId}`);
     if (res.success) {
       setFormNotice({ type: 'success', text: `Document ${docId} deleted.` });
       setSelectedQuote(null);
@@ -1972,16 +1998,14 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                             const costVal = priceVal * 0.7;
                             const pId = Math.floor(100000 + Math.random() * 900000);
                             const skuVal = `QT-${pId}`;
-                            let bizId = '';
-                            try {
-                              bizId = JSON.parse(localStorage.getItem('active_business_profile') || '{}')?.id || '';
-                            } catch {}
+                            const bizId = getActiveBusinessId();
+                            const targetStoreId = getActiveStoreId(activeStore, bizId);
                             const safeName = newCatalogName.trim().replace(/'/g, "''");
                             const cleanDesc = newCatalogDescription.trim();
                             const safeDesc = cleanDesc.replace(/'/g, "''");
 
                             const qryInsert = `
-                              INSERT INTO products (id, name, description, sku, category, stock, cost, price, business_id, is_service)
+                              INSERT INTO products (id, name, description, sku, category, stock, cost, price, business_id, store_id, is_service)
                               VALUES (
                                 ${pId},
                                 '${safeName}',
@@ -1991,14 +2015,15 @@ export default function QuotationsCreator({ settings, activeStore = '' }: Quotat
                                 ${stockCount},
                                 ${costVal.toFixed(2)},
                                 ${priceVal.toFixed(2)},
-                                '${bizId.replace(/'/g, "''")}',
+                                '${sqlEsc(bizId)}',
+                                '${sqlEsc(targetStoreId)}',
                                 0
                               )
                             `;
                             const r = runSql(qryInsert, `Stock Inventory quick registration: ${newCatalogName}`);
                             if (r.success) {
-                              if (activeStore) {
-                                runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price) VALUES ('sp_${pId}_${activeStore}', ${pId}, '${activeStore.replace(/'/g, "''")}', ${stockCount}, ${priceVal.toFixed(2)})`, 'Register branch stock map', true);
+                              if (targetStoreId) {
+                                runSql(`INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES ('sp_${pId}_${sqlEsc(targetStoreId)}', ${pId}, '${sqlEsc(targetStoreId)}', ${stockCount}, ${priceVal.toFixed(2)}, '${sqlEsc(bizId)}')`, 'Register branch stock map', true);
                               }
                               if (selectedQuote) setSelectedQuote(null);
                               setCartItems([

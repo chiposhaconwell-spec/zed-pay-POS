@@ -41,9 +41,12 @@ service cloud.firestore {
     // 3. Entity Validation Blueprints (Anti-Update-Gap)
 
     function isValidBusiness(data) {
-      return data.keys().hasAll(['id', 'name', 'owner', 'email', 'ownerUid', 'createdAt', 'updatedAt']) &&
-             data.keys().hasOnly(['id', 'name', 'owner', 'email', 'ownerUid', 'createdAt', 'updatedAt']) &&
-             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+      return data.keys().hasAll(['id', 'business_id', 'store_id', 'name', 'owner', 'email', 'ownerUid', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'business_id', 'store_id', 'name', 'owner', 'email', 'ownerUid', 'createdAt', 'updatedAt']) &&
+             isValidId(data.id) &&
+             isValidId(data.business_id) &&
+             isValidId(data.store_id) &&
+             data.business_id == data.id &&
              data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
              data.owner is string && data.owner.size() >= 1 && data.owner.size() <= 200 &&
              data.email is string && data.email.size() >= 1 && data.email.size() <= 200 &&
@@ -54,10 +57,12 @@ service cloud.firestore {
     }
 
     function isValidStore(data) {
-      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
-             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
-             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+      return data.keys().hasAll(['id', 'business_id', 'store_id', 'ownerUid', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+             data.keys().hasOnly(['id', 'business_id', 'store_id', 'ownerUid', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+             isValidId(data.id) &&
+             isValidId(data.business_id) &&
+             isValidId(data.store_id) &&
+             data.store_id == data.id &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
@@ -69,10 +74,11 @@ service cloud.firestore {
     }
 
     function isValidProduct(data) {
-      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl']) &&
-             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'description', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
+      return data.keys().hasAll(['id', 'business_id', 'store_id', 'ownerUid', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl']) &&
+             data.keys().hasOnly(['id', 'business_id', 'store_id', 'ownerUid', 'name', 'description', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
              data.id is int &&
-             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             isValidId(data.business_id) &&
+             isValidId(data.store_id) &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              data.name is string && data.name.size() >= 1 && data.name.size() <= 250 &&
@@ -89,10 +95,11 @@ service cloud.firestore {
     }
 
     function isValidCustomer(data) {
-      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
-             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
+      return data.keys().hasAll(['id', 'business_id', 'store_id', 'ownerUid', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
+             data.keys().hasOnly(['id', 'business_id', 'store_id', 'ownerUid', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
              data.id is int &&
-             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             isValidId(data.business_id) &&
+             isValidId(data.store_id) &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
@@ -107,8 +114,8 @@ service cloud.firestore {
     function isValidOrder(data) {
       return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'customerId', 'orderDate', 'subtotal', 'tax', 'discount', 'total', 'paymentMethod', 'status', 'store_id', 'performed_by']) &&
              data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'customerId', 'orderDate', 'subtotal', 'tax', 'discount', 'total', 'paymentMethod', 'status', 'store_id', 'performed_by']) &&
-             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+             isValidId(data.id) &&
+             isValidId(data.business_id) &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              (data.customerId is int || data.customerId == null) &&
@@ -119,15 +126,16 @@ service cloud.firestore {
              data.total is number && data.total >= 0.0 &&
              data.paymentMethod is string && data.paymentMethod.size() >= 1 && data.paymentMethod.size() <= 50 &&
              data.status is string && data.status.size() >= 1 && data.status.size() <= 50 &&
-             data.store_id is string && data.store_id.size() >= 1 && data.store_id.size() <= 128 &&
+             isValidId(data.store_id) &&
              data.performed_by is string && data.performed_by.size() >= 1 && data.performed_by.size() <= 100;
     }
 
     function isValidOrderItem(data) {
-      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'orderId', 'productId', 'quantity', 'unitPrice']) &&
-             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'orderId', 'productId', 'quantity', 'unitPrice']) &&
-             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+      return data.keys().hasAll(['id', 'business_id', 'store_id', 'ownerUid', 'orderId', 'productId', 'quantity', 'unitPrice']) &&
+             data.keys().hasOnly(['id', 'business_id', 'store_id', 'ownerUid', 'orderId', 'productId', 'quantity', 'unitPrice']) &&
+             isValidId(data.id) &&
+             isValidId(data.business_id) &&
+             isValidId(data.store_id) &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 128 &&
@@ -137,10 +145,11 @@ service cloud.firestore {
     }
 
     function isValidLedgerBackup(data) {
-      return data.keys().hasAll(['id', 'business_id', 'ownerUid', 'ledger_type', 'record_count', 'records', 'updatedAt']) &&
-             data.keys().hasOnly(['id', 'business_id', 'ownerUid', 'ledger_type', 'record_count', 'records', 'updatedAt']) &&
-             data.id is string && data.id.size() >= 1 && data.id.size() <= 128 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
-             data.business_id is string && data.business_id.size() >= 1 && data.business_id.size() <= 128 &&
+      return data.keys().hasAll(['id', 'business_id', 'store_id', 'ownerUid', 'ledger_type', 'record_count', 'records', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'business_id', 'store_id', 'ownerUid', 'ledger_type', 'record_count', 'records', 'updatedAt']) &&
+             isValidId(data.id) &&
+             isValidId(data.business_id) &&
+             isValidId(data.store_id) &&
              data.ownerUid is string && data.ownerUid.size() >= 1 && data.ownerUid.size() <= 128 &&
              data.ownerUid == request.auth.uid &&
              data.ledger_type is string && data.ledger_type.size() >= 1 && data.ledger_type.size() <= 100 &&
@@ -159,6 +168,7 @@ service cloud.firestore {
                        isValidId(businessId) &&
                        isValidBusiness(incoming()) &&
                        incoming().id == businessId &&
+                       incoming().business_id == businessId &&
                        incoming().createdAt == request.time &&
                        incoming().updatedAt == request.time;
       allow update: if isSignedIn() &&
@@ -166,21 +176,23 @@ service cloud.firestore {
                        isValidBusiness(incoming()) &&
                        (existing().ownerUid == request.auth.uid || isAdmin()) &&
                        incoming().id == existing().id &&
+                       incoming().business_id == businessId &&
                        incoming().ownerUid == existing().ownerUid &&
                        incoming().createdAt == existing().createdAt &&
                        incoming().updatedAt == request.time &&
-                       incoming().diff(existing()).affectedKeys().hasOnly(['name', 'owner', 'email', 'updatedAt']);
+                       incoming().diff(existing()).affectedKeys().hasOnly(['business_id', 'store_id', 'name', 'owner', 'email', 'updatedAt']);
       allow delete: if false;
 
       // Subcollection: Store Branches
       match /stores/{storeId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(storeId) && isBusinessOwner(businessId);
-        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow list: if isSignedIn() && ((existing().ownerUid == request.auth.uid && existing().business_id == businessId) || isAdmin());
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(storeId) &&
                          isValidStore(incoming()) &&
                          incoming().id == storeId &&
+                         incoming().store_id == storeId &&
                          incoming().business_id == businessId &&
                          isBusinessOwner(businessId);
         allow update: if isSignedIn() &&
@@ -188,9 +200,10 @@ service cloud.firestore {
                          isValidId(storeId) &&
                          isValidStore(incoming()) &&
                          incoming().id == existing().id &&
+                         incoming().store_id == storeId &&
                          incoming().business_id == existing().business_id &&
                          incoming().ownerUid == existing().ownerUid &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['store_id', 'name', 'location', 'allow_discounts', 'allow_refunds', 'allow_laybys', 'require_manager_discount']) &&
                          isBusinessOwner(businessId);
         allow delete: if isSignedIn() && isValidId(businessId) && isValidId(storeId) && isBusinessOwner(businessId);
       }
@@ -198,7 +211,7 @@ service cloud.firestore {
       // Subcollection: Product Catalog & Batches
       match /products/{productId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(productId) && isBusinessOwner(businessId);
-        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow list: if isSignedIn() && ((existing().ownerUid == request.auth.uid && existing().business_id == businessId) || isAdmin());
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(productId) &&
@@ -212,7 +225,7 @@ service cloud.firestore {
                          incoming().id == existing().id &&
                          incoming().business_id == existing().business_id &&
                          incoming().ownerUid == existing().ownerUid &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['store_id', 'name', 'description', 'sku', 'category', 'price', 'cost', 'stock', 'imageUrl', 'is_service', 'batch_number', 'expiry_date']) &&
                          isBusinessOwner(businessId);
         allow delete: if isSignedIn() && isValidId(businessId) && isValidId(productId) && isBusinessOwner(businessId);
       }
@@ -220,7 +233,7 @@ service cloud.firestore {
       // Subcollection: Client CRM Data
       match /customers/{customerId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(customerId) && isBusinessOwner(businessId);
-        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow list: if isSignedIn() && ((existing().ownerUid == request.auth.uid && existing().business_id == businessId) || isAdmin());
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(customerId) &&
@@ -234,7 +247,7 @@ service cloud.firestore {
                          incoming().id == existing().id &&
                          incoming().business_id == existing().business_id &&
                          incoming().ownerUid == existing().ownerUid &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['store_id', 'name', 'phone', 'email', 'loyalPoints', 'tpin', 'zra_connected', 'tax_band']) &&
                          isBusinessOwner(businessId);
         allow delete: if isSignedIn() && isValidId(businessId) && isValidId(customerId) && isBusinessOwner(businessId);
       }
@@ -242,7 +255,7 @@ service cloud.firestore {
       // Subcollection: POS Sales & Refund Orders (Transactions)
       match /orders/{orderId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(orderId) && isBusinessOwner(businessId);
-        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow list: if isSignedIn() && ((existing().ownerUid == request.auth.uid && existing().business_id == businessId) || isAdmin());
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(orderId) &&
@@ -267,7 +280,7 @@ service cloud.firestore {
       // Subcollection: Order Line Items (Relational link between Orders and Products)
       match /order_items/{itemId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(itemId) && isBusinessOwner(businessId);
-        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow list: if isSignedIn() && ((existing().ownerUid == request.auth.uid && existing().business_id == businessId) || isAdmin());
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(itemId) &&
@@ -284,7 +297,7 @@ service cloud.firestore {
                          incoming().ownerUid == existing().ownerUid &&
                          incoming().orderId == existing().orderId &&
                          incoming().productId == existing().productId &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['quantity', 'unitPrice']) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['store_id', 'quantity', 'unitPrice']) &&
                          isBusinessOwner(businessId);
         allow delete: if isSignedIn() && isValidId(businessId) && isValidId(itemId) && isBusinessOwner(businessId);
       }
@@ -292,7 +305,7 @@ service cloud.firestore {
       // Subcollection: Double-Entry Accounting & Client Relational Ledger Backups
       match /ledgers/{ledgerId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(ledgerId) && isBusinessOwner(businessId);
-        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
+        allow list: if isSignedIn() && ((existing().ownerUid == request.auth.uid && existing().business_id == businessId) || isAdmin());
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(ledgerId) &&
@@ -310,7 +323,7 @@ service cloud.firestore {
                          incoming().ownerUid == existing().ownerUid &&
                          incoming().ledger_type == existing().ledger_type &&
                          incoming().updatedAt == request.time &&
-                         incoming().diff(existing()).affectedKeys().hasOnly(['record_count', 'records', 'updatedAt']) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly(['store_id', 'record_count', 'records', 'updatedAt']) &&
                          isBusinessOwner(businessId);
         allow delete: if isSignedIn() && isValidId(businessId) && isValidId(ledgerId) && isBusinessOwner(businessId);
       }

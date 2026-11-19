@@ -6,7 +6,7 @@ import {
   Archive
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { runSql, syncAllAccountingSystems, persistTablesToStorage, getCustomPaymentMethods, resolvePaymentMethodBucket } from '../db';
+import { runSql, syncAllAccountingSystems, persistTablesToStorage, getCustomPaymentMethods, resolvePaymentMethodBucket, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { CustomPaymentMethod } from '../types';
 import { auth, googleSignIn, googleSignOut, getAccessToken } from '../firebase';
 import { User as FirebaseUser } from 'firebase/auth';
@@ -179,13 +179,17 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
 
   const fetchStaffFromDb = () => {
     try {
-      const res = runSql("SELECT id, first_name, surname, email FROM staff", "Fetch staff list for task coordinator");
+      const activeBizId = getActiveBusinessId();
+      const bizWhere = activeBizId ? `WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+      const bizAnd = activeBizId ? `AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
+      const res = runSql(`SELECT id, first_name, surname, email FROM staff ${bizWhere}`, "Fetch staff list for task coordinator");
       if (res.success && Array.isArray(res.data)) {
         setStaffList(res.data as StaffMember[]);
       }
 
       // Fetch corporate services (is_service = 1)
-      const serviceRes = runSql("SELECT id, name, price, cost FROM products WHERE is_service = 1", "Fetch services for financial recording");
+      const serviceRes = runSql(`SELECT id, name, price, cost FROM products WHERE is_service = 1 ${bizAnd}`, "Fetch services for financial recording");
       if (serviceRes.success && Array.isArray(serviceRes.data)) {
         setFinancialsServices(serviceRes.data);
         if (serviceRes.data.length > 0) {
@@ -194,7 +198,7 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
       }
 
       // Fetch customers
-      const custRes = runSql("SELECT id, name FROM customers", "Fetch customers for task financials");
+      const custRes = runSql(`SELECT id, name FROM customers ${bizWhere}`, "Fetch customers for task financials");
       if (custRes.success && Array.isArray(custRes.data)) {
         setCustomerList(custRes.data);
       }
@@ -455,9 +459,12 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
     const discountAmount = 0;
     const totalAmount = subtotal + taxAmount;
 
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
+
     // 1. Post order record
     const orderInsertSql = `
-      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by) VALUES (
+      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
         '${orderId}', 
         ${customerIdVal}, 
         '${dateStr}', 
@@ -465,10 +472,11 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
         ${taxAmount.toFixed(2)}, 
         ${discountAmount.toFixed(2)}, 
         ${totalAmount.toFixed(2)}, 
-        '${paymentMethod}', 
+        '${sqlEsc(paymentMethod)}', 
         'Completed',
-        '${activeStore}',
-        '${(localStorage.getItem('logged_in_user_name') || 'Task Operator').replace(/'/g, "''")}'
+        '${sqlEsc(resolvedStoreId)}',
+        '${(localStorage.getItem('logged_in_user_name') || 'Task Operator').replace(/'/g, "''")}',
+        '${sqlEsc(activeBizId)}'
       )
     `;
     const resOrder = runSql(orderInsertSql, `Billing: Record completed task financials for task ${selectedTaskForFinancials.title}`);
@@ -480,12 +488,14 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
     // 2. Post order item lines
     const orderItemId = `${orderId}_1`;
     const itemInsertSql = `
-      INSERT INTO order_items VALUES (
+      INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
         '${orderItemId}', 
         '${orderId}', 
         ${serviceObj.id}, 
         1, 
-        ${serviceObj.price}
+        ${serviceObj.price},
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(resolvedStoreId)}'
       )
     `;
     runSql(itemInsertSql, `Billing: Post sales line item for service #${serviceObj.name}`);
@@ -512,24 +522,24 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
     }
 
     runSql(`
-      INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at)
-      VALUES ('${txId}', '${idempotencyKey}', 'POS-${activeStore.toUpperCase()}-01', '${channel}', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'Completed Company Task service Checkout #${orderId}', '${dateStr}', '${dateStr}')
+      INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, business_id, store_id)
+      VALUES ('${txId}', '${idempotencyKey}', 'POS-${sqlEsc(resolvedStoreId.toUpperCase())}-01', '${channel}', 'POS-REF-${orderId}', ${totalAmount.toFixed(4)}, ${feeAmount.toFixed(4)}, 'SUCCESS', 'Completed Company Task service Checkout #${orderId}', '${dateStr}', '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
     `, 'Double Entry: Journal completion of task service');
 
     runSql(`
-      INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-      VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${totalAmount.toFixed(4)}, '${dateStr}')
+      INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+      VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${totalAmount.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
     `, 'Double Entry: Debit Clearing account');
 
     runSql(`
-      INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-      VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}')
+      INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+      VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${netSettlement.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
     `, 'Double Entry: Credit Wallet');
 
     if (feeAmount > 0) {
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cre_fee', '${txId}', 'zra-tax-payment-escrow-uuid', 'CREDIT', ${feeAmount.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cre_fee', '${txId}', 'zra-tax-payment-escrow-uuid', 'CREDIT', ${feeAmount.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(resolvedStoreId)}')
       `, 'Double Entry: Credit Escrow');
     }
 
@@ -910,8 +920,10 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
       contentText += `====================================================\n\n\n`;
 
       if (docCompileTemplate === 'summary') {
-        const prodCountRes = runSql("SELECT COUNT(*) AS c FROM products", "Doc creator: prods count");
-        const orderCountRes = runSql("SELECT COUNT(*) AS c, SUM(total) AS sum FROM orders", "Doc creator: sales count");
+        const activeBizId = getActiveBusinessId();
+        const bizWhere = activeBizId ? `WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
+        const prodCountRes = runSql(`SELECT COUNT(*) AS c FROM products ${bizWhere}`, "Doc creator: prods count");
+        const orderCountRes = runSql(`SELECT COUNT(*) AS c, SUM(total) AS sum FROM orders ${bizWhere}`, "Doc creator: sales count");
         const prods = prodCountRes.success ? prodCountRes.data[0]?.c : 0;
         const totalSales = orderCountRes.success ? orderCountRes.data[0]?.c : 0;
         const totalSum = orderCountRes.success ? (orderCountRes.data[0]?.sum || 0).toFixed(2) : '0.00';

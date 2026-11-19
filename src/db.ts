@@ -29,6 +29,98 @@ function generateLogId(): string {
   return 'log_' + Math.random().toString(36).substr(2, 9);
 }
 
+export function sqlEsc(val: any): string {
+  return String(val ?? '').replace(/'/g, "''");
+}
+
+export function getActiveBusinessId(explicitBusinessId?: string): string {
+  const cleanExplicit = String(explicitBusinessId || '').trim();
+  if (cleanExplicit && cleanExplicit !== 'default_biz') {
+    return cleanExplicit;
+  }
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const saved = localStorage.getItem('active_business_profile');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.id && String(parsed.id).trim() && parsed.id !== 'default_biz') {
+          return String(parsed.id).trim();
+        }
+      }
+    } catch {}
+  }
+  try {
+    const bizData = (alasql as any)?.tables?.businesses?.data as any[] | undefined;
+    if (Array.isArray(bizData) && bizData.length > 0) {
+      const valid = bizData.find((b: any) => b?.id && b.id !== 'default_biz') || bizData[0];
+      if (valid?.id && valid.id !== 'default_biz') return String(valid.id).trim();
+    }
+  } catch {}
+  return '';
+}
+
+export function getActiveStoreId(explicitStoreId?: string, explicitBusinessId?: string): string {
+  const cleanExplicit = String(explicitStoreId || '').trim();
+  if (cleanExplicit) return cleanExplicit;
+  if (typeof localStorage !== 'undefined') {
+    const active = localStorage.getItem('active_store_branch') || localStorage.getItem('pos_active_store');
+    if (active && active.trim() && active.trim().toLowerCase() !== 'all') {
+      return active.trim();
+    }
+  }
+  const bizId = getActiveBusinessId(explicitBusinessId);
+  try {
+    const rawStores = (alasql as any)?.tables?.stores?.data as any[] | undefined;
+    if (Array.isArray(rawStores) && rawStores.length > 0) {
+      const match = bizId ? rawStores.find((s: any) => s?.business_id === bizId && s?.id) : rawStores.find((s: any) => s?.id);
+      if (match?.id) return String(match.id).trim();
+    }
+  } catch {}
+  return 'main';
+}
+
+export function filterRowsByBusiness<T extends Record<string, any>>(rows: T[], explicitBusinessId?: string): T[] {
+  if (!Array.isArray(rows)) return [];
+  const bizId = getActiveBusinessId(explicitBusinessId);
+  if (!bizId) {
+    return rows.filter((r: any) => !r?.business_id || r.business_id !== 'default_biz');
+  }
+  return rows.filter((r: any) => {
+    const rBiz = String(r?.business_id || '').trim();
+    const rId = String(r?.id || '').trim();
+    if (rBiz) return rBiz === bizId;
+    if (rId && rId === bizId) return true;
+    return false;
+  });
+}
+
+function stampTenantColumnsOnTables(tableNames?: string[], explicitBizId?: string, explicitStoreId?: string) {
+  if (!alasql?.tables) return;
+  const bizId = getActiveBusinessId(explicitBizId);
+  const storeId = getActiveStoreId(explicitStoreId, bizId);
+  const targets = tableNames && tableNames.length > 0 ? tableNames : ALL_TABLE_NAMES;
+  for (const tbl of targets) {
+    const tblObj = alasql.tables[tbl] as any;
+    if (!tblObj || !Array.isArray(tblObj.data)) continue;
+    for (const row of tblObj.data) {
+      if (!row || typeof row !== 'object') continue;
+      if (tbl === 'businesses') {
+        if (!row.business_id && row.id) row.business_id = String(row.id);
+        if (!row.store_id) row.store_id = storeId || 'main';
+      } else if (tbl === 'stores') {
+        if (!row.business_id && bizId) row.business_id = bizId;
+        if (!row.store_id && row.id) row.store_id = String(row.id);
+      } else if (tbl === 'accounts') {
+        if (!row.business_id && bizId) row.business_id = bizId;
+        if (!row.store_id) row.store_id = 'all';
+      } else {
+        if (!row.business_id && bizId) row.business_id = bizId;
+        if (!row.store_id && storeId) row.store_id = storeId;
+      }
+    }
+  }
+}
+
 // Custom SQL statement splitter that is single-quote, double-quote, and dollar-quote state aware
 function splitSqlStatements(sql: string): string[] {
   const statements: string[] = [];
@@ -256,6 +348,9 @@ export function runSql(sql: string, description: string = 'General Database Quer
     // Automatically persist tables on state modifications
     const upperSql = sql.toUpperCase();
     if (!isDbInitializing && (upperSql.includes('INSERT') || upperSql.includes('UPDATE') || upperSql.includes('DELETE') || upperSql.includes('CREATE') || upperSql.includes('DROP'))) {
+      if (upperSql.includes('INSERT') || upperSql.includes('UPDATE')) {
+        stampTenantColumnsOnTables();
+      }
       persistTablesToStorage();
     }
     
@@ -294,25 +389,31 @@ export function clearSqlLogs() {
   notifySqlLogsUpdated();
 }
 
-export function triggerLoanSweep(orderId: string, orderTotal: number): { deducted: number; status: string; loanId?: string } {
-  // 1. Fetch any active loans
-  const loansRes = runSql("SELECT * FROM loans WHERE status = 'ACTIVE'", 'Sweep: Query active loan agreement');
+export function triggerLoanSweep(orderId: string, orderTotal: number, explicitBusinessId?: string): { deducted: number; status: string; loanId?: string } {
+  // 1. Fetch any active loans strictly scoped to the current business
+  const activeBizId = getActiveBusinessId(explicitBusinessId);
+  const loanWhere = activeBizId
+    ? `WHERE status = 'ACTIVE' AND business_id = '${sqlEsc(activeBizId)}'`
+    : `WHERE status = 'ACTIVE'`;
+  const loansRes = runSql(`SELECT * FROM loans ${loanWhere}`, 'Sweep: Query active loan agreement');
   if (!loansRes.success || !Array.isArray(loansRes.data) || loansRes.data.length === 0) {
     return { deducted: 0, status: 'NO_ACTIVE_LOANS' };
   }
 
   const activeLoan = loansRes.data[0];
-  
+  const loanBizId = String(activeLoan.business_id || activeBizId || '').trim();
+  const loanStoreId = getActiveStoreId(activeLoan.store_id, loanBizId);
+
   // 2. Query sum of previous successful deductions
-  const deductionsRes = runSql("SELECT SUM(amount_deducted) AS total_paid FROM automated_deduction_logs WHERE loan_id = '" + activeLoan.id + "' AND status = 'SUCCESS'", 'Sweep: Compute repaid capital');
-  const totalPaid = (deductionsRes.success && deductionsRes.data[0] && deductionsRes.data[0].total_paid) 
-    ? Number(deductionsRes.data[0].total_paid) 
+  const deductionsRes = runSql("SELECT SUM(amount_deducted) AS total_paid FROM automated_deduction_logs WHERE loan_id = '" + sqlEsc(activeLoan.id) + "' AND status = 'SUCCESS'", 'Sweep: Compute repaid capital');
+  const totalPaid = (deductionsRes.success && deductionsRes.data[0] && deductionsRes.data[0].total_paid)
+    ? Number(deductionsRes.data[0].total_paid)
     : 0;
 
   const remainingDebt = Number(activeLoan.total_repayable) - totalPaid;
   if (remainingDebt <= 0) {
     // Already fully paid, transition loan to PAID_OFF to prevent redundant sweeps
-    runSql("UPDATE loans SET status = 'PAID_OFF', updated_at = '" + new Date().toISOString() + "' WHERE id = '" + activeLoan.id + "'", 'Sweep: Mark loan paid off');
+    runSql("UPDATE loans SET status = 'PAID_OFF', updated_at = '" + new Date().toISOString() + "' WHERE id = '" + sqlEsc(activeLoan.id) + "'", 'Sweep: Mark loan paid off');
     return { deducted: 0, status: 'LOAN_ALREADY_PAID_OFF' };
   }
 
@@ -324,13 +425,13 @@ export function triggerLoanSweep(orderId: string, orderTotal: number): { deducte
     return { deducted: 0, status: 'ZERO_DEDUCTION_COMPUTED' };
   }
 
-  // 4. Log the deduction
+  // 4. Log the deduction with explicit columns & business_id / store_id
   const deductionId = 'DED-' + Math.floor(100000 + Math.random() * 900000);
-  const insertLogSql = "INSERT INTO automated_deduction_logs VALUES ('" + deductionId + "', '" + activeLoan.id + "', '" + orderId + "', " + actualDeduct.toFixed(2) + ", 'SUCCESS', NULL, '" + new Date().toISOString() + "')";
+  const insertLogSql = `INSERT INTO automated_deduction_logs (id, loan_id, source_transaction_id, amount_deducted, status, failure_reason, created_at, business_id, store_id) VALUES ('${deductionId}', '${sqlEsc(activeLoan.id)}', '${sqlEsc(orderId)}', ${actualDeduct.toFixed(2)}, 'SUCCESS', NULL, '${new Date().toISOString()}', '${sqlEsc(loanBizId)}', '${sqlEsc(loanStoreId)}')`;
   runSql(insertLogSql, "Sweep Trigger: Slice " + activeLoan.daily_deduction_percentage + "% from total " + orderTotal);
 
   // 5. Progressively update amortization schedule milestones
-  const schedRes = runSql("SELECT * FROM loan_amortization_schedule WHERE loan_id = '" + activeLoan.id + "' AND is_settled = 0 ORDER BY installment_number ASC", 'Sweep: Grab active amortization milestones');
+  const schedRes = runSql("SELECT * FROM loan_amortization_schedule WHERE loan_id = '" + sqlEsc(activeLoan.id) + "' AND is_settled = 0 ORDER BY installment_number ASC", 'Sweep: Grab active amortization milestones');
   if (schedRes.success && Array.isArray(schedRes.data) && schedRes.data.length > 0) {
     let unallocatedFunds = actualDeduct;
     for (let i = 0; i < schedRes.data.length; i++) {
@@ -343,13 +444,13 @@ export function triggerLoanSweep(orderId: string, orderTotal: number): { deducte
       if (unallocatedFunds >= milestoneOutstanding) {
         // This milestone is now fully settled
         unallocatedFunds -= milestoneOutstanding;
-        const settleSql = "UPDATE loan_amortization_schedule SET amount_paid = " + milestoneDue.toFixed(2) + ", is_settled = 1, settled_at = '" + new Date().toISOString() + "' WHERE id = '" + milestone.id + "'";
+        const settleSql = "UPDATE loan_amortization_schedule SET amount_paid = " + milestoneDue.toFixed(2) + ", is_settled = 1, settled_at = '" + new Date().toISOString() + "' WHERE id = '" + sqlEsc(milestone.id) + "'";
         runSql(settleSql, "Sweep Allocation: Fully settled milestone #" + milestone.installment_number);
       } else {
         // Partially paid milestone
         const newPaid = milestonePaid + unallocatedFunds;
         unallocatedFunds = 0;
-        const partialSql = "UPDATE loan_amortization_schedule SET amount_paid = " + newPaid.toFixed(2) + " WHERE id = '" + milestone.id + "'";
+        const partialSql = "UPDATE loan_amortization_schedule SET amount_paid = " + newPaid.toFixed(2) + " WHERE id = '" + sqlEsc(milestone.id) + "'";
         runSql(partialSql, "Sweep Allocation: Credited partial amount to milestone #" + milestone.installment_number);
       }
     }
@@ -357,7 +458,7 @@ export function triggerLoanSweep(orderId: string, orderTotal: number): { deducte
 
   // 6. Check if loan is now fully paid off
   if (totalPaid + actualDeduct >= Number(activeLoan.total_repayable)) {
-    runSql("UPDATE loans SET status = 'PAID_OFF', updated_at = '" + new Date().toISOString() + "' WHERE id = '" + activeLoan.id + "'", 'Sweep: Complete auto repayment lifecycle');
+    runSql("UPDATE loans SET status = 'PAID_OFF', updated_at = '" + new Date().toISOString() + "' WHERE id = '" + sqlEsc(activeLoan.id) + "'", 'Sweep: Complete auto repayment lifecycle');
   }
 
   persistTablesToStorage();
@@ -370,15 +471,41 @@ const CLEAN_SLATE_MIGRATION_KEY = 'pos_clean_slate_v5';
 
 let cloudPushTimeout: any = null;
 
-export function extractAllTablesSnapshot(): Record<string, any[]> {
+export function extractAllTablesSnapshot(explicitBusinessId?: string): Record<string, any[]> {
   const allTablesData: Record<string, any[]> = {};
+  const targetBizId =
+    explicitBusinessId && explicitBusinessId !== '__global__' && explicitBusinessId !== 'default_biz'
+      ? explicitBusinessId.trim()
+      : '';
+  const defaultStoreId = getActiveStoreId(undefined, targetBizId);
+
   if (alasql && alasql.tables) {
     for (const tableName of ALL_TABLE_NAMES) {
       if (alasql.tables[tableName]) {
         try {
           const rows = alasql(`SELECT * FROM ${tableName}`) as any[];
           if (Array.isArray(rows)) {
-            allTablesData[tableName] = rows;
+            if (!targetBizId) {
+              allTablesData[tableName] = rows;
+            } else if (tableName === 'businesses') {
+              allTablesData[tableName] = rows
+                .filter((r: any) => String(r?.id || '') === targetBizId || String(r?.business_id || '') === targetBizId)
+                .map((r: any) => ({ ...r, business_id: r.business_id || r.id || targetBizId, store_id: r.store_id || defaultStoreId }));
+            } else if (tableName === 'accounts') {
+              allTablesData[tableName] = rows.map((r: any) => ({
+                ...r,
+                business_id: r.business_id || targetBizId,
+                store_id: r.store_id || 'all',
+              }));
+            } else {
+              allTablesData[tableName] = rows
+                .filter((r: any) => String(r?.business_id || '').trim() === targetBizId)
+                .map((r: any) => ({
+                  ...r,
+                  business_id: targetBizId,
+                  store_id: r.store_id || defaultStoreId,
+                }));
+            }
           }
         } catch {
           allTablesData[tableName] = [];
@@ -453,18 +580,19 @@ export function seedHistoricalOrders() {
     { id: 'TXN-8797', custId: 104, date: `${twoDaysAgoStr}T15:10:00Z`, sub: 4.75, tax: 0.71, dis: 0.00, tot: 5.46, pay: 'Mobile Wallet', items: [{ prodId: 6, qty: 1, price: 4.75 }] },
   ];
 
+  const activeBizId = getActiveBusinessId() || 'default_biz';
   historicalOrders.forEach((o, idx) => {
     const custVal = o.custId === null ? 'NULL' : o.custId;
-    const store_id = '';
+    const store_id = getActiveStoreId(undefined, activeBizId);
     runSql(
-      `INSERT INTO orders VALUES ('${o.id}', ${custVal}, '${o.date}', ${o.sub}, ${o.tax}, ${o.dis}, ${o.tot}, '${o.pay}', 'Completed', '${store_id}', 'owner')`,
+      `INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, split_cash, split_momo, status, store_id, performed_by, business_id) VALUES ('${o.id}', ${custVal}, '${o.date}', ${o.sub}, ${o.tax}, ${o.dis}, ${o.tot}, '${o.pay}', 0, 0, 'Completed', '${sqlEsc(store_id)}', 'owner', '${sqlEsc(activeBizId)}')`,
       `Seed Data: Record historical invoice ${o.id}`
     );
 
     o.items.forEach((item, itemIdx) => {
       const detailsId = `${o.id}_${itemIdx}`;
       runSql(
-        `INSERT INTO order_items VALUES ('${detailsId}', '${o.id}', ${item.prodId}, ${item.qty}, ${item.price})`,
+        `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES ('${detailsId}', '${o.id}', ${item.prodId}, ${item.qty}, ${item.price}, '${sqlEsc(activeBizId)}', '${sqlEsc(store_id)}')`,
         `Seed Data: Allocate ${item.qty} units of Product #${item.prodId} to Order ${o.id}`
       );
     });
@@ -485,19 +613,19 @@ export function seedHistoricalOrders() {
     }
 
     runSql(
-      `INSERT INTO transactions VALUES ('${txId}', 'idemp-${txId}', 'POS-LUSAKA-MAIN', '${channelName}', 'PROVISION-REF', ${o.tot}, ${feeAmt}, 'SUCCESS', 'Simulated legacy historical POS order ${o.id}', '${dateStr}', '${dateStr}')`,
+      `INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id) VALUES ('${txId}', 'idemp-${txId}', 'POS-LUSAKA-MAIN', '${channelName}', 'PROVISION-REF', ${o.tot}, ${feeAmt}, 'SUCCESS', 'Simulated legacy historical POS order ${o.id}', '${dateStr}', '${dateStr}', 'owner', '${sqlEsc(activeBizId)}', '${sqlEsc(store_id)}')`,
       `Seed Ledger: Record journal historical ledger txn for order ${o.id}`
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${txId}-deb', '${txId}', '${clearingAcc}', 'DEBIT', ${o.tot})`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${txId}-deb', '${txId}', '${clearingAcc}', 'DEBIT', ${o.tot}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(store_id)}')`,
       `Seed Ledger: Debit Clearing Account`
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${txId}-cre-merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${settleAmt})`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${txId}-cre-merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${settleAmt}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(store_id)}')`,
       `Seed Ledger: Credit Merchant Wallet Liability`
     );
     runSql(
-      `INSERT INTO ledger_entries VALUES ('le-${txId}-cre-fees', '${txId}', 'platform-revenue-account-uuid', 'CREDIT', ${feeAmt})`,
+      `INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id) VALUES ('le-${txId}-cre-fees', '${txId}', 'platform-revenue-account-uuid', 'CREDIT', ${feeAmt}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(store_id)}')`,
       `Seed Ledger: Credit Processing Revenues Accounts`
     );
   });
@@ -519,7 +647,10 @@ export function toLocalDateKey(rawDate?: any): string {
   return match ? match[1] : '';
 }
 
-export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
+export function rehydrateAlasqlFromRecords(
+  tablesData: Record<string, any[]>,
+  options?: { businessId?: string; storeId?: string; preserveOtherBusinesses?: boolean }
+) {
   if (!tablesData || typeof tablesData !== 'object') return;
   const dedupeTables = new Set([
     'businesses',
@@ -545,6 +676,17 @@ export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
     'zra_invoices',
     'zra_sync_queue',
   ]);
+  const bizRows = Array.isArray(tablesData['businesses']) ? tablesData['businesses'] : [];
+  const inferredBizId =
+    options?.businessId ||
+    (bizRows.find((b: any) => b?.id && b.id !== 'default_biz')?.id ? String(bizRows.find((b: any) => b?.id && b.id !== 'default_biz').id) : '') ||
+    getActiveBusinessId();
+  const storeRows = Array.isArray(tablesData['stores']) ? tablesData['stores'] : [];
+  const inferredStoreId =
+    options?.storeId ||
+    (storeRows.find((s: any) => s?.id)?.id ? String(storeRows.find((s: any) => s?.id).id) : '') ||
+    getActiveStoreId(undefined, inferredBizId);
+
   for (const [table, rows] of Object.entries(tablesData)) {
     if (!Array.isArray(rows)) continue;
     try {
@@ -552,10 +694,37 @@ export function rehydrateAlasqlFromRecords(tablesData: Record<string, any[]>) {
       const tableObj = alasql.tables[table] as any;
       const tableCols: any[] = Array.isArray(tableObj.columns) ? tableObj.columns : [];
       const validColSet = tableCols.length > 0 ? new Set(tableCols.map((c: any) => c.columnid)) : null;
-      let cleanRows = rows;
+      const stampedRows = rows
+        .filter((r: any) => r && typeof r === 'object')
+        .map((r: any) => {
+          const copy = { ...r };
+          if (table === 'businesses') {
+            if (!copy.business_id && copy.id) copy.business_id = String(copy.id);
+            if (!copy.store_id) copy.store_id = inferredStoreId || 'main';
+          } else if (table === 'stores') {
+            if (!copy.business_id && inferredBizId) copy.business_id = inferredBizId;
+            if (!copy.store_id && copy.id) copy.store_id = String(copy.id);
+          } else {
+            if (!copy.business_id && inferredBizId) copy.business_id = inferredBizId;
+            if (!copy.store_id && inferredStoreId) copy.store_id = inferredStoreId;
+          }
+          return copy;
+        });
+
+      let mergedRows = stampedRows;
+      if (options?.preserveOtherBusinesses && inferredBizId && table !== 'accounts') {
+        const currentRows = Array.isArray(tableObj.data) ? tableObj.data : [];
+        const otherBizRows = currentRows.filter((r: any) => {
+          const rBiz = String(r?.business_id || r?.id || '').trim();
+          return rBiz && rBiz !== inferredBizId;
+        });
+        mergedRows = [...otherBizRows, ...stampedRows];
+      }
+
+      let cleanRows = mergedRows;
       if (dedupeTables.has(table)) {
         const seen = new Set<string>();
-        cleanRows = rows.filter((r: any) => {
+        cleanRows = mergedRows.filter((r: any) => {
           if (!r || typeof r !== 'object') return false;
           if (r.id === undefined || r.id === null || r.id === '') return true;
           const k = String(r.id);
@@ -867,7 +1036,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         currency STRING,
         tax_rate NUMERIC,
         role STRING,
-        admin_role STRING
+        admin_role STRING,
+        business_id STRING,
+        store_id STRING
       )
     `, 'Multi-Business Schema: Create BUSINESSES table');
 
@@ -884,7 +1055,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         allow_refunds INT,
         allow_laybys INT,
         require_manager_discount INT,
-        stocktake_frequency STRING
+        stocktake_frequency STRING,
+        store_id STRING
       )
     `, 'Multi-Business Schema: Create STORES table');
 
@@ -895,7 +1067,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         store_id STRING,
         taken_at STRING,
         performed_by STRING,
-        status STRING
+        status STRING,
+        business_id STRING
       )
     `, 'Stocktake Schema: Create STOCK_TAKES table');
 
@@ -906,7 +1079,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         product_id INT,
         recorded_stock INT,
         counted_stock INT,
-        variance INT
+        variance INT,
+        business_id STRING,
+        store_id STRING
       )
     `, 'Stocktake Schema: Create STOCK_TAKE_ITEMS mapping table');
 
@@ -927,7 +1102,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         batch_number STRING,
         expiry_date STRING,
         item_cls_cd STRING,
-        tax_ty_cd STRING
+        tax_ty_cd STRING,
+        store_id STRING
       )
     `, 'Durable Schema: Create PRODUCTS table');
 
@@ -941,7 +1117,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         tpin STRING,
         zra_connected INT,
         tax_band STRING,
-        business_id STRING
+        business_id STRING,
+        store_id STRING
       )
     `, 'Durable Schema: Create CUSTOMERS table');
 
@@ -959,7 +1136,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         split_momo NUMERIC,
         status STRING,
         store_id STRING,
-        performed_by STRING
+        performed_by STRING,
+        business_id STRING
       )
     `, 'Durable Schema: Create ORDERS table');
 
@@ -969,7 +1147,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         orderId STRING,
         productId INT,
         quantity INT,
-        unitPrice NUMERIC
+        unitPrice NUMERIC,
+        business_id STRING,
+        store_id STRING
       )
     `, 'Durable Schema: Create ORDER_ITEMS mapping table');
 
@@ -982,7 +1162,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         currency STRING DEFAULT 'ZMW',
         merchant_id STRING,
         created_at STRING,
-        updated_at STRING
+        updated_at STRING,
+        business_id STRING,
+        store_id STRING
       )
     `, 'Durable Schema: Create ACCOUNTS ledger table');
 
@@ -999,7 +1181,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         narration STRING,
         created_at STRING,
         updated_at STRING,
-        performed_by STRING
+        performed_by STRING,
+        business_id STRING,
+        store_id STRING
       )
     `, 'Durable Schema: Create TRANSACTIONS journal table');
 
@@ -1010,7 +1194,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         account_id STRING,
         type STRING,
         amount NUMERIC,
-        created_at STRING
+        created_at STRING,
+        business_id STRING,
+        store_id STRING
       )
     `, 'Durable Schema: Create LEDGER_ENTRIES ledger mappings');
 
@@ -1029,7 +1215,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       status STRING,
       items_json STRING,
       created_at STRING,
-      store_id STRING
+      store_id STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create LAYBYS layaway tracking table');
 
@@ -1040,7 +1227,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       amount NUMERIC,
       payment_method STRING,
       received_by STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create LAYBY_INSTALLMENTS payments table');
 
@@ -1055,7 +1244,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       hours_worked NUMERIC,
       hourly_rate NUMERIC,
       gross_payment NUMERIC,
-      status STRING
+      status STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create TIME_ATTENDANCE payroll sync table');
 
@@ -1090,7 +1281,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       product_id INT,
       store_id STRING,
       stock INT,
-      price NUMERIC
+      price NUMERIC,
+      business_id STRING
     )
   `, 'Durable Schema: Create STORE_PRODUCTS pricing table');
 
@@ -1103,7 +1295,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       quantity INT,
       status STRING,
       created_at STRING,
-      rejection_reason STRING
+      rejection_reason STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create STOCK_TRANSFERS ledger notes');
 
@@ -1121,7 +1315,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       sum_momo_actual NUMERIC,
       variance NUMERIC,
       notes STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create CASH_UPS end-of-day control table');
 
@@ -1142,7 +1337,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       status STRING,
       created_at STRING,
       updated_at STRING,
-      extra_json STRING
+      extra_json STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create QUOTATIONS template table');
 
@@ -1159,7 +1356,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       disbursed_at STRING,
       due_date STRING,
       created_at STRING,
-      updated_at STRING
+      updated_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create LOANS financing agreement table');
 
@@ -1174,7 +1373,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       amount_paid NUMERIC,
       is_settled INT,
       due_date STRING,
-      settled_at STRING
+      settled_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create LOAN_AMORTIZATION_SCHEDULE repayment milestones table');
 
@@ -1186,7 +1387,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       amount_deducted NUMERIC,
       status STRING,
       failure_reason STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create AUTOMATED_DEDUCTION_LOGS revenue sweep history table');
 
@@ -1199,7 +1402,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       amount NUMERIC,
       store_id STRING,
       performed_by STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create AUDIT_LOGS employee audit trail table');
 
@@ -1217,7 +1421,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       store_id STRING,
       performed_by STRING,
       created_by STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create EXPENSES ledger table');
 
@@ -1238,7 +1443,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       created_at STRING,
       updated_at STRING,
       received_at STRING,
-      received_by STRING
+      received_by STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create PURCHASES_TRANSIT goods-in-transit procurement table');
 
@@ -1259,7 +1465,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       created_at STRING,
       updated_at STRING,
       received_at STRING,
-      received_by STRING
+      received_by STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create TRANSIT_PURCHASES procurement table');
 
@@ -1276,7 +1483,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       default_payment_method STRING,
       notes STRING,
       created_at STRING,
-      updated_at STRING
+      updated_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create SUPPLIERS directory table');
 
@@ -1289,7 +1498,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       reference_no STRING,
       transfer_date STRING,
       performed_by STRING,
-      notes STRING
+      notes STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create MONEY_TRANSFERS liquidity balancing table');
 
@@ -1305,7 +1516,17 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       depreciation_rate NUMERIC,
       status STRING,
       notes STRING,
-      linked_equity_id STRING
+      linked_equity_id STRING,
+      business_id STRING,
+      store_id STRING,
+      asset_tag STRING,
+      serial_number STRING,
+      useful_life_years NUMERIC,
+      salvage_value NUMERIC,
+      funding_source STRING,
+      disposal_date STRING,
+      disposal_proceeds NUMERIC,
+      updated_at STRING
     )
   `, 'Durable Schema: Create ASSETS balance sheet table');
 
@@ -1314,7 +1535,17 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       id STRING PRIMARY KEY,
       name STRING,
       value NUMERIC,
-      linked_asset_id STRING
+      linked_asset_id STRING,
+      business_id STRING,
+      store_id STRING,
+      equity_type STRING,
+      shareholder_name STRING,
+      contribution_date STRING,
+      account_id STRING,
+      reference_no STRING,
+      notes STRING,
+      status STRING,
+      created_at STRING
     )
   `, 'Durable Schema: Create EQUITY capital accounts table');
 
@@ -1327,7 +1558,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       account_debit STRING,
       account_credit STRING,
       amount NUMERIC,
-      currency STRING
+      currency STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create DOUBLE_ENTRY_JOURNAL accounting records');
 
@@ -1350,7 +1583,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       performed_by STRING,
       journal_ref STRING,
       status STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create RECEIPT_REFUND_LEDGER table');
 
@@ -1370,7 +1604,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       reference_id STRING,
       description STRING,
       performed_by STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create CASH_FLOW_LEDGER table');
 
@@ -1388,7 +1623,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       transfers_out NUMERIC,
       net_balance NUMERIC,
       transaction_count INT,
-      updated_at STRING
+      updated_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create PAYMENT_METHOD_LEDGER table');
 
@@ -1400,7 +1636,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       account_id STRING,
       is_active INT,
       created_by STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create PAYMENT_METHODS custom payment channels table');
 
@@ -1422,7 +1660,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       payload_json STRING,
       record_json STRING,
       created_at STRING,
-      updated_at STRING
+      updated_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create ZRA_INVOICES fiscal audit table');
 
@@ -1435,7 +1675,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       sale_json STRING,
       retry_count INT,
       last_error STRING,
-      created_at STRING
+      created_at STRING,
+      business_id STRING,
+      store_id STRING
     )
   `, 'Durable Schema: Create ZRA_SYNC_QUEUE offline retry table');
 
@@ -1473,7 +1715,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       investing_cash_flow NUMERIC,
       financing_cash_flow NUMERIC,
       net_cash_flow NUMERIC,
-      updated_at STRING
+      updated_at STRING,
+      business_id STRING
     )
   `, 'Durable Schema: Create FINANCIAL_STATEMENTS_LEDGER table');
 
@@ -1591,7 +1834,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
   }
 }
 
-function seedChartOfAccountsOnly() {
+export function seedChartOfAccountsOnly(explicitBusinessId?: string) {
   const accountsToSeed = [
     { id: 'acc_cash', name: 'Cash Account (Counter Drawer)', type: 'ASSET', cur: 'ZMW' },
     { id: 'acc_airtel', name: 'Airtel Money Account', type: 'ASSET', cur: 'ZMW' },
@@ -1628,9 +1871,14 @@ function seedChartOfAccountsOnly() {
   ];
 
   const nowIso = new Date().toISOString();
+  const activeBizId = getActiveBusinessId(explicitBusinessId);
+  const existingIds = new Set(
+    ((alasql?.tables?.accounts?.data || []) as any[]).map((a: any) => String(a.id || ''))
+  );
   accountsToSeed.forEach(acc => {
+    if (existingIds.has(acc.id)) return;
     runSql(
-      `INSERT INTO accounts VALUES ('${acc.id}', '${acc.name}', '${acc.type}', '${acc.cur}', '', '${nowIso}', '${nowIso}')`,
+      `INSERT INTO accounts (id, name, type, currency, merchant_id, created_at, updated_at, business_id, store_id) VALUES ('${acc.id}', '${sqlEsc(acc.name)}', '${acc.type}', '${acc.cur}', '${sqlEsc(activeBizId)}', '${nowIso}', '${nowIso}', '${sqlEsc(activeBizId)}', 'all')`,
       `Chart of Accounts: Initialize [${acc.name}]`,
       true
     );
@@ -1688,13 +1936,15 @@ function seedTemplateData(template: SeedTemplate) {
 
   // Seed default multi-tenant business and outlet branches
   runSql(`
-    INSERT INTO businesses VALUES (
+    INSERT INTO businesses (id, name, owner, email, password, created_at, business_id, store_id) VALUES (
       'default_biz',
       'Zambia Retail POS',
       'Chiposha Conwell',
       'owner@pos.zm',
       'admin123',
-      '2026-06-07T14:00:00Z'
+      '2026-06-07T14:00:00Z',
+      'default_biz',
+      'main'
     )
   `, 'Seed Data: Insert default business profile');
 
@@ -1702,14 +1952,14 @@ function seedTemplateData(template: SeedTemplate) {
 
   customersToInsert.forEach(c => {
     runSql(
-      `INSERT INTO customers VALUES (${c.id}, '${c.name.replace(/'/g, "''")}', '${c.phone}', '${c.email}', ${c.loyalPoints}, '${c.tpin}', ${c.zra_connected}, '${c.tax_band}', 'default_biz')`,
+      `INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id) VALUES (${c.id}, '${c.name.replace(/'/g, "''")}', '${c.phone}', '${c.email}', ${c.loyalPoints}, '${c.tpin}', ${c.zra_connected}, '${c.tax_band}', 'default_biz', 'main')`,
       `Seed Data: Insert customer ${c.name} with compliant ZRA TPIN`
     );
   });
 
   productsToInsert.forEach(p => {
     runSql(
-      `INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date) VALUES (${p.id}, '${p.name.replace(/'/g, "''")}', '${p.sku}', '${p.category}', ${p.price}, ${p.cost}, ${p.stock}, '${p.imageUrl}', 'default_biz', ${p.is_service || 0}, '${p.batch_number || ''}', '${p.expiry_date || ''}')`,
+      `INSERT INTO products (id, name, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, store_id) VALUES (${p.id}, '${p.name.replace(/'/g, "''")}', '${p.sku}', '${p.category}', ${p.price}, ${p.cost}, ${p.stock}, '${p.imageUrl}', 'default_biz', ${p.is_service || 0}, '${p.batch_number || ''}', '${p.expiry_date || ''}', 'main')`,
       `Seed Data: Insert product ${p.name}`
     );
   });
@@ -1749,7 +1999,7 @@ function seedTemplateData(template: SeedTemplate) {
 
   accountsToSeed.forEach(acc => {
     runSql(
-      `INSERT INTO accounts VALUES ('${acc.id}', '${acc.name}', '${acc.type}', '${acc.cur}', 'merchant-merchant-id', '2026-06-07T12:00:00Z', '2026-06-07T12:00:00Z')`,
+      `INSERT INTO accounts (id, name, type, currency, merchant_id, created_at, updated_at, business_id, store_id) VALUES ('${acc.id}', '${sqlEsc(acc.name)}', '${acc.type}', '${acc.cur}', 'default_biz', '2026-06-07T12:00:00Z', '2026-06-07T12:00:00Z', 'default_biz', 'all')`,
       `Seed Double Entry: Register Ledger Account [${acc.name}]`
     );
   });
@@ -1821,10 +2071,15 @@ export function upsertCustomerSync(data: CustomerSyncData): any {
   const cleanPhone = (data.phone || '').trim();
   const cleanEmail = (data.email || '').trim();
   const cleanTpin = (data.tpin || '').trim();
-  
-  // Search for existing customer by explicit ID first, then phone, then name
+  const activeBizId = getActiveBusinessId();
+  const activeStoreId = getActiveStoreId(undefined, activeBizId);
+
+  // Search for existing customer strictly inside the current business
   let existing: any = null;
-  const allCustsRes = runSql('SELECT * FROM customers', 'CRM Sync: Fetch customers for lookup');
+  const custQuery = activeBizId
+    ? `SELECT * FROM customers WHERE business_id = '${sqlEsc(activeBizId)}'`
+    : 'SELECT * FROM customers';
+  const allCustsRes = runSql(custQuery, 'CRM Sync: Fetch customers for lookup');
   if (allCustsRes.success && Array.isArray(allCustsRes.data)) {
     if (data.id !== undefined && data.id !== null) {
       existing = allCustsRes.data.find((c: any) => Number(c.id) === Number(data.id));
@@ -1849,32 +2104,45 @@ export function upsertCustomerSync(data: CustomerSyncData): any {
 
     const updateSql = `
       UPDATE customers 
-      SET name = '${cleanName.replace(/'/g, "''")}',
-          phone = '${newPhone.replace(/'/g, "''")}',
-          email = '${newEmail.replace(/'/g, "''")}',
-          tpin = '${newTpin.replace(/'/g, "''")}',
-          loyalPoints = ${newPoints}
+      SET name = '${sqlEsc(cleanName)}',
+          phone = '${sqlEsc(newPhone)}',
+          email = '${sqlEsc(newEmail)}',
+          tpin = '${sqlEsc(newTpin)}',
+          loyalPoints = ${newPoints},
+          business_id = '${sqlEsc(activeBizId || existing.business_id || '')}',
+          store_id = '${sqlEsc(existing.store_id || activeStoreId)}'
       WHERE id = ${custId}
     `;
     runSql(updateSql, `CRM Sync: Update customer #${custId} [${cleanName}]`);
     persistTablesToStorage();
-    return { ...existing, id: custId, name: cleanName, phone: newPhone, email: newEmail, tpin: newTpin, loyalPoints: newPoints };
+    return {
+      ...existing,
+      id: custId,
+      name: cleanName,
+      phone: newPhone,
+      email: newEmail,
+      tpin: newTpin,
+      loyalPoints: newPoints,
+      business_id: activeBizId || existing.business_id || '',
+      store_id: existing.store_id || activeStoreId,
+    };
   } else {
     // Insert new customer starting strictly at 0 + earned delta from checkout
     const newCustId = 500 + Math.floor(Math.random() * 950000);
     const initialPoints = pointsToAdd;
     const insertSql = `
-      INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id)
+      INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id)
       VALUES (
         ${newCustId},
-        '${cleanName.replace(/'/g, "''")}',
-        '${(cleanPhone || 'N/A').replace(/'/g, "''")}',
-        '${(cleanEmail || 'N/A').replace(/'/g, "''")}',
+        '${sqlEsc(cleanName)}',
+        '${sqlEsc(cleanPhone || 'N/A')}',
+        '${sqlEsc(cleanEmail || 'N/A')}',
         ${initialPoints},
-        '${cleanTpin.replace(/'/g, "''")}',
+        '${sqlEsc(cleanTpin)}',
         ${data.zra_connected || 0},
-        '${(data.tax_band || 'A - Standard Rate (16%)').replace(/'/g, "''")}',
-        'default_biz'
+        '${sqlEsc(data.tax_band || 'A - Standard Rate (16%)')}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(activeStoreId)}'
       )
     `;
     runSql(insertSql, `CRM Sync: Register dynamic customer [${cleanName}]`);
@@ -1888,18 +2156,19 @@ export function upsertCustomerSync(data: CustomerSyncData): any {
       tpin: cleanTpin,
       zra_connected: data.zra_connected || 0,
       tax_band: data.tax_band || 'A - Standard Rate (16%)',
-      business_id: 'default_biz'
+      business_id: activeBizId,
+      store_id: activeStoreId
     };
   }
 }
 
-// ==========================================
 // ==========================================
 // CENTRAL BRANCHES DATABASE ACCESSOR (SINGLE SOURCE OF TRUTH)
 // ==========================================
 export function getCentralBranches(businessId?: string): Array<{
   id: string;
   business_id?: string;
+  store_id?: string;
   name: string;
   location?: string;
   phone?: string;
@@ -1911,30 +2180,21 @@ export function getCentralBranches(businessId?: string): Array<{
   stocktake_frequency?: string;
 }> {
   try {
-    let targetBizId = businessId;
-    if (!targetBizId && typeof localStorage !== 'undefined') {
-      try {
-        const savedBiz = localStorage.getItem('active_business_profile');
-        if (savedBiz) {
-          const parsed = JSON.parse(savedBiz);
-          if (parsed && parsed.id) targetBizId = parsed.id;
-        }
-      } catch {}
-    }
-    const allRes = runSql('SELECT * FROM stores', 'Central Branches DB: Fetch all configured branches', true);
+    const targetBizId = getActiveBusinessId(businessId);
+    const sql = targetBizId
+      ? `SELECT * FROM stores WHERE business_id = '${sqlEsc(targetBizId)}'`
+      : 'SELECT * FROM stores';
+    const allRes = runSql(sql, 'Central Branches DB: Fetch business branches', true);
     const rawStores = (allRes.success && Array.isArray(allRes.data)) ? allRes.data : [];
     const seenStoreIds = new Set<string>();
-    const allStores = rawStores.filter((s: any) => {
+    const filteredStores = rawStores.filter((s: any) => {
       const id = String(s?.id || '');
       if (!id || seenStoreIds.has(id)) return false;
+      if (targetBizId && String(s?.business_id || '') !== targetBizId) return false;
       seenStoreIds.add(id);
       return true;
     });
-    if (targetBizId) {
-      const bizStores = allStores.filter((s: any) => s.business_id === targetBizId);
-      if (bizStores.length > 0) return bizStores;
-    }
-    return allStores;
+    return filteredStores;
   } catch {
     return [];
   }
@@ -1954,6 +2214,7 @@ export function logEmployeeAudit(
   try {
     const id = `AUDIT_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const nowStr = new Date().toISOString();
+    const activeBizId = getActiveBusinessId();
     const sessionUser =
       (typeof localStorage !== 'undefined' &&
         (localStorage.getItem('logged_in_user_name') || localStorage.getItem('logged_in_user_email'))) ||
@@ -1964,22 +2225,21 @@ export function logEmployeeAudit(
       !rawPerformed || genericRoles.has(rawPerformed.toLowerCase())
         ? sessionUser || rawPerformed || 'Staff Operator'
         : rawPerformed;
-    const centralFirst = getCentralBranches()[0]?.id || '';
-    const store = storeId || localStorage.getItem('active_store_branch') || localStorage.getItem('pos_active_store') || centralFirst;
-    const cleanAction = (action || '').replace(/'/g, "''");
-    const cleanDetails = (details || '').replace(/'/g, "''");
-    const cleanUser = (user || '').replace(/'/g, "''");
+    const store = getActiveStoreId(storeId, activeBizId);
+    const cleanAction = sqlEsc(action);
+    const cleanDetails = sqlEsc(details);
+    const cleanUser = sqlEsc(user);
 
     runSql(`
-      INSERT INTO audit_logs (id, module, action, details, amount, store_id, performed_by, created_at)
-      VALUES ('${id}', '${module}', '${cleanAction}', '${cleanDetails}', ${amount}, '${store}', '${cleanUser}', '${nowStr}')
+      INSERT INTO audit_logs (id, module, action, details, amount, store_id, performed_by, created_at, business_id)
+      VALUES ('${id}', '${module}', '${cleanAction}', '${cleanDetails}', ${amount}, '${sqlEsc(store)}', '${cleanUser}', '${nowStr}', '${sqlEsc(activeBizId)}')
     `, `Audit Trail: [${module}] ${action} by ${user}`);
 
     // Also mirror into transactions journal for financial ledger traceability
     const txId = `TX_${id}`;
     runSql(`
-      INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by)
-      VALUES ('${txId}', 'idem_${txId}', 'AUDIT_TRAIL', '${module}', '${id}', ${amount}, 0.00, 'SUCCESS', '[${module}] ${cleanAction} - ${cleanDetails}', '${nowStr}', '${nowStr}', '${cleanUser}')
+      INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, updated_at, performed_by, business_id, store_id)
+      VALUES ('${txId}', 'idem_${txId}', 'AUDIT_TRAIL', '${module}', '${id}', ${amount}, 0.00, 'SUCCESS', '[${module}] ${cleanAction} - ${cleanDetails}', '${nowStr}', '${nowStr}', '${cleanUser}', '${sqlEsc(activeBizId)}', '${sqlEsc(store)}')
     `, `Audit Journal Entry: ${action}`);
 
     persistTablesToStorage();
@@ -2025,9 +2285,13 @@ function writeSettingsCustomPaymentMethods(methods: CustomPaymentMethod[]) {
 
 export function getCustomPaymentMethods(includeInactive: boolean = false): CustomPaymentMethod[] {
   const mergedMap = new Map<string, CustomPaymentMethod>();
+  const activeBizId = getActiveBusinessId();
   if (alasql?.tables?.payment_methods) {
     try {
-      const rows = alasql('SELECT * FROM payment_methods') as any[];
+      const pmSql = activeBizId
+        ? `SELECT * FROM payment_methods WHERE business_id = '${sqlEsc(activeBizId)}'`
+        : 'SELECT * FROM payment_methods';
+      const rows = alasql(pmSql) as any[];
       if (Array.isArray(rows)) {
         rows.forEach((r: any) => {
           if (!r || !r.name) return;
@@ -2096,6 +2360,8 @@ export function saveCustomPaymentMethod(
   }
   const id = `pm_${slug}_${Math.floor(100 + Math.random() * 900)}`;
   const nowIso = new Date().toISOString();
+  const activeBizId = getActiveBusinessId();
+  const activeStoreId = getActiveStoreId(undefined, activeBizId);
 
   const newMethod: CustomPaymentMethod = {
     id,
@@ -2110,22 +2376,22 @@ export function saveCustomPaymentMethod(
   runSql(
     `CREATE TABLE IF NOT EXISTS payment_methods (
       id STRING PRIMARY KEY, name STRING, category STRING, account_id STRING,
-      is_active INT, created_by STRING, created_at STRING
+      is_active INT, created_by STRING, created_at STRING, business_id STRING, store_id STRING
     )`,
     'Ensure payment_methods table',
     true
   );
 
   runSql(
-    `INSERT INTO payment_methods (id, name, category, account_id, is_active, created_by, created_at)
-     VALUES ('${id}', '${cleanName.replace(/'/g, "''")}', '${category.replace(/'/g, "''")}', '${accountId}', 1, '${createdBy.replace(/'/g, "''")}', '${nowIso}')`,
+    `INSERT INTO payment_methods (id, name, category, account_id, is_active, created_by, created_at, business_id, store_id)
+     VALUES ('${id}', '${sqlEsc(cleanName)}', '${sqlEsc(category)}', '${accountId}', 1, '${sqlEsc(createdBy)}', '${nowIso}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeStoreId)}')`,
     `Admin: Create custom payment method [${cleanName}]`
   );
 
   const accRes = runSql(`SELECT id FROM accounts WHERE id = '${accountId}'`, 'Check custom payment account', true);
   if (!accRes.success || !Array.isArray(accRes.data) || accRes.data.length === 0) {
     runSql(
-      `INSERT INTO accounts VALUES ('${accountId}', '${cleanName.replace(/'/g, "''")} (${category})', 'ASSET', 'ZMW', 'default_biz', '${nowIso}', '${nowIso}')`,
+      `INSERT INTO accounts (id, name, type, currency, merchant_id, created_at, updated_at, business_id, store_id) VALUES ('${accountId}', '${sqlEsc(cleanName)} (${category})', 'ASSET', 'ZMW', '${sqlEsc(activeBizId)}', '${nowIso}', '${nowIso}', '${sqlEsc(activeBizId)}', 'all')`,
       `Chart of Accounts: Register [${cleanName}]`,
       true
     );
@@ -2332,6 +2598,82 @@ export function resolveSplitMobileProvider(
   return { bucket: 'Airtel Money', accountId: 'acc_airtel', clearingAccountId: 'airtel-clearing-account-uuid' };
 }
 
+export function calculateAssetValuation(ast: any, asOfDate: Date = new Date()): {
+  cost: number;
+  salvageValue: number;
+  annualDepreciation: number;
+  accumulatedDepreciation: number;
+  netBookValue: number;
+  yearsElapsed: number;
+} {
+  const cost = Math.max(0, Number(ast?.value || 0));
+  const salvageValue = Math.min(cost, Math.max(0, Number(ast?.salvage_value ?? ast?.salvageValue ?? 0)));
+  const depreciableBase = Math.max(0, cost - salvageValue);
+  const status = String(ast?.status || 'Active').trim();
+  const category = String(ast?.category || 'Fixed').trim();
+  const method = String(ast?.depreciation_method ?? ast?.depreciationMethod ?? 'Straight Line').trim();
+  const rate = Math.max(0, Number(ast?.depreciation_rate ?? ast?.depreciationRate ?? 0));
+  const usefulLifeYears = Math.max(1, Number(ast?.useful_life_years ?? ast?.usefulLifeYears ?? (rate > 0 ? 100 / rate : 5)));
+
+  if (status === 'Disposed' || status === 'Written Off') {
+    return {
+      cost: parseFloat(cost.toFixed(2)),
+      salvageValue: parseFloat(salvageValue.toFixed(2)),
+      annualDepreciation: 0,
+      accumulatedDepreciation: parseFloat(cost.toFixed(2)),
+      netBookValue: 0,
+      yearsElapsed: 0,
+    };
+  }
+
+  if (method === 'None' || category === 'Current' || (rate <= 0 && !ast?.useful_life_years && !ast?.usefulLifeYears)) {
+    return {
+      cost: parseFloat(cost.toFixed(2)),
+      salvageValue: parseFloat(salvageValue.toFixed(2)),
+      annualDepreciation: 0,
+      accumulatedDepreciation: 0,
+      netBookValue: parseFloat(cost.toFixed(2)),
+      yearsElapsed: 0,
+    };
+  }
+
+  const rawPurchaseDate = ast?.purchase_date ?? ast?.purchaseDate ?? '';
+  const purchaseMs = Date.parse(String(rawPurchaseDate || ''));
+  const yearsElapsed = Number.isFinite(purchaseMs)
+    ? Math.max(0, (asOfDate.getTime() - purchaseMs) / (365.25 * 86400000))
+    : 0;
+
+  if (method === 'Reducing Balance') {
+    const effectiveRate = rate > 0 ? Math.min(100, rate) : Math.min(100, 100 / usefulLifeYears);
+    const nbvRaw = cost * Math.pow(Math.max(0, 1 - effectiveRate / 100), yearsElapsed);
+    const netBookValue = parseFloat(Math.max(salvageValue, Math.min(cost, nbvRaw)).toFixed(2));
+    const accumulatedDepreciation = parseFloat(Math.max(0, cost - netBookValue).toFixed(2));
+    const annualDepreciation = parseFloat(Math.max(0, netBookValue * (effectiveRate / 100)).toFixed(2));
+    return {
+      cost: parseFloat(cost.toFixed(2)),
+      salvageValue: parseFloat(salvageValue.toFixed(2)),
+      annualDepreciation,
+      accumulatedDepreciation,
+      netBookValue,
+      yearsElapsed: parseFloat(yearsElapsed.toFixed(2)),
+    };
+  }
+
+  // Straight Line
+  const annualDep = rate > 0 ? depreciableBase * (rate / 100) : depreciableBase / usefulLifeYears;
+  const accumDep = Math.min(depreciableBase, annualDep * yearsElapsed);
+  const accumulatedDepreciation = parseFloat(Math.max(0, accumDep).toFixed(2));
+  const netBookValue = parseFloat(Math.max(salvageValue, cost - accumulatedDepreciation).toFixed(2));
+  return {
+    cost: parseFloat(cost.toFixed(2)),
+    salvageValue: parseFloat(salvageValue.toFixed(2)),
+    annualDepreciation: parseFloat(Math.max(0, annualDep).toFixed(2)),
+    accumulatedDepreciation,
+    netBookValue,
+    yearsElapsed: parseFloat(yearsElapsed.toFixed(2)),
+  };
+}
+
 export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS Sale Accounting Sync') {
   if (isAccountingSyncRunning || isDbInitializing) return;
   isAccountingSyncRunning = true;
@@ -2339,6 +2681,10 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
   try {
     const nowIso = new Date().toISOString();
     const todayDate = toLocalDateKey();
+    const activeBizId = getActiveBusinessId();
+    const activeBizSlug = activeBizId
+      ? activeBizId.replace(/[^a-zA-Z0-9_]/g, '').slice(-10)
+      : 'tenant';
 
     // 0. Ensure all required tables exist (in case recovered from older schema)
     const ensureTables = [
@@ -2346,18 +2692,18 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         id STRING PRIMARY KEY, order_id STRING, entry_type STRING, date STRING, store_id STRING,
         customer_name STRING, payment_method STRING, subtotal NUMERIC, tax NUMERIC, discount NUMERIC,
         total_amount NUMERIC, cogs_amount NUMERIC, net_revenue_impact NUMERIC, cash_impact NUMERIC,
-        performed_by STRING, journal_ref STRING, status STRING, created_at STRING
+        performed_by STRING, journal_ref STRING, status STRING, created_at STRING, business_id STRING
       )`,
       `CREATE TABLE IF NOT EXISTS cash_flow_ledger (
         id STRING PRIMARY KEY, date STRING, store_id STRING, activity_type STRING, category STRING,
         direction STRING, payment_method STRING, account_id STRING, inflow_amount NUMERIC,
         outflow_amount NUMERIC, net_cash_change NUMERIC, reference_id STRING, description STRING,
-        performed_by STRING, created_at STRING
+        performed_by STRING, created_at STRING, business_id STRING
       )`,
       `CREATE TABLE IF NOT EXISTS payment_method_ledger (
         id STRING PRIMARY KEY, payment_method STRING, store_id STRING, account_id STRING,
         gross_receipts NUMERIC, layby_receipts NUMERIC, refunds_out NUMERIC, expenses_out NUMERIC,
-        transfers_in NUMERIC, transfers_out NUMERIC, net_balance NUMERIC, transaction_count INT, updated_at STRING
+        transfers_in NUMERIC, transfers_out NUMERIC, net_balance NUMERIC, transaction_count INT, updated_at STRING, business_id STRING
       )`,
       `CREATE TABLE IF NOT EXISTS financial_statements_ledger (
         id STRING PRIMARY KEY, store_id STRING, period_date STRING, gross_sales_revenue NUMERIC,
@@ -2370,15 +2716,15 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         layby_deposits_liability NUMERIC, loans_payable_liability NUMERIC, total_liabilities NUMERIC,
         owner_capital_equity NUMERIC, retained_earnings NUMERIC, total_equity NUMERIC,
         operating_cash_flow NUMERIC, investing_cash_flow NUMERIC, financing_cash_flow NUMERIC,
-        net_cash_flow NUMERIC, updated_at STRING
+        net_cash_flow NUMERIC, updated_at STRING, business_id STRING
       )`,
       `CREATE TABLE IF NOT EXISTS double_entry_journal (
         id STRING PRIMARY KEY, date STRING, reference STRING, description STRING,
-        account_debit STRING, account_credit STRING, amount NUMERIC, currency STRING
+        account_debit STRING, account_credit STRING, amount NUMERIC, currency STRING, business_id STRING, store_id STRING
       )`,
       `CREATE TABLE IF NOT EXISTS payment_methods (
         id STRING PRIMARY KEY, name STRING, category STRING, account_id STRING,
-        is_active INT, created_by STRING, created_at STRING
+        is_active INT, created_by STRING, created_at STRING, business_id STRING, store_id STRING
       )`
     ];
     for (const ddl of ensureTables) {
@@ -2387,17 +2733,21 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
 
     // Sync any custom payment methods from settings into payment_methods table
     const settingsCustom = readSettingsCustomPaymentMethods();
-    const existingPmRes = runSql('SELECT id FROM payment_methods', 'Check payment_methods', true);
+    const existingPmSql = activeBizId
+      ? `SELECT id FROM payment_methods WHERE business_id = '${sqlEsc(activeBizId)}'`
+      : 'SELECT id FROM payment_methods';
+    const existingPmRes = runSql(existingPmSql, 'Check payment_methods', true);
     const existingPmIds = new Set(
       existingPmRes.success && Array.isArray(existingPmRes.data)
         ? existingPmRes.data.map((r: any) => String(r.id))
         : []
     );
+    const activeDefaultStoreId = getActiveStoreId(undefined, activeBizId);
     for (const cm of settingsCustom) {
       if (cm && cm.id && !existingPmIds.has(cm.id)) {
         runSql(
-          `INSERT INTO payment_methods (id, name, category, account_id, is_active, created_by, created_at)
-           VALUES ('${cm.id.replace(/'/g, "''")}', '${cm.name.replace(/'/g, "''")}', '${cm.category.replace(/'/g, "''")}', '${cm.accountId.replace(/'/g, "''")}', ${cm.isActive ? 1 : 0}, '${(cm.createdBy || 'Admin').replace(/'/g, "''")}', '${cm.createdAt || nowIso}')`,
+          `INSERT INTO payment_methods (id, name, category, account_id, is_active, created_by, created_at, business_id, store_id)
+           VALUES ('${sqlEsc(cm.id)}', '${sqlEsc(cm.name)}', '${sqlEsc(cm.category)}', '${sqlEsc(cm.accountId)}', ${cm.isActive ? 1 : 0}, '${sqlEsc(cm.createdBy || 'Admin')}', '${cm.createdAt || nowIso}', '${sqlEsc(activeBizId)}', '${sqlEsc(activeDefaultStoreId)}')`,
           `Sync custom payment method [${cm.name}]`,
           true
         );
@@ -2416,6 +2766,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       { id: 'acc_inventory', name: 'Store Merchandise Inventory Asset', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_transit', name: 'Goods in Transit Asset', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_fixed_assets', name: 'Fixed Equipment & Property Assets', type: 'ASSET', cur: 'ZMW' },
+      { id: 'acc_accum_depreciation', name: 'Accumulated Depreciation (Contra-Asset)', type: 'ASSET', cur: 'ZMW' },
       { id: 'acc_vat_payable', name: 'VAT / Tax Output Payable (ZRA)', type: 'LIABILITY', cur: 'ZMW' },
       { id: 'acc_layby_deposits', name: 'Customer Layby Unearned Deposits', type: 'LIABILITY', cur: 'ZMW' },
       { id: 'acc_loans_payable', name: 'Working Capital Loans Payable', type: 'LIABILITY', cur: 'ZMW' },
@@ -2425,6 +2776,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       { id: 'acc_cost_of_goods', name: 'Cost of Goods Sold (COGS)', type: 'EXPENSE', cur: 'ZMW' },
       { id: 'acc_retained_earnings', name: 'Owner Equity & Retained Earnings', type: 'EQUITY', cur: 'ZMW' },
       { id: 'acc_owner_capital', name: 'Owner Paid-In Capital Equity', type: 'EQUITY', cur: 'ZMW' },
+      { id: 'acc_depreciation_exp', name: 'Asset Depreciation Expense', type: 'EXPENSE', cur: 'ZMW' },
       { id: 'acc_exp_rent', name: 'Rent & Premises Expense', type: 'EXPENSE', cur: 'ZMW' },
       { id: 'acc_exp_utilities', name: 'Utilities Expense (Power/Water/Internet)', type: 'EXPENSE', cur: 'ZMW' },
       { id: 'acc_exp_wages', name: 'Wages & Payroll Expense', type: 'EXPENSE', cur: 'ZMW' },
@@ -2458,7 +2810,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     for (const acc of requiredAccounts) {
       if (!existingAccIds.has(acc.id)) {
         runSql(
-          `INSERT INTO accounts VALUES ('${acc.id}', '${acc.name.replace(/'/g, "''")}', '${acc.type}', '${acc.cur}', 'default_biz', '${nowIso}', '${nowIso}')`,
+          `INSERT INTO accounts (id, name, type, currency, merchant_id, created_at, updated_at, business_id, store_id) VALUES ('${acc.id}', '${sqlEsc(acc.name)}', '${acc.type}', '${acc.cur}', '${sqlEsc(activeBizId)}', '${nowIso}', '${nowIso}', '${sqlEsc(activeBizId)}', 'all')`,
           `Accounting Sync: Ensure account ${acc.id}`,
           true
         );
@@ -2466,25 +2818,33 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       }
     }
 
-    // 2. Fetch all source records from the database
-    const productsRes = runSql('SELECT * FROM products', 'Accounting Sync: Products', true);
-    const storeProductsRes = runSql('SELECT * FROM store_products', 'Accounting Sync: Store Products', true);
-    const customersRes = runSql('SELECT * FROM customers', 'Accounting Sync: Customers', true);
-    const ordersRes = runSql('SELECT * FROM orders ORDER BY orderDate ASC', 'Accounting Sync: Orders', true);
-    const orderItemsRes = runSql('SELECT * FROM order_items', 'Accounting Sync: Order Items', true);
-    const laybysRes = runSql('SELECT * FROM laybys ORDER BY created_at ASC', 'Accounting Sync: Laybys', true);
-    const laybyInstRes = runSql('SELECT * FROM layby_installments ORDER BY created_at ASC', 'Accounting Sync: Layby Installments', true);
-    const expensesRes = runSql('SELECT * FROM expenses ORDER BY expense_date ASC', 'Accounting Sync: Expenses', true);
-    const attendanceRes = runSql("SELECT * FROM time_attendance WHERE status = 'PAID'", 'Accounting Sync: Paid Payroll', true);
-    const transfersRes = runSql('SELECT * FROM money_transfers ORDER BY transfer_date ASC', 'Accounting Sync: Transfers', true);
-    const transitRes = runSql('SELECT * FROM transit_purchases ORDER BY created_at ASC', 'Accounting Sync: Transit POs', true);
-    const purchasesTransitRes = runSql('SELECT * FROM purchases_transit ORDER BY created_at ASC', 'Accounting Sync: Supply Management POs', true);
-    const assetsRes = runSql('SELECT * FROM assets', 'Accounting Sync: Assets', true);
-    const equityRes = runSql('SELECT * FROM equity', 'Accounting Sync: Equity', true);
-    const loansRes = runSql("SELECT * FROM loans WHERE status = 'ACTIVE'", 'Accounting Sync: Active Loans', true);
-    const loanDedRes = runSql("SELECT * FROM automated_deduction_logs WHERE status = 'SUCCESS'", 'Accounting Sync: Loan Sweeps', true);
-    const ledgerEntriesRes = runSql('SELECT * FROM ledger_entries', 'Accounting Sync: Existing Ledger Entries', true);
-    const transactionsRes = runSql('SELECT * FROM transactions', 'Accounting Sync: Existing Transactions', true);
+    // 2. Fetch all source records strictly isolated by active business_id
+    const bizFilter = (alias?: string) => {
+      if (!activeBizId) return '';
+      const col = alias ? `${alias}.business_id` : 'business_id';
+      return `${col} = '${sqlEsc(activeBizId)}'`;
+    };
+    const whereBiz = activeBizId ? `WHERE ${bizFilter()}` : '';
+    const andBiz = activeBizId ? `AND ${bizFilter()}` : '';
+
+    const productsRes = runSql(`SELECT * FROM products ${whereBiz}`, 'Accounting Sync: Products', true);
+    const storeProductsRes = runSql(`SELECT * FROM store_products ${whereBiz}`, 'Accounting Sync: Store Products', true);
+    const customersRes = runSql(`SELECT * FROM customers ${whereBiz}`, 'Accounting Sync: Customers', true);
+    const ordersRes = runSql(`SELECT * FROM orders ${whereBiz} ORDER BY orderDate ASC`, 'Accounting Sync: Orders', true);
+    const orderItemsRes = runSql(`SELECT * FROM order_items ${whereBiz}`, 'Accounting Sync: Order Items', true);
+    const laybysRes = runSql(`SELECT * FROM laybys ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Laybys', true);
+    const laybyInstRes = runSql(`SELECT * FROM layby_installments ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Layby Installments', true);
+    const expensesRes = runSql(`SELECT * FROM expenses ${whereBiz} ORDER BY expense_date ASC`, 'Accounting Sync: Expenses', true);
+    const attendanceRes = runSql(`SELECT * FROM time_attendance WHERE status = 'PAID' ${andBiz}`, 'Accounting Sync: Paid Payroll', true);
+    const transfersRes = runSql(`SELECT * FROM money_transfers ${whereBiz} ORDER BY transfer_date ASC`, 'Accounting Sync: Transfers', true);
+    const transitRes = runSql(`SELECT * FROM transit_purchases ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Transit POs', true);
+    const purchasesTransitRes = runSql(`SELECT * FROM purchases_transit ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Supply Management POs', true);
+    const assetsRes = runSql(`SELECT * FROM assets ${whereBiz}`, 'Accounting Sync: Assets', true);
+    const equityRes = runSql(`SELECT * FROM equity ${whereBiz}`, 'Accounting Sync: Equity', true);
+    const loansRes = runSql(`SELECT * FROM loans WHERE status = 'ACTIVE' ${andBiz}`, 'Accounting Sync: Active Loans', true);
+    const loanDedRes = runSql(`SELECT * FROM automated_deduction_logs WHERE status = 'SUCCESS' ${andBiz}`, 'Accounting Sync: Loan Sweeps', true);
+    const ledgerEntriesRes = runSql(`SELECT * FROM ledger_entries ${whereBiz}`, 'Accounting Sync: Existing Ledger Entries', true);
+    const transactionsRes = runSql(`SELECT * FROM transactions ${whereBiz}`, 'Accounting Sync: Existing Transactions', true);
 
     const products: any[] = (productsRes.success && Array.isArray(productsRes.data)) ? productsRes.data : [];
     const storeProducts: any[] = (storeProductsRes.success && Array.isArray(storeProductsRes.data)) ? storeProductsRes.data : [];
@@ -2616,19 +2976,19 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       };
     };
 
-    // 3. Rebuild authoritative accounting ledgers:
-    // - double_entry_journal
-    // - receipt_refund_ledger
-    // - cash_flow_ledger
-    // - payment_method_ledger
-    // - financial_statements_ledger
-    // - ledger_entries (ensuring view_account_balances is 100% accurate)
-    runSql('DELETE FROM double_entry_journal', 'Accounting Sync: Reset double_entry_journal', true);
-    runSql('DELETE FROM receipt_refund_ledger', 'Accounting Sync: Reset receipt_refund_ledger', true);
-    runSql('DELETE FROM cash_flow_ledger', 'Accounting Sync: Reset cash_flow_ledger', true);
-    runSql('DELETE FROM payment_method_ledger', 'Accounting Sync: Reset payment_method_ledger', true);
-    runSql('DELETE FROM financial_statements_ledger', 'Accounting Sync: Reset financial_statements_ledger', true);
-    runSql('DELETE FROM ledger_entries', 'Accounting Sync: Rebuild balanced ledger_entries', true);
+    // 3. Preserve rows from OTHER businesses while resetting current business's accounting ledgers
+    const preserveOtherRows = (tableName: string) => {
+      if (!activeBizId || !alasql.tables?.[tableName]?.data) return [] as any[];
+      return alasql.tables[tableName].data.filter(
+        (r: any) => r?.business_id && String(r.business_id) !== activeBizId
+      );
+    };
+    const otherJournalRows = preserveOtherRows('double_entry_journal');
+    const otherReceiptRefundRows = preserveOtherRows('receipt_refund_ledger');
+    const otherCashFlowRows = preserveOtherRows('cash_flow_ledger');
+    const otherPaymentMethodRows = preserveOtherRows('payment_method_ledger');
+    const otherStatementRows = preserveOtherRows('financial_statements_ledger');
+    const otherLedgerEntries = preserveOtherRows('ledger_entries');
 
     const journalRows: any[] = [];
     const receiptRefundRows: any[] = [];
@@ -2643,11 +3003,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       debitAcc: string,
       creditAcc: string,
       amount: number,
-      txIdForLedger?: string
+      txIdForLedger?: string,
+      rowStoreId?: string
     ) => {
       const cleanAmt = parseFloat(Number(amount || 0).toFixed(4));
       if (cleanAmt <= 0) return;
       const jId = `JRN_${idSuffix}`;
+      const rowStore = rowStoreId || activeDefaultStoreId || 'main';
       journalRows.push({
         id: jId,
         date,
@@ -2656,7 +3018,9 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         account_debit: debitAcc,
         account_credit: creditAcc,
         amount: cleanAmt,
-        currency: 'ZMW'
+        currency: 'ZMW',
+        business_id: activeBizId,
+        store_id: rowStore
       });
       const txRef = txIdForLedger || `tx_${idSuffix}`;
       rebuiltLedgerEntries.push({
@@ -2665,7 +3029,9 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         account_id: debitAcc,
         type: 'DEBIT',
         amount: cleanAmt,
-        created_at: date
+        created_at: date,
+        business_id: activeBizId,
+        store_id: rowStore
       });
       rebuiltLedgerEntries.push({
         id: `le_${idSuffix}_cr`,
@@ -2673,13 +3039,18 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         account_id: creditAcc,
         type: 'CREDIT',
         amount: cleanAmt,
-        created_at: date
+        created_at: date,
+        business_id: activeBizId,
+        store_id: rowStore
       });
     };
 
-    // Dynamically collect all store IDs from stores table and active records (ignoring deleted legacy demo store IDs)
+    // Dynamically collect store IDs belonging strictly to the active business
     const legacyIgnoredStores = new Set(['lusaka', 'kitwe', 'ndola', 'store_main']);
-    const dbStoresRes = runSql('SELECT id FROM stores', 'Accounting Sync: Stores', true);
+    const dbStoresSql = activeBizId
+      ? `SELECT id FROM stores WHERE business_id = '${sqlEsc(activeBizId)}'`
+      : 'SELECT id FROM stores';
+    const dbStoresRes = runSql(dbStoresSql, 'Accounting Sync: Stores', true);
     const dynamicStoreSet = new Set<string>();
     if (dbStoresRes.success && Array.isArray(dbStoresRes.data)) {
       dbStoresRes.data.forEach((s: any) => {
@@ -2695,10 +3066,12 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     expenses.forEach(e => addIfActiveStore(e.store_id));
     laybys.forEach(l => addIfActiveStore(l.store_id));
     storeProducts.forEach(sp => addIfActiveStore(sp.store_id));
+    assetsList.forEach(a => addIfActiveStore(a.store_id));
+    equityList.forEach(eq => addIfActiveStore(eq.store_id));
 
     const individualStores = Array.from(dynamicStoreSet);
     const storesList = [...individualStores, 'all'];
-    const defaultFallbackStore = individualStores[0] || 'main';
+    const defaultFallbackStore = individualStores[0] || activeDefaultStoreId || 'main';
     const customMethodNames = allCustomMethods.map(cm => cm.name);
     const methodNamesSet = new Set<string>([
       'Cash',
@@ -2833,7 +3206,8 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         performed_by: cashier,
         journal_ref: `JRN_SALE_${ordId}`,
         status: isRefunded ? 'REFUNDED' : 'COMPLETED',
-        created_at: dateStr
+        created_at: dateStr,
+        business_id: activeBizId
       });
 
       if (isLaybyCompletionOrder) {
@@ -3017,7 +3391,8 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
           reference_id: ordId,
           description: `POS Sale Receipt #${ordId} (${custName}) via ${rawPayMethod}`,
           performed_by: cashier,
-          created_at: dateStr
+          created_at: dateStr,
+          business_id: activeBizId
         });
       }
 
@@ -3434,54 +3809,178 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       });
     });
 
-    // G. Process Fixed Assets & Owner Capital Equity
+    // G. Process Fixed/Current Assets & Owner Capital Equity (Standardized + Branch-Scoped)
     assetsList.forEach((ast, idx) => {
       const astId = String(ast.id || `AST-${idx}`);
       const val = Number(ast.value || 0);
       if (val <= 0) return;
+      const astStore = String(ast.store_id || defaultFallbackStore).toLowerCase().trim();
       const dateStr = ast.purchase_date || nowIso;
+      const status = String(ast.status || 'Active');
+      const funding = String(ast.funding_source || (ast.linked_equity_id ? 'owner_equity' : 'acc_owner_capital')).trim();
+      const isFundedByCashOrBank = funding.startsWith('acc_') && funding !== 'acc_owner_capital';
+      const creditAccount = isFundedByCashOrBank ? funding : 'acc_owner_capital';
+
       addJournalPair(
         `ASSET_${astId}`,
         dateStr,
         astId,
-        `Fixed/Current Asset Registration: ${ast.name}`,
+        `Asset Registration (${ast.category || 'Fixed'} - ${ast.type || 'Equipment'}): ${ast.name}`,
         'acc_fixed_assets',
-        'acc_owner_capital',
-        val
+        creditAccount,
+        val,
+        undefined,
+        astStore
       );
+
+      if (isFundedByCashOrBank) {
+        const payMeta = resolvePaymentMethodBucket(creditAccount);
+        addMethodStat(astStore, payMeta.bucket, 'expenses_out', val, false);
+        cashFlowRows.push({
+          id: `CF_ASSET_${astId}`,
+          date: dateStr,
+          store_id: astStore,
+          activity_type: 'INVESTING',
+          category: 'Fixed & Capital Asset Purchase',
+          direction: 'OUTFLOW',
+          payment_method: payMeta.bucket,
+          account_id: creditAccount,
+          inflow_amount: 0,
+          outflow_amount: val,
+          net_cash_change: -val,
+          reference_id: astId,
+          description: `Capital Asset Acquisition: ${ast.name}`,
+          performed_by: 'Finance Admin',
+          created_at: dateStr
+        });
+      }
+
+      if (status === 'Active') {
+        const valuation = calculateAssetValuation(ast);
+        if (valuation.accumulatedDepreciation > 0) {
+          addJournalPair(
+            `DEP_${astId}`,
+            nowIso,
+            astId,
+            `Accumulated Depreciation (${ast.depreciation_method || 'Straight Line'}): ${ast.name}`,
+            'acc_depreciation_exp',
+            'acc_accum_depreciation',
+            valuation.accumulatedDepreciation,
+            undefined,
+            astStore
+          );
+        }
+      } else if (status === 'Disposed' && Number(ast.disposal_proceeds || 0) > 0) {
+        const proceeds = Number(ast.disposal_proceeds || 0);
+        const dispDate = ast.disposal_date || nowIso;
+        addJournalPair(
+          `AST_DISP_${astId}`,
+          dispDate,
+          astId,
+          `Asset Disposal Proceeds: ${ast.name}`,
+          'acc_bank',
+          'acc_fixed_assets',
+          proceeds,
+          undefined,
+          astStore
+        );
+        addMethodStat(astStore, 'Credit Card / Bank', 'transfers_in', proceeds, false);
+        cashFlowRows.push({
+          id: `CF_DISP_${astId}`,
+          date: dispDate,
+          store_id: astStore,
+          activity_type: 'INVESTING',
+          category: 'Asset Disposal Proceeds',
+          direction: 'INFLOW',
+          payment_method: 'Credit Card / Bank',
+          account_id: 'acc_bank',
+          inflow_amount: proceeds,
+          outflow_amount: 0,
+          net_cash_change: proceeds,
+          reference_id: astId,
+          description: `Proceeds from Disposal of ${ast.name}`,
+          performed_by: 'Finance Admin',
+          created_at: dispDate
+        });
+      }
     });
 
     equityList.forEach((eq, idx) => {
-      if (eq.linked_asset_id) return; // already paired above
+      if (String(eq.status || 'Active') === 'Reversed') return;
+      if (eq.linked_asset_id) return; // already paired via asset contribution above
       const eqId = String(eq.id || `EQ-${idx}`);
       const val = Number(eq.value || 0);
       if (val <= 0) return;
-      addJournalPair(
-        `EQUITY_${eqId}`,
-        nowIso,
-        eqId,
-        `Owner Capital Equity Contribution: ${eq.name}`,
-        'acc_bank',
-        'acc_owner_capital',
-        val
-      );
-      cashFlowRows.push({
-        id: `CF_EQ_${eqId}`,
-        date: nowIso,
-        store_id: defaultFallbackStore,
-        activity_type: 'FINANCING',
-        category: 'Owner Capital Injection',
-        direction: 'INFLOW',
-        payment_method: 'Credit Card / Bank',
-        account_id: 'acc_bank',
-        inflow_amount: val,
-        outflow_amount: 0,
-        net_cash_change: val,
-        reference_id: eqId,
-        description: `Owner Capital Equity: ${eq.name}`,
-        performed_by: 'Owner',
-        created_at: nowIso
-      });
+      const eqStore = String(eq.store_id || defaultFallbackStore).toLowerCase().trim();
+      const eqType = String(eq.equity_type || 'Owner Capital');
+      const isDrawings =
+        eqType.toLowerCase().includes('drawing') ||
+        eqType.toLowerCase().includes('dividend');
+      const payAcc = String(eq.account_id || 'acc_bank').trim() || 'acc_bank';
+      const eqDate = eq.contribution_date || eq.created_at || nowIso;
+      const payMeta = resolvePaymentMethodBucket(payAcc);
+
+      if (isDrawings) {
+        addJournalPair(
+          `EQUITY_${eqId}`,
+          eqDate,
+          eqId,
+          `${eqType}: ${eq.name}${eq.shareholder_name ? ` (${eq.shareholder_name})` : ''}`,
+          'acc_owner_capital',
+          payAcc,
+          val,
+          undefined,
+          eqStore
+        );
+        addMethodStat(eqStore, payMeta.bucket, 'expenses_out', val, false);
+        cashFlowRows.push({
+          id: `CF_EQ_${eqId}`,
+          date: eqDate,
+          store_id: eqStore,
+          activity_type: 'FINANCING',
+          category: eqType,
+          direction: 'OUTFLOW',
+          payment_method: payMeta.bucket,
+          account_id: payAcc,
+          inflow_amount: 0,
+          outflow_amount: val,
+          net_cash_change: -val,
+          reference_id: eqId,
+          description: `${eqType}: ${eq.name}`,
+          performed_by: eq.shareholder_name || 'Owner',
+          created_at: eqDate
+        });
+      } else {
+        addJournalPair(
+          `EQUITY_${eqId}`,
+          eqDate,
+          eqId,
+          `${eqType}: ${eq.name}${eq.shareholder_name ? ` (${eq.shareholder_name})` : ''}`,
+          payAcc,
+          'acc_owner_capital',
+          val,
+          undefined,
+          eqStore
+        );
+        addMethodStat(eqStore, payMeta.bucket, 'transfers_in', val, false);
+        cashFlowRows.push({
+          id: `CF_EQ_${eqId}`,
+          date: eqDate,
+          store_id: eqStore,
+          activity_type: 'FINANCING',
+          category: eqType,
+          direction: 'INFLOW',
+          payment_method: payMeta.bucket,
+          account_id: payAcc,
+          inflow_amount: val,
+          outflow_amount: 0,
+          net_cash_change: val,
+          reference_id: eqId,
+          description: `${eqType}: ${eq.name}`,
+          performed_by: eq.shareholder_name || 'Owner',
+          created_at: eqDate
+        });
+      }
     });
 
     // H. Process Inventory Stock Valuation & Retained Earnings Alignment
@@ -3511,21 +4010,27 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
 
     // No synthetic opening inventory capitalization journal entry is posted; double-entry journal strictly reflects real recorded transactions.
 
-    // 4. Bulk insert rebuilt rows into AlaSQL tables
+    // 4. Merge rebuilt rows for active business with preserved rows for other businesses
+    const stampRowBiz = (arr: any[]) =>
+      arr.map(r => ({
+        ...r,
+        business_id: r.business_id || activeBizId,
+        store_id: r.store_id || defaultFallbackStore,
+      }));
+
     if (alasql.tables.double_entry_journal) {
-      alasql.tables.double_entry_journal.data = journalRows;
+      alasql.tables.double_entry_journal.data = [...otherJournalRows, ...stampRowBiz(journalRows)];
     }
     if (alasql.tables.receipt_refund_ledger) {
-      // Sort newest first
       receiptRefundRows.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-      alasql.tables.receipt_refund_ledger.data = receiptRefundRows;
+      alasql.tables.receipt_refund_ledger.data = [...otherReceiptRefundRows, ...stampRowBiz(receiptRefundRows)];
     }
     if (alasql.tables.cash_flow_ledger) {
       cashFlowRows.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-      alasql.tables.cash_flow_ledger.data = cashFlowRows;
+      alasql.tables.cash_flow_ledger.data = [...otherCashFlowRows, ...stampRowBiz(cashFlowRows)];
     }
     if (alasql.tables.ledger_entries) {
-      alasql.tables.ledger_entries.data = rebuiltLedgerEntries;
+      alasql.tables.ledger_entries.data = [...otherLedgerEntries, ...stampRowBiz(rebuiltLedgerEntries)];
     }
 
     // 5. Populate `payment_method_ledger`
@@ -3542,7 +4047,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         ).toFixed(2)
       );
       paymentMethodRows.push({
-        id: `PML_${key.replace(/[^a-zA-Z0-9_]/g, '_')}`,
+        id: `PML_${activeBizSlug}_${key.replace(/[^a-zA-Z0-9_]/g, '_')}`,
         payment_method: stat.payment_method,
         store_id: stat.store_id,
         account_id: stat.account_id,
@@ -3554,19 +4059,16 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         transfers_out: parseFloat(stat.transfers_out.toFixed(2)),
         net_balance: netBal,
         transaction_count: stat.transaction_count,
-        updated_at: nowIso
+        updated_at: nowIso,
+        business_id: activeBizId
       });
     });
     if (alasql.tables.payment_method_ledger) {
-      alasql.tables.payment_method_ledger.data = paymentMethodRows;
+      alasql.tables.payment_method_ledger.data = [...otherPaymentMethodRows, ...paymentMethodRows];
     }
 
     // 6. Compute and populate `financial_statements_ledger` for each store and 'all'
     const statementRows: any[] = [];
-    const totalFixedAssetsVal = assetsList
-      .filter(a => a.status !== 'Disposed' && a.status !== 'Written Off')
-      .reduce((s, a) => s + Number(a.value || 0), 0);
-    const totalOwnerCapitalVal = equityList.reduce((s, e) => s + Number(e.value || 0), 0);
     const totalLoansRepayable = activeLoans.reduce((s, l) => s + Number(l.total_repayable || 0), 0);
     const totalLoansSwept = loanSweeps.reduce((s, d) => s + Number(d.amount_deducted || 0), 0);
     const netLoansPayable = Math.max(0, totalLoansRepayable - totalLoansSwept);
@@ -3653,7 +4155,9 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         supplyPos
           .filter(p => matchStore(p.store_id) && p.stage !== 'LANDED_AT_STORE')
           .reduce((s, p) => s + Number(p.total_landed_cost || 0), 0);
-      const stFixedAssets = st === 'all' || st === defaultFallbackStore ? totalFixedAssetsVal : 0;
+      const stFixedAssets = assetsList
+        .filter(a => matchStore(a.store_id) && a.status !== 'Disposed' && a.status !== 'Written Off')
+        .reduce((s, a) => s + calculateAssetValuation(a).netBookValue, 0);
       const totalAssets = totalCashEquiv + stInvVal + stTransitVal + stFixedAssets;
 
       // Liabilities
@@ -3664,7 +4168,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const totalLiabilities = vatCollected + stLaybyLiability + stLoansLiability;
 
       // Equity (Assets - Liabilities = Total Equity, decomposed into Owner Capital + Retained Earnings)
-      const stOwnerCapital = st === 'all' || st === defaultFallbackStore ? totalOwnerCapitalVal : 0;
+      const stOwnerCapital = equityList
+        .filter(eq => matchStore(eq.store_id) && String(eq.status || 'Active') !== 'Reversed')
+        .reduce((s, eq) => {
+          const t = String(eq.equity_type || '').toLowerCase();
+          const isDraw = t.includes('drawing') || t.includes('dividend');
+          return s + (isDraw ? -Number(eq.value || 0) : Number(eq.value || 0));
+        }, 0);
       const totalEquity = totalAssets - totalLiabilities;
       const retainedEarnings = totalEquity - stOwnerCapital;
 
@@ -3682,7 +4192,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const netCf = opCf + invCf + finCf;
 
       statementRows.push({
-        id: `STMT_${st.toUpperCase()}`,
+        id: `STMT_${activeBizSlug}_${st.toUpperCase()}`,
         store_id: st,
         period_date: todayDate,
         gross_sales_revenue: parseFloat(grossSales.toFixed(2)),
@@ -3714,12 +4224,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         investing_cash_flow: parseFloat(invCf.toFixed(2)),
         financing_cash_flow: parseFloat(finCf.toFixed(2)),
         net_cash_flow: parseFloat(netCf.toFixed(2)),
-        updated_at: nowIso
+        updated_at: nowIso,
+        business_id: activeBizId
       });
     }
 
     if (alasql.tables.financial_statements_ledger) {
-      alasql.tables.financial_statements_ledger.data = statementRows;
+      alasql.tables.financial_statements_ledger.data = [...otherStatementRows, ...statementRows];
     }
 
     // 7. Immediately update/upsert Today's Live EOD Cash-Up Register (`cash_ups`) in the database
@@ -3819,14 +4330,14 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
         const netExpectedCard = parseFloat((eodCardSales - eodRefundsCard).toFixed(2));
         const netExpectedMomo = parseFloat((eodMomoSales - eodRefundsMomo).toFixed(2));
 
-        const liveEodId = `EOD-LIVE-${todayDate}-${st.toUpperCase()}`;
-        runSql(`DELETE FROM cash_ups WHERE id = '${liveEodId}'`, 'EOD Sync: Refresh live EOD row', true);
+        const liveEodId = `EOD-LIVE-${activeBizSlug}-${todayDate}-${st.toUpperCase()}`;
+        runSql(`DELETE FROM cash_ups WHERE id = '${sqlEsc(liveEodId)}'`, 'EOD Sync: Refresh live EOD row', true);
         runSql(
-          `INSERT INTO cash_ups VALUES (
-            '${liveEodId}',
+          `INSERT INTO cash_ups (id, date, store_id, cashier_name, sum_cash_expected, sum_cash_actual, sum_card_expected, sum_card_actual, sum_momo_expected, sum_momo_actual, variance, notes, created_at, business_id) VALUES (
+            '${sqlEsc(liveEodId)}',
             '${todayDate}',
-            '${st}',
-            'LIVE AUTO-LEDGER (${triggerReason.replace(/'/g, '')})',
+            '${sqlEsc(st)}',
+            'LIVE AUTO-LEDGER (${sqlEsc(triggerReason)})',
             ${netExpectedCash},
             ${netExpectedCash},
             ${netExpectedCard},
@@ -3835,7 +4346,8 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
             ${netExpectedMomo},
             0.00,
             'Auto-synced EOD | Cash Sales: ${eodCashSales.toFixed(2)} | Airtel: ${eodAirtelSales.toFixed(2)} | MTN: ${eodMtnSales.toFixed(2)}${eodCustomMomoSales > 0 ? ` | Custom MoMo: ${eodCustomMomoSales.toFixed(2)}` : ''} | Refunds: ${(eodRefundsCash + eodRefundsCard + eodRefundsMomo).toFixed(2)} | Cash Out: ${eodCashExpenses.toFixed(2)}',
-            '${nowIso}'
+            '${nowIso}',
+            '${sqlEsc(activeBizId)}'
           )`,
           `EOD Sync: Auto-update live EOD cash-up for ${st}`,
           true
@@ -3873,24 +4385,33 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
   activeCloudPushPromise = (async () => {
   try {
     syncAllAccountingSystems('Pre-Cloud Push Sync');
-    const tables = extractAllTablesSnapshot();
-    const bizRows = tables['businesses'] || [];
-    let bizId = explicitBusinessId || '';
+    const resolvedBizId = getActiveBusinessId(explicitBusinessId);
+    const allSnapshot = extractAllTablesSnapshot();
+    const bizRows = allSnapshot['businesses'] || [];
+    let bizId = resolvedBizId || '';
     let bizName = '';
     let ownerEmail = '';
 
-    if (!bizId && typeof localStorage !== 'undefined') {
+    if (typeof localStorage !== 'undefined') {
       try {
         const cached = JSON.parse(localStorage.getItem('active_business_profile') || '{}');
         if (cached && cached.id && cached.id !== 'default_biz') {
-          bizId = cached.id;
-          bizName = cached.name || '';
-          ownerEmail = cached.email || '';
+          if (!bizId) bizId = cached.id;
+          if (!bizId || cached.id === bizId) {
+            bizName = cached.name || '';
+            ownerEmail = cached.email || '';
+          }
         }
       } catch {}
     }
 
-    if (!bizId && bizRows.length > 0) {
+    if (bizId) {
+      const matchedBiz = bizRows.find((b: any) => b.id === bizId);
+      if (matchedBiz) {
+        bizName = bizName || matchedBiz.name || '';
+        ownerEmail = ownerEmail || matchedBiz.email || '';
+      }
+    } else if (bizRows.length > 0) {
       bizId = bizRows[0].id;
       bizName = bizRows[0].name || '';
       ownerEmail = bizRows[0].email || '';
@@ -3899,6 +4420,8 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
     if (!bizId) {
       bizId = '__global__';
     }
+
+    const tables = extractAllTablesSnapshot(bizId !== '__global__' ? bizId : undefined);
 
     let settingsObj: any = null;
     if (typeof localStorage !== 'undefined') {
@@ -3988,14 +4511,6 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
     }
 
     const cleanedTables = scrubLegacyPreseededRows(data.tables);
-    rehydrateAlasqlFromRecords(cleanedTables);
-    syncAllAccountingSystems('Cloud SQL Pull Rehydration');
-    persistTablesToStorage(true);
-
-    if (data.settings && typeof localStorage !== 'undefined') {
-      localStorage.setItem('android_pos_settings', JSON.stringify(data.settings));
-    }
-
     const bizRows = Array.isArray(cleanedTables.businesses) ? cleanedTables.businesses : [];
     const targetBiz =
       bizRows.find((b: any) => b.id === data.businessId) ||
@@ -4005,6 +4520,17 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
 
     if (targetBiz && typeof localStorage !== 'undefined') {
       localStorage.setItem('active_business_profile', JSON.stringify(targetBiz));
+    }
+
+    rehydrateAlasqlFromRecords(cleanedTables, {
+      businessId: targetBiz?.id || data.businessId,
+      preserveOtherBusinesses: true,
+    });
+    syncAllAccountingSystems('Cloud SQL Pull Rehydration');
+    persistTablesToStorage(true);
+
+    if (data.settings && typeof localStorage !== 'undefined') {
+      localStorage.setItem('android_pos_settings', JSON.stringify(data.settings));
     }
 
     if (data.updatedAt && typeof localStorage !== 'undefined') {
@@ -4039,6 +4565,52 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
   }
 }
 
+export function getTenantAccountBalances(explicitBusinessId?: string): Array<{
+  account_id: string;
+  account_name: string;
+  currency: string;
+  current_balance: number;
+}> {
+  const bizId = getActiveBusinessId(explicitBusinessId);
+  const rawAccounts = (alasql?.tables?.accounts?.data || []) as any[];
+  const acctMap = new Map<string, any>();
+  rawAccounts.forEach((a: any) => {
+    if (!a?.id) return;
+    if (!acctMap.has(String(a.id))) {
+      acctMap.set(String(a.id), a);
+    }
+  });
+
+  const entries = filterRowsByBusiness((alasql?.tables?.ledger_entries?.data || []) as any[], bizId);
+  const balMap = new Map<string, number>();
+
+  acctMap.forEach((_a, id) => {
+    balMap.set(id, 0);
+  });
+
+  entries.forEach((le: any) => {
+    const accId = String(le.account_id || '');
+    const accDef = acctMap.get(accId);
+    const accType = String(accDef?.type || 'ASSET').toUpperCase();
+    const amt = Number(le.amount || 0);
+    const entryType = String(le.type || '').toUpperCase();
+    let delta = 0;
+    if (accType === 'ASSET' || accType === 'EXPENSE') {
+      delta = entryType === 'DEBIT' ? amt : entryType === 'CREDIT' ? -amt : 0;
+    } else if (accType === 'LIABILITY' || accType === 'REVENUE' || accType === 'EQUITY') {
+      delta = entryType === 'CREDIT' ? amt : entryType === 'DEBIT' ? -amt : 0;
+    }
+    balMap.set(accId, (balMap.get(accId) || 0) + delta);
+  });
+
+  return Array.from(acctMap.entries()).map(([id, a]) => ({
+    account_id: id,
+    account_name: String(a.name || id),
+    currency: String(a.currency || 'ZMW'),
+    current_balance: parseFloat((balMap.get(id) || 0).toFixed(2)),
+  }));
+}
+
 export async function clearAllDatabaseToBlank() {
   initializeDatabase('blank', true);
   if (typeof localStorage !== 'undefined') {
@@ -4053,6 +4625,7 @@ export async function clearAllDatabaseToBlank() {
     window.dispatchEvent(new Event('pos_data_updated'));
   }
 }
+
 
 
 

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
-import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, getCentralBranches, getCustomPaymentMethods, resolvePaymentMethodBucket, calculateLoyaltyPoints, isWalkInCustomerName } from '../db';
+import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, getCentralBranches, getCustomPaymentMethods, resolvePaymentMethodBucket, calculateLoyaltyPoints, isWalkInCustomerName, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { 
   Users, 
   Search, 
@@ -395,15 +395,19 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
   };
 
   const loadData = () => {
-    const storeWhere = activeStore ? `WHERE LOWER(store_id) = '${activeStore.toLowerCase()}'` : '';
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    const storeWhere = activeStore
+      ? `WHERE ${bizCond} AND LOWER(store_id) = '${sqlEsc(activeStore.toLowerCase())}'`
+      : `WHERE ${bizCond}`;
     const res = runSql(`SELECT * FROM laybys ${storeWhere} ORDER BY created_at DESC`, 'Layby: Fetch branch layaway customer accounts');
     if (res.success && Array.isArray(res.data)) {
       setLaybys(res.data);
     }
     
-    const spAllRes = runSql('SELECT product_id, store_id, stock, price FROM store_products', 'Layby: Check branch stock map', true);
+    const spAllRes = runSql(`SELECT product_id, store_id, stock, price FROM store_products WHERE ${bizCond}`, 'Layby: Check branch stock map', true);
     const spList = (spAllRes.success && Array.isArray(spAllRes.data)) ? spAllRes.data : [];
-    const prodRes = runSql('SELECT * FROM products', 'Layby: Load stock catalog');
+    const prodRes = runSql(`SELECT * FROM products WHERE ${bizCond}`, 'Layby: Load stock catalog');
     if (prodRes.success && Array.isArray(prodRes.data)) {
       const branchProds = prodRes.data.map((p: any) => {
         const override = spList.find((sp: any) => Number(sp.product_id) === Number(p.id) && String(sp.store_id) === String(activeStore));
@@ -417,20 +421,20 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       setAllProducts(branchProds);
     }
 
-    const custRes = runSql('SELECT * FROM customers ORDER BY name ASC', 'Layby: Load saved CRM customers');
+    const custRes = runSql(`SELECT * FROM customers WHERE ${bizCond} ORDER BY name ASC`, 'Layby: Load saved CRM customers');
     if (custRes.success && Array.isArray(custRes.data)) {
       setExistingCustomers(custRes.data);
     }
 
     if (selectedLayby) {
       const activeId = selectedLayby.id;
-      const instRes = runSql(`SELECT * FROM layby_installments WHERE layby_id = '${activeId}' ORDER BY created_at DESC`, 'Layby: Fetch payments log');
+      const instRes = runSql(`SELECT * FROM layby_installments WHERE layby_id = '${sqlEsc(activeId)}' AND ${bizCond} ORDER BY created_at DESC`, 'Layby: Fetch payments log');
       if (instRes.success && Array.isArray(instRes.data)) {
         setInstallments(instRes.data);
       }
       
       // refresh active selected layby record from db
-      const freshRes = runSql(`SELECT * FROM laybys WHERE id = '${activeId}'`, 'Layby: Sync client tracker data');
+      const freshRes = runSql(`SELECT * FROM laybys WHERE id = '${sqlEsc(activeId)}' AND ${bizCond}`, 'Layby: Sync client tracker data');
       if (freshRes.success && Array.isArray(freshRes.data) && freshRes.data.length > 0) {
         setSelectedLayby(freshRes.data[0]);
       }
@@ -535,10 +539,11 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
     });
     const finalCustId = syncedCust ? syncedCust.id : 100 + Math.floor(Math.random() * 900);
 
-    const targetBranch = activeStore || 'main';
-    // Insert layby record with branch store_id
+    const activeBizId = getActiveBusinessId();
+    const targetBranch = getActiveStoreId(activeStore, activeBizId);
+    // Insert layby record with business_id and branch store_id
     const insertLaybySql = `
-      INSERT INTO laybys (id, customer_id, customer_name, customer_phone, customer_email, total_amount, deposit_amount, amount_paid, balance_due, status, items_json, store_id, created_at)
+      INSERT INTO laybys (id, customer_id, customer_name, customer_phone, customer_email, total_amount, deposit_amount, amount_paid, balance_due, status, items_json, store_id, created_at, business_id)
       VALUES (
         '${laybyId}',
         ${finalCustId},
@@ -551,8 +556,9 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
         ${(total - depositNum).toFixed(2)},
         'PENDING',
         '${itemsJson.replace(/'/g, "''")}',
-        '${targetBranch}',
-        '${dateStr}'
+        '${sqlEsc(targetBranch)}',
+        '${dateStr}',
+        '${sqlEsc(activeBizId)}'
       )
     `;
     const laybyRes = runSql(insertLaybySql, `Layby: Provision client invoice tracking contract ${laybyId} for branch ${targetBranch}`);
@@ -564,14 +570,15 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       // Record initial installment using chosen deposit payment method
       const installmentId = 'inst-' + Math.floor(10000 + Math.random() * 90000);
       runSql(`
-        INSERT INTO layby_installments (id, layby_id, amount, payment_method, received_by, created_at)
-        VALUES ('${installmentId}', '${laybyId}', ${depositNum.toFixed(2)}, '${initialPayMethod.replace(/'/g, "''")}', '${activeCashier.replace(/'/g, "''")}', '${dateStr}')
+        INSERT INTO layby_installments (id, layby_id, amount, payment_method, received_by, created_at, business_id, store_id)
+        VALUES ('${installmentId}', '${laybyId}', ${depositNum.toFixed(2)}, '${initialPayMethod.replace(/'/g, "''")}', '${activeCashier.replace(/'/g, "''")}', '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(targetBranch)}')
       `, `Layby: Log initial security deposit +K${depositNum} via ${initialPayMethod}`);
 
       // Decrement physical warehouse stock instantly to reserve items in the selected branch
+      const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
       selectedItems.forEach((x) => {
-        runSql(`UPDATE products SET stock = stock - ${x.quantity} WHERE id = ${x.id}`, `Layby: Reserve stock item ${x.sku}`);
-        runSql(`UPDATE store_products SET stock = stock - ${x.quantity} WHERE product_id = ${x.id} AND store_id = '${targetBranch}'`, `Layby: Reserve branch stock in ${targetBranch}`);
+        runSql(`UPDATE products SET stock = stock - ${x.quantity} WHERE id = ${x.id}${bizMatch}`, `Layby: Reserve stock item ${x.sku}`);
+        runSql(`UPDATE store_products SET stock = stock - ${x.quantity} WHERE product_id = ${x.id} AND store_id = '${sqlEsc(targetBranch)}'${bizMatch}`, `Layby: Reserve branch stock in ${targetBranch}`);
       });
 
       // Clear layout
@@ -616,16 +623,19 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
 
     const dateStr = new Date().toISOString();
     const instId = 'inst-' + Math.floor(10000 + Math.random() * 90000);
+    const activeBizId = getActiveBusinessId();
+    const storeId = getActiveStoreId(selectedLayby.store_id || activeStore, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
 
     // Record installment
     const addInstSql = `
-      INSERT INTO layby_installments (id, layby_id, amount, payment_method, received_by, created_at)
-      VALUES ('${instId}', '${selectedLayby.id}', ${payNum.toFixed(2)}, '${payMethod}', '${cashierName.replace(/'/g, "''")}', '${dateStr}')
+      INSERT INTO layby_installments (id, layby_id, amount, payment_method, received_by, created_at, business_id, store_id)
+      VALUES ('${instId}', '${sqlEsc(selectedLayby.id)}', ${payNum.toFixed(2)}, '${sqlEsc(payMethod)}', '${cashierName.replace(/'/g, "''")}', '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(storeId)}')
     `;
     const instRes = runSql(addInstSql, `Layby: Collect partial payment +K${payNum.toFixed(2)} on invoice ${selectedLayby.id}`);
 
     if (instRes.success) {
-      logEmployeeAudit('LAYBY', 'Recorded Layby Payment', `Layby #${selectedLayby.id}, Payment K${payNum.toFixed(2)} via ${payMethod}, Customer: ${selectedLayby.customer_name}`, payNum, selectedLayby.store_id || activeStore || '', cashierName);
+      logEmployeeAudit('LAYBY', 'Recorded Layby Payment', `Layby #${selectedLayby.id}, Payment K${payNum.toFixed(2)} via ${payMethod}, Customer: ${selectedLayby.customer_name}`, payNum, storeId, cashierName);
       const newPaid = selectedLayby.amount_paid + payNum;
       const newDue = selectedLayby.total_amount - newPaid;
       const isCompleted = newDue <= 0.01;
@@ -635,18 +645,17 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
       runSql(`
         UPDATE laybys 
         SET amount_paid = ${newPaid.toFixed(2)}, balance_due = ${newDue.toFixed(2)}, status = '${finalStatus}' 
-        WHERE id = '${selectedLayby.id}'
+        WHERE id = '${sqlEsc(selectedLayby.id)}'${bizMatch}
       `, 'Layby: Update client installment statements');
 
       if (isCompleted) {
         const orderId = selectedLayby.id;
-        const checkOrder = runSql(`SELECT id FROM orders WHERE id = '${orderId}'`);
+        const checkOrder = runSql(`SELECT id FROM orders WHERE id = '${sqlEsc(orderId)}'${bizMatch}`);
         if (!checkOrder.success || !checkOrder.data || checkOrder.data.length === 0) {
-          const storeId = selectedLayby.store_id || activeStore || '';
           runSql(`
-            INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by)
+            INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id)
             VALUES (
-              '${orderId}',
+              '${sqlEsc(orderId)}',
               ${selectedLayby.customer_id || 'NULL'},
               '${dateStr}',
               ${Number(selectedLayby.total_amount || 0).toFixed(2)},
@@ -655,8 +664,9 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
               ${Number(selectedLayby.total_amount || 0).toFixed(2)},
               'Layby (Paid in Full)',
               'Completed',
-              '${storeId}',
-              '${cashierName.replace(/'/g, "''")}'
+              '${sqlEsc(storeId)}',
+              '${cashierName.replace(/'/g, "''")}',
+              '${sqlEsc(activeBizId)}'
             )
           `, `Layby Completion: Log finished sale ${orderId} into orders ledger`);
 
@@ -665,13 +675,15 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
               const items = JSON.parse(selectedLayby.items_json);
               items.forEach((it: any, idx: number) => {
                 runSql(`
-                  INSERT INTO order_items (id, orderId, productId, quantity, unitPrice)
+                  INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id)
                   VALUES (
-                    '${orderId}_item_${idx + 1}',
-                    '${orderId}',
+                    '${sqlEsc(orderId)}_item_${idx + 1}',
+                    '${sqlEsc(orderId)}',
                     ${it.id || 0},
                     ${it.quantity || 1},
-                    ${it.unitPrice || it.price || 0}
+                    ${it.unitPrice || it.price || 0},
+                    '${sqlEsc(activeBizId)}',
+                    '${sqlEsc(storeId)}'
                   )
                 `);
               });
@@ -681,7 +693,7 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
           runSql(`
             UPDATE orders
             SET status = 'Completed', paymentMethod = 'Layby (Paid in Full)'
-            WHERE id = '${orderId}'
+            WHERE id = '${sqlEsc(orderId)}'${bizMatch}
           `);
         }
       }
@@ -714,20 +726,20 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
         channel = `CUSTOM_${payMethod.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
       }
 
-      const storeTerminalCode = (selectedLayby.store_id || activeStore || 'MAIN').toUpperCase();
+      const storeTerminalCode = storeId.toUpperCase();
       runSql(`
-        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at)
-        VALUES ('${txId}', 'idemp-${txId}', 'POS-${storeTerminalCode}-01', '${channel}', 'POS-LAYBY-REF-${selectedLayby.id}', ${payNum.toFixed(4)}, 0.00, 'SUCCESS', 'Layby installment client payment ${selectedLayby.id}', '${dateStr}')
+        INSERT INTO transactions (id, idempotency_key, pos_terminal_id, channel, provider_reference, amount, fee_amount, status, narration, created_at, business_id, store_id)
+        VALUES ('${txId}', 'idemp-${txId}', 'POS-${storeTerminalCode}-01', '${channel}', 'POS-LAYBY-REF-${sqlEsc(selectedLayby.id)}', ${payNum.toFixed(4)}, 0.00, 'SUCCESS', 'Layby installment client payment ${sqlEsc(selectedLayby.id)}', '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(storeId)}')
       `, 'Double Entry: Record layby installment');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${payNum.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_deb', '${txId}', '${clearingAccountId}', 'DEBIT', ${payNum.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(storeId)}')
       `, 'Double Entry: Debit asset clearing');
 
       runSql(`
-        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at)
-        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${payNum.toFixed(4)}, '${dateStr}')
+        INSERT INTO ledger_entries (id, transaction_id, account_id, type, amount, created_at, business_id, store_id)
+        VALUES ('le_${txId}_cre_merch', '${txId}', 'merchant-wallet-account-uuid', 'CREDIT', ${payNum.toFixed(4)}, '${dateStr}', '${sqlEsc(activeBizId)}', '${sqlEsc(storeId)}')
       `, 'Double Entry: Credit customer liability settlement');
 
       setPaymentAmount('');

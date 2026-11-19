@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts';
-import { runSql, getCentralBranches } from '../db';
+import { runSql, getCentralBranches, getActiveBusinessId, getTenantAccountBalances, sqlEsc } from '../db';
 import { StoreSettings } from '../types';
 import { TrendingUp, Award, Wallet, Activity, Code, Play, Download, FileText } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -58,21 +58,24 @@ export default function SmeDashboard({ settings, setActiveTab, setTerminalCode, 
   const [showSqlFor, setShowSqlFor] = useState<'metrics' | 'trend' | 'payments' | 'leaderboard' | 'double_entry' | 'customer_crm' | null>(null);
 
   const getFilteredQueries = (storeId: string) => {
-    const storeFilterRaw = storeId === 'all' ? '' : `AND LOWER(store_id) = '${storeId.toLowerCase()}'`;
-    const storeFilterAlias = storeId === 'all' ? '' : `AND LOWER(o.store_id) = '${storeId.toLowerCase()}'`;
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const bizCondAlias = (alias: string) => (activeBizId ? `AND ${alias}.business_id = '${sqlEsc(activeBizId)}'` : '');
+    const storeFilterRaw = storeId === 'all' ? '' : `AND LOWER(store_id) = '${sqlEsc(storeId.toLowerCase())}'`;
+    const storeFilterAlias = storeId === 'all' ? '' : `AND LOWER(o.store_id) = '${sqlEsc(storeId.toLowerCase())}'`;
     const completedCond = `LOWER(TRIM(status)) IN ('completed', 'success', 'paid', 'active', 'quicksale')`;
     const completedCondAlias = `LOWER(TRIM(o.status)) IN ('completed', 'success', 'paid', 'active', 'quicksale')`;
     return {
       metrics: `
 -- Aggregate top-level financial metrics from invoices and products for branch ${storeId.toUpperCase()}
 SELECT 
-  COALESCE((SELECT SUM(total) FROM orders WHERE ${completedCond} ${storeFilterRaw}), 0) AS total_revenue,
-  COALESCE((SELECT COUNT(*) FROM orders WHERE ${completedCond} ${storeFilterRaw}), 0) AS transaction_count,
+  COALESCE((SELECT SUM(total) FROM orders WHERE ${completedCond} ${bizCond} ${storeFilterRaw}), 0) AS total_revenue,
+  COALESCE((SELECT COUNT(*) FROM orders WHERE ${completedCond} ${bizCond} ${storeFilterRaw}), 0) AS transaction_count,
   COALESCE((SELECT SUM(oi.quantity * (oi.unitPrice - COALESCE(p.cost, oi.unitPrice * 0.7))) 
    FROM order_items oi 
    LEFT JOIN products p ON oi.productId = p.id
    JOIN orders o ON oi.orderId = o.id
-   WHERE ${completedCondAlias} ${storeFilterAlias}), 0) - COALESCE((SELECT SUM(discount) FROM orders WHERE ${completedCond} ${storeFilterRaw}), 0) AS total_profit;
+   WHERE ${completedCondAlias} ${bizCondAlias('o')} ${storeFilterAlias}), 0) - COALESCE((SELECT SUM(discount) FROM orders WHERE ${completedCond} ${bizCond} ${storeFilterRaw}), 0) AS total_profit;
       `,
       trend: `
 -- Rollup sales transactions by daily date calendar buckets for branch ${storeId.toUpperCase()}
@@ -80,7 +83,7 @@ SELECT
   SUBSTR(orderDate, 1, 10) AS date,
   SUM(total) AS revenue
 FROM orders
-WHERE ${completedCond} ${storeFilterRaw}
+WHERE ${completedCond} ${bizCond} ${storeFilterRaw}
 GROUP BY SUBSTR(orderDate, 1, 10)
 ORDER BY date ASC;
       `,
@@ -90,7 +93,7 @@ SELECT
   paymentMethod AS name,
   SUM(total) AS value
 FROM orders
-WHERE ${completedCond} ${storeFilterRaw}
+WHERE ${completedCond} ${bizCond} ${storeFilterRaw}
 GROUP BY paymentMethod;
       `,
       leaderboard: `
@@ -101,24 +104,29 @@ SELECT
 FROM order_items oi
 JOIN products p ON oi.productId = p.id
 JOIN orders o ON oi.orderId = o.id
-WHERE ${completedCondAlias} ${storeFilterAlias}
+WHERE ${completedCondAlias} ${bizCondAlias('o')} ${storeFilterAlias}
 GROUP BY p.name
 ORDER BY value DESC
 LIMIT 5;
       `,
       double_entry: `
--- Query from our SQL VIEW to calculate absolute balances of all active ledgers
+-- Tenant-isolated account balances computed from ledger_entries for business ${activeBizId || 'current'}
 SELECT 
-  account_id,
-  account_name,
-  currency,
-  COALESCE(current_balance, 0) AS balance
-FROM view_account_balances;
+  a.id AS account_id,
+  a.name AS account_name,
+  a.currency,
+  COALESCE(SUM(CASE WHEN (a.type IN ('ASSET', 'EXPENSE') AND le.type = 'DEBIT') OR (a.type IN ('LIABILITY', 'REVENUE', 'EQUITY') AND le.type = 'CREDIT') THEN le.amount WHEN (a.type IN ('ASSET', 'EXPENSE') AND le.type = 'CREDIT') OR (a.type IN ('LIABILITY', 'REVENUE', 'EQUITY') AND le.type = 'DEBIT') THEN -le.amount ELSE 0 END), 0) AS balance
+FROM accounts a
+LEFT JOIN ledger_entries le ON a.id = le.account_id ${activeBizId ? `AND le.business_id = '${sqlEsc(activeBizId)}'` : ''}
+GROUP BY a.id, a.name, a.currency;
       `
     };
   };
 
   const calculateAnalytics = (storeId = selectedStoreFilter) => {
+    const activeBizId = getActiveBusinessId();
+    const bizCondWhere = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    const bizCondAnd = activeBizId ? `AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const queries = getFilteredQueries(storeId);
 
     // 1. Rollup core metrics using SELECT sums
@@ -169,16 +177,19 @@ FROM view_account_balances;
       setTopItems([]);
     }
 
-    // 5. Fetch double-entry clearing accounts view
-    const balRes = runSql(queries.double_entry, 'Dashboard: Compile trial balances from SQL view');
-    if (balRes.success && Array.isArray(balRes.data)) {
-      setAccountBalances(balRes.data);
-    }
+    // 5. Fetch tenant-isolated double-entry clearing account balances
+    const tenantBalances = getTenantAccountBalances(activeBizId).map((b) => ({
+      account_id: b.account_id,
+      account_name: b.account_name,
+      currency: b.currency,
+      balance: b.current_balance
+    }));
+    setAccountBalances(tenantBalances);
 
     // 6. Fetch last 5 ledger transactions
     const auditQuery = storeId === 'all'
-      ? 'SELECT * FROM transactions ORDER BY created_at DESC LIMIT 5'
-      : `SELECT * FROM transactions WHERE pos_terminal_id LIKE '%${storeId.toUpperCase()}%' ORDER BY created_at DESC LIMIT 5`;
+      ? `SELECT * FROM transactions WHERE ${bizCondWhere} ORDER BY created_at DESC LIMIT 5`
+      : `SELECT * FROM transactions WHERE ${bizCondWhere} AND (LOWER(store_id) = '${sqlEsc(storeId.toLowerCase())}' OR pos_terminal_id LIKE '%${sqlEsc(storeId.toUpperCase())}%') ORDER BY created_at DESC LIMIT 5`;
     const journalsRes = runSql(auditQuery, `Dashboard: Fetch checkout audits on branch ${storeId}`);
     if (journalsRes.success && Array.isArray(journalsRes.data)) {
       setLedgerLogs(journalsRes.data);
@@ -187,6 +198,7 @@ FROM view_account_balances;
     }
 
     // 7. Load CRM Analytics: compile frequent active clients based on transaction quantities & total spent values
+    const oBiz = activeBizId ? `AND o.business_id = '${sqlEsc(activeBizId)}'` : '';
     const custCrmQuery = `
       SELECT 
         c.id,
@@ -194,10 +206,11 @@ FROM view_account_balances;
         c.phone,
         c.email,
         c.loyalPoints,
-        (SELECT COUNT(*) FROM orders o WHERE o.customerId = c.id AND o.status = 'Completed' ${storeId === 'all' ? '' : `AND o.store_id = '${storeId}'`}) AS purchase_count,
-        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.customerId = c.id AND o.status = 'Completed' ${storeId === 'all' ? '' : `AND o.store_id = '${storeId}'`}) AS total_value,
-        (SELECT COALESCE(SUM(oi.quantity), 0) FROM order_items oi JOIN orders o ON oi.orderId = o.id WHERE o.customerId = c.id AND o.status = 'Completed' ${storeId === 'all' ? '' : `AND o.store_id = '${storeId}'`}) AS total_qty
+        (SELECT COUNT(*) FROM orders o WHERE o.customerId = c.id AND o.status = 'Completed' ${oBiz} ${storeId === 'all' ? '' : `AND o.store_id = '${sqlEsc(storeId)}'`}) AS purchase_count,
+        (SELECT COALESCE(SUM(o.total), 0) FROM orders o WHERE o.customerId = c.id AND o.status = 'Completed' ${oBiz} ${storeId === 'all' ? '' : `AND o.store_id = '${sqlEsc(storeId)}'`}) AS total_value,
+        (SELECT COALESCE(SUM(oi.quantity), 0) FROM order_items oi JOIN orders o ON oi.orderId = o.id WHERE o.customerId = c.id AND o.status = 'Completed' ${oBiz} ${storeId === 'all' ? '' : `AND o.store_id = '${sqlEsc(storeId)}'`}) AS total_qty
       FROM customers c
+      WHERE c.${bizCondWhere.replace('business_id', 'business_id')}${bizCondAnd ? '' : ''}
     `;
     const custCrmRes = runSql(custCrmQuery, 'CRM: Compile loyalty profiles aggregate and client frequency tracking ledger');
     if (custCrmRes.success && Array.isArray(custCrmRes.data)) {
@@ -252,9 +265,10 @@ FROM view_account_balances;
       day: 'numeric'
     });
 
+    const activeBizId = getActiveBusinessId();
+    const oBizFilter = activeBizId ? `AND o.business_id = '${sqlEsc(activeBizId)}'` : '';
     // Filter SQL results logically by store selection
-    const storeFilterWhere = selectedStoreFilter === 'all' ? '' : `AND o.store_id = '${selectedStoreFilter}'`;
-    const storeFilterWhereBare = selectedStoreFilter === 'all' ? '' : `AND store_id = '${selectedStoreFilter}'`;
+    const storeFilterWhere = selectedStoreFilter === 'all' ? '' : `AND o.store_id = '${sqlEsc(selectedStoreFilter)}'`;
 
     // Query Database
     // 1. Core aggregates
@@ -266,7 +280,7 @@ FROM view_account_balances;
         SUM(o.tax) AS total_tax,
         SUM(o.discount) AS total_discount
       FROM orders o 
-      WHERE o.orderDate LIKE '${todayStr}%' AND o.status = 'Completed' ${storeFilterWhere}
+      WHERE o.orderDate LIKE '${todayStr}%' AND o.status = 'Completed' ${oBizFilter} ${storeFilterWhere}
     `, 'Daily PDF: Aggregates');
 
     // Profit aggregates
@@ -275,7 +289,7 @@ FROM view_account_balances;
       FROM order_items oi 
       JOIN products p ON oi.productId = p.id
       JOIN orders o ON oi.orderId = o.id
-      WHERE o.status = 'Completed' AND o.orderDate LIKE '${todayStr}%' ${storeFilterWhere}
+      WHERE o.status = 'Completed' AND o.orderDate LIKE '${todayStr}%' ${oBizFilter} ${storeFilterWhere}
     `, 'Daily PDF: Profit');
 
     // Transactions listing
@@ -283,7 +297,7 @@ FROM view_account_balances;
       SELECT o.id, o.orderDate, o.total, o.paymentMethod, c.name AS customer_name
       FROM orders o
       LEFT JOIN customers c ON o.customerId = c.id
-      WHERE o.orderDate LIKE '${todayStr}%' AND o.status = 'Completed' ${storeFilterWhere}
+      WHERE o.orderDate LIKE '${todayStr}%' AND o.status = 'Completed' ${oBizFilter} ${storeFilterWhere}
       ORDER BY o.orderDate DESC
     `, 'Daily PDF: Transactions');
 
@@ -293,13 +307,21 @@ FROM view_account_balances;
       FROM order_items oi
       JOIN products p ON oi.productId = p.id
       JOIN orders o ON oi.orderId = o.id
-      WHERE o.status = 'Completed' AND o.orderDate LIKE '${todayStr}%' ${storeFilterWhere}
+      WHERE o.status = 'Completed' AND o.orderDate LIKE '${todayStr}%' ${oBizFilter} ${storeFilterWhere}
       GROUP BY p.id, p.name, p.sku
       ORDER BY qty_sold DESC
     `, 'Daily PDF: Item sales');
 
     // Balances
-    const balRes = runSql(getFilteredQueries(selectedStoreFilter).double_entry, 'Daily PDF: Trial balances');
+    const balRes = {
+      success: true,
+      data: getTenantAccountBalances(activeBizId).map((b) => ({
+        account_id: b.account_id,
+        account_name: b.account_name,
+        currency: b.currency,
+        balance: b.current_balance
+      }))
+    };
 
     // Extracts
     const summary = (dailySummaryRes.success && Array.isArray(dailySummaryRes.data) && dailySummaryRes.data[0]) 
@@ -1371,7 +1393,9 @@ ORDER BY total_value DESC;`}
                           exportAndSharePdf(`LOYALTY_TICKET_${selectedRewardingCustomer.id}.pdf`, doc);
                           
                           // Update loyalty points counter in the SQLite DB!
-                          runSql(`UPDATE customers SET loyalPoints = loyalPoints + 120 WHERE id = ${selectedRewardingCustomer.id}`, 'CRM: Update customer account points balance');
+                          const activeBizId = getActiveBusinessId();
+                          const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+                          runSql(`UPDATE customers SET loyalPoints = loyalPoints + 120 WHERE id = ${selectedRewardingCustomer.id}${bizMatch}`, 'CRM: Update customer account points balance');
                           calculateAnalytics(selectedStoreFilter);
                           
                           setIssuedRewardMessage(`✓ Success! Dynamic PDF Loyalty Gift Ticket printed & downloaded. Customer points +120.`);

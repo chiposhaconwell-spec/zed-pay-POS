@@ -2,10 +2,12 @@
   "entities": {
     "Business": {
       "title": "Business",
-      "description": "Enterprise business profile linked to Firebase Auth ownerUid",
+      "description": "Enterprise business profile linked to Firebase Auth ownerUid with explicit business_id and store_id tags",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique identifier for the business" },
+        "business_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Tenant business_id identifier" },
+        "store_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Primary store_id identifier for the business" },
         "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Business Name" },
         "owner": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Owner Full Name" },
         "email": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Business Corporate Email" },
@@ -13,7 +15,7 @@
         "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
         "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
       },
-      "required": ["id", "name", "owner", "email", "ownerUid", "createdAt", "updatedAt"]
+      "required": ["id", "business_id", "store_id", "name", "owner", "email", "ownerUid", "createdAt", "updatedAt"]
     },
     "Store": {
       "title": "Store Branch",
@@ -22,6 +24,7 @@
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique store branch ID" },
         "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "store_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Explicit store branch identifier" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Outlet Name" },
         "location": { "type": "string", "maxLength": 200, "description": "City/Region location" },
@@ -30,15 +33,16 @@
         "allow_laybys": { "type": "integer", "description": "Is layaway support enabled (1/0)" },
         "require_manager_discount": { "type": "integer", "description": "Is manager level signature needed for discount (1/0)" }
       },
-      "required": ["id", "business_id", "ownerUid", "name", "location", "allow_discounts", "allow_refunds", "allow_laybys", "require_manager_discount"]
+      "required": ["id", "business_id", "store_id", "ownerUid", "name", "location", "allow_discounts", "allow_refunds", "allow_laybys", "require_manager_discount"]
     },
     "Product": {
       "title": "Product Asset",
-      "description": "Inventory product item and batch tracking linked to Business",
+      "description": "Inventory product item and batch tracking linked to Business and Store",
       "type": "object",
       "properties": {
         "id": { "type": "integer", "description": "Auto-increment ID" },
         "business_id": { "type": "string", "maxLength": 128, "description": "Associated business identifier" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Primary associated store branch identifier" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "name": { "type": "string", "minLength": 1, "maxLength": 250, "description": "Item product name" },
         "description": { "type": "string", "maxLength": 4000, "description": "Full item features and product description" },
@@ -52,15 +56,16 @@
         "batch_number": { "type": "string", "maxLength": 100, "description": "Batch or lot identifier" },
         "expiry_date": { "type": "string", "maxLength": 100, "description": "Expiry date string" }
       },
-      "required": ["id", "business_id", "ownerUid", "name", "sku", "category", "price", "cost", "stock", "imageUrl"]
+      "required": ["id", "business_id", "store_id", "ownerUid", "name", "sku", "category", "price", "cost", "stock", "imageUrl"]
     },
     "Customer": {
       "title": "Customer CRM",
-      "description": "Client CRM details and tax profile linked to Business",
+      "description": "Client CRM details and tax profile linked to Business and Store",
       "type": "object",
       "properties": {
         "id": { "type": "integer", "description": "Unique Client ID" },
         "business_id": { "type": "string", "maxLength": 128, "description": "Associated business id" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Associated store branch id" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Client name" },
         "phone": { "type": "string", "maxLength": 50, "description": "Primary phone" },
@@ -70,7 +75,7 @@
         "zra_connected": { "type": "integer", "description": "ZRA taxation link status (1/0)" },
         "tax_band": { "type": "string", "maxLength": 100, "description": "Zambian Revenue tax bracket" }
       },
-      "required": ["id", "business_id", "ownerUid", "name", "phone", "email", "loyalPoints", "tpin", "zra_connected", "tax_band"]
+      "required": ["id", "business_id", "store_id", "ownerUid", "name", "phone", "email", "loyalPoints", "tpin", "zra_connected", "tax_band"]
     },
     "Order": {
       "title": "POS Invoice Order",
@@ -100,13 +105,14 @@
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique line item ID" },
         "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Origin outlet branch" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "orderId": { "type": "string", "maxLength": 128, "description": "Parent Order ID" },
         "productId": { "type": "integer", "description": "Referenced Product ID" },
         "quantity": { "type": "integer", "description": "Quantity sold" },
         "unitPrice": { "type": "number", "description": "Unit selling price at time of sale" }
       },
-      "required": ["id", "business_id", "ownerUid", "orderId", "productId", "quantity", "unitPrice"]
+      "required": ["id", "business_id", "store_id", "ownerUid", "orderId", "productId", "quantity", "unitPrice"]
     },
     "LedgerBackup": {
       "title": "Accounting & Client Relational Ledger Backup",
@@ -115,13 +121,14 @@
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Ledger table key" },
         "business_id": { "type": "string", "maxLength": 128, "description": "Parent business ID" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Primary store branch ID" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "ledger_type": { "type": "string", "maxLength": 100, "description": "Ledger category name" },
         "record_count": { "type": "integer", "description": "Total number of records in snapshot" },
         "records": { "type": "array", "description": "Bounded array of native map records (up to 500 items)" },
         "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp of backup" }
       },
-      "required": ["id", "business_id", "ownerUid", "ledger_type", "record_count", "records", "updatedAt"]
+      "required": ["id", "business_id", "store_id", "ownerUid", "ledger_type", "record_count", "records", "updatedAt"]
     }
   },
   "firestore": {

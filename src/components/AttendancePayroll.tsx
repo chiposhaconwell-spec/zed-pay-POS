@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { runSql, persistTablesToStorage } from '../db';
+import { runSql, persistTablesToStorage, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { safeSystemPrint } from '../androidUtils';
 import { 
   Users, 
@@ -96,7 +96,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
   const [employeeList, setEmployeeList] = useState<{name: string, role: string, rate: number}[]>([]);
 
   const loadStaffMembers = () => {
-    const res = runSql('SELECT * FROM staff', 'Staff: Fetch all registered profiles');
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    const res = runSql(`SELECT * FROM staff WHERE ${bizCond}`, 'Staff: Fetch all registered profiles');
     if (res.success && Array.isArray(res.data)) {
       setStaffList(res.data);
       
@@ -118,7 +120,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
   };
 
   const loadAttendance = () => {
-    const res = runSql('SELECT * FROM time_attendance ORDER BY date DESC, clock_in DESC', 'Attendance: Retrieve worktimes cards');
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+    const res = runSql(`SELECT * FROM time_attendance WHERE ${bizCond} ORDER BY date DESC, clock_in DESC`, 'Attendance: Retrieve worktimes cards');
     if (res.success && Array.isArray(res.data)) {
       setRecords(res.data);
       
@@ -196,6 +200,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     const permissionsString = JSON.stringify({ ...extraPermsMeta, ...perms });
     const staffId = editingStaffId || `staff-${Math.floor(1000 + Math.random() * 9000)}`;
     
+    const activeBizId = getActiveBusinessId();
+    const activeStoreId = getActiveStoreId(undefined, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     if (editingStaffId) {
       const sql = `
         UPDATE staff 
@@ -212,23 +219,15 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
             basic_salary = ${salaryNum},
             permissions_json = '${permissionsString.replace(/'/g, "''")}',
             password = '${password.replace(/'/g, "''")}'
-        WHERE id = '${editingStaffId}'
+        WHERE id = '${sqlEsc(editingStaffId)}'${bizMatch}
       `;
       const res = runSql(sql, `Staff: Update profile ${staffId}`);
       if (res.success) {
         alert(`✓ Staff Profile Updated: Changed details for ${firstName} ${surname}.`);
       }
     } else {
-      let activeBizId = 'default_biz';
-      try {
-        const savedBiz = localStorage.getItem('active_business_profile');
-        if (savedBiz) {
-          const parsed = JSON.parse(savedBiz);
-          if (parsed && parsed.id) activeBizId = parsed.id;
-        }
-      } catch (e) {}
       const sql = `
-        INSERT INTO staff (id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password)
+        INSERT INTO staff (id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, store_id, password)
         VALUES (
           '${staffId}',
           '${firstName.replace(/'/g, "''")}',
@@ -243,7 +242,8 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
           '${contractFilename.replace(/'/g, "''")}',
           ${salaryNum},
           '${permissionsString.replace(/'/g, "''")}',
-          '${activeBizId.replace(/'/g, "''")}',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(activeStoreId)}',
           '${password.replace(/'/g, "''")}'
         )
       `;
@@ -308,7 +308,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
       return;
     }
     if (confirm(`Are you absolutely sure you want to delete staff member "${name}"? This removes their credentials permanently.`)) {
-      const res = runSql(`DELETE FROM staff WHERE id = '${id}'`, `Staff: Delete profile ${id}`);
+      const activeBizId = getActiveBusinessId();
+      const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+      const res = runSql(`DELETE FROM staff WHERE id = '${sqlEsc(id)}'${bizMatch}`, `Staff: Delete profile ${id}`);
       if (res.success) {
         alert(`Deleted staff member ${name}`);
         loadStaffMembers();
@@ -352,10 +354,14 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     const todayStr = new Date().toISOString().split('T')[0];
     const timeStr = new Date().toTimeString().split(' ')[0]; // HH:MM:SS
 
+    const activeBizId = getActiveBusinessId();
+    const activeStoreId = getActiveStoreId(undefined, activeBizId);
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
     // Check if player has already checked in and not checked out yet today
     const activeRes = runSql(`
       SELECT * FROM time_attendance 
-      WHERE employee_name = '${quickName.replace(/'/g, "''")}' AND clock_out IS NULL
+      WHERE employee_name = '${quickName.replace(/'/g, "''")}' AND clock_out IS NULL${bizMatch}
     `, 'Attendance: Guard active shifts');
 
     if (activeRes.success && activeRes.data && activeRes.data.length > 0) {
@@ -365,18 +371,20 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
 
     const recId = 'attend-' + Math.floor(1000 + Math.random() * 9000);
     const insertSql = `
-      INSERT INTO time_attendance (id, employee_name, employee_role, date, clock_in, clock_out, hours_worked, hourly_rate, gross_payment, status)
+      INSERT INTO time_attendance (id, employee_name, employee_role, date, clock_in, clock_out, hours_worked, hourly_rate, gross_payment, status, business_id, store_id)
       VALUES (
         '${recId}',
         '${quickName.replace(/'/g, "''")}',
-        '${role}',
+        '${sqlEsc(role)}',
         '${todayStr}',
         '${timeStr}',
         NULL,
         0,
         ${rate},
         0,
-        'PENDING'
+        'PENDING',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(activeStoreId)}'
       )
     `;
     const res = runSql(insertSql, `Attendance: Clock-In employee ${quickName} at ${timeStr}`);
@@ -406,11 +414,13 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     if (diffHours <= 0) diffHours = 0.5; // minimum safety half-hour
 
     const gross = parseFloat((diffHours * r.hourly_rate).toFixed(2));
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
 
     const updateSql = `
       UPDATE time_attendance 
       SET clock_out = '${timeStr}', hours_worked = ${diffHours}, gross_payment = ${gross} 
-      WHERE id = '${recordId}'
+      WHERE id = '${sqlEsc(recordId)}'${bizMatch}
     `;
     const res = runSql(updateSql, `Attendance: Clock-Out shift record ${recordId} at ${timeStr}`);
     if (res.success) {
@@ -426,10 +436,12 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
       alert('Access Denied: Only Store Manager or Business Owner can approve and clear payroll payouts.');
       return;
     }
+    const activeBizId = getActiveBusinessId();
+    const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const updateSql = `
       UPDATE time_attendance 
       SET status = 'PAID' 
-      WHERE employee_name = '${employeeName.replace(/'/g, "''")}' AND status = 'PENDING' AND clock_out IS NOT NULL
+      WHERE employee_name = '${employeeName.replace(/'/g, "''")}' AND status = 'PENDING' AND clock_out IS NOT NULL${bizMatch}
     `;
     const res = runSql(updateSql, `Payroll: Clear accumulated outstanding salary payouts to ${employeeName}`);
     if (res.success) {

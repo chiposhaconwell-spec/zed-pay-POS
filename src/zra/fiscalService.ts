@@ -1,5 +1,5 @@
 import QRCode from 'qrcode';
-import { runSql, persistTablesToStorage } from '../db';
+import { runSql, persistTablesToStorage, getActiveBusinessId, getActiveStoreId } from '../db';
 import {
   getZraConfig,
   saveZraConfig,
@@ -72,6 +72,8 @@ export interface ZraFiscalReceiptData {
 export interface ZraOfflineQueueItem {
   id: string;
   orderId: string;
+  business_id?: string;
+  store_id?: string;
   endpoint: string;
   vsdcApiUrl: string;
   useServerProxy: boolean;
@@ -203,18 +205,29 @@ function loadRecordsMap(): Record<string, ZraFiscalReceiptData> {
 }
 
 function saveFiscalRecord(orderId: string, record: ZraFiscalReceiptData, payload?: Record<string, any>) {
+  const activeBizId = getActiveBusinessId();
+  const activeStoreId = getActiveStoreId(undefined, activeBizId);
   try {
     const map = loadRecordsMap();
-    map[orderId] = record;
+    const recordWithTenant = {
+      ...record,
+      business_id: activeBizId || undefined,
+      store_id: activeStoreId || undefined,
+    } as any;
+    map[orderId] = recordWithTenant;
+    if (activeBizId) {
+      map[`${activeBizId}::${orderId}`] = recordWithTenant;
+    }
     localStorage.setItem(ZRA_RECORDS_STORAGE_KEY, JSON.stringify(map));
   } catch {}
 
   try {
     const nowIso = new Date().toISOString();
     const recordId = `zra_${sqlEscape(orderId)}`;
-    runSql(`DELETE FROM zra_invoices WHERE order_id = '${sqlEscape(orderId)}'`, 'ZRA: Replace fiscal invoice entry', true);
+    const bizDeleteClause = activeBizId ? ` AND (business_id = '${sqlEscape(activeBizId)}' OR business_id IS NULL OR business_id = '')` : '';
+    runSql(`DELETE FROM zra_invoices WHERE order_id = '${sqlEscape(orderId)}'${bizDeleteClause}`, 'ZRA: Replace fiscal invoice entry', true);
     runSql(
-      `INSERT INTO zra_invoices (id, order_id, status, tpin, bhf_id, sdc_id, mrc_no, rcpt_no, cis_invc_no, intrl_data, rcpt_sign, qr_code_url, vsdc_date, payload_json, record_json, created_at, updated_at) VALUES (
+      `INSERT INTO zra_invoices (id, order_id, status, tpin, bhf_id, sdc_id, mrc_no, rcpt_no, cis_invc_no, intrl_data, rcpt_sign, qr_code_url, vsdc_date, payload_json, record_json, created_at, updated_at, business_id, store_id) VALUES (
         '${recordId}',
         '${sqlEscape(orderId)}',
         '${sqlEscape(record.status)}',
@@ -231,7 +244,9 @@ function saveFiscalRecord(orderId: string, record: ZraFiscalReceiptData, payload
         '${sqlEscape(payload ? JSON.stringify(payload) : '{}')}',
         '${sqlEscape(JSON.stringify(record))}',
         '${nowIso}',
-        '${nowIso}'
+        '${nowIso}',
+        '${sqlEscape(activeBizId)}',
+        '${sqlEscape(activeStoreId)}'
       )`,
       `ZRA: Persist fiscal signature for ${orderId}`,
       true
@@ -240,7 +255,7 @@ function saveFiscalRecord(orderId: string, record: ZraFiscalReceiptData, payload
   } catch {}
 }
 
-function loadOfflineQueueFromStorage(): ZraOfflineQueueItem[] {
+function loadAllOfflineQueueFromStorage(): ZraOfflineQueueItem[] {
   try {
     const raw = localStorage.getItem(ZRA_QUEUE_STORAGE_KEY);
     if (raw) {
@@ -251,16 +266,42 @@ function loadOfflineQueueFromStorage(): ZraOfflineQueueItem[] {
   return [];
 }
 
-function saveOfflineQueueToStorage(queue: ZraOfflineQueueItem[]) {
+function loadOfflineQueueFromStorage(): ZraOfflineQueueItem[] {
+  const all = loadAllOfflineQueueFromStorage();
+  const activeBizId = getActiveBusinessId();
+  if (!activeBizId) return all;
+  return all.filter((q) => !q.business_id || q.business_id === activeBizId);
+}
+
+function saveOfflineQueueToStorage(queueForActiveBiz: ZraOfflineQueueItem[]) {
+  const activeBizId = getActiveBusinessId();
+  const activeStoreId = getActiveStoreId(undefined, activeBizId);
+  const normalizedForBiz = queueForActiveBiz.map((item) => ({
+    ...item,
+    business_id: item.business_id || activeBizId || '',
+    store_id: item.store_id || activeStoreId || 'main',
+  }));
+  const allExisting = loadAllOfflineQueueFromStorage();
+  const otherBizItems = activeBizId
+    ? allExisting.filter((q) => q.business_id && q.business_id !== activeBizId)
+    : [];
+  const mergedAll = [...otherBizItems, ...normalizedForBiz];
+
   try {
-    localStorage.setItem(ZRA_QUEUE_STORAGE_KEY, JSON.stringify(queue));
+    localStorage.setItem(ZRA_QUEUE_STORAGE_KEY, JSON.stringify(mergedAll));
   } catch {}
 
   try {
-    runSql(`DELETE FROM zra_sync_queue`, 'ZRA Queue: Clear sync snapshot', true);
-    queue.forEach((item) => {
+    if (activeBizId) {
+      runSql(`DELETE FROM zra_sync_queue WHERE business_id = '${sqlEscape(activeBizId)}' OR business_id IS NULL OR business_id = ''`, 'ZRA Queue: Refresh active business sync snapshot', true);
+    } else {
+      runSql(`DELETE FROM zra_sync_queue`, 'ZRA Queue: Clear sync snapshot', true);
+    }
+    normalizedForBiz.forEach((item) => {
+      const itemBiz = item.business_id || activeBizId || '';
+      const itemStore = item.store_id || activeStoreId || 'main';
       runSql(
-        `INSERT INTO zra_sync_queue (id, order_id, endpoint, payload_json, sale_json, retry_count, last_error, created_at) VALUES (
+        `INSERT INTO zra_sync_queue (id, order_id, endpoint, payload_json, sale_json, retry_count, last_error, created_at, business_id, store_id) VALUES (
           '${sqlEscape(item.id)}',
           '${sqlEscape(item.orderId)}',
           '${sqlEscape(item.endpoint)}',
@@ -268,7 +309,9 @@ function saveOfflineQueueToStorage(queue: ZraOfflineQueueItem[]) {
           '${sqlEscape(JSON.stringify(item.saleInput))}',
           ${Number(item.retryCount || 0)},
           '${sqlEscape(item.lastError || '')}',
-          '${sqlEscape(item.createdAt)}'
+          '${sqlEscape(item.createdAt)}',
+          '${sqlEscape(itemBiz)}',
+          '${sqlEscape(itemStore)}'
         )`,
         `ZRA Queue: Save pending item ${item.orderId}`,
         true
@@ -278,7 +321,7 @@ function saveOfflineQueueToStorage(queue: ZraOfflineQueueItem[]) {
   } catch {}
 
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('zra_queue_updated', { detail: queue }));
+    window.dispatchEvent(new CustomEvent('zra_queue_updated', { detail: normalizedForBiz }));
   }
 }
 
@@ -834,9 +877,13 @@ export const FiscalService = {
     const existingIdx = queue.findIndex((q) => q.orderId === saleData.orderId);
     const queueId = existingIdx >= 0 ? queue[existingIdx].id : `zraq_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
 
+    const activeBizId = getActiveBusinessId();
+    const activeStoreId = getActiveStoreId(undefined, activeBizId);
     const queueItem: ZraOfflineQueueItem = {
       id: queueId,
       orderId: saleData.orderId,
+      business_id: activeBizId || '',
+      store_id: activeStoreId || 'main',
       endpoint: '/trnsSales/saveSales',
       vsdcApiUrl: config.vsdcApiUrl,
       useServerProxy: config.useServerProxy,
@@ -900,11 +947,19 @@ export const FiscalService = {
 
   getFiscalRecordByOrderId(orderId: string): ZraFiscalReceiptData | null {
     if (!orderId) return null;
-    const map = loadRecordsMap();
-    if (map[orderId]) return map[orderId];
+    const activeBizId = getActiveBusinessId();
+    const map = loadRecordsMap() as Record<string, any>;
+    if (activeBizId && map[`${activeBizId}::${orderId}`]) {
+      return map[`${activeBizId}::${orderId}`];
+    }
+    const direct = map[orderId];
+    if (direct && (!activeBizId || !direct.business_id || direct.business_id === activeBizId)) {
+      return direct;
+    }
     try {
+      const bizFilter = activeBizId ? ` AND business_id = '${sqlEscape(activeBizId)}'` : '';
       const res = runSql(
-        `SELECT record_json FROM zra_invoices WHERE order_id = '${sqlEscape(orderId)}' LIMIT 1`,
+        `SELECT record_json FROM zra_invoices WHERE order_id = '${sqlEscape(orderId)}'${bizFilter} LIMIT 1`,
         'ZRA: Lookup fiscal record',
         true
       );
