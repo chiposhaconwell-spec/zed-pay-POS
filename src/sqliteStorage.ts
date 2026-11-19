@@ -5,57 +5,70 @@ import { Preferences } from '@capacitor/preferences';
 import { App as CapApp } from '@capacitor/app';
 
 const DB_NAME = 'pos_retail_db';
-const SNAPSHOT_FILENAME = 'pos_retail_db_store.json';
+const CACHE_FILENAME = 'pos_retail_device_cache.json';
+const LEGACY_SNAPSHOT_FILENAME = 'pos_retail_db_store.json';
+const WEB_RECEIPT_CACHE_KEY = 'pos_sqlite_receipt_cache_v1';
 
 let sqliteConnection: SQLiteConnection | null = null;
 let dbConnection: SQLiteDBConnection | null = null;
 let isSqliteReady = false;
 let isInitInProgress = false;
 
-// List of all tables managed by the POS system
-export const ALL_TABLE_NAMES = [
+/**
+ * On-device SQLite scope:
+ * Strictly restricted to read-through catalog/branch/customer caching and local receipts / offline ZRA fiscal queue.
+ * Financial ledgers, double-entry journals, assets, equity, payroll, and centralized reports live in Firestore & Central Cloud SQL.
+ */
+export const SQLITE_CACHE_TABLES = [
   'businesses',
   'stores',
   'products',
+  'store_products',
   'customers',
+  'payment_methods',
+  'suppliers',
+] as const;
+
+export const SQLITE_RECEIPT_TABLES = [
   'orders',
   'order_items',
-  'accounts',
-  'transactions',
-  'ledger_entries',
-  'laybys',
-  'layby_installments',
-  'time_attendance',
-  'staff',
-  'store_products',
-  'stock_transfers',
-  'cash_ups',
-  'quotations',
-  'loans',
-  'loan_amortization_schedule',
-  'automated_deduction_logs',
-  'stock_takes',
-  'stock_take_items',
-  'expenses',
-  'purchases_transit',
-  'transit_purchases',
-  'suppliers',
-  'money_transfers',
-  'assets',
-  'equity',
-  'double_entry_journal',
-  'audit_logs',
-  'receipt_refund_ledger',
-  'cash_flow_ledger',
-  'payment_method_ledger',
-  'financial_statements_ledger',
-  'payment_methods',
   'zra_invoices',
-  'zra_sync_queue'
+  'zra_sync_queue',
+  'local_receipts',
+] as const;
+
+export const SQLITE_SCOPED_TABLES: string[] = [
+  ...SQLITE_CACHE_TABLES,
+  ...SQLITE_RECEIPT_TABLES,
 ];
 
+// Kept for backward-compatible exports; SQLite storage itself only persists SQLITE_SCOPED_TABLES.
+export const ALL_TABLE_NAMES: string[] = [...SQLITE_SCOPED_TABLES];
+
+export interface LocalReceiptRecord {
+  id: string;
+  order_id: string;
+  business_id: string;
+  store_id: string;
+  tx_type: 'SALE' | 'REFUND';
+  receipt_number: string;
+  customer_name: string;
+  payment_method: string;
+  subtotal: number;
+  tax: number;
+  discount: number;
+  total: number;
+  items_json: string;
+  receipt_payload_json?: string;
+  fiscal_qr_url?: string;
+  performed_by: string;
+  status: string;
+  mirror_status: 'PENDING' | 'MIRRORED';
+  created_at: string;
+}
+
 /**
- * Table DDL definitions for SQLite compatibility
+ * Table DDL definitions for SQLite on-device cache & receipt store ONLY
  */
 const SQLITE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS businesses (
@@ -74,6 +87,8 @@ CREATE TABLE IF NOT EXISTS stores (
   business_id TEXT,
   name TEXT,
   location TEXT,
+  phone TEXT,
+  email TEXT,
   allow_discounts INTEGER,
   allow_refunds INTEGER,
   allow_laybys INTEGER,
@@ -101,6 +116,15 @@ CREATE TABLE IF NOT EXISTS products (
   store_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS store_products (
+  id TEXT PRIMARY KEY,
+  product_id INTEGER,
+  store_id TEXT,
+  stock INTEGER,
+  price REAL,
+  business_id TEXT
+);
+
 CREATE TABLE IF NOT EXISTS customers (
   id INTEGER PRIMARY KEY,
   name TEXT,
@@ -110,6 +134,35 @@ CREATE TABLE IF NOT EXISTS customers (
   tpin TEXT,
   zra_connected INTEGER,
   tax_band TEXT,
+  business_id TEXT,
+  store_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS payment_methods (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  category TEXT,
+  account_id TEXT,
+  is_active INTEGER,
+  created_by TEXT,
+  created_at TEXT,
+  business_id TEXT,
+  store_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS suppliers (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  contact_person TEXT,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  tpin TEXT,
+  payment_terms TEXT,
+  default_payment_method TEXT,
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT,
   business_id TEXT,
   store_id TEXT
 );
@@ -137,496 +190,6 @@ CREATE TABLE IF NOT EXISTS order_items (
   productId INTEGER,
   quantity INTEGER,
   unitPrice REAL,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS accounts (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  type TEXT,
-  currency TEXT DEFAULT 'ZMW',
-  merchant_id TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS transactions (
-  id TEXT PRIMARY KEY,
-  idempotency_key TEXT,
-  pos_terminal_id TEXT,
-  channel TEXT,
-  provider_reference TEXT,
-  amount REAL,
-  fee_amount REAL,
-  status TEXT,
-  narration TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  performed_by TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS ledger_entries (
-  id TEXT PRIMARY KEY,
-  transaction_id TEXT,
-  account_id TEXT,
-  type TEXT,
-  amount REAL,
-  created_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS laybys (
-  id TEXT PRIMARY KEY,
-  customer_id INTEGER,
-  customer_name TEXT,
-  customer_phone TEXT,
-  customer_email TEXT,
-  total_amount REAL,
-  deposit_amount REAL,
-  amount_paid REAL,
-  balance_due REAL,
-  status TEXT,
-  items_json TEXT,
-  created_at TEXT,
-  store_id TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS layby_installments (
-  id TEXT PRIMARY KEY,
-  layby_id TEXT,
-  amount REAL,
-  payment_method TEXT,
-  received_by TEXT,
-  created_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS time_attendance (
-  id TEXT PRIMARY KEY,
-  employee_name TEXT,
-  employee_role TEXT,
-  date TEXT,
-  clock_in TEXT,
-  clock_out TEXT,
-  hours_worked REAL,
-  hourly_rate REAL,
-  gross_payment REAL,
-  status TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS staff (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  role TEXT,
-  hourly_rate REAL,
-  pin TEXT,
-  store_id TEXT,
-  first_name TEXT,
-  surname TEXT,
-  contact TEXT,
-  email TEXT,
-  residential_address TEXT,
-  joining_date TEXT,
-  nrc_file TEXT,
-  nrc_filename TEXT,
-  contract_file TEXT,
-  contract_filename TEXT,
-  basic_salary REAL,
-  permissions_json TEXT,
-  business_id TEXT,
-  password TEXT
-);
-
-CREATE TABLE IF NOT EXISTS store_products (
-  id TEXT PRIMARY KEY,
-  product_id INTEGER,
-  store_id TEXT,
-  stock INTEGER,
-  price REAL,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS stock_transfers (
-  id TEXT PRIMARY KEY,
-  product_id INTEGER,
-  from_store TEXT,
-  to_store TEXT,
-  quantity INTEGER,
-  status TEXT,
-  created_at TEXT,
-  rejection_reason TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS cash_ups (
-  id TEXT PRIMARY KEY,
-  date TEXT,
-  store_id TEXT,
-  cashier_name TEXT,
-  sum_cash_expected REAL,
-  sum_cash_actual REAL,
-  sum_card_expected REAL,
-  sum_card_actual REAL,
-  sum_momo_expected REAL,
-  sum_momo_actual REAL,
-  variance REAL,
-  notes TEXT,
-  created_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS quotations (
-  id TEXT PRIMARY KEY,
-  customer_name TEXT,
-  customer_phone TEXT,
-  customer_email TEXT,
-  items_json TEXT,
-  subtotal REAL,
-  tax REAL,
-  discount REAL,
-  total REAL,
-  bank_name TEXT,
-  bank_account TEXT,
-  bank_branch TEXT,
-  status TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  extra_json TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS loans (
-  id TEXT PRIMARY KEY,
-  merchant_id TEXT,
-  loan_account_id TEXT,
-  principal_amount REAL,
-  interest_amount REAL,
-  total_repayable REAL,
-  daily_deduction_percentage REAL,
-  status TEXT,
-  disbursed_at TEXT,
-  due_date TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS loan_amortization_schedule (
-  id TEXT PRIMARY KEY,
-  loan_id TEXT,
-  installment_number INTEGER,
-  principal_due REAL,
-  interest_due REAL,
-  total_due REAL,
-  amount_paid REAL,
-  is_settled INTEGER,
-  due_date TEXT,
-  settled_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS automated_deduction_logs (
-  id TEXT PRIMARY KEY,
-  loan_id TEXT,
-  source_transaction_id TEXT,
-  amount_deducted REAL,
-  status TEXT,
-  failure_reason TEXT,
-  created_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS stock_takes (
-  id TEXT PRIMARY KEY,
-  store_id TEXT,
-  taken_at TEXT,
-  performed_by TEXT,
-  status TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS stock_take_items (
-  id TEXT PRIMARY KEY,
-  stock_take_id TEXT,
-  product_id INTEGER,
-  recorded_stock INTEGER,
-  counted_stock INTEGER,
-  variance INTEGER,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS expenses (
-  id TEXT PRIMARY KEY,
-  category TEXT,
-  payment_method TEXT,
-  account_id TEXT,
-  amount REAL,
-  description TEXT,
-  ref_number TEXT,
-  reference_no TEXT,
-  expense_date TEXT,
-  store_id TEXT,
-  performed_by TEXT,
-  created_by TEXT,
-  created_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS purchases_transit (
-  id TEXT PRIMARY KEY,
-  supplier_name TEXT,
-  store_id TEXT,
-  payment_account_id TEXT,
-  payment_method TEXT,
-  items_json TEXT,
-  additional_expenses_json TEXT,
-  total_base_amount REAL,
-  total_additional_expenses REAL,
-  total_landed_cost REAL,
-  stage TEXT,
-  notes TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  received_at TEXT,
-  received_by TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS transit_purchases (
-  id TEXT PRIMARY KEY,
-  supplier_name TEXT,
-  store_id TEXT,
-  payment_account TEXT,
-  payment_method TEXT,
-  base_total REAL,
-  additional_expenses_total REAL,
-  grand_landed_total REAL,
-  status TEXT,
-  items_json TEXT,
-  additional_expenses_json TEXT,
-  notes TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  received_at TEXT,
-  received_by TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS suppliers (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  contact_person TEXT,
-  phone TEXT,
-  email TEXT,
-  address TEXT,
-  tpin TEXT,
-  payment_terms TEXT,
-  default_payment_method TEXT,
-  notes TEXT,
-  created_at TEXT,
-  updated_at TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS money_transfers (
-  id TEXT PRIMARY KEY,
-  source_account TEXT,
-  dest_account TEXT,
-  amount REAL,
-  reference_no TEXT,
-  transfer_date TEXT,
-  performed_by TEXT,
-  notes TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS assets (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  category TEXT,
-  type TEXT,
-  purchase_date TEXT,
-  value REAL,
-  depreciation_method TEXT,
-  depreciation_rate REAL,
-  status TEXT,
-  notes TEXT,
-  linked_equity_id TEXT,
-  business_id TEXT,
-  store_id TEXT,
-  asset_tag TEXT,
-  serial_number TEXT,
-  useful_life_years REAL,
-  salvage_value REAL,
-  funding_source TEXT,
-  disposal_date TEXT,
-  disposal_proceeds REAL,
-  updated_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS equity (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  value REAL,
-  linked_asset_id TEXT,
-  business_id TEXT,
-  store_id TEXT,
-  equity_type TEXT,
-  shareholder_name TEXT,
-  contribution_date TEXT,
-  account_id TEXT,
-  reference_no TEXT,
-  notes TEXT,
-  status TEXT,
-  created_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS double_entry_journal (
-  id TEXT PRIMARY KEY,
-  date TEXT,
-  reference TEXT,
-  description TEXT,
-  account_debit TEXT,
-  account_credit TEXT,
-  amount REAL,
-  currency TEXT,
-  business_id TEXT,
-  store_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-  id TEXT PRIMARY KEY,
-  module TEXT,
-  action TEXT,
-  details TEXT,
-  amount REAL,
-  store_id TEXT,
-  performed_by TEXT,
-  created_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS receipt_refund_ledger (
-  id TEXT PRIMARY KEY,
-  order_id TEXT,
-  entry_type TEXT,
-  date TEXT,
-  store_id TEXT,
-  customer_name TEXT,
-  payment_method TEXT,
-  subtotal REAL,
-  tax REAL,
-  discount REAL,
-  total_amount REAL,
-  cogs_amount REAL,
-  net_revenue_impact REAL,
-  cash_impact REAL,
-  performed_by TEXT,
-  journal_ref TEXT,
-  status TEXT,
-  created_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS cash_flow_ledger (
-  id TEXT PRIMARY KEY,
-  date TEXT,
-  store_id TEXT,
-  activity_type TEXT,
-  category TEXT,
-  direction TEXT,
-  payment_method TEXT,
-  account_id TEXT,
-  inflow_amount REAL,
-  outflow_amount REAL,
-  net_cash_change REAL,
-  reference_id TEXT,
-  description TEXT,
-  performed_by TEXT,
-  created_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS payment_method_ledger (
-  id TEXT PRIMARY KEY,
-  payment_method TEXT,
-  store_id TEXT,
-  account_id TEXT,
-  gross_receipts REAL,
-  layby_receipts REAL,
-  refunds_out REAL,
-  expenses_out REAL,
-  transfers_in REAL,
-  transfers_out REAL,
-  net_balance REAL,
-  transaction_count INTEGER,
-  updated_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS financial_statements_ledger (
-  id TEXT PRIMARY KEY,
-  store_id TEXT,
-  period_date TEXT,
-  gross_sales_revenue REAL,
-  sales_returns_refunds REAL,
-  discounts_allowed REAL,
-  vat_tax_collected REAL,
-  net_sales_revenue REAL,
-  cost_of_goods_sold REAL,
-  gross_profit REAL,
-  operating_expenses REAL,
-  payroll_expenses REAL,
-  net_operating_income REAL,
-  cash_and_equivalents REAL,
-  cash_drawer_balance REAL,
-  mobile_money_balance REAL,
-  bank_card_balance REAL,
-  inventory_asset_value REAL,
-  goods_in_transit_value REAL,
-  fixed_assets_value REAL,
-  total_assets REAL,
-  vat_payable_liability REAL,
-  layby_deposits_liability REAL,
-  loans_payable_liability REAL,
-  total_liabilities REAL,
-  owner_capital_equity REAL,
-  retained_earnings REAL,
-  total_equity REAL,
-  operating_cash_flow REAL,
-  investing_cash_flow REAL,
-  financing_cash_flow REAL,
-  net_cash_flow REAL,
-  updated_at TEXT,
-  business_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS payment_methods (
-  id TEXT PRIMARY KEY,
-  name TEXT,
-  category TEXT,
-  account_id TEXT,
-  is_active INTEGER,
-  created_by TEXT,
-  created_at TEXT,
   business_id TEXT,
   store_id TEXT
 );
@@ -665,10 +228,42 @@ CREATE TABLE IF NOT EXISTS zra_sync_queue (
   business_id TEXT,
   store_id TEXT
 );
+
+CREATE TABLE IF NOT EXISTS local_receipts (
+  id TEXT PRIMARY KEY,
+  order_id TEXT,
+  business_id TEXT,
+  store_id TEXT,
+  tx_type TEXT,
+  receipt_number TEXT,
+  customer_name TEXT,
+  payment_method TEXT,
+  subtotal REAL,
+  tax REAL,
+  discount REAL,
+  total REAL,
+  items_json TEXT,
+  receipt_payload_json TEXT,
+  fiscal_qr_url TEXT,
+  performed_by TEXT,
+  status TEXT,
+  mirror_status TEXT DEFAULT 'PENDING',
+  created_at TEXT
+);
 `;
 
+function filterToSqliteScope(rawTables: Record<string, any[]>): Record<string, any[]> {
+  const scoped: Record<string, any[]> = {};
+  for (const tbl of SQLITE_SCOPED_TABLES) {
+    if (Array.isArray(rawTables[tbl])) {
+      scoped[tbl] = rawTables[tbl];
+    }
+  }
+  return scoped;
+}
+
 /**
- * Initializes the SQLite Connection on Android devices
+ * Initializes the on-device SQLite cache & receipts database on Android devices
  */
 export async function initSqliteStorage(): Promise<boolean> {
   if (isSqliteReady) return true;
@@ -677,12 +272,10 @@ export async function initSqliteStorage(): Promise<boolean> {
 
   try {
     const isNative = Capacitor.isNativePlatform();
-    console.log(`[SqliteStorage] Initializing storage, isNative: ${isNative}, platform: ${Capacitor.getPlatform()}`);
 
     if (isNative) {
       sqliteConnection = new SQLiteConnection(CapacitorSQLite);
 
-      // Check if connection already exists
       const isConn = await sqliteConnection.isConnection(DB_NAME, false);
       if (isConn.result) {
         dbConnection = await sqliteConnection.retrieveConnection(DB_NAME, false);
@@ -697,59 +290,30 @@ export async function initSqliteStorage(): Promise<boolean> {
       }
 
       await dbConnection.open();
-      console.log('[SqliteStorage] SQLite database opened on Android filesystem');
-
-      // Create schema
       await dbConnection.execute(SQLITE_SCHEMA);
-      try { await dbConnection.execute('ALTER TABLE quotations ADD COLUMN updated_at TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE quotations ADD COLUMN extra_json TEXT;'); } catch {}
+
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN item_cls_cd TEXT;'); } catch {}
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN tax_ty_cd TEXT;'); } catch {}
       try { await dbConnection.execute('ALTER TABLE products ADD COLUMN description TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN name TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN role TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN hourly_rate REAL;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN pin TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE staff ADD COLUMN store_id TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN asset_tag TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN serial_number TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN useful_life_years REAL;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN salvage_value REAL;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN funding_source TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN disposal_date TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN disposal_proceeds REAL;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE assets ADD COLUMN updated_at TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN equity_type TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN shareholder_name TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN contribution_date TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN account_id TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN reference_no TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN notes TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN status TEXT;'); } catch {}
-      try { await dbConnection.execute('ALTER TABLE equity ADD COLUMN created_at TEXT;'); } catch {}
-      for (const tbl of ALL_TABLE_NAMES) {
+      try { await dbConnection.execute('ALTER TABLE stores ADD COLUMN phone TEXT;'); } catch {}
+      try { await dbConnection.execute('ALTER TABLE stores ADD COLUMN email TEXT;'); } catch {}
+      for (const tbl of SQLITE_SCOPED_TABLES) {
         try { await dbConnection.execute(`ALTER TABLE ${tbl} ADD COLUMN business_id TEXT;`); } catch {}
         try { await dbConnection.execute(`ALTER TABLE ${tbl} ADD COLUMN store_id TEXT;`); } catch {}
       }
-      console.log('[SqliteStorage] SQLite schema verified');
       isSqliteReady = true;
     }
 
-    // Set up app lifecycle event listeners to guarantee flush before closing
     setupLifecycleListeners();
-
     return true;
   } catch (err) {
-    console.warn('[SqliteStorage] Native SQLite initialization fallback to Filesystem & Preferences:', err);
+    console.warn('[SqliteStorage] Native SQLite cache fallback:', err);
     return false;
   } finally {
     isInitInProgress = false;
   }
 }
 
-/**
- * Listen for Android app pause, backgrounding, or tab close to flush database
- */
 let isListenerSet = false;
 function setupLifecycleListeners() {
   if (isListenerSet) return;
@@ -760,16 +324,11 @@ function setupLifecycleListeners() {
       Promise.resolve(
         CapApp.addListener('appStateChange', (state) => {
           if (!state.isActive) {
-            console.log('[SqliteStorage] App went to background, triggering immediate flush');
             triggerImmediateFlush();
           }
         })
-      ).catch(() => {
-        // web fallback
-      });
-    } catch (e) {
-      // web fallback
-    }
+      ).catch(() => {});
+    } catch {}
   }
 
   if (typeof window !== 'undefined') {
@@ -788,10 +347,10 @@ let pendingFlushData: Record<string, any[]> | null = null;
 let flushTimeout: any = null;
 
 export function registerPendingSync(tablesData: Record<string, any[]>) {
-  pendingFlushData = tablesData;
+  pendingFlushData = filterToSqliteScope(tablesData || {});
   if (flushTimeout) clearTimeout(flushTimeout);
   flushTimeout = setTimeout(() => {
-    executePersistentFlush();
+    void executePersistentFlush();
   }, 350);
 }
 
@@ -800,44 +359,39 @@ export function triggerImmediateFlush() {
     clearTimeout(flushTimeout);
     flushTimeout = null;
   }
-  executePersistentFlush();
+  void executePersistentFlush();
 }
 
 /**
- * Asynchronously flushes in-memory data to:
- * 1. Persistent SQLite database (on Android)
- * 2. Persistent Filesystem JSON file in Directory.Data
- * 3. Capacitor Preferences
+ * Asynchronously flushes ONLY the on-device cache & receipt tables to SQLite + local device cache file.
  */
 async function executePersistentFlush() {
   if (!pendingFlushData) return;
   const data = pendingFlushData;
   pendingFlushData = null;
 
-  // 1. Filesystem snapshot (Android path: /data/user/0/com.pos.retail.app/files/pos_retail_db_store.json)
+  // 1. Filesystem on-device cache file (Android Directory.Data)
   try {
     const jsonString = JSON.stringify(data);
     await Filesystem.writeFile({
-      path: SNAPSHOT_FILENAME,
+      path: CACHE_FILENAME,
       data: jsonString,
       directory: Directory.Data,
-      encoding: Encoding.UTF8
+      encoding: Encoding.UTF8,
     });
-  } catch (fsErr) {
-    console.warn('[SqliteStorage] Filesystem write notice (expected in web preview):', fsErr);
+  } catch {
+    // Expected in standard web preview
   }
 
-  // 2. Preferences sync (Android SharedPreferences)
+  // 2. Preferences last-cached timestamp
   try {
     await Preferences.set({
-      key: 'pos_retail_last_sync_timestamp',
-      value: new Date().toISOString()
+      key: 'pos_retail_last_cache_timestamp',
+      value: new Date().toISOString(),
     });
-  } catch (prefErr) {
-    // ignore
-  }
+  } catch {}
 
-  // 3. Native SQLite database sync
+  // 3. Native SQLite on-device cache & receipt tables
   if (isSqliteReady && dbConnection) {
     try {
       const isOpened = await dbConnection.isDBOpen();
@@ -848,9 +402,10 @@ async function executePersistentFlush() {
       await dbConnection.beginTransaction();
 
       for (const [table, rows] of Object.entries(data)) {
-        if (!Array.isArray(rows) || !ALL_TABLE_NAMES.includes(table)) continue;
+        if (!Array.isArray(rows) || !SQLITE_SCOPED_TABLES.includes(table) || table === 'local_receipts') {
+          continue;
+        }
 
-        // Clear existing table and re-insert rows
         await dbConnection.run(`DELETE FROM ${table};`, []);
 
         if (rows.length > 0) {
@@ -858,7 +413,7 @@ async function executePersistentFlush() {
             const keys = Object.keys(row);
             if (keys.length === 0) continue;
             const placeholders = keys.map(() => '?').join(', ');
-            const values = keys.map(k => {
+            const values = keys.map((k) => {
               const v = row[k];
               if (v === null || v === undefined) return null;
               if (typeof v === 'object') return JSON.stringify(v);
@@ -872,69 +427,196 @@ async function executePersistentFlush() {
       }
 
       await dbConnection.commitTransaction();
-      console.log('[SqliteStorage] Flushed tables to native SQLite successfully');
     } catch (sqlErr) {
-      console.error('[SqliteStorage] Error saving to SQLite:', sqlErr);
+      console.error('[SqliteStorage] Error updating local SQLite cache:', sqlErr);
       try {
         await dbConnection.rollbackTransaction();
-      } catch (rbErr) {
-        // ignore
-      }
+      } catch {}
     }
   }
 }
 
 /**
- * Recovers all tables from persistent storage (SQLite or Filesystem snapshot)
+ * Recovers on-device cached catalog & receipts from SQLite / Filesystem cache.
  */
 export async function loadTablesFromPersistentStorage(): Promise<Record<string, any[]> | null> {
   const result: Record<string, any[]> = {};
   let foundAny = false;
 
-  // 1. Try native SQLite if ready
   if (isSqliteReady && dbConnection) {
     try {
       const isOpened = await dbConnection.isDBOpen();
       if (!isOpened.result) await dbConnection.open();
 
-      for (const table of ALL_TABLE_NAMES) {
+      for (const table of SQLITE_SCOPED_TABLES) {
         try {
           const res = await dbConnection.query(`SELECT * FROM ${table};`);
           if (res && res.values && res.values.length > 0) {
             result[table] = res.values;
             foundAny = true;
           }
-        } catch (tableErr) {
-          // Table might be empty or not yet seeded
-        }
+        } catch {}
       }
 
-      if (foundAny && ((result['businesses'] && result['businesses'].length > 0) || (result['products'] && result['products'].length > 0) || (result['orders'] && result['orders'].length > 0))) {
-        console.log('[SqliteStorage] Successfully recovered data from native SQLite database');
-        return result;
+      if (
+        foundAny &&
+        ((result['businesses'] && result['businesses'].length > 0) ||
+          (result['products'] && result['products'].length > 0) ||
+          (result['orders'] && result['orders'].length > 0))
+      ) {
+        return filterToSqliteScope(result);
       }
     } catch (err) {
-      console.warn('[SqliteStorage] Failed to query SQLite, trying filesystem backup:', err);
+      console.warn('[SqliteStorage] Failed to query SQLite cache, trying filesystem cache:', err);
     }
   }
 
-  // 2. Try Filesystem persistent snapshot
-  try {
-    const file = await Filesystem.readFile({
-      path: SNAPSHOT_FILENAME,
-      directory: Directory.Data,
-      encoding: Encoding.UTF8
-    });
-    if (file && typeof file.data === 'string') {
-      const parsed = JSON.parse(file.data);
-      if (parsed && typeof parsed === 'object') {
-        console.log('[SqliteStorage] Successfully recovered data from Android Filesystem snapshot');
-        return parsed;
+  for (const filename of [CACHE_FILENAME, LEGACY_SNAPSHOT_FILENAME]) {
+    try {
+      const file = await Filesystem.readFile({
+        path: filename,
+        directory: Directory.Data,
+        encoding: Encoding.UTF8,
+      });
+      if (file && typeof file.data === 'string') {
+        const parsed = JSON.parse(file.data);
+        if (parsed && typeof parsed === 'object') {
+          return filterToSqliteScope(parsed);
+        }
       }
-    }
-  } catch (fsErr) {
-    // File not found or not yet created
+    } catch {}
   }
 
   return null;
+}
+
+// ============================================================================
+// ON-DEVICE RECEIPT CACHE HELPERS (SQLite on Native + Local Cache Fallback)
+// ============================================================================
+
+function readWebReceiptCache(): LocalReceiptRecord[] {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(WEB_RECEIPT_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeWebReceiptCache(rows: LocalReceiptRecord[]) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    // Cap at 300 most recent local receipts to respect localStorage quota while keeping SQLite unlimited
+    localStorage.setItem(WEB_RECEIPT_CACHE_KEY, JSON.stringify(rows.slice(0, 300)));
+  } catch {}
+}
+
+export async function saveReceiptToSqliteCache(receipt: LocalReceiptRecord): Promise<void> {
+  if (!receipt || !receipt.order_id || !receipt.business_id) return;
+
+  const clean: LocalReceiptRecord = {
+    ...receipt,
+    id: receipt.id || `${receipt.tx_type || 'SALE'}_${receipt.order_id}`,
+    mirror_status: receipt.mirror_status || 'PENDING',
+    created_at: receipt.created_at || new Date().toISOString(),
+  };
+
+  // Update web receipt cache immediately (for offline lookup & web preview)
+  const existing = readWebReceiptCache().filter((r) => r.id !== clean.id);
+  writeWebReceiptCache([clean, ...existing]);
+
+  // Write to native SQLite local_receipts table when on Capacitor Android
+  if (isSqliteReady && dbConnection) {
+    try {
+      const isOpened = await dbConnection.isDBOpen();
+      if (!isOpened.result) await dbConnection.open();
+      await dbConnection.run(
+        `INSERT OR REPLACE INTO local_receipts (
+          id, order_id, business_id, store_id, tx_type, receipt_number,
+          customer_name, payment_method, subtotal, tax, discount, total,
+          items_json, receipt_payload_json, fiscal_qr_url, performed_by,
+          status, mirror_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+        [
+          clean.id,
+          clean.order_id,
+          clean.business_id,
+          clean.store_id,
+          clean.tx_type,
+          clean.receipt_number,
+          clean.customer_name,
+          clean.payment_method,
+          Number(clean.subtotal || 0),
+          Number(clean.tax || 0),
+          Number(clean.discount || 0),
+          Number(clean.total || 0),
+          clean.items_json || '[]',
+          clean.receipt_payload_json || '',
+          clean.fiscal_qr_url || '',
+          clean.performed_by || 'owner',
+          clean.status || 'Completed',
+          clean.mirror_status,
+          clean.created_at,
+        ]
+      );
+    } catch (err) {
+      console.warn('[SqliteStorage] local_receipts write notice:', err);
+    }
+  }
+}
+
+export async function markReceiptMirroredInSqlite(orderId: string, businessId: string): Promise<void> {
+  if (!orderId || !businessId) return;
+
+  const list = readWebReceiptCache().map((r) =>
+    r.order_id === orderId && r.business_id === businessId
+      ? { ...r, mirror_status: 'MIRRORED' as const }
+      : r
+  );
+  writeWebReceiptCache(list);
+
+  if (isSqliteReady && dbConnection) {
+    try {
+      const isOpened = await dbConnection.isDBOpen();
+      if (!isOpened.result) await dbConnection.open();
+      await dbConnection.run(
+        `UPDATE local_receipts SET mirror_status = 'MIRRORED' WHERE order_id = ? AND business_id = ?;`,
+        [orderId, businessId]
+      );
+    } catch {}
+  }
+}
+
+export async function getCachedReceiptsFromSqlite(
+  businessId: string,
+  storeId?: string,
+  limit: number = 100
+): Promise<LocalReceiptRecord[]> {
+  if (!businessId) return [];
+
+  if (isSqliteReady && dbConnection) {
+    try {
+      const isOpened = await dbConnection.isDBOpen();
+      if (!isOpened.result) await dbConnection.open();
+      const hasStore = storeId && storeId !== 'all';
+      const query = hasStore
+        ? `SELECT * FROM local_receipts WHERE business_id = ? AND store_id = ? ORDER BY created_at DESC LIMIT ?;`
+        : `SELECT * FROM local_receipts WHERE business_id = ? ORDER BY created_at DESC LIMIT ?;`;
+      const params = hasStore ? [businessId, storeId, limit] : [businessId, limit];
+      const res = await dbConnection.query(query, params);
+      if (res && Array.isArray(res.values)) {
+        return res.values as LocalReceiptRecord[];
+      }
+    } catch {}
+  }
+
+  return readWebReceiptCache()
+    .filter((r) => {
+      if (r.business_id !== businessId) return false;
+      if (storeId && storeId !== 'all' && r.store_id !== storeId) return false;
+      return true;
+    })
+    .slice(0, limit);
 }

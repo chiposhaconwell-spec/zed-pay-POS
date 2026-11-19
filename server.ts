@@ -5,7 +5,12 @@ import { fileURLToPath } from 'url';
 import { requireAuth } from './src/middleware/auth.ts';
 import type { AuthRequest } from './src/middleware/auth.ts';
 import { getOrCreateUser, getUsers } from './src/db/users.ts';
-import { pushPosSyncToCloudSql, pullPosSyncFromCloudSql } from './src/db/sync.ts';
+import {
+  pushPosSyncToCloudSql,
+  pullPosSyncFromCloudSql,
+  mirrorFinalizedTransactionToCloudSql,
+  getCentralSqlReportingSummary,
+} from './src/db/sync.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -209,6 +214,45 @@ app.get('/api/sync/status', async (_req, res) => {
       hasCloudData: false,
       error: error.message || 'Cloud SQL unavailable',
     });
+  }
+});
+
+// API: Server-side trigger mirroring finalized Firestore transactions into Central Cloud SQL for reporting
+app.post('/api/triggers/firestore-transaction', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.businessId || !body.txType) {
+      return res.status(400).json({ error: 'Missing required businessId or txType for transaction mirror.' });
+    }
+    const result = await mirrorFinalizedTransactionToCloudSql(body, req.user?.uid);
+    return res.json(result);
+  } catch (error: any) {
+    console.warn('[SQL Mirror Trigger] Error mirroring finalized transaction:', error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Failed to mirror finalized transaction to Cloud SQL' });
+  }
+});
+
+// API: Central SQL Reporting Summary scoped by businessId and optional storeId / date window
+app.get('/api/reports/sql-summary', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const businessId = typeof req.query.businessId === 'string' ? req.query.businessId.trim() : '';
+    if (!businessId) {
+      return res.status(400).json({ error: 'businessId query parameter is required.' });
+    }
+    const storeId = typeof req.query.storeId === 'string' ? req.query.storeId.trim() : undefined;
+    const startDate = typeof req.query.startDate === 'string' ? req.query.startDate.trim() : undefined;
+    const endDate = typeof req.query.endDate === 'string' ? req.query.endDate.trim() : undefined;
+
+    const summary = await getCentralSqlReportingSummary({
+      businessId,
+      storeId,
+      startDate,
+      endDate,
+    });
+    return res.json(summary);
+  } catch (error: any) {
+    console.warn('[SQL Reporting] Error querying central SQL summary:', error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Failed to query central SQL reporting summary' });
   }
 });
 

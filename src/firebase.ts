@@ -43,6 +43,8 @@ import {
   rehydrateAlasqlFromRecords,
   sqlEsc,
   getActiveStoreId,
+  saveReceiptToSqliteCache,
+  markReceiptMirroredInSqlite,
 } from './db';
 
 const app = initializeApp(firebaseConfig);
@@ -637,13 +639,125 @@ async function writeDocOfflineAware(
   }
 }
 
+const PENDING_SQL_MIRRORS_KEY = 'pos_pending_sql_mirrors_v1';
+
+interface PendingSqlMirrorEntry {
+  eventKey: string;
+  payload: Record<string, any>;
+  queuedAt: string;
+}
+
+function readPendingSqlMirrors(): PendingSqlMirrorEntry[] {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(PENDING_SQL_MIRRORS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingSqlMirrors(list: PendingSqlMirrorEntry[]) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(PENDING_SQL_MIRRORS_KEY, JSON.stringify(list.slice(-250)));
+  } catch {}
+}
+
+function enqueuePendingSqlMirror(eventKey: string, payload: Record<string, any>) {
+  const list = readPendingSqlMirrors().filter((item) => item.eventKey !== eventKey);
+  list.push({ eventKey, payload, queuedAt: new Date().toISOString() });
+  writePendingSqlMirrors(list);
+}
+
+function removePendingSqlMirror(eventKey: string) {
+  const list = readPendingSqlMirrors().filter((item) => item.eventKey !== eventKey);
+  writePendingSqlMirrors(list);
+}
+
+async function dispatchSqlMirrorRequest(payload: Record<string, any>): Promise<boolean> {
+  if (!auth.currentUser) return false;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+
+  try {
+    const token = await auth.currentUser.getIdToken();
+    const res = await fetch('/api/triggers/firestore-transaction', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function flushPendingFinalizedTxMirrors(): Promise<number> {
+  if (!auth.currentUser) return 0;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return 0;
+
+  const queue = readPendingSqlMirrors();
+  if (queue.length === 0) return 0;
+
+  let mirroredCount = 0;
+  for (const entry of queue) {
+    const ok = await dispatchSqlMirrorRequest(entry.payload);
+    if (ok) {
+      removePendingSqlMirror(entry.eventKey);
+      const orderId = entry.payload?.order?.id || entry.payload?.cashUp?.id;
+      const bizId = entry.payload?.businessId;
+      if (orderId && bizId) {
+        void markReceiptMirroredInSqlite(String(orderId), String(bizId));
+      }
+      mirroredCount++;
+    }
+  }
+  return mirroredCount;
+}
+
+export async function fetchCentralSqlReport(params: {
+  businessId: string;
+  storeId?: string;
+  startDate?: string;
+  endDate?: string;
+}) {
+  if (!auth.currentUser) {
+    throw new Error('Sign in with Firebase Auth to load Central SQL reports.');
+  }
+  const token = await auth.currentUser.getIdToken();
+  const qs = new URLSearchParams();
+  qs.set('businessId', params.businessId);
+  if (params.storeId && params.storeId !== 'all') qs.set('storeId', params.storeId);
+  if (params.startDate) qs.set('startDate', params.startDate);
+  if (params.endDate) qs.set('endDate', params.endDate);
+
+  const res = await fetch(`/api/reports/sql-summary?${qs.toString()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Central SQL report returned ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Queues a POS checkout (order, line items, and stock/customer updates) directly into Firestore
- * with IndexedDB offline persistence. Never blocks checkout UI when offline.
+ * with IndexedDB offline persistence, caches the local receipt in on-device SQLite, and triggers
+ * server-side Central SQL mirroring upon Firestore commit.
  */
 export function syncSaleToFirestoreOfflineSafe(params: {
   businessId: string;
   storeId: string;
+  customerName?: string;
+  fiscalQrUrl?: string;
   order: {
     id: string;
     customerId?: number | null;
@@ -652,6 +766,7 @@ export function syncSaleToFirestoreOfflineSafe(params: {
     tax: number;
     discount: number;
     total: number;
+    cogsAmount?: number;
     paymentMethod: string;
     status: string;
     performed_by: string;
@@ -659,8 +774,10 @@ export function syncSaleToFirestoreOfflineSafe(params: {
   items: Array<{
     id: string;
     productId: number;
+    productName?: string;
     quantity: number;
     unitPrice: number;
+    unitCost?: number;
   }>;
   updatedProducts?: Array<{
     id: number;
@@ -678,9 +795,54 @@ export function syncSaleToFirestoreOfflineSafe(params: {
   }>;
 }) {
   try {
-    if (!auth.currentUser) return;
     const rawBizId = String(params.businessId || '').trim();
     if (!rawBizId || rawBizId === 'default_biz') return;
+
+    const safeBizId = sanitizeIdForFirestore(rawBizId, 'biz');
+    const safeStoreId = sanitizeIdForFirestore(params.storeId || getActiveStoreId(undefined, rawBizId), 'store');
+    const safeOrderId = sanitizeIdForFirestore(params.order.id, 'ord');
+
+    // 1. Always save local receipt copy into on-device SQLite receipt cache immediately (offline-safe)
+    void saveReceiptToSqliteCache({
+      id: `SALE_${safeOrderId}`,
+      order_id: safeOrderId,
+      business_id: safeBizId,
+      store_id: safeStoreId,
+      tx_type: 'SALE',
+      receipt_number: safeOrderId,
+      customer_name: params.customerName || 'Walk-In Customer',
+      payment_method: String(params.order.paymentMethod || 'Cash'),
+      subtotal: Number(params.order.subtotal || 0),
+      tax: Number(params.order.tax || 0),
+      discount: Number(params.order.discount || 0),
+      total: Number(params.order.total || 0),
+      items_json: JSON.stringify(params.items || []),
+      fiscal_qr_url: params.fiscalQrUrl || '',
+      performed_by: String(params.order.performed_by || 'owner'),
+      status: String(params.order.status || 'Completed'),
+      mirror_status: 'PENDING',
+      created_at: String(params.order.orderDate || new Date().toISOString()),
+    });
+
+    // Queue finalized sale mirror payload for Central SQL reporting
+    const mirrorPayload = {
+      txType: 'SALE' as const,
+      businessId: safeBizId,
+      storeId: safeStoreId,
+      firestorePath: `businesses/${safeBizId}/orders/${safeOrderId}`,
+      source: 'firestore_commit_trigger',
+      order: {
+        ...params.order,
+        id: safeOrderId,
+        customerName: params.customerName || 'Walk-In Customer',
+      },
+      items: params.items || [],
+      updatedProducts: params.updatedProducts || [],
+    };
+    const mirrorEventKey = `${safeBizId}::SALE::${safeOrderId}`;
+    enqueuePendingSqlMirror(mirrorEventKey, mirrorPayload);
+
+    if (!auth.currentUser) return;
     if (!isCurrentUserAuthorizedBusinessOwner(rawBizId)) return;
 
     const shouldUseOfflineMode =
@@ -690,11 +852,7 @@ export function syncSaleToFirestoreOfflineSafe(params: {
       void setFirestoreOfflineMode();
     }
 
-    const safeBizId = sanitizeIdForFirestore(rawBizId, 'biz');
-    const safeStoreId = sanitizeIdForFirestore(params.storeId || getActiveStoreId(undefined, rawBizId), 'store');
-    const safeOrderId = sanitizeIdForFirestore(params.order.id, 'ord');
     const currentUid = auth.currentUser.uid;
-
     const orderPayload = {
       id: safeOrderId,
       business_id: safeBizId,
@@ -711,14 +869,23 @@ export function syncSaleToFirestoreOfflineSafe(params: {
       performed_by: String(params.order.performed_by || 'owner').slice(0, 100),
     };
 
-    void setDoc(doc(db, 'businesses', safeBizId, 'orders', safeOrderId), orderPayload).catch((err) => {
-      if (isNetworkOrOfflineAuthError(err)) {
-        lastAuthNetworkFailureAt = Date.now();
-        void setFirestoreOfflineMode();
-        return;
-      }
-      console.warn('[Firestore Offline Order Sync]', err?.message || err);
-    });
+    // 2. Write to Firestore; upon Firestore commit, fire server-side SQL reporting trigger
+    void setDoc(doc(db, 'businesses', safeBizId, 'orders', safeOrderId), orderPayload)
+      .then(async () => {
+        const ok = await dispatchSqlMirrorRequest(mirrorPayload);
+        if (ok) {
+          removePendingSqlMirror(mirrorEventKey);
+          void markReceiptMirroredInSqlite(safeOrderId, safeBizId);
+        }
+      })
+      .catch((err) => {
+        if (isNetworkOrOfflineAuthError(err)) {
+          lastAuthNetworkFailureAt = Date.now();
+          void setFirestoreOfflineMode();
+          return;
+        }
+        console.warn('[Firestore Offline Order Sync]', err?.message || err);
+      });
 
     for (const item of params.items || []) {
       const safeItemId = sanitizeIdForFirestore(item.id, 'item');
@@ -771,6 +938,155 @@ export function syncSaleToFirestoreOfflineSafe(params: {
     }
   } catch (err) {
     console.warn('[Firestore Offline Checkout Hook]', err);
+  }
+}
+
+export function syncRefundToFirestoreAndMirror(params: {
+  businessId: string;
+  storeId: string;
+  customerName?: string;
+  order: {
+    id: string;
+    customerId?: number | null;
+    orderDate: string;
+    subtotal: number;
+    tax: number;
+    discount: number;
+    total: number;
+    paymentMethod: string;
+    performed_by: string;
+  };
+  items?: Array<{
+    id: string;
+    productId: number;
+    quantity: number;
+    unitPrice: number;
+  }>;
+}) {
+  try {
+    const rawBizId = String(params.businessId || '').trim();
+    if (!rawBizId || rawBizId === 'default_biz') return;
+
+    const safeBizId = sanitizeIdForFirestore(rawBizId, 'biz');
+    const safeStoreId = sanitizeIdForFirestore(params.storeId || getActiveStoreId(undefined, rawBizId), 'store');
+    const safeOrderId = sanitizeIdForFirestore(params.order.id, 'ord');
+
+    void saveReceiptToSqliteCache({
+      id: `REFUND_${safeOrderId}`,
+      order_id: safeOrderId,
+      business_id: safeBizId,
+      store_id: safeStoreId,
+      tx_type: 'REFUND',
+      receipt_number: `${safeOrderId}-RF`,
+      customer_name: params.customerName || 'Walk-In Customer',
+      payment_method: String(params.order.paymentMethod || 'Cash'),
+      subtotal: Number(params.order.subtotal || 0),
+      tax: Number(params.order.tax || 0),
+      discount: Number(params.order.discount || 0),
+      total: Number(params.order.total || 0),
+      items_json: JSON.stringify(params.items || []),
+      performed_by: String(params.order.performed_by || 'supervisor'),
+      status: 'Refunded',
+      mirror_status: 'PENDING',
+      created_at: new Date().toISOString(),
+    });
+
+    const mirrorPayload = {
+      txType: 'REFUND' as const,
+      businessId: safeBizId,
+      storeId: safeStoreId,
+      firestorePath: `businesses/${safeBizId}/orders/${safeOrderId}`,
+      source: 'firestore_commit_trigger',
+      order: {
+        ...params.order,
+        id: safeOrderId,
+        status: 'Refunded',
+        customerName: params.customerName || 'Walk-In Customer',
+      },
+      items: params.items || [],
+    };
+    const mirrorEventKey = `${safeBizId}::REFUND::${safeOrderId}`;
+    enqueuePendingSqlMirror(mirrorEventKey, mirrorPayload);
+
+    if (!auth.currentUser || !isCurrentUserAuthorizedBusinessOwner(rawBizId)) return;
+
+    const orderRef = doc(db, 'businesses', safeBizId, 'orders', safeOrderId);
+    void setDoc(
+      orderRef,
+      {
+        id: safeOrderId,
+        business_id: safeBizId,
+        store_id: safeStoreId,
+        ownerUid: auth.currentUser.uid,
+        customerId: params.order.customerId ? parseInt(params.order.customerId as any, 10) : null,
+        orderDate: String(params.order.orderDate || new Date().toISOString()).slice(0, 100),
+        subtotal: Math.max(0, parseFloat(params.order.subtotal as any) || 0.0),
+        tax: Math.max(0, parseFloat(params.order.tax as any) || 0.0),
+        discount: Math.max(0, parseFloat(params.order.discount as any) || 0.0),
+        total: Math.max(0, parseFloat(params.order.total as any) || 0.0),
+        paymentMethod: String(params.order.paymentMethod || 'Cash').slice(0, 50),
+        status: 'Refunded',
+        performed_by: String(params.order.performed_by || 'supervisor').slice(0, 100),
+      },
+      { merge: true }
+    )
+      .then(async () => {
+        const ok = await dispatchSqlMirrorRequest(mirrorPayload);
+        if (ok) {
+          removePendingSqlMirror(mirrorEventKey);
+          void markReceiptMirroredInSqlite(safeOrderId, safeBizId);
+        }
+      })
+      .catch(() => {});
+  } catch (err) {
+    console.warn('[Firestore Refund Mirror Hook]', err);
+  }
+}
+
+export function syncCashUpToFirestoreAndMirror(params: {
+  businessId: string;
+  storeId: string;
+  cashUp: {
+    id: string;
+    date: string;
+    cashierName?: string;
+    expectedCash: number;
+    actualCash: number;
+    variance: number;
+    expectedCard: number;
+    expectedMobile: number;
+    notes?: string;
+    createdAt?: string;
+  };
+}) {
+  try {
+    const rawBizId = String(params.businessId || '').trim();
+    if (!rawBizId || rawBizId === 'default_biz') return;
+
+    const safeBizId = sanitizeIdForFirestore(rawBizId, 'biz');
+    const safeStoreId = sanitizeIdForFirestore(params.storeId || getActiveStoreId(undefined, rawBizId), 'store');
+    const safeCashUpId = sanitizeIdForFirestore(params.cashUp.id, 'csh');
+
+    const mirrorPayload = {
+      txType: 'EOD_CASHUP' as const,
+      businessId: safeBizId,
+      storeId: safeStoreId,
+      firestorePath: `businesses/${safeBizId}/cash_ups/${safeCashUpId}`,
+      source: 'firestore_commit_trigger',
+      cashUp: {
+        ...params.cashUp,
+        id: safeCashUpId,
+      },
+    };
+    const mirrorEventKey = `${safeBizId}::EOD_CASHUP::${safeCashUpId}`;
+    enqueuePendingSqlMirror(mirrorEventKey, mirrorPayload);
+
+    if (!auth.currentUser) return;
+    void dispatchSqlMirrorRequest(mirrorPayload).then((ok) => {
+      if (ok) removePendingSqlMirror(mirrorEventKey);
+    });
+  } catch (err) {
+    console.warn('[Firestore CashUp Mirror Hook]', err);
   }
 }
 
@@ -1671,6 +1987,7 @@ if (typeof window !== 'undefined') {
     lastAuthNetworkFailureAt = 0;
     void ensureFirestoreOnlineIfReachable().then((online) => {
       if (online) {
+        void flushPendingFinalizedTxMirrors();
         triggerAutoFirebaseBackup();
       }
     });

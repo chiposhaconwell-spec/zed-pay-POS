@@ -8,7 +8,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { runSql, syncAllAccountingSystems, persistTablesToStorage, getCustomPaymentMethods, resolvePaymentMethodBucket, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { CustomPaymentMethod } from '../types';
-import { auth, googleSignIn, googleSignOut, getAccessToken } from '../firebase';
+import { auth, googleSignIn, googleSignOut, getAccessToken, syncSaleToFirestoreOfflineSafe } from '../firebase';
 import { User as FirebaseUser } from 'firebase/auth';
 
 interface WorkspaceCoordinatorProps {
@@ -544,6 +544,30 @@ export default function WorkspaceCoordinator({ userRole, activeStore }: Workspac
     }
 
     syncAllAccountingSystems(`Workspace Task Sale #${orderId}`);
+    syncSaleToFirestoreOfflineSafe({
+      businessId: activeBizId,
+      storeId: resolvedStoreId,
+      customerName: 'Task Client',
+      order: {
+        id: orderId,
+        customerId: selectedCustomerId ? Number(selectedCustomerId) : null,
+        orderDate: dateStr,
+        subtotal,
+        tax: taxAmount,
+        discount: discountAmount,
+        total: totalAmount,
+        paymentMethod,
+        status: 'Completed',
+        performed_by: localStorage.getItem('logged_in_user_name') || 'Task Operator',
+      },
+      items: [{
+        id: orderItemId,
+        productId: Number(serviceObj.id),
+        productName: serviceObj.name,
+        quantity: 1,
+        unitPrice: Number(serviceObj.price),
+      }],
+    });
     persistTablesToStorage();
     try {
       window.dispatchEvent(new CustomEvent('pos_sale_completed', {

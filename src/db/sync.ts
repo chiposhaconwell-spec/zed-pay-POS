@@ -13,9 +13,10 @@ import {
   cashFlowLedger,
   paymentMethodLedger,
   financialStatementsLedger,
+  finalizedTransactionEvents,
   posSyncSnapshots,
 } from './schema.ts';
-import { desc, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 
 export interface SyncPushPayload {
   businessId: string;
@@ -419,6 +420,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (o: any) => o.id
     ).map((o: any) => ({
       id: String(o.id),
+      businessId: String(o.business_id || bizId),
       customerId: o.customerId ? Number(o.customerId) : null,
       orderDate: String(o.orderDate || nowIso),
       subtotal: String(Number(o.subtotal || 0).toFixed(2)),
@@ -438,6 +440,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: orders.id,
           set: {
+            businessId: sql`excluded."business_id"`,
             status: sql`excluded."status"`,
             total: sql`excluded."total"`,
             paymentMethod: sql`excluded."payment_method"`,
@@ -452,6 +455,8 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (oi: any) => oi.id
     ).map((oi: any) => ({
       id: String(oi.id),
+      businessId: String(oi.business_id || bizId),
+      storeId: String(oi.store_id || primaryStoreId),
       orderId: String(oi.orderId || ''),
       productId: Number(oi.productId || 0),
       quantity: Number(oi.quantity || 1),
@@ -470,6 +475,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (j: any) => namespaceKey(bizId, String(j.id))
     ).map((j: any) => ({
       id: namespaceKey(bizId, String(j.id)),
+      businessId: bizId,
       entryDate: String(j.date || nowIso),
       referenceId: String(j.reference || ''),
       module: 'POS_LEDGER',
@@ -489,6 +495,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: doubleEntryJournal.id,
           set: {
+            businessId: sql`excluded."business_id"`,
             amount: sql`excluded."amount"`,
             description: sql`excluded."description"`,
             storeId: sql`excluded."store_id"`,
@@ -502,6 +509,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (r: any) => namespaceKey(bizId, String(r.id))
     ).map((r: any) => ({
       id: namespaceKey(bizId, String(r.id)),
+      businessId: bizId,
       entryDate: String(r.date || nowIso),
       txType: String(r.entry_type || 'RECEIPT'),
       referenceId: String(r.order_id || ''),
@@ -526,6 +534,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: receiptRefundLedger.id,
           set: {
+            businessId: sql`excluded."business_id"`,
             status: sql`excluded."status"`,
             grossAmount: sql`excluded."gross_amount"`,
             storeId: sql`excluded."store_id"`,
@@ -541,6 +550,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       const netVal = Number(cf.net_cash_change || 0);
       return {
         id: namespaceKey(bizId, String(cf.id)),
+        businessId: bizId,
         entryDate: String(cf.date || nowIso),
         activityCategory: String(cf.activity_type || 'OPERATING'),
         direction: String(cf.direction || 'INFLOW'),
@@ -562,6 +572,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: cashFlowLedger.id,
           set: {
+            businessId: sql`excluded."business_id"`,
             signedAmount: sql`excluded."signed_amount"`,
             amount: sql`excluded."amount"`,
             storeId: sql`excluded."store_id"`,
@@ -575,6 +586,8 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (pm: any) => namespaceKey(bizId, String(pm.id))
     ).map((pm: any) => ({
       methodKey: namespaceKey(bizId, String(pm.id)),
+      businessId: bizId,
+      storeId: String(pm.store_id || primaryStoreId),
       methodLabel: `${pm.payment_method} (${pm.store_id || primaryStoreId})`,
       accountCode: String(pm.account_id || 'acc_cash'),
       grossInflows: String(Number((pm.gross_receipts || 0) + (pm.layby_receipts || 0)).toFixed(2)),
@@ -593,6 +606,8 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: paymentMethodLedger.methodKey,
           set: {
+            businessId: sql`excluded."business_id"`,
+            storeId: sql`excluded."store_id"`,
             grossInflows: sql`excluded."gross_inflows"`,
             refundOutflows: sql`excluded."refund_outflows"`,
             expenseOutflows: sql`excluded."expense_outflows"`,
@@ -609,6 +624,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (cu: any) => cu.id
     ).map((cu: any) => ({
       id: String(cu.id),
+      businessId: String(cu.business_id || bizId),
       storeId: String(cu.store_id || primaryStoreId),
       date: String(cu.date || nowIso.split('T')[0]),
       expectedCash: String(Number(cu.sum_cash_expected || 0).toFixed(2)),
@@ -629,6 +645,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: cashUps.id,
           set: {
+            businessId: sql`excluded."business_id"`,
             expectedCash: sql`excluded."expected_cash"`,
             actualCash: sql`excluded."actual_cash"`,
             variance: sql`excluded."variance"`,
@@ -645,6 +662,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (fs: any) => namespaceKey(bizId, String(fs.id))
     ).map((fs: any) => ({
       statementKey: namespaceKey(bizId, String(fs.id)),
+      businessId: bizId,
       statementType: 'FULL_STATEMENT_SNAPSHOT',
       section: String(fs.store_id || primaryStoreId),
       lineItem: `Net Income: ${fs.net_operating_income || 0} | Total Assets: ${fs.total_assets || 0} | Net Cash Flow: ${fs.net_cash_flow || 0}`,
@@ -661,6 +679,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
         .onConflictDoUpdate({
           target: financialStatementsLedger.statementKey,
           set: {
+            businessId: sql`excluded."business_id"`,
             lineItem: sql`excluded."line_item"`,
             amount: sql`excluded."amount"`,
             storeId: sql`excluded."store_id"`,
@@ -675,6 +694,7 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
       (al: any) => al.id
     ).map((al: any) => ({
       id: String(al.id),
+      businessId: String(al.business_id || bizId),
       module: String(al.module || 'SYSTEM'),
       action: String(al.action || ''),
       details: String(al.details || ''),
@@ -785,3 +805,534 @@ export async function pullPosSyncFromCloudSql(businessId?: string, email?: strin
     availableBusinesses,
   };
 }
+
+// ============================================================================
+// SERVER-SIDE FINALIZED TRANSACTION MIRROR (Firestore Commit -> Central SQL)
+// ============================================================================
+
+export interface FinalizedTransactionMirrorPayload {
+  txType: 'SALE' | 'REFUND' | 'EOD_CASHUP';
+  businessId: string;
+  businessName?: string;
+  ownerEmail?: string;
+  storeId: string;
+  storeName?: string;
+  firestorePath?: string;
+  source?: string;
+  order?: {
+    id: string;
+    customerId?: number | null;
+    customerName?: string;
+    orderDate: string;
+    subtotal: number;
+    tax: number;
+    discount: number;
+    total: number;
+    cogsAmount?: number;
+    paymentMethod: string;
+    status: string;
+    performed_by: string;
+  };
+  items?: Array<{
+    id: string;
+    productId: number;
+    productName?: string;
+    quantity: number;
+    unitPrice: number;
+    unitCost?: number;
+  }>;
+  updatedProducts?: Array<{
+    id: number;
+    name: string;
+    sku?: string;
+    category?: string;
+    price: number;
+    cost: number;
+    stock: number;
+    imageUrl?: string;
+    is_service?: number;
+    batch_number?: string;
+    expiry_date?: string;
+  }>;
+  cashUp?: {
+    id: string;
+    date: string;
+    cashierName?: string;
+    expectedCash: number;
+    actualCash: number;
+    variance: number;
+    expectedCard: number;
+    expectedMobile: number;
+    notes?: string;
+    createdAt?: string;
+  };
+}
+
+export async function mirrorFinalizedTransactionToCloudSql(
+  payload: FinalizedTransactionMirrorPayload,
+  actorUid?: string
+) {
+  const nowIso = new Date().toISOString();
+  const bizId = String(payload.businessId || '').trim();
+  const storeId = String(payload.storeId || 'main').trim() || 'main';
+  if (!bizId || bizId === 'default_biz' || bizId === '__global__') {
+    throw new Error('Valid businessId is required to mirror finalized transaction.');
+  }
+
+  // Ensure business and store reference records exist in Central SQL
+  await db
+    .insert(businesses)
+    .values({
+      id: bizId,
+      name: String(payload.businessName || bizId),
+      email: String(payload.ownerEmail || ''),
+    })
+    .onConflictDoNothing();
+
+  await db
+    .insert(stores)
+    .values({
+      id: storeId,
+      businessId: bizId,
+      name: String(payload.storeName || storeId),
+    })
+    .onConflictDoNothing();
+
+  const txType = payload.txType || 'SALE';
+
+  if ((txType === 'SALE' || txType === 'REFUND') && payload.order?.id) {
+    const o = payload.order;
+    const orderId = String(o.id).trim();
+    const subtotalNum = Number(o.subtotal || 0);
+    const taxNum = Number(o.tax || 0);
+    const discountNum = Number(o.discount || 0);
+    const totalNum = Number(o.total || 0);
+    const occurredAt = String(o.orderDate || nowIso);
+
+    const computedCogs =
+      o.cogsAmount !== undefined
+        ? Number(o.cogsAmount || 0)
+        : (payload.items || []).reduce((acc, it) => {
+            const c = Number(it.unitCost ?? Number(it.unitPrice || 0) * 0.7);
+            return acc + c * Number(it.quantity || 1);
+          }, 0);
+
+    const netRevImpact = Math.max(0, totalNum - taxNum);
+
+    await db
+      .insert(orders)
+      .values({
+        id: orderId,
+        businessId: bizId,
+        customerId: o.customerId ? Number(o.customerId) : null,
+        orderDate: occurredAt,
+        subtotal: subtotalNum.toFixed(2),
+        tax: taxNum.toFixed(2),
+        discount: discountNum.toFixed(2),
+        total: totalNum.toFixed(2),
+        paymentMethod: String(o.paymentMethod || 'Cash'),
+        status: txType === 'REFUND' ? 'Refunded' : String(o.status || 'Completed'),
+        storeId,
+        performedBy: String(o.performed_by || 'owner'),
+      })
+      .onConflictDoUpdate({
+        target: orders.id,
+        set: {
+          businessId: sql`excluded."business_id"`,
+          status: sql`excluded."status"`,
+          total: sql`excluded."total"`,
+          paymentMethod: sql`excluded."payment_method"`,
+          storeId: sql`excluded."store_id"`,
+        },
+      });
+
+    if (Array.isArray(payload.items) && payload.items.length > 0) {
+      const cleanItems = payload.items
+        .filter((it) => it && it.id)
+        .map((it) => ({
+          id: String(it.id),
+          businessId: bizId,
+          storeId,
+          orderId,
+          productId: Number(it.productId || 0),
+          quantity: Math.max(1, Number(it.quantity || 1)),
+          unitPrice: Number(it.unitPrice || 0).toFixed(2),
+        }));
+      if (cleanItems.length > 0) {
+        await db.insert(orderItems).values(cleanItems).onConflictDoNothing();
+      }
+    }
+
+    if (Array.isArray(payload.updatedProducts) && payload.updatedProducts.length > 0) {
+      for (const p of payload.updatedProducts) {
+        if (!p || p.id === undefined || p.id === null) continue;
+        const pid = Number(p.id);
+        await db
+          .insert(products)
+          .values({
+            id: pid,
+            name: String(p.name || `Item #${pid}`),
+            sku: String(p.sku || `SKU-${pid}-${bizId.slice(-4)}`),
+            category: String(p.category || 'General'),
+            price: Number(p.price || 0).toFixed(2),
+            cost: Number(p.cost || 0).toFixed(2),
+            stock: Number(p.stock || 0),
+            imageUrl: String(p.imageUrl || ''),
+            businessId: bizId,
+            isService: Number(p.is_service || 0),
+            batchNumber: String(p.batch_number || ''),
+            expiryDate: String(p.expiry_date || ''),
+          })
+          .onConflictDoUpdate({
+            target: products.id,
+            set: {
+              stock: sql`excluded."stock"`,
+              price: sql`excluded."price"`,
+              cost: sql`excluded."cost"`,
+            },
+          });
+      }
+    }
+
+    const rrId = namespaceKey(bizId, `${txType}_${orderId}`);
+    const sign = txType === 'REFUND' ? -1 : 1;
+    await db
+      .insert(receiptRefundLedger)
+      .values({
+        id: rrId,
+        businessId: bizId,
+        entryDate: occurredAt,
+        txType: txType === 'REFUND' ? 'REFUND' : 'RECEIPT',
+        referenceId: orderId,
+        customerName: String(o.customerName || 'Walk-In Customer'),
+        paymentMethod: String(o.paymentMethod || 'Cash'),
+        grossAmount: (sign * totalNum).toFixed(2),
+        taxAmount: (sign * taxNum).toFixed(2),
+        discountAmount: (sign * discountNum).toFixed(2),
+        netRevenue: (sign * netRevImpact).toFixed(2),
+        cogsAmount: (sign * computedCogs).toFixed(2),
+        storeId,
+        performedBy: String(o.performed_by || 'owner'),
+        status: 'Posted',
+        notes: payload.firestorePath ? `Mirrored from ${payload.firestorePath}` : 'Mirrored finalized transaction',
+      })
+      .onConflictDoUpdate({
+        target: receiptRefundLedger.id,
+        set: {
+          status: sql`excluded."status"`,
+          grossAmount: sql`excluded."gross_amount"`,
+          netRevenue: sql`excluded."net_revenue"`,
+          cogsAmount: sql`excluded."cogs_amount"`,
+        },
+      });
+
+    const cfId = namespaceKey(bizId, `CF_${txType}_${orderId}`);
+    await db
+      .insert(cashFlowLedger)
+      .values({
+        id: cfId,
+        businessId: bizId,
+        entryDate: occurredAt,
+        activityCategory: 'OPERATING',
+        direction: txType === 'REFUND' ? 'OUTFLOW' : 'INFLOW',
+        paymentMethod: String(o.paymentMethod || 'Cash'),
+        referenceId: orderId,
+        description:
+          txType === 'REFUND'
+            ? `POS Refund #${orderId} (${o.paymentMethod || 'Cash'})`
+            : `POS Sale #${orderId} (${o.paymentMethod || 'Cash'})`,
+        amount: totalNum.toFixed(2),
+        signedAmount: (sign * totalNum).toFixed(2),
+        storeId,
+        performedBy: String(o.performed_by || 'owner'),
+      })
+      .onConflictDoUpdate({
+        target: cashFlowLedger.id,
+        set: {
+          amount: sql`excluded."amount"`,
+          signedAmount: sql`excluded."signed_amount"`,
+        },
+      });
+
+    const eventId = namespaceKey(bizId, `${txType}_${orderId}`);
+    await db
+      .insert(finalizedTransactionEvents)
+      .values({
+        eventId,
+        businessId: bizId,
+        storeId,
+        txType,
+        orderId,
+        source: String(payload.source || 'firestore_commit_trigger'),
+        firestorePath: String(payload.firestorePath || `businesses/${bizId}/orders/${orderId}`),
+        grossTotal: (sign * totalNum).toFixed(2),
+        taxAmount: (sign * taxNum).toFixed(2),
+        discountAmount: (sign * discountNum).toFixed(2),
+        netRevenue: (sign * netRevImpact).toFixed(2),
+        cogsAmount: (sign * computedCogs).toFixed(2),
+        paymentMethod: String(o.paymentMethod || 'Cash'),
+        performedBy: String(o.performed_by || actorUid || 'owner'),
+        status: 'MIRRORED',
+        occurredAt,
+        mirroredAt: nowIso,
+      })
+      .onConflictDoUpdate({
+        target: finalizedTransactionEvents.eventId,
+        set: {
+          status: sql`excluded."status"`,
+          grossTotal: sql`excluded."gross_total"`,
+          netRevenue: sql`excluded."net_revenue"`,
+          mirroredAt: sql`excluded."mirrored_at"`,
+        },
+      });
+
+    return {
+      success: true,
+      mirrored: true,
+      eventId,
+      businessId: bizId,
+      storeId,
+      txType,
+      orderId,
+      mirroredAt: nowIso,
+    };
+  }
+
+  if (txType === 'EOD_CASHUP' && payload.cashUp?.id) {
+    const cu = payload.cashUp;
+    const cashUpId = String(cu.id).trim();
+    const occurredAt = String(cu.createdAt || nowIso);
+
+    await db
+      .insert(cashUps)
+      .values({
+        id: cashUpId,
+        businessId: bizId,
+        storeId,
+        date: String(cu.date || nowIso.split('T')[0]),
+        expectedCash: Number(cu.expectedCash || 0).toFixed(2),
+        actualCash: Number(cu.actualCash || 0).toFixed(2),
+        variance: Number(cu.variance || 0).toFixed(2),
+        expectedCard: Number(cu.expectedCard || 0).toFixed(2),
+        expectedMobile: Number(cu.expectedMobile || 0).toFixed(2),
+        status: 'SYNCED',
+        performedBy: String(cu.cashierName || ''),
+        notes: String(cu.notes || ''),
+        createdAt: occurredAt,
+      })
+      .onConflictDoUpdate({
+        target: cashUps.id,
+        set: {
+          businessId: sql`excluded."business_id"`,
+          expectedCash: sql`excluded."expected_cash"`,
+          actualCash: sql`excluded."actual_cash"`,
+          variance: sql`excluded."variance"`,
+          notes: sql`excluded."notes"`,
+        },
+      });
+
+    const eventId = namespaceKey(bizId, `EOD_${cashUpId}`);
+    await db
+      .insert(finalizedTransactionEvents)
+      .values({
+        eventId,
+        businessId: bizId,
+        storeId,
+        txType: 'EOD_CASHUP',
+        orderId: cashUpId,
+        source: String(payload.source || 'firestore_commit_trigger'),
+        firestorePath: String(payload.firestorePath || `businesses/${bizId}/cash_ups/${cashUpId}`),
+        grossTotal: Number(cu.actualCash || 0).toFixed(2),
+        taxAmount: '0.00',
+        discountAmount: '0.00',
+        netRevenue: Number(cu.variance || 0).toFixed(2),
+        cogsAmount: '0.00',
+        paymentMethod: 'EOD Cash-Up',
+        performedBy: String(cu.cashierName || actorUid || 'owner'),
+        status: 'MIRRORED',
+        occurredAt,
+        mirroredAt: nowIso,
+      })
+      .onConflictDoUpdate({
+        target: finalizedTransactionEvents.eventId,
+        set: {
+          mirroredAt: sql`excluded."mirrored_at"`,
+        },
+      });
+
+    return {
+      success: true,
+      mirrored: true,
+      eventId,
+      businessId: bizId,
+      storeId,
+      txType: 'EOD_CASHUP',
+      orderId: cashUpId,
+      mirroredAt: nowIso,
+    };
+  }
+
+  throw new Error('Unsupported or incomplete finalized transaction payload.');
+}
+
+export async function getCentralSqlReportingSummary(params: {
+  businessId: string;
+  storeId?: string;
+  startDate?: string;
+  endDate?: string;
+}) {
+  const bizId = String(params.businessId || '').trim();
+  if (!bizId || bizId === '__global__') {
+    throw new Error('businessId is required for central SQL reporting.');
+  }
+
+  const cleanStoreId = params.storeId && params.storeId !== 'all' ? params.storeId.trim() : '';
+  const startDate = params.startDate ? params.startDate.trim() : '';
+  const endDate = params.endDate ? params.endDate.trim() : '';
+
+  const inDateRange = (rawDate?: string | null) => {
+    const d = String(rawDate || '').slice(0, 10);
+    if (!d) return !startDate && !endDate;
+    if (startDate && d < startDate) return false;
+    if (endDate && d > endDate) return false;
+    return true;
+  };
+
+  const orderConditions = cleanStoreId
+    ? and(eq(orders.businessId, bizId), eq(orders.storeId, cleanStoreId))
+    : eq(orders.businessId, bizId);
+
+  const bizOrders = (await db.select().from(orders).where(orderConditions)).filter((o) =>
+    inDateRange(o.orderDate)
+  );
+
+  const completedOrders = bizOrders.filter((o) => String(o.status || '').toLowerCase() !== 'refunded');
+  const refundedOrders = bizOrders.filter((o) => String(o.status || '').toLowerCase() === 'refunded');
+
+  const grossSales = completedOrders.reduce((acc, o) => acc + Number(o.total || 0), 0);
+  const refundTotal = refundedOrders.reduce((acc, o) => acc + Number(o.total || 0), 0);
+  const taxCollected = completedOrders.reduce((acc, o) => acc + Number(o.tax || 0), 0);
+  const discountsAllowed = completedOrders.reduce((acc, o) => acc + Number(o.discount || 0), 0);
+
+  const rrConditions = cleanStoreId
+    ? and(eq(receiptRefundLedger.businessId, bizId), eq(receiptRefundLedger.storeId, cleanStoreId))
+    : eq(receiptRefundLedger.businessId, bizId);
+
+  const bizRR = (await db.select().from(receiptRefundLedger).where(rrConditions)).filter((r) =>
+    inDateRange(r.entryDate)
+  );
+  const totalCogs = bizRR.reduce((acc, r) => acc + Number(r.cogsAmount || 0), 0);
+
+  const netRevenue = Math.max(0, grossSales - refundTotal - taxCollected);
+  const grossProfit = netRevenue - totalCogs;
+
+  // Payment method breakdown from completed orders
+  const pmMap = new Map<string, { method: string; count: number; total: number }>();
+  for (const o of completedOrders) {
+    const method = String(o.paymentMethod || 'Cash');
+    const cur = pmMap.get(method) || { method, count: 0, total: 0 };
+    cur.count += 1;
+    cur.total += Number(o.total || 0);
+    pmMap.set(method, cur);
+  }
+
+  // Branch breakdown across completed + refunded orders
+  const storeRows = await db.select().from(stores).where(eq(stores.businessId, bizId));
+  const storeNameMap = new Map(storeRows.map((s) => [s.id, s.name]));
+  const branchMap = new Map<
+    string,
+    { storeId: string; storeName: string; orderCount: number; refundCount: number; grossSales: number; refunds: number }
+  >();
+  for (const o of bizOrders) {
+    const stId = String(o.storeId || 'main');
+    const cur = branchMap.get(stId) || {
+      storeId: stId,
+      storeName: storeNameMap.get(stId) || stId,
+      orderCount: 0,
+      refundCount: 0,
+      grossSales: 0,
+      refunds: 0,
+    };
+    if (String(o.status || '').toLowerCase() === 'refunded') {
+      cur.refundCount += 1;
+      cur.refunds += Number(o.total || 0);
+    } else {
+      cur.orderCount += 1;
+      cur.grossSales += Number(o.total || 0);
+    }
+    branchMap.set(stId, cur);
+  }
+
+  // Top selling products from order_items joined in memory
+  const orderIds = bizOrders.map((o) => o.id);
+  const topProducts: Array<{ productId: number; name: string; quantitySold: number; revenue: number }> = [];
+  if (orderIds.length > 0) {
+    const itemsRows = await db.select().from(orderItems).where(inArray(orderItems.orderId, orderIds.slice(0, 500)));
+    const bizProducts = await db.select().from(products).where(eq(products.businessId, bizId));
+    const prodNameMap = new Map(bizProducts.map((p) => [p.id, p.name]));
+    const prodAgg = new Map<number, { productId: number; name: string; quantitySold: number; revenue: number }>();
+    for (const it of itemsRows) {
+      const pid = Number(it.productId || 0);
+      const cur = prodAgg.get(pid) || {
+        productId: pid,
+        name: prodNameMap.get(pid) || `Product #${pid}`,
+        quantitySold: 0,
+        revenue: 0,
+      };
+      cur.quantitySold += Number(it.quantity || 0);
+      cur.revenue += Number(it.quantity || 0) * Number(it.unitPrice || 0);
+      prodAgg.set(pid, cur);
+    }
+    topProducts.push(
+      ...Array.from(prodAgg.values())
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 8)
+    );
+  }
+
+  // Cash-up reconciliation stats
+  const cuConditions = cleanStoreId
+    ? and(eq(cashUps.businessId, bizId), eq(cashUps.storeId, cleanStoreId))
+    : eq(cashUps.businessId, bizId);
+  const bizCashUps = (await db.select().from(cashUps).where(cuConditions)).filter((cu) => inDateRange(cu.date));
+  const totalCashUpVariance = bizCashUps.reduce((acc, cu) => acc + Number(cu.variance || 0), 0);
+
+  // Recent mirrored Firestore -> SQL finalized events
+  const evConditions = cleanStoreId
+    ? and(eq(finalizedTransactionEvents.businessId, bizId), eq(finalizedTransactionEvents.storeId, cleanStoreId))
+    : eq(finalizedTransactionEvents.businessId, bizId);
+  const recentEvents = (
+    await db
+      .select()
+      .from(finalizedTransactionEvents)
+      .where(evConditions)
+      .orderBy(desc(finalizedTransactionEvents.mirroredAt))
+  )
+    .filter((ev) => inDateRange(ev.occurredAt))
+    .slice(0, 25);
+
+  return {
+    businessId: bizId,
+    storeId: cleanStoreId || 'all',
+    generatedAt: new Date().toISOString(),
+    metrics: {
+      completedOrderCount: completedOrders.length,
+      refundOrderCount: refundedOrders.length,
+      grossSales: Number(grossSales.toFixed(2)),
+      refundTotal: Number(refundTotal.toFixed(2)),
+      taxCollected: Number(taxCollected.toFixed(2)),
+      discountsAllowed: Number(discountsAllowed.toFixed(2)),
+      netRevenue: Number(netRevenue.toFixed(2)),
+      cogsAmount: Number(totalCogs.toFixed(2)),
+      grossProfit: Number(grossProfit.toFixed(2)),
+      cashUpCount: bizCashUps.length,
+      cashUpVariance: Number(totalCashUpVariance.toFixed(2)),
+      mirroredEventCount: recentEvents.length,
+    },
+    paymentBreakdown: Array.from(pmMap.values()).sort((a, b) => b.total - a.total),
+    branchBreakdown: Array.from(branchMap.values()).sort((a, b) => b.grossSales - a.grossSales),
+    topProducts,
+    recentEvents,
+  };
+}
+

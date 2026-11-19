@@ -68,6 +68,7 @@ export const customers = pgTable('customers', {
 // 6. Orders table
 export const orders = pgTable('orders', {
   id: text('id').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
   customerId: integer('customer_id'),
   orderDate: text('order_date').notNull(),
   subtotal: numeric('subtotal', { precision: 12, scale: 2 }).notNull(),
@@ -76,13 +77,15 @@ export const orders = pgTable('orders', {
   total: numeric('total', { precision: 12, scale: 2 }).notNull(),
   paymentMethod: text('payment_method').notNull(),
   status: text('status').default('Completed'),
-  storeId: text('store_id').default('lusaka'),
+  storeId: text('store_id').default('main'),
   performedBy: text('performed_by').default('owner'),
 });
 
 // 7. Order Items table
 export const orderItems = pgTable('order_items', {
   id: text('id').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
+  storeId: text('store_id').default('main'),
   orderId: text('order_id').notNull(),
   productId: integer('product_id').notNull(),
   quantity: integer('quantity').notNull(),
@@ -92,11 +95,12 @@ export const orderItems = pgTable('order_items', {
 // 8. Audit Logs table
 export const auditLogs = pgTable('audit_logs', {
   id: text('id').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
   module: text('module').notNull(),
   action: text('action').notNull(),
   details: text('details'),
   amount: numeric('amount', { precision: 12, scale: 2 }).default('0.00'),
-  storeId: text('store_id').default('lusaka'),
+  storeId: text('store_id').default('main'),
   performedBy: text('performed_by'),
   createdAt: text('created_at'),
 });
@@ -104,7 +108,8 @@ export const auditLogs = pgTable('audit_logs', {
 // 9. EOD Cash-Ups table
 export const cashUps = pgTable('cash_ups', {
   id: text('id').primaryKey(),
-  storeId: text('store_id').default('lusaka'),
+  businessId: text('business_id').default('default_biz'),
+  storeId: text('store_id').default('main'),
   date: text('date').notNull(),
   expectedCash: numeric('expected_cash', { precision: 12, scale: 2 }).default('0.00'),
   actualCash: numeric('actual_cash', { precision: 12, scale: 2 }).default('0.00'),
@@ -120,6 +125,7 @@ export const cashUps = pgTable('cash_ups', {
 // 10. Double-Entry General Journal table
 export const doubleEntryJournal = pgTable('double_entry_journal', {
   id: text('id').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
   entryDate: text('entry_date').notNull(),
   referenceId: text('reference_id'),
   module: text('module'),
@@ -127,13 +133,14 @@ export const doubleEntryJournal = pgTable('double_entry_journal', {
   debitAccount: text('debit_account').notNull(),
   creditAccount: text('credit_account').notNull(),
   amount: numeric('amount', { precision: 12, scale: 2 }).notNull(),
-  storeId: text('store_id').default('lusaka'),
+  storeId: text('store_id').default('main'),
   performedBy: text('performed_by'),
 });
 
 // 11. Receipt & Refund Ledger table
 export const receiptRefundLedger = pgTable('receipt_refund_ledger', {
   id: text('id').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
   entryDate: text('entry_date').notNull(),
   txType: text('tx_type').notNull(),
   referenceId: text('reference_id').notNull(),
@@ -144,7 +151,7 @@ export const receiptRefundLedger = pgTable('receipt_refund_ledger', {
   discountAmount: numeric('discount_amount', { precision: 12, scale: 2 }).default('0.00'),
   netRevenue: numeric('net_revenue', { precision: 12, scale: 2 }).default('0.00'),
   cogsAmount: numeric('cogs_amount', { precision: 12, scale: 2 }).default('0.00'),
-  storeId: text('store_id').default('lusaka'),
+  storeId: text('store_id').default('main'),
   performedBy: text('performed_by'),
   status: text('status').default('Posted'),
   notes: text('notes'),
@@ -153,6 +160,7 @@ export const receiptRefundLedger = pgTable('receipt_refund_ledger', {
 // 12. Cash Flow Statement Ledger table
 export const cashFlowLedger = pgTable('cash_flow_ledger', {
   id: text('id').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
   entryDate: text('entry_date').notNull(),
   activityCategory: text('activity_category').notNull(),
   direction: text('direction').notNull(),
@@ -161,13 +169,15 @@ export const cashFlowLedger = pgTable('cash_flow_ledger', {
   description: text('description'),
   amount: numeric('amount', { precision: 12, scale: 2 }).notNull(),
   signedAmount: numeric('signed_amount', { precision: 12, scale: 2 }).notNull(),
-  storeId: text('store_id').default('lusaka'),
+  storeId: text('store_id').default('main'),
   performedBy: text('performed_by'),
 });
 
 // 13. Cash by Payment Method Sub-Ledger table
 export const paymentMethodLedger = pgTable('payment_method_ledger', {
   methodKey: text('method_key').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
+  storeId: text('store_id').default('main'),
   methodLabel: text('method_label').notNull(),
   accountCode: text('account_code').notNull(),
   grossInflows: numeric('gross_inflows', { precision: 12, scale: 2 }).default('0.00'),
@@ -181,6 +191,7 @@ export const paymentMethodLedger = pgTable('payment_method_ledger', {
 // 14. Financial Statements Snapshot (P&L, Balance Sheet, Cash Flow, EOD)
 export const financialStatementsLedger = pgTable('financial_statements_ledger', {
   statementKey: text('statement_key').primaryKey(),
+  businessId: text('business_id').default('default_biz'),
   statementType: text('statement_type').notNull(),
   section: text('section').notNull(),
   lineItem: text('line_item').notNull(),
@@ -189,7 +200,28 @@ export const financialStatementsLedger = pgTable('financial_statements_ledger', 
   updatedAt: text('updated_at'),
 });
 
-// 15. Full POS Multi-Table State Synchronization Snapshot table
+// 15. Finalized Transaction Events (Idempotent Firestore-to-SQL Mirror Log for Central Reporting)
+export const finalizedTransactionEvents = pgTable('finalized_transaction_events', {
+  eventId: text('event_id').primaryKey(),
+  businessId: text('business_id').notNull(),
+  storeId: text('store_id').notNull(),
+  txType: text('tx_type').notNull(), // 'SALE' | 'REFUND' | 'EOD_CASHUP'
+  orderId: text('order_id').notNull(),
+  source: text('source').default('firestore_trigger'),
+  firestorePath: text('firestore_path'),
+  grossTotal: numeric('gross_total', { precision: 12, scale: 2 }).default('0.00'),
+  taxAmount: numeric('tax_amount', { precision: 12, scale: 2 }).default('0.00'),
+  discountAmount: numeric('discount_amount', { precision: 12, scale: 2 }).default('0.00'),
+  netRevenue: numeric('net_revenue', { precision: 12, scale: 2 }).default('0.00'),
+  cogsAmount: numeric('cogs_amount', { precision: 12, scale: 2 }).default('0.00'),
+  paymentMethod: text('payment_method').default('Cash'),
+  performedBy: text('performed_by').default('owner'),
+  status: text('status').default('MIRRORED'),
+  occurredAt: text('occurred_at').notNull(),
+  mirroredAt: text('mirrored_at').notNull(),
+});
+
+// 16. Full POS Multi-Table State Synchronization Snapshot table
 export const posSyncSnapshots = pgTable('pos_sync_snapshots', {
   businessId: text('business_id').primaryKey(),
   businessName: text('business_name'),
@@ -288,5 +320,4 @@ export const cashFlowLedgerRelations = relations(cashFlowLedger, ({ one }) => ({
     references: [stores.id],
   }),
 }));
-
 

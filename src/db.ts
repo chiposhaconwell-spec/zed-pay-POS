@@ -5,8 +5,60 @@ import {
   registerPendingSync, 
   loadTablesFromPersistentStorage, 
   triggerImmediateFlush, 
-  ALL_TABLE_NAMES 
+  SQLITE_SCOPED_TABLES,
+  saveReceiptToSqliteCache,
+  markReceiptMirroredInSqlite,
+  getCachedReceiptsFromSqlite,
+  type LocalReceiptRecord,
 } from './sqliteStorage';
+
+export {
+  saveReceiptToSqliteCache,
+  markReceiptMirroredInSqlite,
+  getCachedReceiptsFromSqlite,
+  type LocalReceiptRecord,
+};
+
+export const ALL_TABLE_NAMES = [
+  'businesses',
+  'stores',
+  'products',
+  'customers',
+  'orders',
+  'order_items',
+  'accounts',
+  'transactions',
+  'ledger_entries',
+  'laybys',
+  'layby_installments',
+  'time_attendance',
+  'staff',
+  'store_products',
+  'stock_transfers',
+  'cash_ups',
+  'quotations',
+  'loans',
+  'loan_amortization_schedule',
+  'automated_deduction_logs',
+  'stock_takes',
+  'stock_take_items',
+  'expenses',
+  'purchases_transit',
+  'transit_purchases',
+  'suppliers',
+  'money_transfers',
+  'assets',
+  'equity',
+  'double_entry_journal',
+  'audit_logs',
+  'receipt_refund_ledger',
+  'cash_flow_ledger',
+  'payment_method_ledger',
+  'financial_statements_ledger',
+  'payment_methods',
+  'zra_invoices',
+  'zra_sync_queue',
+];
 
 // In-memory SQL Logs state (we will also notify listeners when it changes)
 let sqlLogs: SqlLogEntry[] = [];
@@ -516,9 +568,12 @@ export function extractAllTablesSnapshot(explicitBusinessId?: string): Record<st
   return allTablesData;
 }
 
-export function persistTablesToStorage(skipCloudSync: boolean = false) {
+export function persistTablesToStorage(_skipCloudSync: boolean = false) {
   try {
     const allTablesData: Record<string, any[]> = {};
+    const sqliteCacheData: Record<string, any[]> = {};
+    const sqliteScopeSet = new Set(SQLITE_SCOPED_TABLES);
+
     if (alasql && alasql.tables) {
       for (const tableName of ALL_TABLE_NAMES) {
         if (alasql.tables[tableName]) {
@@ -526,34 +581,24 @@ export function persistTablesToStorage(skipCloudSync: boolean = false) {
             const rows = alasql(`SELECT * FROM ${tableName}`) as any[];
             if (Array.isArray(rows)) {
               allTablesData[tableName] = rows;
+              if (sqliteScopeSet.has(tableName)) {
+                sqliteCacheData[tableName] = rows;
+              }
             }
-            // Also store in localStorage with prefix for instant web fallback
+            // Store in localStorage for instant in-browser session fallback
             try {
               localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${tableName}`, JSON.stringify(rows));
-            } catch (lsErr) {
+            } catch {
               // quota exceeded or restricted in WebView
             }
-          } catch (tErr) {
+          } catch {
             // ignore table query errors
           }
         }
       }
     }
-    // Asynchronously flush to native SQLite database on Android filesystem & JSON snapshot
-    registerPendingSync(allTablesData);
-
-    // Automatically schedule background Cloud SQL synchronization if a business account is set up
-    if (!skipCloudSync && !isDbInitializing && typeof window !== 'undefined') {
-      const bizList = allTablesData['businesses'] || [];
-      if (bizList.length > 0) {
-        if (cloudPushTimeout) clearTimeout(cloudPushTimeout);
-        cloudPushTimeout = setTimeout(() => {
-          pushDatabaseToServer().catch(() => {
-            // background sync failure ignored (offline-safe)
-          });
-        }, 1200);
-      }
-    }
+    // Asynchronously flush ONLY on-device cache & receipt tables to native SQLite / cache file
+    registerPendingSync(sqliteCacheData);
   } catch (e) {
     console.error('Failed to save state to storage:', e);
   }
@@ -1798,16 +1843,16 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     }
   }
 
-  // Trigger background SQLite and persistent Android filesystem initialization
+  // Trigger background SQLite on-device cache & receipt store initialization
   initSqliteStorage().then(async (ready) => {
-    if (ready && !forceReset) {
+    if (ready && !forceReset && !hasRecoveredData) {
       try {
         const rawPersistentData = await loadTablesFromPersistentStorage();
         const persistentData = rawPersistentData ? scrubLegacyPreseededRows(rawPersistentData) : null;
         if (persistentData && !isLegacyPreseededSnapshot(rawPersistentData || {}) && hasAnyUserCreatedData(persistentData)) {
-          console.log('[DB] Recovered tables from persistent SQLite / Filesystem storage layer');
+          console.log('[DB] Hydrated on-device catalog & receipt cache from SQLite');
           rehydrateAlasqlFromRecords(persistentData);
-          syncAllAccountingSystems('SQLite Rehydration');
+          syncAllAccountingSystems('SQLite Cache Rehydration');
           notifySqlLogsUpdated();
           if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('database-rehydrated'));
@@ -1815,7 +1860,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
           }
         }
       } catch (sqErr) {
-        console.warn('[DB] Persistent storage background rehydrate error:', sqErr);
+        console.warn('[DB] SQLite cache background rehydrate error:', sqErr);
       }
     }
   }).catch((err) => {

@@ -54,7 +54,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
-import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud, syncSaleToFirestoreOfflineSafe, triggerAutoFirebaseBackup } from '../firebase';
+import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud, syncSaleToFirestoreOfflineSafe, syncRefundToFirestoreAndMirror, syncCashUpToFirestoreAndMirror, flushPendingFinalizedTxMirrors, triggerAutoFirebaseBackup } from '../firebase';
 import { FiscalService, ZraFiscalReceiptData } from '../zra/fiscalService';
 import { getZraConfig, subscribeZraConfig, ZraConfig } from '../zra/zraConfig';
 
@@ -540,7 +540,7 @@ export default function BillingTerminal({
 
     if (successCount > 0) {
       if (currentBizId) {
-        pushDatabaseToServer(currentBizId).catch(() => {});
+        void flushPendingFinalizedTxMirrors();
         triggerAutoFirebaseBackup(currentBizId);
       }
       alert(`⚡ Reconnect Synchronization Success!\n\nSuccessfully synchronized ${successCount} offline POS checkout invoice(s) to Cloud & ZRA. Main ledger journals, stock valuations, and co-signed credit sweeps are up to date!`);
@@ -1164,6 +1164,33 @@ export default function BillingTerminal({
     // 3. Log a refund audit event & synchronize all double-entry accounting tables immediately
     logEmployeeAudit('SALES', 'Processed Refund', `Refunded Order #${inv.id}, Supervisor Approved: ${supervisorName}`, Number(inv.total || 0), refundStore);
     syncAllAccountingSystems(`POS Refund #${inv.id}`);
+
+    // Mirror finalized refund to Firestore + Central SQL reporting
+    const refundBizId = getActiveBusinessId(inv.business_id);
+    if (refundBizId) {
+      syncRefundToFirestoreAndMirror({
+        businessId: refundBizId,
+        storeId: refundStore,
+        customerName: inv.customer_name || 'Walk-In Customer',
+        order: {
+          id: String(inv.id),
+          customerId: inv.customerId ? Number(inv.customerId) : null,
+          orderDate: String(inv.orderDate || new Date().toISOString()),
+          subtotal: Number(inv.subtotal || 0),
+          tax: Number(inv.tax || 0),
+          discount: Number(inv.discount || 0),
+          total: Number(inv.total || 0),
+          paymentMethod: String(inv.paymentMethod || 'Cash'),
+          performed_by: supervisorName,
+        },
+        items: (Array.isArray(itemRes.data) ? itemRes.data : []).map((it: any) => ({
+          id: String(it.id || `${inv.id}_${it.productId}`),
+          productId: Number(it.productId || 0),
+          quantity: Number(it.quantity || 1),
+          unitPrice: Number(it.unitPrice || 0),
+        })),
+      });
+    }
 
     alert(`✓ Refund Processed Successfully!\n\nOrder Ref: ${inv.id}\nValue: ${settings.currency}${Number(inv.total || 0).toFixed(2)}\nSupervisor Approved: ${supervisorName}\n\nInventory levels and all Double-Entry Accounting Ledgers (EOD, Cash Flow, Payment Methods, P&L, Balance Sheet & Refund Ledger) have been updated!`);
 
@@ -2811,6 +2838,24 @@ export default function BillingTerminal({
 
     const res = runSql(insertSql, `Reconciliation: Post completed end-of-day cash balance audit`);
     if (res.success) {
+      if (activeBizId) {
+        syncCashUpToFirestoreAndMirror({
+          businessId: activeBizId,
+          storeId: resolvedCashUpStore,
+          cashUp: {
+            id: cashUpId,
+            date: cashUpDate,
+            cashierName: `Cashier: ${cashUpCashier} (Approved: ${supervisorNameInput.trim()})`,
+            expectedCash,
+            actualCash,
+            variance: cashDiff,
+            expectedCard: salesCardSum + laybyCardSum,
+            expectedMobile: expectedMomoTotal,
+            notes: fullNotes,
+            createdAt: timestamp,
+          },
+        });
+      }
       setIsCashUpPosted(true);
       loadReconciliationHistory();
       setIsSupervisorApproved(false);
@@ -3140,6 +3185,7 @@ export default function BillingTerminal({
       syncSaleToFirestoreOfflineSafe({
         businessId: activeBizId,
         storeId: activeStId,
+        customerName: syncedQuickCustomer?.name || quickCustomer || 'Walk-In Customer',
         order: {
           id: orderId,
           customerId: syncedQuickCustomer ? Number(syncedQuickCustomer.id) : null,
@@ -3148,6 +3194,7 @@ export default function BillingTerminal({
           tax: taxAmountQS,
           discount: 0,
           total: totalAmountQS,
+          cogsAmount: totalCogs,
           paymentMethod: quickPaymentMethod,
           status: 'Completed',
           performed_by: salesperson,
@@ -3155,8 +3202,10 @@ export default function BillingTerminal({
         items: [{
           id: `${orderId}_item_1`,
           productId: quickSelectedProduct.id,
+          productName: quickSelectedProduct.name,
           quantity: qty,
           unitPrice: quickSelectedProduct.price,
+          unitCost,
         }],
         updatedProducts: quickSelectedProduct.is_service === 1 ? [] : [{
           id: quickSelectedProduct.id,
@@ -3709,6 +3758,7 @@ export default function BillingTerminal({
     syncSaleToFirestoreOfflineSafe({
       businessId: activeBizId,
       storeId: activeStId,
+      customerName: customerName || 'Walk-In Customer',
       order: {
         id: orderId,
         customerId: activeCustomerId !== 'NULL' ? Number(activeCustomerId) : null,
@@ -3724,8 +3774,10 @@ export default function BillingTerminal({
       items: cart.map((it, idx) => ({
         id: `${orderId}_${idx + 1}`,
         productId: it.product.id,
+        productName: it.product.name,
         quantity: it.quantity,
         unitPrice: it.product.price,
+        unitCost: Number(it.product.cost || it.product.price * 0.7),
       })),
       updatedProducts: updatedProductsForFirestore,
     });

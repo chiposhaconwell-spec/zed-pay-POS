@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { jsPDF } from 'jspdf';
 import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFileDirectly, WhatsAppPdfDispatchResult } from '../androidUtils';
 import { runSql, persistTablesToStorage, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, getCentralBranches, getCustomPaymentMethods, resolvePaymentMethodBucket, calculateLoyaltyPoints, isWalkInCustomerName, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
+import { syncSaleToFirestoreOfflineSafe } from '../firebase';
 import { 
   Users, 
   Search, 
@@ -696,6 +697,35 @@ export default function LaybysBoard({ settings, activeStore = '', onTriggerSales
             WHERE id = '${sqlEsc(orderId)}'${bizMatch}
           `);
         }
+
+        let parsedLaybyItems: any[] = [];
+        try {
+          parsedLaybyItems = selectedLayby.items_json ? JSON.parse(selectedLayby.items_json) : [];
+        } catch {}
+        syncSaleToFirestoreOfflineSafe({
+          businessId: activeBizId,
+          storeId,
+          customerName: selectedLayby.customer_name || 'Walk-In Customer',
+          order: {
+            id: String(orderId),
+            customerId: selectedLayby.customer_id ? Number(selectedLayby.customer_id) : null,
+            orderDate: dateStr,
+            subtotal: Number(selectedLayby.total_amount || 0),
+            tax: 0,
+            discount: 0,
+            total: Number(selectedLayby.total_amount || 0),
+            paymentMethod: 'Layby (Paid in Full)',
+            status: 'Completed',
+            performed_by: cashierName,
+          },
+          items: (Array.isArray(parsedLaybyItems) ? parsedLaybyItems : []).map((it: any, idx: number) => ({
+            id: `${orderId}_item_${idx + 1}`,
+            productId: Number(it.id || it.productId || 0),
+            productName: it.name || '',
+            quantity: Number(it.quantity || 1),
+            unitPrice: Number(it.unitPrice || it.price || 0),
+          })),
+        });
       }
       persistTablesToStorage();
 

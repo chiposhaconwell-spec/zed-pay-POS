@@ -36,7 +36,10 @@ import {
   getTenantAccountBalances,
   sqlEsc,
   calculateAssetValuation,
+  getCachedReceiptsFromSqlite,
+  type LocalReceiptRecord,
 } from '../db';
+import { fetchCentralSqlReport, flushPendingFinalizedTxMirrors } from '../firebase';
 import { StoreSettings } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
@@ -311,6 +314,41 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   const [registrySearch, setRegistrySearch] = useState('');
   const [registryBranchFilter, setRegistryBranchFilter] = useState<string>('all');
   const [registryStatusFilter, setRegistryStatusFilter] = useState<'ALL' | 'Active' | 'Disposed' | 'Written Off'>('ALL');
+
+  // Central SQL Reporting & SQLite Receipt Cache state
+  const [centralSqlReport, setCentralSqlReport] = useState<any | null>(null);
+  const [centralSqlLoading, setCentralSqlLoading] = useState(false);
+  const [centralSqlError, setCentralSqlError] = useState<string | null>(null);
+  const [cachedReceipts, setCachedReceipts] = useState<LocalReceiptRecord[]>([]);
+
+  const loadCentralSqlAndReceiptCache = async () => {
+    const bizId = getActiveBusinessId();
+    if (!bizId) return;
+    const scopeStore =
+      statementBranchMode === 'single' && statementStoreFilter !== 'all' ? statementStoreFilter : 'all';
+
+    try {
+      const localRows = await getCachedReceiptsFromSqlite(bizId, scopeStore, 50);
+      setCachedReceipts(localRows);
+    } catch {}
+
+    setCentralSqlLoading(true);
+    setCentralSqlError(null);
+    try {
+      await flushPendingFinalizedTxMirrors();
+      const report = await fetchCentralSqlReport({
+        businessId: bizId,
+        storeId: scopeStore,
+        startDate: periodMeta.from || undefined,
+        endDate: periodMeta.to || undefined,
+      });
+      setCentralSqlReport(report);
+    } catch (err: any) {
+      setCentralSqlError(err?.message || 'Unable to load Central SQL report');
+    } finally {
+      setCentralSqlLoading(false);
+    }
+  };
 
   const notifyFinance = (type: 'success' | 'error', text: string) => {
     setFinanceFeedback({ type, text });
@@ -2439,6 +2477,72 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                   </tbody>
                 </table>
               </div>
+            </div>
+
+            {/* CENTRAL SQL REPORTING & ON-DEVICE RECEIPT CACHE */}
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                <div>
+                  <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">
+                    CENTRAL SQL REPORTING LEDGER &amp; ON-DEVICE RECEIPT CACHE
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium mt-0.5">
+                    Finalized Firestore transactions mirror to PostgreSQL for consolidated reporting, while SQLite caches {cachedReceipts.length} recent receipt(s) locally on-device.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void loadCentralSqlAndReceiptCache()}
+                  disabled={centralSqlLoading}
+                  className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-black uppercase tracking-wider flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                >
+                  <RefreshCw size={13} className={centralSqlLoading ? 'animate-spin' : ''} />
+                  <span>{centralSqlLoading ? 'Querying Central SQL...' : 'Refresh Central SQL Report'}</span>
+                </button>
+              </div>
+
+              {centralSqlError && (
+                <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-800">
+                  {centralSqlError}
+                </div>
+              )}
+
+              {centralSqlReport?.metrics ? (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase block">SQL Gross Sales</span>
+                    <span className="text-base font-black text-slate-900 mt-0.5 block">
+                      {settings.currency}{Number(centralSqlReport.metrics.grossSales || 0).toFixed(2)}
+                    </span>
+                    <span className="text-[10px] text-slate-500">{centralSqlReport.metrics.completedOrderCount} order(s)</span>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase block">SQL Net Revenue</span>
+                    <span className="text-base font-black text-emerald-700 mt-0.5 block">
+                      {settings.currency}{Number(centralSqlReport.metrics.netRevenue || 0).toFixed(2)}
+                    </span>
+                    <span className="text-[10px] text-slate-500">Tax: {settings.currency}{Number(centralSqlReport.metrics.taxCollected || 0).toFixed(2)}</span>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase block">SQL Gross Profit</span>
+                    <span className="text-base font-black text-indigo-700 mt-0.5 block">
+                      {settings.currency}{Number(centralSqlReport.metrics.grossProfit || 0).toFixed(2)}
+                    </span>
+                    <span className="text-[10px] text-slate-500">COGS: {settings.currency}{Number(centralSqlReport.metrics.cogsAmount || 0).toFixed(2)}</span>
+                  </div>
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase block">SQL Refunds</span>
+                    <span className="text-base font-black text-rose-600 mt-0.5 block">
+                      -{settings.currency}{Number(centralSqlReport.metrics.refundTotal || 0).toFixed(2)}
+                    </span>
+                    <span className="text-[10px] text-slate-500">{centralSqlReport.metrics.refundOrderCount} refund(s)</span>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs text-slate-500 font-medium">
+                  Click &ldquo;Refresh Central SQL Report&rdquo; to query the PostgreSQL reporting warehouse for the selected branch and period.
+                </p>
+              )}
             </div>
           </motion.div>
         )}

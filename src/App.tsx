@@ -48,6 +48,8 @@ import FinanceDashboard from './components/FinanceDashboard';
 import WorkspaceCoordinator from './components/WorkspaceCoordinator';
 import EmployeeAuditTrail from './components/EmployeeAuditTrail';
 import ShareAppApkModal from './components/ShareAppApkModal';
+import { PWAInstallButton } from './components/PWAInstallButton';
+import { OfflineIndicator } from './components/OfflineIndicator';
 
 export const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
@@ -1093,7 +1095,9 @@ export default function App() {
               </div>
 
               {/* Switch between Log In & Create Account */}
-              <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 shrink-0 self-start sm:self-auto">
+              <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                <PWAInstallButton variant="header" />
+                <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 shrink-0">
                 <button
                   type="button"
                   onClick={() => {
@@ -1122,6 +1126,7 @@ export default function App() {
                 >
                   Create Account
                 </button>
+              </div>
               </div>
             </div>
 
@@ -1489,6 +1494,7 @@ export default function App() {
 
           {/* Cloud Sync, Settings & Log Out Badge */}
           <div className="flex items-center gap-1.5 sm:gap-2">
+            <PWAInstallButton variant="header" />
             {hasAnySettingsAccess && (
               <button
                 onClick={() => openUnifiedSettings(permittedSettingsTabs[0] || 'general')}
@@ -2337,6 +2343,9 @@ export default function App() {
                   </button>
                 )}
 
+                {/* Install as Standalone PWA */}
+                <PWAInstallButton variant="drawer" onActionComplete={() => setShowNavDrawer(false)} />
+
                 {/* Share the App (Direct APK via Bluetooth, WhatsApp, Quick Share) */}
                 <button
                   type="button"
@@ -2914,6 +2923,7 @@ export default function App() {
         onClose={() => setShowShareAppModal(false)}
         storeName={settings.storeName || activeBusiness.name}
       />
+      <OfflineIndicator />
     </AndroidShell>
   );
 }
