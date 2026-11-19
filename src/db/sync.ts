@@ -17,6 +17,7 @@ import {
   posSyncSnapshots,
 } from './schema.ts';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { computeCredentialHashSync, normalizeAuthEmail } from '../multiTenantAuth.ts';
 
 export interface SyncPushPayload {
   businessId: string;
@@ -719,7 +720,41 @@ export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
   };
 }
 
-export async function pullPosSyncFromCloudSql(businessId?: string, email?: string) {
+function snapshotMatchesCredential(
+  snap: typeof posSyncSnapshots.$inferSelect,
+  cleanEmail: string,
+  cleanCredHash: string
+): boolean {
+  try {
+    const parsed = JSON.parse(snap.tablesJson || '{}');
+    const memberships = Array.isArray(parsed?.business_memberships) ? parsed.business_memberships : [];
+    for (const m of memberships) {
+      if (normalizeAuthEmail(m?.email) !== cleanEmail) continue;
+      if (m?.credential_hash && String(m.credential_hash).trim() === cleanCredHash) return true;
+      if (m?.password && m.password !== 'cloud_recovered' && computeCredentialHashSync(cleanEmail, String(m.password)) === cleanCredHash) {
+        return true;
+      }
+    }
+    const bizRows = Array.isArray(parsed?.businesses) ? parsed.businesses : [];
+    for (const b of bizRows) {
+      if (normalizeAuthEmail(b?.email) !== cleanEmail) continue;
+      if (b?.password && b.password !== 'cloud_recovered' && computeCredentialHashSync(cleanEmail, String(b.password)) === cleanCredHash) {
+        return true;
+      }
+    }
+    const staffList = Array.isArray(parsed?.staff) ? parsed.staff : [];
+    for (const st of staffList) {
+      if (normalizeAuthEmail(st?.email) !== cleanEmail) continue;
+      if (st?.password && computeCredentialHashSync(cleanEmail, String(st.password)) === cleanCredHash) return true;
+      if (st?.pin && computeCredentialHashSync(cleanEmail, String(st.pin)) === cleanCredHash) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+export async function pullPosSyncFromCloudSql(businessId?: string, email?: string, credentialHash?: string) {
   let allSnapshots: (typeof posSyncSnapshots.$inferSelect)[] = [];
   try {
     allSnapshots = await db
@@ -746,38 +781,52 @@ export async function pullPosSyncFromCloudSql(businessId?: string, email?: strin
 
   const cleanBizId = businessId ? businessId.trim() : '';
   const cleanEmail = email ? email.trim().toLowerCase() : '';
-  const hasExplicitSelector = Boolean(cleanBizId || cleanEmail);
+  const cleanCredHash = credentialHash ? credentialHash.trim().toLowerCase() : '';
+  const hasExplicitSelector = Boolean(cleanBizId || cleanEmail || cleanCredHash);
 
   let targetSnap: (typeof posSyncSnapshots.$inferSelect) | null = null;
-  if (cleanBizId) {
-    targetSnap = realBusinessSnapshots.find((s) => s.businessId === cleanBizId) || null;
-  }
-  if (!targetSnap && cleanEmail) {
-    targetSnap =
-      realBusinessSnapshots.find((s) => (s.ownerEmail || '').toLowerCase() === cleanEmail) ||
-      realBusinessSnapshots.find((s) => {
-        try {
-          const parsed = JSON.parse(s.tablesJson);
-          const staffList = Array.isArray(parsed?.staff) ? parsed.staff : [];
-          return staffList.some(
-            (st: any) => st?.email && String(st.email).trim().toLowerCase() === cleanEmail
-          );
-        } catch {
-          return false;
-        }
-      }) ||
-      null;
-  }
+  let matchedBusinessIds: string[] = [];
 
-  // Only allow generic lookup when caller did NOT pass any businessId or email (e.g. /api/sync/status)
-  if (!targetSnap && !hasExplicitSelector) {
-    targetSnap = realBusinessSnapshots[0] || null;
+  if (cleanCredHash && cleanEmail) {
+    const matchedSnaps = realBusinessSnapshots.filter((s) =>
+      snapshotMatchesCredential(s, cleanEmail, cleanCredHash)
+    );
+    matchedBusinessIds = matchedSnaps.map((s) => s.businessId);
+    if (cleanBizId) {
+      targetSnap = matchedSnaps.find((s) => s.businessId === cleanBizId) || null;
+    } else {
+      targetSnap = matchedSnaps[0] || null;
+    }
+  } else {
+    if (cleanBizId) {
+      targetSnap = realBusinessSnapshots.find((s) => s.businessId === cleanBizId) || null;
+    }
+    if (!targetSnap && cleanEmail) {
+      targetSnap =
+        realBusinessSnapshots.find((s) => (s.ownerEmail || '').toLowerCase() === cleanEmail) ||
+        realBusinessSnapshots.find((s) => {
+          try {
+            const parsed = JSON.parse(s.tablesJson);
+            const staffList = Array.isArray(parsed?.staff) ? parsed.staff : [];
+            return staffList.some(
+              (st: any) => st?.email && String(st.email).trim().toLowerCase() === cleanEmail
+            );
+          } catch {
+            return false;
+          }
+        }) ||
+        null;
+    }
+    if (!targetSnap && !hasExplicitSelector) {
+      targetSnap = realBusinessSnapshots[0] || null;
+    }
   }
 
   if (!targetSnap) {
     return {
       found: false,
-      availableBusinesses,
+      availableBusinesses: cleanCredHash ? [] : availableBusinesses,
+      matchedBusinessIds,
     };
   }
 
@@ -802,7 +851,8 @@ export async function pullPosSyncFromCloudSql(businessId?: string, email?: strin
     tables: parsedTables,
     settings: parsedSettings,
     updatedAt: targetSnap.updatedAt,
-    availableBusinesses,
+    availableBusinesses: cleanCredHash ? [] : availableBusinesses,
+    matchedBusinessIds,
   };
 }
 

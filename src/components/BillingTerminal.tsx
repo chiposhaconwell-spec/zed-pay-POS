@@ -57,6 +57,7 @@ import { exportAndSharePdf, safeSystemPrint, dispatchPdfToWhatsApp, sharePdfFile
 import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFromCloud, syncSaleToFirestoreOfflineSafe, syncRefundToFirestoreAndMirror, syncCashUpToFirestoreAndMirror, flushPendingFinalizedTxMirrors, triggerAutoFirebaseBackup } from '../firebase';
 import { FiscalService, ZraFiscalReceiptData } from '../zra/fiscalService';
 import { getZraConfig, subscribeZraConfig, ZraConfig } from '../zra/zraConfig';
+import { ActiveShift } from '../services/terminalAuthService';
 
 const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
@@ -71,6 +72,10 @@ interface BillingTerminalProps {
   onClearInitialAction?: () => void;
   onStoreChange?: (storeId: string) => void;
   onUserRoleChange?: (role: string) => void;
+  activeShift?: ActiveShift | null;
+  isRestrictedPosMode?: boolean;
+  onLockSwitchCashier?: () => void;
+  onRequestAdminAccess?: () => void;
 }
 
 interface CartItem {
@@ -81,6 +86,7 @@ interface CartItem {
 interface OfflineOrder {
   orderId: string;
   business_id?: string;
+  cashierId?: string;
   customerId: string | null;
   items: CartItem[];
   dateStr: string;
@@ -106,7 +112,9 @@ export default function BillingTerminal({
   initialAction,
   onClearInitialAction,
   onStoreChange,
-  onUserRoleChange
+  onUserRoleChange,
+  activeShift = null,
+  isRestrictedPosMode = false,
 }: BillingTerminalProps) {
   const [products, setProducts] = useState<Product[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -243,11 +251,12 @@ export default function BillingTerminal({
         );
 
         if (trx.type === 'quicksale') {
-          const qpName = trx.salesperson || 'Default Cashier';
+          const qpName = trx.salesperson || activeShift?.cashierName || 'Default Cashier';
+          const resolvedTrxCashierId = trx.cashierId || activeShift?.cashierId || '';
           let committedNow = alreadyInLocalDb;
           if (!alreadyInLocalDb) {
             const orderInsertSql = `
-              INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
+              INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id, cashier_id) VALUES (
                 '${sqlEsc(trx.orderId)}',
                 NULL,
                 '${sqlEsc(trx.dateStr)}',
@@ -259,7 +268,8 @@ export default function BillingTerminal({
                 'Completed',
                 '${sqlEsc(trxStoreId)}',
                 '${sqlEsc(qpName)}',
-                '${sqlEsc(trxBizId)}'
+                '${sqlEsc(trxBizId)}',
+                '${sqlEsc(resolvedTrxCashierId)}'
               )
             `;
             const resOrder = runSql(orderInsertSql, `Sync: Post quick order ${trx.orderId}`);
@@ -306,6 +316,7 @@ export default function BillingTerminal({
                 paymentMethod: trx.paymentMethod,
                 status: 'Completed',
                 performed_by: qpName,
+                cashierId: resolvedTrxCashierId || undefined,
               },
               items: (trx.items || []).map((it, idx) => ({
                 id: `${trx.orderId}_item_${idx + 1}`,
@@ -344,11 +355,13 @@ export default function BillingTerminal({
           const isSplit = String(trx.paymentMethod || '').toLowerCase().startsWith('split');
           const splitCashStored = isSplit ? Number(trx.splitCash ?? (trx.totalAmount / 2)) : 0;
           const splitMobileStored = isSplit ? Number(trx.splitMobile ?? Math.max(0, trx.totalAmount - splitCashStored)) : 0;
+          const resolvedStdCashierId = trx.cashierId || activeShift?.cashierId || '';
+          const resolvedStdCashierName = trx.salesperson || activeShift?.cashierName || 'Default Cashier';
           let committedNow = alreadyInLocalDb;
 
           if (!alreadyInLocalDb) {
             const orderInsertSql = `
-              INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo, business_id) VALUES (
+              INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo, business_id, cashier_id) VALUES (
                 '${sqlEsc(trx.orderId)}',
                 ${customerIdVal},
                 '${sqlEsc(trx.dateStr)}',
@@ -359,10 +372,11 @@ export default function BillingTerminal({
                 '${sqlEsc(trx.paymentMethod)}',
                 'Completed',
                 '${sqlEsc(trxStoreId)}',
-                '${sqlEsc(trx.salesperson || 'Default Cashier')}',
+                '${sqlEsc(resolvedStdCashierName)}',
                 ${splitCashStored.toFixed(2)},
                 ${splitMobileStored.toFixed(2)},
-                '${sqlEsc(trxBizId)}'
+                '${sqlEsc(trxBizId)}',
+                '${sqlEsc(resolvedStdCashierId)}'
               )
             `;
             const resOrder = runSql(orderInsertSql, `Sync: Post standard order ${trx.orderId}`);
@@ -489,7 +503,8 @@ export default function BillingTerminal({
                 total: trx.totalAmount,
                 paymentMethod: trx.paymentMethod,
                 status: 'Completed',
-                performed_by: trx.salesperson || 'Cashier',
+                performed_by: resolvedStdCashierName,
+                cashierId: resolvedStdCashierId || undefined,
               },
               items: (trx.items || []).map((it, idx) => ({
                 id: `${trx.orderId}_${idx + 1}`,
@@ -678,6 +693,7 @@ export default function BillingTerminal({
   // Shift & Handover active states
   const [isShiftActive, setIsShiftActive] = useState<boolean>(() => {
     return (
+      Boolean(activeShift) ||
       localStorage.getItem('pos_authenticated_session') === 'true' ||
       localStorage.getItem('pos_shift_active') === 'true' ||
       localStorage.getItem('shift_active_' + activeStore) === 'true'
@@ -727,19 +743,28 @@ export default function BillingTerminal({
   }, [userRole]);
 
   useEffect(() => {
+    if (activeShift) {
+      setIsShiftActive(true);
+      setQuickSalespersonName(activeShift.cashierName);
+      localStorage.setItem('quick_salesperson_name', activeShift.cashierName);
+    }
+  }, [activeShift]);
+
+  useEffect(() => {
     if (activeStore) {
       setSelectedLoginStore(activeStore);
       setCashUpStore(activeStore);
       setHistoryStoreFilter(activeStore);
       setOpeningCash(localStorage.getItem('shift_opening_cash_' + activeStore) || localStorage.getItem('shift_opening_cash_global') || '0.00');
       setIsShiftActive(
+        Boolean(activeShift) ||
         localStorage.getItem('pos_authenticated_session') === 'true' ||
         localStorage.getItem('pos_shift_active') === 'true' ||
         localStorage.getItem('shift_active_' + activeStore) === 'true'
       );
     }
     loadDynamicLoginStores();
-  }, [activeStore]);
+  }, [activeStore, activeShift]);
 
   // End of Day Cash Up Filters (defaults strictly to logged-in branch)
   const [cashUpDate, setCashUpDate] = useState<string>(() => {
@@ -1182,6 +1207,7 @@ export default function BillingTerminal({
           total: Number(inv.total || 0),
           paymentMethod: String(inv.paymentMethod || 'Cash'),
           performed_by: supervisorName,
+          cashierId: activeShift?.cashierId || inv.cashier_id || undefined,
         },
         items: (Array.isArray(itemRes.data) ? itemRes.data : []).map((it: any) => ({
           id: String(it.id || `${inv.id}_${it.productId}`),
@@ -1242,12 +1268,16 @@ export default function BillingTerminal({
   }, [showInvoiceHistoryModal, activeStore, historyStoreFilter]);
 
   useEffect(() => {
-    const hasActiveShift = localStorage.getItem('pos_shift_active') === 'true' || localStorage.getItem('shift_active_' + activeStore) === 'true';
+    const hasActiveShift =
+      Boolean(activeShift) ||
+      localStorage.getItem('pos_authenticated_session') === 'true' ||
+      localStorage.getItem('pos_shift_active') === 'true' ||
+      localStorage.getItem('shift_active_' + activeStore) === 'true';
     setIsShiftActive(hasActiveShift);
     setOpeningCash(localStorage.getItem('shift_opening_cash_' + activeStore) || localStorage.getItem('shift_opening_cash_global') || '0.00');
     setIsSupervisorApproved(false);
     setSupervisorNameInput('');
-  }, [activeStore]);
+  }, [activeStore, activeShift]);
 
   // Trigger real QR Code scanner using html5-qrcode
   useEffect(() => {
@@ -3000,7 +3030,8 @@ export default function BillingTerminal({
       alert('🔒 Gated Action: Please open your active shift first by declaring the opening register drawer cash balance!');
       return;
     }
-    if (!quickSalespersonName.trim()) {
+    const effectiveQsCashierName = activeShift?.cashierName || quickSalespersonName.trim();
+    if (!effectiveQsCashierName) {
       alert('Accountability Gating: Please provide your name to log the transaction performer.');
       return;
     }
@@ -3019,11 +3050,12 @@ export default function BillingTerminal({
     }
 
     // Save salesperson name in cache
-    localStorage.setItem('quick_salesperson_name', quickSalespersonName.trim());
+    localStorage.setItem('quick_salesperson_name', effectiveQsCashierName);
 
     const orderId = 'TXN-QS-' + Math.floor(100000 + Math.random() * 900000);
     const dateStr = new Date().toISOString();
-    const salesperson = quickSalespersonName.trim();
+    const salesperson = effectiveQsCashierName;
+    const qsCashierId = activeShift?.cashierId || localStorage.getItem('logged_in_user_email') || 'owner';
 
     const subtotalAmt = quickSelectedProduct.price * qty;
     const activeTaxRate = settings.taxRate;
@@ -3057,7 +3089,7 @@ export default function BillingTerminal({
 
     // 1. Always persist the sale immediately into local SQLite/AlaSQL + Firestore offline cache (never block offline checkouts)
     const orderInsertSql = `
-      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
+      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id, cashier_id) VALUES (
         '${orderId}', 
         ${syncedQuickCustomer ? syncedQuickCustomer.id : 'NULL'}, 
         '${dateStr}', 
@@ -3069,7 +3101,8 @@ export default function BillingTerminal({
         'Completed',
         '${sqlEsc(activeStId)}',
         '${sqlEsc(salesperson)}',
-        '${sqlEsc(activeBizId)}'
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(qsCashierId)}'
       )
     `;
     const resOrder = runSql(orderInsertSql, `Quick Sale: Logging cashier order header metadata`);
@@ -3198,6 +3231,7 @@ export default function BillingTerminal({
           paymentMethod: quickPaymentMethod,
           status: 'Completed',
           performed_by: salesperson,
+          cashierId: qsCashierId,
         },
         items: [{
           id: `${orderId}_item_1`,
@@ -3235,6 +3269,7 @@ export default function BillingTerminal({
         const newOfflineQS: OfflineOrder = {
           orderId,
           business_id: activeBizId,
+          cashierId: qsCashierId,
           customerId: syncedQuickCustomer ? String(syncedQuickCustomer.id) : null,
           items: [{ product: quickSelectedProduct, quantity: qty }],
           dateStr,
@@ -3509,15 +3544,16 @@ export default function BillingTerminal({
     const isSplitMethod = paymentMethod === 'Split';
     const finalPaymentMethod = isSplitMethod ? `Split (Cash + ${splitMobileProvider})` : paymentMethod;
 
-    const activeCashierName = localStorage.getItem('logged_in_user_name') || 'Default Cashier';
+    const activeCashierName = activeShift?.cashierName || localStorage.getItem('logged_in_user_name') || 'Default Cashier';
+    const stdCashierId = activeShift?.cashierId || localStorage.getItem('logged_in_user_email') || 'owner';
     const splitCashInput = isSplitMethod ? (parseFloat(splitCashAmount) || 0) : 0;
     const splitMobileInput = isSplitMethod ? (parseFloat(splitMobileAmount) || 0) : 0;
     const splitChangeAmt = isSplitMethod ? Math.max(0, (splitCashInput + splitMobileInput) - totalAmount) : 0;
     const splitCashKept = isSplitMethod ? Math.max(0, splitCashInput - splitChangeAmt) : 0;
 
-    // 1. Always commit order immediately into SQLite/AlaSQL (even if offline!) with business_id & store_id
+    // 1. Always commit order immediately into SQLite/AlaSQL (even if offline!) with business_id, store_id & cashier_id
     const orderInsertSql = `
-      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo, business_id) VALUES (
+      INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, split_cash, split_momo, business_id, cashier_id) VALUES (
         '${orderId}', 
         ${customerIdVal}, 
         '${dateStr}', 
@@ -3531,7 +3567,8 @@ export default function BillingTerminal({
         '${sqlEsc(activeCashierName)}',
         ${splitCashKept.toFixed(2)},
         ${splitMobileInput.toFixed(2)},
-        '${sqlEsc(activeBizId)}'
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(stdCashierId)}'
       )
     `;
     runSql(orderInsertSql, `Billing: Post order ticket details to SQLite for store ${activeStId.toUpperCase()}`);
@@ -3770,6 +3807,7 @@ export default function BillingTerminal({
         paymentMethod: finalPaymentMethod,
         status: 'Completed',
         performed_by: activeCashierName,
+        cashierId: stdCashierId,
       },
       items: cart.map((it, idx) => ({
         id: `${orderId}_${idx + 1}`,
@@ -3794,6 +3832,7 @@ export default function BillingTerminal({
       const newOfflineStd: OfflineOrder = {
         orderId,
         business_id: activeBizId,
+        cashierId: stdCashierId,
         customerId: activeCustomerId !== 'NULL' ? String(activeCustomerId) : null,
         items: [...cart],
         dateStr,
@@ -4132,7 +4171,7 @@ export default function BillingTerminal({
                       authResult.fullName || undefined
                     );
                     if (!authResult.foundUser) {
-                      const fbPull = await restoreFromCloud();
+                      const fbPull = await restoreFromCloud(undefined, { silentIfUnlinked: true });
                       if (fbPull.success) {
                         loadDynamicLoginStores();
                         refreshDbData();

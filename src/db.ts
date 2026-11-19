@@ -11,6 +11,12 @@ import {
   getCachedReceiptsFromSqlite,
   type LocalReceiptRecord,
 } from './sqliteStorage';
+import {
+  computeCredentialHashSync,
+  deriveMembershipId,
+  deriveUserId,
+  normalizeAuthEmail,
+} from './multiTenantAuth';
 
 export {
   saveReceiptToSqliteCache,
@@ -20,6 +26,8 @@ export {
 };
 
 export const ALL_TABLE_NAMES = [
+  'users',
+  'business_memberships',
   'businesses',
   'stores',
   'products',
@@ -539,6 +547,19 @@ export function extractAllTablesSnapshot(explicitBusinessId?: string): Record<st
           if (Array.isArray(rows)) {
             if (!targetBizId) {
               allTablesData[tableName] = rows;
+            } else if (tableName === 'users') {
+              const memberships = Array.isArray((alasql.tables as any)?.business_memberships?.data)
+                ? ((alasql.tables as any).business_memberships.data as any[])
+                : [];
+              const allowedUserIds = new Set(
+                memberships
+                  .filter((m: any) => String(m?.business_id || '').trim() === targetBizId)
+                  .map((m: any) => String(m?.user_id || '').trim())
+                  .filter(Boolean)
+              );
+              allTablesData[tableName] = rows
+                .filter((u: any) => allowedUserIds.has(String(u?.id || '').trim()) || String(u?.business_id || '').trim() === targetBizId)
+                .map((u: any) => ({ ...u, business_id: u.business_id || targetBizId, store_id: u.store_id || defaultStoreId }));
             } else if (tableName === 'businesses') {
               allTablesData[tableName] = rows
                 .filter((r: any) => String(r?.id || '') === targetBizId || String(r?.business_id || '') === targetBizId)
@@ -698,16 +719,33 @@ export function rehydrateAlasqlFromRecords(
 ) {
   if (!tablesData || typeof tablesData !== 'object') return;
   const dedupeTables = new Set([
+    'users',
+    'business_memberships',
     'businesses',
     'stores',
     'staff',
     'products',
+    'store_products',
+    'stock_transfers',
+    'stock_takes',
+    'stock_take_items',
     'customers',
     'orders',
     'order_items',
     'laybys',
+    'layby_installments',
     'cash_ups',
     'accounts',
+    'transactions',
+    'ledger_entries',
+    'time_attendance',
+    'loans',
+    'loan_amortization_schedule',
+    'automated_deduction_logs',
+    'expenses',
+    'assets',
+    'equity',
+    'money_transfers',
     'double_entry_journal',
     'receipt_refund_ledger',
     'cash_flow_ledger',
@@ -718,6 +756,7 @@ export function rehydrateAlasqlFromRecords(
     'quotations',
     'suppliers',
     'purchases_transit',
+    'transit_purchases',
     'zra_invoices',
     'zra_sync_queue',
   ]);
@@ -1042,7 +1081,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     runSql('DROP TABLE IF EXISTS loan_amortization_schedule', 'Clean database: Drops old loan amortization schedules');
     runSql('DROP TABLE IF EXISTS automated_deduction_logs', 'Clean database: Drops old automated deduction logs');
 
-    // Multi-tenant businesses & Dynamic store parameters
+    // Multi-tenant decoupled users, memberships, businesses & Dynamic store parameters
+    runSql('DROP TABLE IF EXISTS users', 'Clean database: Drops old users identity table');
+    runSql('DROP TABLE IF EXISTS business_memberships', 'Clean database: Drops old business memberships table');
     runSql('DROP TABLE IF EXISTS businesses', 'Clean database: Drops old business accounts');
     runSql('DROP TABLE IF EXISTS stores', 'Clean database: Drops old stores');
     runSql('DROP TABLE IF EXISTS stock_takes', 'Clean database: Drops old stock takes');
@@ -1061,6 +1102,39 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     runSql('DROP TABLE IF EXISTS payment_method_ledger', 'Clean database: Drops old payment_method_ledger');
     runSql('DROP TABLE IF EXISTS financial_statements_ledger', 'Clean database: Drops old financial_statements_ledger');
     runSql('DROP TABLE IF EXISTS payment_methods', 'Clean database: Drops old payment_methods');
+
+    // Decoupled global User Identity table (email + full_name only; credentials live per membership)
+    runSql(`
+      CREATE TABLE users (
+        id STRING PRIMARY KEY,
+        email STRING,
+        full_name STRING,
+        created_at STRING,
+        updated_at STRING,
+        business_id STRING,
+        store_id STRING
+      )
+    `, 'Multi-Tenant Identity Schema: Create USERS table');
+
+    // Many-to-Many Business Membership table with isolated per-business password/credential_hash and role
+    runSql(`
+      CREATE TABLE business_memberships (
+        id STRING PRIMARY KEY,
+        user_id STRING,
+        business_id STRING,
+        email STRING,
+        full_name STRING,
+        credential_hash STRING,
+        password STRING,
+        role STRING,
+        store_id STRING,
+        accessible_branches STRING,
+        permissions_json STRING,
+        status STRING,
+        created_at STRING,
+        updated_at STRING
+      )
+    `, 'Multi-Tenant Membership Schema: Create BUSINESS_MEMBERSHIPS table');
 
     // Create Business Identity container (with billing address, tax & admin role metadata)
     runSql(`
@@ -1874,6 +1948,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
   } finally {
     isDbInitializing = false;
     isDbSchemaCreated = true;
+    syncUsersAndMembershipsFromLegacyTables();
     syncAllAccountingSystems('Database Initialization');
     persistTablesToStorage(true);
   }
@@ -4525,12 +4600,17 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
   return activeCloudPushPromise;
 }
 
-export async function pullDatabaseFromServer(businessId?: string, email?: string): Promise<{
+export async function pullDatabaseFromServer(
+  businessId?: string,
+  email?: string,
+  credentialHash?: string
+): Promise<{
   success: boolean;
   found: boolean;
   business?: any;
   settings?: any;
   availableBusinesses?: any[];
+  matchedBusinessIds?: string[];
   updatedAt?: string;
   details: string;
 }> {
@@ -4538,6 +4618,7 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
     const params = new URLSearchParams();
     if (businessId && businessId.trim()) params.set('businessId', businessId.trim());
     if (email && email.trim()) params.set('email', email.trim());
+    if (credentialHash && credentialHash.trim()) params.set('credentialHash', credentialHash.trim());
 
     const res = await fetch(`/api/sync/pull?${params.toString()}`);
     if (!res.ok) {
@@ -4551,6 +4632,7 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
         success: true,
         found: false,
         availableBusinesses: data.availableBusinesses || [],
+        matchedBusinessIds: data.matchedBusinessIds || [],
         details: 'No synchronized business data found on Cloud SQL server yet.',
       };
     }
@@ -4571,11 +4653,17 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
       businessId: targetBiz?.id || data.businessId,
       preserveOtherBusinesses: true,
     });
+    syncUsersAndMembershipsFromLegacyTables(targetBiz?.id || data.businessId);
     syncAllAccountingSystems('Cloud SQL Pull Rehydration');
     persistTablesToStorage(true);
 
     if (data.settings && typeof localStorage !== 'undefined') {
-      localStorage.setItem('android_pos_settings', JSON.stringify(data.settings));
+      const targetBizId = String(targetBiz?.id || data.businessId || '').trim();
+      const serialized = JSON.stringify(data.settings);
+      if (targetBizId && targetBizId !== 'default_biz') {
+        localStorage.setItem(`android_pos_settings_${targetBizId}`, serialized);
+      }
+      localStorage.setItem('android_pos_settings', serialized);
     }
 
     if (data.updatedAt && typeof localStorage !== 'undefined') {
@@ -4598,6 +4686,7 @@ export async function pullDatabaseFromServer(businessId?: string, email?: string
       business: targetBiz,
       settings: data.settings || null,
       availableBusinesses: data.availableBusinesses || [],
+      matchedBusinessIds: data.matchedBusinessIds || [],
       updatedAt: data.updatedAt,
       details: `Pulled business [${targetBiz?.name || data.businessName || 'Workspace'}] from Cloud SQL (${storeCount} branches, ${prodCount} stock items, ${orderCount} orders).`,
     };
@@ -4654,6 +4743,320 @@ export function getTenantAccountBalances(explicitBusinessId?: string): Array<{
     currency: String(a.currency || 'ZMW'),
     current_balance: parseFloat((balMap.get(id) || 0).toFixed(2)),
   }));
+}
+
+export function upsertUserAndMembership(params: {
+  id?: string;
+  businessId: string;
+  email: string;
+  fullName: string;
+  password?: string;
+  credentialHash?: string;
+  role: 'owner' | 'manager' | 'sales';
+  storeId?: string;
+  accessibleBranches?: string[];
+  permissionsJson?: string;
+  status?: 'ACTIVE' | 'SUSPENDED';
+}) {
+  const cleanEmail = normalizeAuthEmail(params.email);
+  const cleanBizId = String(params.businessId || '').trim();
+  if (!cleanEmail || !cleanBizId || cleanBizId === 'default_biz') return null;
+
+  const userId = deriveUserId(cleanEmail);
+  const nowIso = new Date().toISOString();
+  const normRole: 'owner' | 'manager' | 'sales' =
+    params.role === 'owner' ? 'owner' : params.role === 'manager' ? 'manager' : 'sales';
+  const membershipId = params.id ? String(params.id) : deriveMembershipId(cleanBizId, userId, normRole);
+  const cleanPass = String(params.password || '').trim();
+  const computedHash =
+    params.credentialHash ||
+    (cleanPass && cleanPass !== 'cloud_recovered' ? computeCredentialHashSync(cleanEmail, cleanPass) : '');
+  const branchesJson = JSON.stringify(Array.isArray(params.accessibleBranches) ? params.accessibleBranches : []);
+  const statusVal = params.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
+  const primaryStore = String(params.storeId || (params.accessibleBranches?.[0] || 'main')).trim() || 'main';
+  const safeName = String(params.fullName || cleanEmail).trim() || cleanEmail;
+
+  const existingUsers = (alasql?.tables?.users?.data || []) as any[];
+  const userIdx = existingUsers.findIndex((u: any) => String(u?.id || '') === userId || normalizeAuthEmail(u?.email) === cleanEmail);
+  if (userIdx >= 0) {
+    existingUsers[userIdx] = {
+      ...existingUsers[userIdx],
+      id: userId,
+      email: cleanEmail,
+      full_name: safeName,
+      updated_at: nowIso,
+      business_id: existingUsers[userIdx].business_id || cleanBizId,
+      store_id: existingUsers[userIdx].store_id || primaryStore,
+    };
+  } else {
+    runSql(
+      `INSERT INTO users (id, email, full_name, created_at, updated_at, business_id, store_id) VALUES ('${sqlEsc(userId)}', '${sqlEsc(cleanEmail)}', '${sqlEsc(safeName)}', '${nowIso}', '${nowIso}', '${sqlEsc(cleanBizId)}', '${sqlEsc(primaryStore)}')`,
+      'MultiTenant: Upsert decoupled user identity',
+      true
+    );
+  }
+
+  const memberships = (alasql?.tables?.business_memberships?.data || []) as any[];
+  const existingMemIdx = memberships.findIndex(
+    (m: any) =>
+      String(m?.id || '') === membershipId ||
+      (String(m?.business_id || '') === cleanBizId &&
+        normalizeAuthEmail(m?.email) === cleanEmail &&
+        String(m?.role || '') === normRole)
+  );
+  const rowPayload = {
+    id: membershipId,
+    user_id: userId,
+    business_id: cleanBizId,
+    email: cleanEmail,
+    full_name: safeName,
+    credential_hash: computedHash || (existingMemIdx >= 0 ? memberships[existingMemIdx].credential_hash || '' : ''),
+    password: cleanPass || (existingMemIdx >= 0 ? memberships[existingMemIdx].password || '' : ''),
+    role: normRole,
+    store_id: primaryStore,
+    accessible_branches: branchesJson,
+    permissions_json: params.permissionsJson || (existingMemIdx >= 0 ? memberships[existingMemIdx].permissions_json || '{}' : '{}'),
+    status: statusVal,
+    created_at: existingMemIdx >= 0 ? memberships[existingMemIdx].created_at || nowIso : nowIso,
+    updated_at: nowIso,
+  };
+
+  if (existingMemIdx >= 0) {
+    memberships[existingMemIdx] = rowPayload;
+  } else {
+    runSql(
+      `INSERT INTO business_memberships (id, user_id, business_id, email, full_name, credential_hash, password, role, store_id, accessible_branches, permissions_json, status, created_at, updated_at) VALUES (
+        '${sqlEsc(rowPayload.id)}',
+        '${sqlEsc(rowPayload.user_id)}',
+        '${sqlEsc(rowPayload.business_id)}',
+        '${sqlEsc(rowPayload.email)}',
+        '${sqlEsc(rowPayload.full_name)}',
+        '${sqlEsc(rowPayload.credential_hash)}',
+        '${sqlEsc(rowPayload.password)}',
+        '${sqlEsc(rowPayload.role)}',
+        '${sqlEsc(rowPayload.store_id)}',
+        '${sqlEsc(rowPayload.accessible_branches)}',
+        '${sqlEsc(rowPayload.permissions_json)}',
+        '${sqlEsc(rowPayload.status)}',
+        '${sqlEsc(rowPayload.created_at)}',
+        '${sqlEsc(rowPayload.updated_at)}'
+      )`,
+      'MultiTenant: Insert decoupled business membership',
+      true
+    );
+  }
+  return rowPayload;
+}
+
+export function syncUsersAndMembershipsFromLegacyTables(explicitBusinessId?: string) {
+  if (!alasql?.tables?.businesses || !alasql?.tables?.business_memberships) return;
+  const filterBiz = String(explicitBusinessId || '').trim();
+  const bizRows = ((alasql.tables.businesses.data || []) as any[]).filter(
+    (b: any) => b?.id && b.id !== 'default_biz' && (!filterBiz || b.id === filterBiz)
+  );
+  for (const b of bizRows) {
+    const ownerEmail = normalizeAuthEmail(b.email || '');
+    if (!ownerEmail) continue;
+    upsertUserAndMembership({
+      businessId: String(b.id),
+      email: ownerEmail,
+      fullName: String(b.owner || b.name || ownerEmail),
+      password: b.password && b.password !== 'cloud_recovered' ? String(b.password) : '',
+      role: 'owner',
+      storeId: String(b.store_id || 'main'),
+      accessibleBranches: [],
+      status: 'ACTIVE',
+    });
+  }
+
+  const staffRows = ((alasql.tables.staff?.data || []) as any[]).filter(
+    (s: any) => s?.business_id && s.business_id !== 'default_biz' && (!filterBiz || s.business_id === filterBiz)
+  );
+  for (const st of staffRows) {
+    const staffEmail = normalizeAuthEmail(st.email || '');
+    if (!staffEmail) continue;
+    let parsedPerms: any = {};
+    try {
+      if (st.permissions_json) parsedPerms = JSON.parse(st.permissions_json);
+    } catch {}
+    const staffRole =
+      st.role === 'owner' ? 'owner' : st.role === 'manager' ? 'manager' : 'sales';
+    const branches = Array.isArray(parsedPerms?.accessible_branches)
+      ? parsedPerms.accessible_branches
+      : st.store_id
+        ? [String(st.store_id)]
+        : [];
+    const staffPass = String(st.password || parsedPerms?.password || st.pin || '').trim();
+    const isSusp = Boolean(parsedPerms?.suspended || parsedPerms?.status === 'SUSPENDED');
+    upsertUserAndMembership({
+      id: `mem_staff_${String(st.id)}_${String(st.business_id)}`,
+      businessId: String(st.business_id),
+      email: staffEmail,
+      fullName: String(st.name || `${st.first_name || ''} ${st.surname || ''}`.trim() || staffEmail),
+      password: staffPass,
+      role: staffRole,
+      storeId: String(st.store_id || branches[0] || 'main'),
+      accessibleBranches: branches,
+      permissionsJson: String(st.permissions_json || '{}'),
+      status: isSusp ? 'SUSPENDED' : 'ACTIVE',
+    });
+  }
+}
+
+export interface CredentialMembershipMatch {
+  business: any;
+  membership: any;
+  staffRow: any | null;
+  role: 'owner' | 'manager' | 'sales';
+  fullName: string;
+  accessibleBranches: string[];
+  permissionsJson: string;
+  isSuspended: boolean;
+  credentialHash: string;
+}
+
+export function resolveMembershipsByCredential(
+  email: string,
+  password: string
+): CredentialMembershipMatch[] {
+  syncUsersAndMembershipsFromLegacyTables();
+  const cleanEmail = normalizeAuthEmail(email);
+  const rawPass = String(password || '').trim();
+  if (!cleanEmail || !rawPass) return [];
+
+  const targetHash = computeCredentialHashSync(cleanEmail, rawPass);
+  const bizRows = ((alasql?.tables?.businesses?.data || []) as any[]).filter(
+    (b: any) => b?.id && b.id !== 'default_biz'
+  );
+  const bizMap = new Map<string, any>(bizRows.map((b: any) => [String(b.id), b]));
+
+  const staffRows = (alasql?.tables?.staff?.data || []) as any[];
+  const memRows = (alasql?.tables?.business_memberships?.data || []) as any[];
+  const results = new Map<string, CredentialMembershipMatch>();
+
+  // 1. Strict (email, password/credential_hash) check against business_memberships
+  for (const m of memRows) {
+    const mEmail = normalizeAuthEmail(m?.email || '');
+    const biz = bizMap.get(String(m?.business_id || ''));
+    if (!mEmail || !biz) continue;
+    if (mEmail !== cleanEmail) continue;
+
+    const storedHash = String(m?.credential_hash || '').trim();
+    const storedPass = String(m?.password || '').trim();
+    const hashMatched = Boolean(storedHash && storedHash === targetHash);
+    const passMatched = Boolean(storedPass && storedPass !== 'cloud_recovered' && storedPass === rawPass);
+    if (!hashMatched && !passMatched) continue;
+
+    if (!storedHash && passMatched) {
+      m.credential_hash = targetHash;
+    }
+
+    const normRole: 'owner' | 'manager' | 'sales' =
+      m.role === 'owner' ? 'owner' : m.role === 'manager' ? 'manager' : 'sales';
+    let branches: string[] = [];
+    try {
+      const parsedB = JSON.parse(m.accessible_branches || '[]');
+      if (Array.isArray(parsedB)) branches = parsedB;
+    } catch {}
+    const matchedStaff =
+      staffRows.find(
+        (s: any) =>
+          String(s?.business_id || '') === String(biz.id) &&
+          normalizeAuthEmail(s?.email || '') === cleanEmail
+      ) || null;
+    const key = `${biz.id}::${normRole}`;
+    results.set(key, {
+      business: biz,
+      membership: m,
+      staffRow: matchedStaff,
+      role: normRole,
+      fullName: String(m.full_name || matchedStaff?.name || biz.owner || cleanEmail),
+      accessibleBranches: branches,
+      permissionsJson: String(m.permissions_json || matchedStaff?.permissions_json || '{}'),
+      isSuspended: String(m.status || 'ACTIVE').toUpperCase() === 'SUSPENDED',
+      credentialHash: targetHash,
+    });
+  }
+
+  // 2. Fallback check against businesses & staff directly in case any row wasn't stamped yet
+  for (const b of bizRows) {
+    const bEmail = normalizeAuthEmail(b?.email || '');
+    const bPass = String(b?.password || '').trim();
+    if (bEmail === cleanEmail && bPass && bPass !== 'cloud_recovered' && bPass === rawPass) {
+      const key = `${b.id}::owner`;
+      if (!results.has(key)) {
+        const mem = upsertUserAndMembership({
+          businessId: String(b.id),
+          email: cleanEmail,
+          fullName: String(b.owner || b.name || cleanEmail),
+          password: rawPass,
+          role: 'owner',
+          storeId: String(b.store_id || 'main'),
+        });
+        results.set(key, {
+          business: b,
+          membership: mem,
+          staffRow: null,
+          role: 'owner',
+          fullName: String(b.owner || b.name || cleanEmail),
+          accessibleBranches: [],
+          permissionsJson: '{}',
+          isSuspended: false,
+          credentialHash: targetHash,
+        });
+      }
+    }
+  }
+
+  for (const st of staffRows) {
+    const biz = bizMap.get(String(st?.business_id || ''));
+    if (!biz) continue;
+    const sEmail = normalizeAuthEmail(st?.email || '');
+    const sPass = String(st?.password || '').trim();
+    const sPin = String(st?.pin || '').trim();
+    if (sEmail === cleanEmail && ((sPass && sPass === rawPass) || (sPin && sPin === rawPass))) {
+      const normRole: 'owner' | 'manager' | 'sales' =
+        st.role === 'owner' ? 'owner' : st.role === 'manager' ? 'manager' : 'sales';
+      const key = `${biz.id}::${normRole}`;
+      if (!results.has(key)) {
+        let perms: any = {};
+        try {
+          if (st.permissions_json) perms = JSON.parse(st.permissions_json);
+        } catch {}
+        const branches = Array.isArray(perms?.accessible_branches)
+          ? perms.accessible_branches
+          : st.store_id
+            ? [String(st.store_id)]
+            : [];
+        const isSusp = Boolean(perms?.suspended || perms?.status === 'SUSPENDED');
+        const mem = upsertUserAndMembership({
+          id: `mem_staff_${String(st.id)}_${String(biz.id)}`,
+          businessId: String(biz.id),
+          email: cleanEmail,
+          fullName: String(st.name || `${st.first_name || ''} ${st.surname || ''}`.trim() || cleanEmail),
+          password: rawPass,
+          role: normRole,
+          storeId: String(st.store_id || branches[0] || 'main'),
+          accessibleBranches: branches,
+          permissionsJson: String(st.permissions_json || '{}'),
+          status: isSusp ? 'SUSPENDED' : 'ACTIVE',
+        });
+        results.set(key, {
+          business: biz,
+          membership: mem,
+          staffRow: st,
+          role: normRole,
+          fullName: String(st.name || cleanEmail),
+          accessibleBranches: branches,
+          permissionsJson: String(st.permissions_json || '{}'),
+          isSuspended: isSusp,
+          credentialHash: targetHash,
+        });
+      }
+    }
+  }
+
+  return Array.from(results.values());
 }
 
 export async function clearAllDatabaseToBlank() {

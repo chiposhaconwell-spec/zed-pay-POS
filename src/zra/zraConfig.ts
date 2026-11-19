@@ -95,6 +95,26 @@ export interface ZraConfig {
 
 export const ZRA_CONFIG_STORAGE_KEY = 'pos_zra_config';
 
+function getActiveBusinessIdFromStorage(): string {
+  try {
+    const raw = localStorage.getItem('active_business_profile');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed?.id && String(parsed.id).trim() && parsed.id !== 'default_biz') {
+        return String(parsed.id).trim();
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return '';
+}
+
+export function getZraScopedStorageKey(businessId?: string): string {
+  const clean = String(businessId || getActiveBusinessIdFromStorage() || '').trim();
+  return clean ? `${ZRA_CONFIG_STORAGE_KEY}_${clean}` : ZRA_CONFIG_STORAGE_KEY;
+}
+
 export const DEFAULT_ZRA_CONFIG: ZraConfig = {
   enabled: false,
   tpin: '',
@@ -141,8 +161,22 @@ function sanitizeZraConfig(raw: Partial<ZraConfig> | null | undefined): ZraConfi
   };
 }
 
-export function getZraConfig(): ZraConfig {
+export function getZraConfig(explicitBusinessId?: string): ZraConfig {
   try {
+    const bizId = String(explicitBusinessId || getActiveBusinessIdFromStorage() || '').trim();
+    if (bizId) {
+      const scopedRaw = localStorage.getItem(`${ZRA_CONFIG_STORAGE_KEY}_${bizId}`);
+      if (scopedRaw) {
+        return sanitizeZraConfig(JSON.parse(scopedRaw));
+      }
+      const scopedSettingsRaw = localStorage.getItem(`android_pos_settings_${bizId}`);
+      if (scopedSettingsRaw) {
+        const parsedScoped = JSON.parse(scopedSettingsRaw);
+        if (parsedScoped?.zraConfig) return sanitizeZraConfig(parsedScoped.zraConfig);
+        if (parsedScoped?.tpin) return sanitizeZraConfig({ tpin: parsedScoped.tpin });
+      }
+      return { ...DEFAULT_ZRA_CONFIG };
+    }
     const raw = localStorage.getItem(ZRA_CONFIG_STORAGE_KEY);
     if (raw) {
       return sanitizeZraConfig(JSON.parse(raw));
@@ -163,8 +197,9 @@ export function getZraConfig(): ZraConfig {
   return { ...DEFAULT_ZRA_CONFIG };
 }
 
-export function saveZraConfig(partial: Partial<ZraConfig>): ZraConfig {
-  const current = getZraConfig();
+export function saveZraConfig(partial: Partial<ZraConfig>, explicitBusinessId?: string): ZraConfig {
+  const bizId = String(explicitBusinessId || getActiveBusinessIdFromStorage() || '').trim();
+  const current = getZraConfig(bizId || undefined);
   const next = sanitizeZraConfig({
     ...current,
     ...partial,
@@ -172,8 +207,15 @@ export function saveZraConfig(partial: Partial<ZraConfig>): ZraConfig {
   });
 
   try {
-    localStorage.setItem(ZRA_CONFIG_STORAGE_KEY, JSON.stringify(next));
-    const settingsRaw = localStorage.getItem('android_pos_settings');
+    const serialized = JSON.stringify(next);
+    if (bizId) {
+      localStorage.setItem(`${ZRA_CONFIG_STORAGE_KEY}_${bizId}`, serialized);
+    }
+    if (!explicitBusinessId || bizId === getActiveBusinessIdFromStorage()) {
+      localStorage.setItem(ZRA_CONFIG_STORAGE_KEY, serialized);
+    }
+    const settingsKey = bizId ? `android_pos_settings_${bizId}` : 'android_pos_settings';
+    const settingsRaw = localStorage.getItem(settingsKey) || localStorage.getItem('android_pos_settings');
     if (settingsRaw) {
       const parsedSettings = JSON.parse(settingsRaw);
       if (parsedSettings && typeof parsedSettings === 'object') {
@@ -181,13 +223,35 @@ export function saveZraConfig(partial: Partial<ZraConfig>): ZraConfig {
         if (next.tpin && !parsedSettings.tpin) {
           parsedSettings.tpin = next.tpin;
         }
-        localStorage.setItem('android_pos_settings', JSON.stringify(parsedSettings));
+        const updatedSettingsJson = JSON.stringify(parsedSettings);
+        if (bizId) localStorage.setItem(`android_pos_settings_${bizId}`, updatedSettingsJson);
+        if (!explicitBusinessId || bizId === getActiveBusinessIdFromStorage()) {
+          localStorage.setItem('android_pos_settings', updatedSettingsJson);
+        }
       }
     }
   } catch {
     // ignore storage quota errors
   }
 
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('zra_config_updated', { detail: next }));
+  }
+  return next;
+}
+
+export function switchZraConfigForBusiness(businessId?: string, overrideCfg?: Partial<ZraConfig>): ZraConfig {
+  const cleanBiz = String(businessId || '').trim();
+  const next = overrideCfg
+    ? saveZraConfig(overrideCfg, cleanBiz || undefined)
+    : getZraConfig(cleanBiz || undefined);
+  try {
+    if (cleanBiz) {
+      localStorage.setItem(ZRA_CONFIG_STORAGE_KEY, JSON.stringify(next));
+    } else {
+      localStorage.removeItem(ZRA_CONFIG_STORAGE_KEY);
+    }
+  } catch {}
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('zra_config_updated', { detail: next }));
   }

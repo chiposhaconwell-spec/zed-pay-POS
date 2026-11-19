@@ -1006,6 +1006,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       setShowTransferModal(false);
       loadRawData();
       persistTablesToStorage();
+      window.dispatchEvent(new Event('pos_data_updated'));
       
       let message = `✓ Stock transfer process completed successfully!\n\n${successCount} items have been processed and initiated under shipment reference group ${transferBaseId}. Current status: 'PENDING'. Stock deducted from ${transferFromStore.toUpperCase()}. Waiting for ${transferToStore.toUpperCase()} to approve.`;
       if (failedItems.length > 0) {
@@ -1119,6 +1120,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       alert(`✓ Stock Transfer ${st.id} APPROVED successfully!\nAll branch stock layers have been updated and verified receipt PDF has been downloaded.`);
       loadRawData();
       persistTablesToStorage();
+      window.dispatchEvent(new Event('pos_data_updated'));
     } else {
       alert('Error updating destination stock: ' + incRes.error);
     }
@@ -1182,6 +1184,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
       alert(`✗ Stock Transfer ${st.id} REJECTED!\n\nReason recorded: "${reason}"\nStock has been safely returned to branch [${st.from_store.toUpperCase()}].`);
       loadRawData();
       persistTablesToStorage();
+      window.dispatchEvent(new Event('pos_data_updated'));
     } else {
       alert('Error returning stock on reject: ' + restoreRes.error);
     }
@@ -1287,6 +1290,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
     setStocktakeNotes('');
     loadRawData();
     persistTablesToStorage();
+    window.dispatchEvent(new Event('pos_data_updated'));
     setActiveSubTab('catalog');
   };
 
@@ -1997,6 +2001,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                     }
                                     loadRawData();
                                     persistTablesToStorage();
+                                    window.dispatchEvent(new Event('pos_data_updated'));
                                   }
                                 }}
                                 className="text-slate-400 hover:text-indigo-600 p-1 rounded-md hover:bg-slate-100 cursor-pointer transition-all"
@@ -2257,6 +2262,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                         runSql(`UPDATE stores SET stocktake_frequency = '${newFreq}' WHERE id = '${sqlEsc(activeStore)}'${bizMatch}`, `Update stocktake frequency to ${newFreq}`);
                         alert(`✓ Admin Configuration Saved:\n\nSet stocktake balancing schedules for store branch [${activeStore.toUpperCase()}] to a [${newFreq.toUpperCase()}] compliance interval.`);
                         persistTablesToStorage();
+                        window.dispatchEvent(new Event('pos_data_updated'));
                       }}
                       className="px-3 py-1.5 bg-indigo-50 border border-indigo-200 focus:bg-white text-xs rounded-lg font-black text-indigo-850 cursor-pointer"
                     >
@@ -3645,6 +3651,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                 saveCustomCategories(updated);
                                 loadRawData();
                                 persistTablesToStorage();
+                                window.dispatchEvent(new Event('pos_data_updated'));
                                 if (selectedCategory === catName) {
                                   setSelectedCategory(newCat);
                                 }
@@ -3697,6 +3704,7 @@ export default function InventoryManager({ settings, userRole, activeStore, onNa
                                     saveCustomCategories(customCategories.filter(c => c !== catName));
                                     loadRawData();
                                     persistTablesToStorage();
+                                    window.dispatchEvent(new Event('pos_data_updated'));
                                     if (selectedCategory === catName) {
                                       setSelectedCategory('All');
                                     }

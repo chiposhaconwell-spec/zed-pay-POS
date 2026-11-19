@@ -190,7 +190,8 @@ app.get('/api/sync/pull', async (req, res) => {
   try {
     const businessId = typeof req.query.businessId === 'string' ? req.query.businessId : undefined;
     const email = typeof req.query.email === 'string' ? req.query.email : undefined;
-    const result = await pullPosSyncFromCloudSql(businessId, email);
+    const credentialHash = typeof req.query.credentialHash === 'string' ? req.query.credentialHash : undefined;
+    const result = await pullPosSyncFromCloudSql(businessId, email, credentialHash);
     res.json(result);
   } catch (error: any) {
     console.warn('Cloud SQL pull sync unavailable:', error?.message || 'Unknown error');

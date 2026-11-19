@@ -30,13 +30,50 @@ import {
   Ban,
   UserCheck
 } from 'lucide-react';
-import { runSql, getCentralBranches, initializeDatabase, SeedTemplate, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getCustomPaymentMethods, saveCustomPaymentMethod, toggleCustomPaymentMethod, deleteCustomPaymentMethod, calculateLoyaltyPoints, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
+import {
+  runSql,
+  getCentralBranches,
+  initializeDatabase,
+  SeedTemplate,
+  persistTablesToStorage,
+  pushDatabaseToServer,
+  pullDatabaseFromServer,
+  getCustomPaymentMethods,
+  saveCustomPaymentMethod,
+  toggleCustomPaymentMethod,
+  deleteCustomPaymentMethod,
+  calculateLoyaltyPoints,
+  getActiveBusinessId,
+  getActiveStoreId,
+  sqlEsc,
+  upsertUserAndMembership,
+} from '../db';
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings, CustomPaymentMethod } from '../types';
 import { onAuthStateChanged, User as FirebaseUser, signInWithPopup } from 'firebase/auth';
-import { auth, googleProvider, googleSignOut, backupToCloud, restoreFromCloud, getTransportSecurityStatus, registerOrSignInWithEmailPassword } from '../firebase';
-import { getZraConfig, saveZraConfig, subscribeZraConfig, ZraConfig, ZraTaxTypeCode, ZRA_TAX_TYPES, ZRA_PACKAGING_UNITS, ZRA_QTY_UNITS } from '../zra/zraConfig';
+import {
+  auth,
+  googleProvider,
+  googleSignOut,
+  backupToCloud,
+  restoreFromCloud,
+  getTransportSecurityStatus,
+  registerOrSignInWithEmailPassword,
+  publishCredentialMembershipToCloud,
+  revokeCredentialMembershipInCloud,
+  linkOwnerWorkspacesWithCurrentFirebaseAdmin,
+} from '../firebase';
+import { getZraConfig, saveZraConfig, subscribeZraConfig, switchZraConfigForBusiness, ZraConfig, ZraTaxTypeCode, ZRA_TAX_TYPES, ZRA_PACKAGING_UNITS, ZRA_QTY_UNITS } from '../zra/zraConfig';
 import { FiscalService, ZraOfflineQueueItem } from '../zra/fiscalService';
+import {
+  UnlockedWorkspaceSession,
+  getUnlockedWorkspaces,
+  saveScopedBusinessSettings,
+  computeCredentialHashSync,
+  deriveUserId,
+  deriveMembershipId,
+  normalizeAuthEmail,
+} from '../multiTenantAuth';
 import {
   UserPermissions,
   SettingsPermissionKey,
@@ -69,6 +106,10 @@ interface SettingsPanelProps {
   activeBusiness?: any;
   setActiveBusiness?: (biz: any) => void;
   businesses?: any[];
+  unlockedWorkspaces?: UnlockedWorkspaceSession[];
+  onSwitchUnlockedWorkspace?: (ws: UnlockedWorkspaceSession) => void | Promise<void>;
+  onUnlockWorkspace?: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  onCreateNewWorkspace?: () => void;
   onSelectBusinessWorkspace?: (biz: any) => void;
   onSyncExistingAccount?: (e: React.FormEvent) => void;
   syncLoginEmail?: string;
@@ -90,6 +131,10 @@ export default function SettingsPanel({
   userRole: currentUserRole = 'owner',
   userPermissions,
   activeBusiness,
+  unlockedWorkspaces = [],
+  onSwitchUnlockedWorkspace,
+  onUnlockWorkspace,
+  onCreateNewWorkspace,
   onNavigateToInventory,
   initialSubTab = 'general',
 }: SettingsPanelProps) {
@@ -129,6 +174,10 @@ export default function SettingsPanel({
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [wsUnlockEmail, setWsUnlockEmail] = useState('');
+  const [wsUnlockPass, setWsUnlockPass] = useState('');
+  const [wsUnlockLoading, setWsUnlockLoading] = useState(false);
+  const [wsUnlockFeedback, setWsUnlockFeedback] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
   const effectivePermissions: UserPermissions = React.useMemo(() => {
     if (normalizeRole(currentUserRole) === 'owner') {
@@ -381,6 +430,17 @@ export default function SettingsPanel({
       setSyncStatus('Logging in with Google...');
       setSyncError(null);
       await signInWithPopup(auth, googleProvider);
+      const unlockedList = getUnlockedWorkspaces();
+      if (unlockedList.length > 0) {
+        const linkRes = await linkOwnerWorkspacesWithCurrentFirebaseAdmin(unlockedList).catch(() => ({
+          linkedBusinesses: [],
+        }));
+        if (linkRes.linkedBusinesses.length > 0) {
+          triggerNotify(`Logged in with Google and linked ${linkRes.linkedBusinesses.length} cloud workspace(s)!`);
+          setSyncStatus(`Google Auth connected & linked workspace(s): ${linkRes.linkedBusinesses.join(', ')}.`);
+          return;
+        }
+      }
       triggerNotify('Logged in with Google via Firebase Auth successfully!');
       setSyncStatus(null);
     } catch (err: any) {
@@ -429,32 +489,37 @@ export default function SettingsPanel({
 
   const handleBackupToCloud = async () => {
     setIsSyncing(true);
-    setSyncStatus('Synchronizing clients data, transactions, stock, batches & accounting ledgers to Cloud SQL, Firestore & Firebase Storage...');
+    setSyncStatus('Backing up all business settings, profile, branches, stock, clients & accounting ledgers to Cloud Firestore...');
     setSyncError(null);
     try {
       const bizId = getActiveBusinessId();
-      const sqlRes = await pushDatabaseToServer(bizId);
-      let msg = sqlRes.details;
+      let fbRes: { success: boolean; details: string } | null = null;
+      let fbErrMsg: string | null = null;
 
-      if (user) {
+      if (auth.currentUser) {
         try {
-          const fbRes = await backupToCloud(bizId, { silentIfNotOwner: true });
-          if (fbRes.success) {
-            msg += ' | ' + fbRes.details;
-          } else if (fbRes.details) {
-            msg += ' | ' + fbRes.details;
-          }
+          fbRes = await backupToCloud(bizId, { silentIfNotOwner: true });
         } catch (fbErr: any) {
           console.warn('Firebase backup notice:', fbErr);
-          msg += ` | Firebase note: ${fbErr?.message || String(fbErr)}`;
+          fbErrMsg = fbErr?.message || String(fbErr);
         }
       }
 
-      if (sqlRes.success) {
+      const sqlRes = await pushDatabaseToServer(bizId).catch((err: any) => ({
+        success: false,
+        details: err?.message || 'Cloud SQL unavailable',
+      }));
+
+      if (fbRes?.success) {
+        const extra = sqlRes.success ? ` | ${sqlRes.details}` : '';
+        triggerNotify('Cloud Firestore Backup succeeded!');
+        setSyncStatus(`${fbRes.details}${extra}`);
+      } else if (sqlRes.success) {
+        const extra = fbRes?.details ? ` | ${fbRes.details}` : fbErrMsg ? ` | Firestore note: ${fbErrMsg}` : '';
         triggerNotify('Cloud Synchronization Push succeeded!');
-        setSyncStatus(msg);
+        setSyncStatus(`${sqlRes.details}${extra}`);
       } else {
-        setSyncError(sqlRes.details);
+        setSyncError(fbErrMsg || fbRes?.details || sqlRes.details || 'Cloud backup failed. Please sign in to Firebase.');
       }
     } catch (err: any) {
       console.error(err);
@@ -466,10 +531,31 @@ export default function SettingsPanel({
 
   const handleRestoreFromCloud = async () => {
     setIsSyncing(true);
-    setSyncStatus('Pulling latest synchronized business, stock, batches & accounting state from Cloud...');
+    setSyncStatus('Restoring latest business settings, profile, branches, stocks & ledgers from Cloud Firestore...');
     setSyncError(null);
     try {
       const bizId = getActiveBusinessId();
+      if (auth.currentUser) {
+        try {
+          const res = await restoreFromCloud(bizId || undefined, { silentIfUnlinked: true });
+          if (res.success) {
+            try {
+              const rawS = localStorage.getItem('android_pos_settings');
+              if (rawS) {
+                setSettings(JSON.parse(rawS));
+              }
+            } catch {}
+            loadUsersList();
+            loadStoresList();
+            triggerNotify('Cloud Firestore Restore succeeded!');
+            setSyncStatus(res.details);
+            return;
+          }
+        } catch (fbErr: any) {
+          console.warn('Firestore restore fallback notice:', fbErr);
+        }
+      }
+
       const sqlPull = await pullDatabaseFromServer(bizId || undefined);
       if (sqlPull.success && sqlPull.found) {
         if (sqlPull.settings) {
@@ -481,18 +567,6 @@ export default function SettingsPanel({
         setSyncStatus(sqlPull.details);
         window.dispatchEvent(new Event('local_db_restored'));
         return;
-      }
-
-      if (user) {
-        const res = await restoreFromCloud(bizId);
-        if (res.success) {
-          loadUsersList();
-          loadStoresList();
-          triggerNotify('Firebase Cloud Restore succeeded!');
-          setSyncStatus(res.details);
-          window.dispatchEvent(new Event('local_db_restored'));
-          return;
-        }
       }
 
       setSyncError(sqlPull.details || 'No cloud backup found for this business yet.');
@@ -534,6 +608,8 @@ export default function SettingsPanel({
 
   const handleSaveSettings = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    const activeBizId = getActiveBusinessId(activeBusiness?.id);
+    const currentZra = getZraConfig();
     const updated: StoreSettings = {
       storeName,
       currency,
@@ -553,13 +629,13 @@ export default function SettingsPanel({
       printerName,
       printerInterface,
       printerStatus,
-      customPaymentMethods: getCustomPaymentMethods(true)
+      customPaymentMethods: getCustomPaymentMethods(true),
+      zraConfig: currentZra,
     };
     setSettings(updated);
-    localStorage.setItem('android_pos_settings', JSON.stringify(updated));
-
-    const activeBizId = getActiveBusinessId();
+    saveScopedBusinessSettings(activeBizId, updated);
     if (activeBizId) {
+      switchZraConfigForBusiness(activeBizId, currentZra);
       runSql(`
         UPDATE businesses
         SET name = '${storeName.trim().replace(/'/g, "''")}',
@@ -1084,8 +1160,8 @@ export default function SettingsPanel({
 
   const handleSaveUser = (e: React.FormEvent) => {
     e.preventDefault();
-    const emailLower = userEmail.trim().toLowerCase();
-    
+    const emailLower = normalizeAuthEmail(userEmail);
+
     if (!emailLower || !userFirstName.trim() || !userSurname.trim() || !userPassword.trim()) {
       setUserActionFeedback({ type: 'error', text: 'Invalid Form: Please complete First Name, Surname, Email, and Password.' });
       return;
@@ -1102,58 +1178,32 @@ export default function SettingsPanel({
     });
     const permissionsString = JSON.stringify(basicPermissions);
 
-    // 2. Decide if Owner or Staff
-    const activeBizId = getActiveBusinessId();
+    // 2. Scope strictly to the currently active business (never create cross-tenant business rows)
+    const activeBizId = getActiveBusinessId(activeBusiness?.id);
     const fallbackStoreId = activeStore || getActiveStoreId(undefined, activeBizId) || (storesList[0]?.id ?? 'main');
-    if (userRole === 'owner') {
-      if (editingUserId) {
-        const sql = `
-          UPDATE businesses
-          SET owner = '${sqlEsc(userFirstName.trim())} ${sqlEsc(userSurname.trim())}',
-              email = '${sqlEsc(emailLower)}',
-              password = '${sqlEsc(userPassword.trim())}'
-          WHERE id = '${sqlEsc(String(editingUserId))}'
-        `;
-        runSql(sql, `SettingsPanel: Update Corporate Owner profile`);
-      } else {
-        const newBizId = `biz_${Math.floor(100000 + Math.random() * 900000)}`;
-        const existsRes = runSql(`SELECT * FROM businesses WHERE id = '${sqlEsc(String(newBizId))}'`);
-        const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
+    const fullStaffName = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
+    const primaryStore = selectedBranches[0] || fallbackStoreId;
+    const rawPass = userPassword.trim();
+    const isNowSuspended = userRole !== 'owner' && userSuspended;
+    const isPrimaryBizOwnerEdit = Boolean(editingUserId && String(editingUserId) === String(activeBizId));
 
-        if (alreadyExists) {
-          const sql = `
-            UPDATE businesses
-            SET owner = '${sqlEsc(userFirstName.trim())} ${sqlEsc(userSurname.trim())}',
-                email = '${sqlEsc(emailLower)}',
-                password = '${sqlEsc(userPassword.trim())}'
-            WHERE id = '${sqlEsc(String(newBizId))}'
-          `;
-          runSql(sql, `SettingsPanel: Update Corporate Owner`);
-        } else {
-          const sql = `
-            INSERT INTO businesses (id, name, owner, email, password, created_at, business_id, store_id)
-            VALUES (
-              '${sqlEsc(newBizId)}',
-              '${sqlEsc(storeName)} HQ',
-              '${sqlEsc(userFirstName.trim())} ${sqlEsc(userSurname.trim())}',
-              '${sqlEsc(emailLower)}',
-              '${sqlEsc(userPassword.trim())}',
-              '${new Date().toISOString()}',
-              '${sqlEsc(activeBizId || newBizId)}',
-              '${sqlEsc(fallbackStoreId)}'
-            )
-          `;
-          runSql(sql, `SettingsPanel: Register secondary Corporate Owner account`);
-        }
-      }
+    if (userRole === 'owner' && isPrimaryBizOwnerEdit) {
+      const sql = `
+        UPDATE businesses
+        SET owner = '${sqlEsc(fullStaffName)}',
+            email = '${sqlEsc(emailLower)}',
+            password = '${sqlEsc(rawPass)}'
+        WHERE id = '${sqlEsc(activeBizId)}'
+      `;
+      runSql(sql, `SettingsPanel: Update Corporate Owner profile`);
     } else {
       const salaryNum = parseFloat(userSalary) || 0;
-      const targetStaffId = editingUserId ? editingUserId : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
-      const fullStaffName = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
-      const primaryStore = selectedBranches[0] || fallbackStoreId;
+      const targetStaffId = editingUserId && !isPrimaryBizOwnerEdit
+        ? editingUserId
+        : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
       const idWhereClause = buildSqlIdWhereClause(targetStaffId);
       const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
-      
+
       const existsRes = runSql(`SELECT * FROM staff WHERE ${idWhereClause}${staffBizAnd}`);
       const alreadyExists = existsRes.success && Array.isArray(existsRes.data) && existsRes.data.length > 0;
 
@@ -1164,13 +1214,13 @@ export default function SettingsPanel({
               first_name = '${sqlEsc(userFirstName.trim())}',
               surname = '${sqlEsc(userSurname.trim())}',
               role = '${sqlEsc(userRole)}',
-              pin = '${sqlEsc(userPassword.trim().slice(0, 6))}',
+              pin = '${sqlEsc(rawPass.slice(0, 6))}',
               store_id = '${sqlEsc(primaryStore)}',
               contact = '${sqlEsc(userContact.trim())}',
               email = '${sqlEsc(emailLower)}',
               basic_salary = ${salaryNum},
               permissions_json = '${sqlEsc(permissionsString)}',
-              password = '${sqlEsc(userPassword.trim())}'
+              password = '${sqlEsc(rawPass)}'
           WHERE ${idWhereClause}${staffBizAnd}
         `;
         runSql(sql, `SettingsPanel: Modify staff profile ${targetStaffId}`);
@@ -1182,7 +1232,7 @@ export default function SettingsPanel({
             '${sqlEsc(fullStaffName)}',
             '${sqlEsc(userRole)}',
             0,
-            '${sqlEsc(userPassword.trim().slice(0, 6))}',
+            '${sqlEsc(rawPass.slice(0, 6))}',
             '${sqlEsc(primaryStore)}',
             '${sqlEsc(userFirstName.trim())}',
             '${sqlEsc(userSurname.trim())}',
@@ -1194,23 +1244,54 @@ export default function SettingsPanel({
             ${salaryNum},
             '${sqlEsc(permissionsString)}',
             '${sqlEsc(activeBizId)}',
-            '${sqlEsc(userPassword.trim())}'
+            '${sqlEsc(rawPass)}'
           )
         `;
         runSql(sql, `SettingsPanel: Register new staff profile ${targetStaffId}`);
       }
     }
 
+    // 3. Upsert into decoupled business_memberships + publish zero-plaintext invite to Firestore /credential_directory
+    const credHash = computeCredentialHashSync(emailLower, rawPass);
+    const membershipRec = upsertUserAndMembership({
+      businessId: activeBizId,
+      email: emailLower,
+      fullName: fullStaffName,
+      password: rawPass,
+      credentialHash: credHash,
+      role: userRole,
+      storeId: primaryStore,
+      accessibleBranches: userRole === 'owner' ? [] : selectedBranches,
+      permissionsJson: permissionsString,
+      status: isNowSuspended ? 'SUSPENDED' : 'ACTIVE',
+    });
+
+    if (auth.currentUser && activeBizId) {
+      publishCredentialMembershipToCloud({
+        businessId: activeBizId,
+        businessName: storeName || activeBusiness?.name || activeBizId,
+        membershipId: String(membershipRec?.id || deriveMembershipId(activeBizId, deriveUserId(emailLower), userRole)),
+        userId: String(membershipRec?.user_id || deriveUserId(emailLower)),
+        email: emailLower,
+        fullName: fullStaffName,
+        role: userRole,
+        password: rawPass,
+        credentialHash: credHash,
+        storeId: primaryStore,
+        accessibleBranches: userRole === 'owner' ? [] : selectedBranches,
+        permissionsJson: permissionsString,
+        status: isNowSuspended ? 'SUSPENDED' : 'ACTIVE',
+      }).catch(() => {});
+    }
+
     // If editing the currently logged-in user's account, apply updated role & ticked permissions immediately
-    const currentLoggedEmail = (localStorage.getItem('logged_in_user_email') || '').trim().toLowerCase();
+    const currentLoggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || '');
     if (currentLoggedEmail && currentLoggedEmail === emailLower) {
       localStorage.setItem('logged_in_user_role', userRole);
       localStorage.setItem('logged_in_accessible_branches', JSON.stringify(basicPermissions.accessible_branches));
       saveSessionPermissionsToStorage(basicPermissions, normalizeRole(userRole));
     }
 
-    const savedLabel = `${userFirstName.trim()} ${userSurname.trim()}`.trim();
-    const isNowSuspended = userRole !== 'owner' && userSuspended;
     handleResetUserForm();
     loadUsersList();
     persistTablesToStorage();
@@ -1222,8 +1303,8 @@ export default function SettingsPanel({
     setUserActionFeedback({
       type: isNowSuspended ? 'warning' : 'success',
       text: isNowSuspended
-        ? `Saved profile for ${savedLabel} (account status: SUSPENDED).`
-        : `✓ Security credentials, role permissions & settings access saved for ${savedLabel}.`,
+        ? `Saved profile for ${fullStaffName} (account status: SUSPENDED).`
+        : `✓ Security credentials, role permissions & settings access saved for ${fullStaffName}.`,
     });
     triggerNotify('✓ User security credentials, role permissions & settings access saved!');
   };
@@ -1283,18 +1364,32 @@ export default function SettingsPanel({
       return;
     }
 
-    const activeBizId = getActiveBusinessId();
+    const activeBizId = getActiveBusinessId(activeBusiness?.id);
     const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    const safeEmail = normalizeAuthEmail(usr.email || '');
     if (usr.is_owner) {
       const safeId = sqlEsc(String(usr.id));
       runSql(`DELETE FROM businesses WHERE id = '${safeId}'`, `SettingsPanel: Revoke secondary owner account ${usr.id}`);
-      if (usr.email) {
-        const safeEmail = sqlEsc(String(usr.email).trim().toLowerCase());
-        runSql(`DELETE FROM staff WHERE LOWER(email) = '${safeEmail}'${staffBizAnd}`, `SettingsPanel: Clean secondary owner staff link`);
+      if (safeEmail) {
+        runSql(`DELETE FROM staff WHERE LOWER(email) = '${sqlEsc(safeEmail)}'${staffBizAnd}`, `SettingsPanel: Clean secondary owner staff link`);
       }
     } else {
       const idWhereClause = buildSqlIdWhereClause(usr.id);
       runSql(`DELETE FROM staff WHERE ${idWhereClause}${staffBizAnd}`, `SettingsPanel: Revoke staff account ${usr.id}`);
+    }
+
+    if (activeBizId && safeEmail) {
+      runSql(
+        `DELETE FROM business_memberships WHERE business_id = '${sqlEsc(activeBizId)}' AND LOWER(email) = '${sqlEsc(safeEmail)}'`,
+        `SettingsPanel: Revoke membership record`
+      );
+      if (auth.currentUser) {
+        revokeCredentialMembershipInCloud({
+          businessId: activeBizId,
+          email: safeEmail,
+          password: usr.password || undefined,
+        }).catch(() => {});
+      }
     }
 
     if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
@@ -1313,7 +1408,7 @@ export default function SettingsPanel({
     const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
     setUserActionFeedback({
       type: 'success',
-      text: `Access revoked: "${fullName}" has been permanently removed from this terminal.`,
+      text: `Access revoked: "${fullName}" has been permanently removed from this workspace.`,
     });
     triggerNotify(`Revoked access for ${fullName}!`);
   };
@@ -1338,9 +1433,10 @@ export default function SettingsPanel({
       suspendedAt: nextSuspended ? new Date().toISOString() : null,
     });
 
-    const permsJsonEscaped = sqlEsc(JSON.stringify(updatedPerms));
+    const permsJsonStr = JSON.stringify(updatedPerms);
+    const permsJsonEscaped = sqlEsc(permsJsonStr);
     const idWhereClause = buildSqlIdWhereClause(usr.id);
-    const activeBizId = getActiveBusinessId();
+    const activeBizId = getActiveBusinessId(activeBusiness?.id);
     const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
     const res = runSql(
       `UPDATE staff SET permissions_json = '${permsJsonEscaped}' WHERE ${idWhereClause}${staffBizAnd}`,
@@ -1350,6 +1446,41 @@ export default function SettingsPanel({
     if (!res.success) {
       setUserActionFeedback({ type: 'error', text: `Failed updating status: ${res.error || 'Database error'}` });
       return;
+    }
+
+    const cleanUsrEmail = normalizeAuthEmail(usr.email || '');
+    const usrPass = String(usr.password || parsedExisting.password || '').trim();
+    const normUsrRole = normalizeRole(usr.role || parsedExisting.role);
+    const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
+    if (activeBizId && cleanUsrEmail) {
+      const memRec = upsertUserAndMembership({
+        businessId: activeBizId,
+        email: cleanUsrEmail,
+        fullName,
+        password: usrPass,
+        credentialHash: usrPass ? computeCredentialHashSync(cleanUsrEmail, usrPass) : '',
+        role: normUsrRole,
+        storeId: String(usr.raw?.store_id || usr.accessible_branches?.[0] || 'main'),
+        accessibleBranches: Array.isArray(usr.accessible_branches) ? usr.accessible_branches : parsedExisting.accessible_branches,
+        permissionsJson: permsJsonStr,
+        status: nextSuspended ? 'SUSPENDED' : 'ACTIVE',
+      });
+      if (auth.currentUser && usrPass) {
+        publishCredentialMembershipToCloud({
+          businessId: activeBizId,
+          businessName: storeName || activeBusiness?.name || activeBizId,
+          membershipId: String(memRec?.id || deriveMembershipId(activeBizId, deriveUserId(cleanUsrEmail), normUsrRole)),
+          userId: String(memRec?.user_id || deriveUserId(cleanUsrEmail)),
+          email: cleanUsrEmail,
+          fullName,
+          role: normUsrRole,
+          password: usrPass,
+          storeId: String(usr.raw?.store_id || 'main'),
+          accessibleBranches: Array.isArray(usr.accessible_branches) ? usr.accessible_branches : [],
+          permissionsJson: permsJsonStr,
+          status: nextSuspended ? 'SUSPENDED' : 'ACTIVE',
+        }).catch(() => {});
+      }
     }
 
     if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
@@ -1364,7 +1495,6 @@ export default function SettingsPanel({
     }
     window.dispatchEvent(new Event('pos_data_updated'));
 
-    const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
     setUserActionFeedback({
       type: nextSuspended ? 'warning' : 'success',
       text: nextSuspended
@@ -1954,49 +2084,160 @@ export default function SettingsPanel({
         </div>
       ) : activeSubTab === 'workspaces' && canAccessSettingTab('workspaces', currentUserRole, effectivePermissions) ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-          {/* Registered Business Workspaces */}
+          {/* Verified Unlocked Workspaces & Strict Multi-Tenant Switcher */}
           <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs flex flex-col gap-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
                 <Building2 className="text-indigo-600" size={16} />
                 <h3 className="text-xs font-black uppercase tracking-wider text-slate-800">
-                  Registered Business Workspaces ({businessesList.length})
+                  Unlocked Workspaces ({unlockedWorkspaces.length || 1})
                 </h3>
               </div>
+              {onCreateNewWorkspace && (
+                <button
+                  type="button"
+                  onClick={onCreateNewWorkspace}
+                  className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1 cursor-pointer"
+                >
+                  <Plus size={12} /> New Business
+                </button>
+              )}
             </div>
+
             <div className="flex flex-col gap-2.5">
-              {businessesList.length === 0 ? (
-                <div className="p-4 text-xs text-slate-500 bg-slate-50 rounded-lg border border-slate-200">
-                  No business workspaces found.
-                </div>
-              ) : (
-                businessesList.map((b: any, idx: number) => {
-                  const isActiveBiz = b.id === getActiveBusinessId();
-                  return (
+              {unlockedWorkspaces.length === 0 ? (
+                businessesList
+                  .filter((b: any) => String(b.id) === String(getActiveBusinessId(activeBusiness?.id)))
+                  .map((b: any, idx: number) => (
                     <div
                       key={`${b.id}-${idx}`}
-                      className={`p-4 rounded-xl border flex items-center justify-between ${
+                      className="p-4 rounded-xl border bg-indigo-50/70 border-indigo-400 text-slate-900 flex items-center justify-between"
+                    >
+                      <div>
+                        <div className="font-extrabold text-xs">{b.name}</div>
+                        <div className="text-[10px] font-mono text-slate-500 mt-0.5">
+                          Role: {normalizeRole(currentUserRole).toUpperCase()} · {localStorage.getItem('logged_in_user_email') || b.email}
+                        </div>
+                      </div>
+                      <span className="px-2.5 py-1 bg-emerald-600 text-white text-[9px] font-black uppercase rounded-full">
+                        Active
+                      </span>
+                    </div>
+                  ))
+              ) : (
+                unlockedWorkspaces.map((ws) => {
+                  const isActiveBiz = ws.businessId === getActiveBusinessId(activeBusiness?.id);
+                  const roleLabel = ws.role === 'owner' ? 'Owner' : ws.role === 'manager' ? 'Manager' : 'Cashier';
+                  return (
+                    <div
+                      key={`${ws.businessId}_${ws.membershipId}`}
+                      className={`p-4 rounded-xl border flex items-center justify-between gap-3 ${
                         isActiveBiz
                           ? 'bg-indigo-50/70 border-indigo-400 text-slate-900'
                           : 'bg-slate-50 border-slate-200 text-slate-700'
                       }`}
                     >
-                      <div>
-                        <div className="font-extrabold text-xs">{b.name}</div>
-                        <div className="text-[10px] font-mono text-slate-500 mt-0.5">
-                          Admin: {b.owner} ({b.email})
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-extrabold text-xs truncate">{ws.businessName}</span>
+                          <span className={`px-2 py-0.5 rounded-full text-[9px] font-black uppercase ${
+                            ws.role === 'owner'
+                              ? 'bg-indigo-100 text-indigo-800 border border-indigo-200'
+                              : ws.role === 'manager'
+                                ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                          }`}>
+                            {roleLabel}
+                          </span>
+                        </div>
+                        <div className="text-[10px] font-mono text-slate-500 mt-0.5 truncate">
+                          {ws.fullName} · {ws.email}
                         </div>
                       </div>
-                      {isActiveBiz && (
-                        <span className="px-2.5 py-1 bg-emerald-600 text-white text-[9px] font-black uppercase rounded-full">
-                          Active Workspace
+                      {isActiveBiz ? (
+                        <span className="px-2.5 py-1 bg-emerald-600 text-white text-[9px] font-black uppercase rounded-full shrink-0">
+                          Active
                         </span>
+                      ) : (
+                        onSwitchUnlockedWorkspace && (
+                          <button
+                            type="button"
+                            onClick={() => void onSwitchUnlockedWorkspace(ws)}
+                            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-black uppercase rounded-lg cursor-pointer shrink-0 shadow-xs"
+                          >
+                            Switch Here
+                          </button>
+                        )
                       )}
                     </div>
                   );
                 })
               )}
             </div>
+
+            {onUnlockWorkspace && (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setWsUnlockFeedback(null);
+                  setWsUnlockLoading(true);
+                  try {
+                    const res = await onUnlockWorkspace(wsUnlockEmail, wsUnlockPass);
+                    if (res.success) {
+                      setWsUnlockPass('');
+                      setWsUnlockFeedback({ type: 'success', text: '✓ Workspace unlocked and activated!' });
+                    } else {
+                      setWsUnlockFeedback({ type: 'error', text: res.error || 'Could not verify credentials.' });
+                    }
+                  } finally {
+                    setWsUnlockLoading(false);
+                  }
+                }}
+                className="mt-2 pt-4 border-t border-slate-100 flex flex-col gap-2.5"
+              >
+                <div className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-slate-700">
+                  <Key size={13} className="text-emerald-600" />
+                  <span>Unlock &amp; Add Another Business (Email + Password)</span>
+                </div>
+                <p className="text-[10.5px] text-slate-500">
+                  Same email can belong to multiple shops with different roles and different passwords. Enter the exact email and password for the shop you want to unlock.
+                </p>
+                {wsUnlockFeedback && (
+                  <div className={`px-3 py-2 rounded-lg text-xs font-bold border ${
+                    wsUnlockFeedback.type === 'error'
+                      ? 'bg-rose-50 border-rose-200 text-rose-700'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  }`}>
+                    {wsUnlockFeedback.text}
+                  </div>
+                )}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    type="email"
+                    value={wsUnlockEmail}
+                    onChange={(e) => setWsUnlockEmail(e.target.value)}
+                    placeholder="Account Email"
+                    required
+                    className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono focus:border-indigo-500 focus:outline-hidden"
+                  />
+                  <input
+                    type="password"
+                    value={wsUnlockPass}
+                    onChange={(e) => setWsUnlockPass(e.target.value)}
+                    placeholder="Shop Password"
+                    required
+                    className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono focus:border-indigo-500 focus:outline-hidden"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={wsUnlockLoading}
+                  className="py-2 px-4 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-xs font-black uppercase tracking-wider rounded-lg cursor-pointer self-start"
+                >
+                  {wsUnlockLoading ? 'Verifying...' : 'Unlock & Switch Workspace'}
+                </button>
+              </form>
+            )}
           </div>
 
           {/* Cloud Synchronization Controls */}
@@ -2013,7 +2254,7 @@ export default function SettingsPanel({
               </span>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Push or pull your complete business setup, stores, staff accounts, stock, batches, customers, and accounting ledgers across devices.
+              Push or pull your complete business setup, stores, staff accounts, stock, batches, customers, and accounting ledgers across devices (strictly isolated to the active workspace).
             </p>
             <div className="grid grid-cols-2 gap-3">
               <button
@@ -2703,6 +2944,7 @@ export default function SettingsPanel({
                   };
                   setSettings(nextSettings);
                   localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                  window.dispatchEvent(new Event('pos_data_updated'));
                   const activeBizId = getActiveBusinessId();
                   if (activeBizId) {
                     pushDatabaseToServer(activeBizId).catch(() => {});
@@ -2837,6 +3079,7 @@ export default function SettingsPanel({
                                   const nextSettings = { ...settings, customPaymentMethods: updated };
                                   setSettings(nextSettings);
                                   localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                                  window.dispatchEvent(new Event('pos_data_updated'));
                                   const activeBizId = getActiveBusinessId();
                                   if (activeBizId) {
                                     pushDatabaseToServer(activeBizId).catch(() => {});
@@ -2856,6 +3099,7 @@ export default function SettingsPanel({
                                   const nextSettings = { ...settings, customPaymentMethods: updated };
                                   setSettings(nextSettings);
                                   localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                                  window.dispatchEvent(new Event('pos_data_updated'));
                                   const activeBizId = getActiveBusinessId();
                                   if (activeBizId) {
                                     pushDatabaseToServer(activeBizId).catch(() => {});
@@ -2942,6 +3186,7 @@ export default function SettingsPanel({
                     const nextSettings: StoreSettings = { ...settings, zraConfig: toggled };
                     setSettings(nextSettings);
                     localStorage.setItem('android_pos_settings', JSON.stringify(nextSettings));
+                    window.dispatchEvent(new Event('pos_data_updated'));
                     setZraFeedback({
                       type: toggled.enabled ? 'success' : 'info',
                       text: toggled.enabled

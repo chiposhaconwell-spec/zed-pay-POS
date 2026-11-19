@@ -13,8 +13,39 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 
 // Database & Firebase Cloud API
-import { initializeDatabase, SeedTemplate, runSql, getCentralBranches, upsertCustomerSync, logEmployeeAudit, persistTablesToStorage, pushDatabaseToServer, pullDatabaseFromServer, getAllSelectableAccounts, syncAllAccountingSystems, seedChartOfAccountsOnly, getActiveBusinessId, getActiveStoreId, sqlEsc } from './db';
-import { auth, registerOrSignInWithEmailPassword, signInWithEmailPasswordAccount, backupToCloud, restoreFromCloud, googleSignOut } from './firebase';
+import {
+  initializeDatabase,
+  SeedTemplate,
+  runSql,
+  getCentralBranches,
+  upsertCustomerSync,
+  logEmployeeAudit,
+  persistTablesToStorage,
+  pushDatabaseToServer,
+  pullDatabaseFromServer,
+  getAllSelectableAccounts,
+  syncAllAccountingSystems,
+  seedChartOfAccountsOnly,
+  getActiveBusinessId,
+  getActiveStoreId,
+  sqlEsc,
+  resolveMembershipsByCredential,
+  upsertUserAndMembership,
+} from './db';
+import {
+  auth,
+  registerOrSignInWithEmailPassword,
+  signInWithEmailPasswordAccount,
+  signInOrCreateCredentialAuth,
+  signInWithCredentialHash,
+  claimCredentialInviteAndRestore,
+  publishCredentialMembershipToCloud,
+  hasVerifiedFirestoreAccessToBusiness,
+  tryMigrateLegacyOwnerToCredentialAuth,
+  backupToCloud,
+  restoreFromCloud,
+  googleSignOut,
+} from './firebase';
 import { StoreSettings, ActiveTab } from './types';
 import {
   UserPermissions,
@@ -31,8 +62,22 @@ import {
   clearSessionPermissionsFromStorage,
   normalizeRole,
 } from './permissions';
+import {
+  UnlockedWorkspaceSession,
+  computeCredentialHashSync,
+  deriveUserId,
+  deriveMembershipId,
+  normalizeAuthEmail,
+  getUnlockedWorkspaces,
+  upsertUnlockedWorkspace,
+  clearUnlockedWorkspaces,
+  saveScopedBusinessSettings,
+  loadScopedBusinessSettings,
+  saveScopedActiveBranch,
+  loadScopedActiveBranch,
+} from './multiTenantAuth';
 import { FiscalService } from './zra/fiscalService';
-import { getZraConfig, saveZraConfig } from './zra/zraConfig';
+import { getZraConfig, saveZraConfig, switchZraConfigForBusiness } from './zra/zraConfig';
 
 // Custom sub-components
 import AndroidShell from './components/AndroidShell';
@@ -112,7 +157,15 @@ export default function App() {
   const [businesses, setBusinesses] = useState<any[]>([]);
   const [stores, setStores] = useState<any[]>([]);
   const [staffMembers, setStaffMembers] = useState<any[]>([]);
-  const [settingsInitialSubTab, setSettingsInitialSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'printer' | 'database'>('general');
+  const [unlockedWorkspaces, setUnlockedWorkspaces] = useState<UnlockedWorkspaceSession[]>(() => getUnlockedWorkspaces());
+  const [showWorkspaceDropdown, setShowWorkspaceDropdown] = useState(false);
+  const [showUnlockWorkspaceModal, setShowUnlockWorkspaceModal] = useState(false);
+  const [isCreatingNewWorkspace, setIsCreatingNewWorkspace] = useState(false);
+  const [unlockEmail, setUnlockEmail] = useState('');
+  const [unlockPassword, setUnlockPassword] = useState('');
+  const [unlockFeedback, setUnlockFeedback] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
+  const [isUnlockingWorkspace, setIsUnlockingWorkspace] = useState(false);
+  const [settingsInitialSubTab, setSettingsInitialSubTab] = useState<'general' | 'stores' | 'users' | 'stock' | 'payments' | 'zra' | 'printer' | 'database' | 'workspaces'>('general');
   const [newBizName, setNewBizName] = useState('');
   const [newBizOwner, setNewBizOwner] = useState('');
   const [newBizEmail, setNewBizEmail] = useState('');
@@ -295,20 +348,43 @@ export default function App() {
     const isSessionAuth = localStorage.getItem('pos_authenticated_session') === 'true';
 
     const checkActiveStaffAccessStatus = (bizCandidate?: any): { valid: boolean; reason?: string } => {
-      const loggedEmail = (localStorage.getItem('logged_in_user_email') || '').trim().toLowerCase();
+      const loggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || '');
       if (!loggedEmail) return { valid: true };
-      const bizEmail = String(bizCandidate?.email || '').trim().toLowerCase();
+      const bizEmail = normalizeAuthEmail(bizCandidate?.email || '');
       const savedAuthRole = normalizeRole(localStorage.getItem(AUTH_ROLE_STORAGE_KEY) || localStorage.getItem('logged_in_user_role'));
+      const bizIdFilter = bizCandidate?.id ? ` WHERE business_id = '${sqlEsc(bizCandidate.id)}'` : '';
+
+      // Check decoupled business_memberships first
+      if (bizCandidate?.id) {
+        const memRes = runSql(
+          `SELECT * FROM business_memberships WHERE business_id = '${sqlEsc(bizCandidate.id)}' AND LOWER(email) = '${sqlEsc(loggedEmail)}'`,
+          'Session check: Verify membership status'
+        );
+        const memRows = (memRes.success && Array.isArray(memRes.data)) ? memRes.data : [];
+        const matchedMem = memRows.find((m: any) => normalizeRole(m.role) === savedAuthRole) || memRows[0];
+        if (matchedMem) {
+          if (String(matchedMem.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
+            return {
+              valid: false,
+              reason: 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
+            };
+          }
+          if (normalizeRole(matchedMem.role) === 'owner') {
+            return { valid: true };
+          }
+        }
+      }
+
       // Corporate owner session is not gated by staff deletion/suspension
-      if (bizEmail && loggedEmail === bizEmail) {
+      if (bizEmail && loggedEmail === bizEmail && savedAuthRole === 'owner') {
         return { valid: true };
       }
-      const staffBizFilter = bizCandidate?.id ? ` WHERE business_id = '${sqlEsc(bizCandidate.id)}'` : '';
-      const stCheckRes = runSql(`SELECT * FROM staff${staffBizFilter}`, 'Session check: Verify staff status');
+
+      const stCheckRes = runSql(`SELECT * FROM staff${bizIdFilter}`, 'Session check: Verify staff status');
       const stRows = (stCheckRes.success && Array.isArray(stCheckRes.data)) ? stCheckRes.data : [];
       const matchedStaffRow = stRows.find(
         (u: any) =>
-          (u.email && String(u.email).trim().toLowerCase() === loggedEmail) ||
+          (u.email && normalizeAuthEmail(u.email) === loggedEmail) ||
           (u.name && String(u.name).trim().toLowerCase() === loggedEmail)
       );
       if (matchedStaffRow) {
@@ -342,16 +418,58 @@ export default function App() {
           setUserRole(savedRole);
           setAuthenticatedRole(savedAuthRole);
           setUserPermissions(savedPerms);
-          const savedStore = localStorage.getItem('active_store_branch') || '';
+
+          const scopedSettings = loadScopedBusinessSettings(match.id, DEFAULT_SETTINGS, match);
+          const bizZra = switchZraConfigForBusiness(match.id, scopedSettings.zraConfig);
+          scopedSettings.zraConfig = bizZra;
+          setSettings(scopedSettings);
+
+          const savedStore = loadScopedActiveBranch(match.id) || localStorage.getItem('active_store_branch') || '';
           if (savedStore) {
             setActiveStore(savedStore);
           }
+
+          // Ensure active session appears in unlockedWorkspaces if credential_hash exists
+          const loggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || match.email || '');
+          const currentUnlocked = getUnlockedWorkspaces();
+          if (currentUnlocked.length === 0 && loggedEmail) {
+            const mRes = runSql(
+              `SELECT * FROM business_memberships WHERE business_id = '${sqlEsc(match.id)}' AND LOWER(email) = '${sqlEsc(loggedEmail)}'`,
+              'Startup: Load active membership'
+            );
+            const mRow = (mRes.success && Array.isArray(mRes.data))
+              ? mRes.data.find((r: any) => normalizeRole(r.role) === savedAuthRole) || mRes.data[0]
+              : null;
+            if (mRow?.credential_hash) {
+              const seededWs = upsertUnlockedWorkspace({
+                businessId: match.id,
+                businessName: match.name,
+                membershipId: String(mRow.id || deriveMembershipId(match.id, deriveUserId(loggedEmail), savedAuthRole)),
+                userId: String(mRow.user_id || deriveUserId(loggedEmail)),
+                email: loggedEmail,
+                fullName: String(mRow.full_name || localStorage.getItem('logged_in_user_name') || match.owner || 'User'),
+                role: savedAuthRole,
+                credentialHash: String(mRow.credential_hash),
+                accessibleBranches: savedPerms.accessible_branches || [],
+                permissionsJson: String(mRow.permissions_json || JSON.stringify(savedPerms)),
+                storeId: savedStore || String(mRow.store_id || 'main'),
+                unlockedAt: new Date().toISOString(),
+              });
+              setUnlockedWorkspaces(seededWs);
+            }
+          } else {
+            setUnlockedWorkspaces(currentUnlocked);
+          }
+
           setIsAuthenticatedSession(true);
         } else {
           localStorage.removeItem('active_business_profile');
           localStorage.removeItem('pos_authenticated_session');
           localStorage.removeItem('android_pos_settings');
           clearSessionPermissionsFromStorage();
+          clearUnlockedWorkspaces();
+          switchZraConfigForBusiness('');
+          setUnlockedWorkspaces([]);
           setSettings(DEFAULT_SETTINGS);
           setActiveBusiness({ id: '', name: '', owner: '', email: '' });
           setIsAuthenticatedSession(false);
@@ -365,6 +483,9 @@ export default function App() {
         localStorage.removeItem('pos_authenticated_session');
         localStorage.removeItem('android_pos_settings');
         clearSessionPermissionsFromStorage();
+        clearUnlockedWorkspaces();
+        switchZraConfigForBusiness('');
+        setUnlockedWorkspaces([]);
         setSettings(DEFAULT_SETTINGS);
         setActiveBusiness({ id: '', name: '', owner: '', email: '' });
         setIsAuthenticatedSession(false);
@@ -376,6 +497,9 @@ export default function App() {
       localStorage.removeItem('pos_authenticated_session');
       localStorage.removeItem('android_pos_settings');
       clearSessionPermissionsFromStorage();
+      clearUnlockedWorkspaces();
+      switchZraConfigForBusiness('');
+      setUnlockedWorkspaces([]);
       setSettings(DEFAULT_SETTINGS);
       setActiveBusiness({ id: '', name: '', owner: '', email: '' });
       setIsAuthenticatedSession(false);
@@ -407,6 +531,9 @@ export default function App() {
           localStorage.removeItem('quick_salesperson_name');
           localStorage.removeItem('android_pos_settings');
           clearSessionPermissionsFromStorage();
+          clearUnlockedWorkspaces();
+          switchZraConfigForBusiness('');
+          setUnlockedWorkspaces([]);
           void googleSignOut();
           setSettings(DEFAULT_SETTINGS);
           setActiveBusiness({ id: '', name: '', owner: '', email: '' });
@@ -513,12 +640,10 @@ export default function App() {
     }
 
     let currentBiz = activeBusiness;
-    if (bizRows.length > 0 && isAuthenticatedSession) {
+    if (bizRows.length > 0 && isAuthenticatedSession && activeBusiness.id) {
       const matched = bizRows.find((b: any) => b.id === activeBusiness.id);
-      if (!matched && activeBusiness.id) {
-        currentBiz = bizRows[0];
-        setActiveBusiness(currentBiz);
-        localStorage.setItem('active_business_profile', JSON.stringify(currentBiz));
+      if (matched) {
+        currentBiz = matched;
       }
     } else if (bizRows.length === 0 && activeBusiness.id) {
       currentBiz = { id: '', name: '', owner: '', email: '' };
@@ -526,8 +651,8 @@ export default function App() {
       setIsAuthenticatedSession(false);
     }
 
-    // 2. Fetch stores from the single central branches database (strictly 0 pre-created branches)
-    const allStores = getCentralBranches(currentBiz?.id || undefined);
+    // 2. Fetch stores from the single central branches database (strictly scoped to currentBiz.id)
+    const allStores = currentBiz?.id ? getCentralBranches(currentBiz.id) : [];
     setStores(allStores);
     if (currentBiz && currentBiz.id && allStores.length > 0) {
       const permittedStores = (userRole !== 'owner' && accessibleStoreIds.length > 0)
@@ -538,7 +663,7 @@ export default function App() {
       if (!exists) {
         const nextStore = listToUse[0].id;
         setActiveStore(nextStore);
-        localStorage.setItem('active_store_branch', nextStore);
+        saveScopedActiveBranch(currentBiz.id, nextStore);
       }
     } else {
       setActiveStore('');
@@ -549,6 +674,18 @@ export default function App() {
     loadBusinessData();
 
     const handleDbRestored = () => {
+      try {
+        const rawBiz = localStorage.getItem('active_business_profile');
+        if (rawBiz && localStorage.getItem('pos_authenticated_session') === 'true') {
+          const parsedBiz = JSON.parse(rawBiz);
+          if (parsedBiz?.id) {
+            setActiveBusiness(parsedBiz);
+            const scoped = loadScopedBusinessSettings(parsedBiz.id, DEFAULT_SETTINGS, parsedBiz);
+            setSettings(scoped);
+            switchZraConfigForBusiness(parsedBiz.id, scoped.zraConfig);
+          }
+        }
+      } catch {}
       setSqlSeedTrigger(prev => prev + 1);
       loadBusinessData();
       updateBadgeCounts();
@@ -580,7 +717,6 @@ export default function App() {
     try {
       const targetBizId = activeBusiness?.id || undefined;
       if (targetBizId) {
-        const pushRes = await pushDatabaseToServer(targetBizId);
         let fbSuccess = false;
         if (auth.currentUser) {
           try {
@@ -590,29 +726,37 @@ export default function App() {
             console.warn('Header Firebase backup notice:', fbErr);
           }
         }
-        if (pushRes.success || fbSuccess) {
+        const pushRes = await pushDatabaseToServer(targetBizId).catch(() => ({ success: false }));
+        if (fbSuccess || pushRes.success) {
           setLastHeaderSyncMsg('Synced');
         } else {
           setLastHeaderSyncMsg('Sync Retry');
         }
       } else {
-        const sessionEmail = (
-          localStorage.getItem('logged_in_user_email') ||
-          auth.currentUser?.email ||
-          ''
-        ).trim().toLowerCase();
         let restored = false;
-        if (sessionEmail) {
-          const pullRes = await pullDatabaseFromServer(undefined, sessionEmail);
-          restored = pullRes.success && pullRes.found;
-        }
-        if (!restored && auth.currentUser) {
+        if (auth.currentUser) {
           try {
-            const fbPull = await restoreFromCloud();
+            const fbPull = await restoreFromCloud(undefined, { silentIfUnlinked: true });
             restored = fbPull.success;
           } catch {}
         }
+        if (!restored) {
+          const activeWs = unlockedWorkspaces.find((w) => w.businessId === activeBusiness?.id);
+          const sessionEmail = normalizeAuthEmail(
+            activeWs?.email || localStorage.getItem('logged_in_user_email') || auth.currentUser?.email || ''
+          );
+          if (sessionEmail && activeWs?.credentialHash) {
+            const pullRes = await pullDatabaseFromServer(undefined, sessionEmail, activeWs.credentialHash);
+            restored = pullRes.success && pullRes.found;
+          }
+        }
         if (restored) {
+          try {
+            const rawSettings = localStorage.getItem('android_pos_settings');
+            if (rawSettings) {
+              setSettings(prev => ({ ...prev, ...JSON.parse(rawSettings) }));
+            }
+          } catch {}
           loadBusinessData();
           updateBadgeCounts();
           setSqlSeedTrigger(prev => prev + 1);
@@ -629,7 +773,7 @@ export default function App() {
     }
   };
 
-  // Register New Business Account (100% Blank Stock/Batches/Branches Setup + First Account Automatically Becomes Admin)
+  // Register New Business Account (100% Isolated Workspace + Strict Credential Auth)
   const handleRegisterBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthFeedback(null);
@@ -638,10 +782,13 @@ export default function App() {
       return;
     }
     if (newBizPassword.trim().length < 6) {
-      setAuthFeedback({ type: 'error', text: 'Please enter a password of at least 6 characters for Firebase Email/Password Authentication.' });
+      setAuthFeedback({ type: 'error', text: 'Please enter a password of at least 6 characters for Authentication.' });
       return;
     }
 
+    const cleanEmail = normalizeAuthEmail(newBizEmail.trim());
+    const rawPass = newBizPassword.trim();
+    const credHash = computeCredentialHashSync(cleanEmail, rawPass);
     const bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
     const hasInitialStore = Boolean(newBizFirstStore.trim());
     const storeId = hasInitialStore ? ('store_' + Math.floor(1000 + Math.random() * 9000)) : '';
@@ -651,79 +798,94 @@ export default function App() {
     const resolvedTaxRate = !isNaN(parseFloat(newBizTaxRate)) ? parseFloat(newBizTaxRate) : 0;
     const nowStr = new Date().toISOString();
 
-    // 1. Register / Authenticate Admin in Firebase Email/Password Provider
+    // 1. Register / Authenticate Admin using strict (email + password) credential identity
     try {
-      await registerOrSignInWithEmailPassword(newBizEmail.trim(), newBizPassword, newBizOwner.trim());
+      await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+        allowCreate: true,
+        displayName: newBizOwner.trim(),
+      });
     } catch (fbAuthErr: any) {
-      console.warn('Firebase Email/Password registration notice:', fbAuthErr);
+      console.warn('Firebase Credential Auth registration notice:', fbAuthErr);
     }
 
-    // 2. Insert registration record into BUSINESSES (First account = Admin with full billing details)
+    // 2. Insert registration record into BUSINESSES
     runSql(`
       INSERT INTO businesses (
         id, name, owner, email, password, billing_address, billing_city, billing_country,
         billing_phone, billing_email, tpin, currency, tax_rate, admin_role, created_at, business_id, store_id
       ) VALUES (
         '${bizId}',
-        '${newBizName.trim().replace(/'/g, "''")}',
-        '${newBizOwner.trim().replace(/'/g, "''")}',
-        '${newBizEmail.trim().replace(/'/g, "''")}',
-        '${newBizPassword.replace(/'/g, "''")}',
-        '${newBizBillingAddress.trim().replace(/'/g, "''")}',
-        '${newBizBillingCity.trim().replace(/'/g, "''")}',
-        '${newBizBillingCountry.trim().replace(/'/g, "''")}',
-        '${newBizBillingPhone.trim().replace(/'/g, "''")}',
-        '${(newBizBillingEmail.trim() || newBizEmail.trim()).replace(/'/g, "''")}',
-        '${newBizTpin.trim().replace(/'/g, "''")}',
-        '${resolvedCurrency.replace(/'/g, "''")}',
+        '${sqlEsc(newBizName.trim())}',
+        '${sqlEsc(newBizOwner.trim())}',
+        '${sqlEsc(cleanEmail)}',
+        '${sqlEsc(rawPass)}',
+        '${sqlEsc(newBizBillingAddress.trim())}',
+        '${sqlEsc(newBizBillingCity.trim())}',
+        '${sqlEsc(newBizBillingCountry.trim())}',
+        '${sqlEsc(newBizBillingPhone.trim())}',
+        '${sqlEsc(newBizBillingEmail.trim() || cleanEmail)}',
+        '${sqlEsc(newBizTpin.trim())}',
+        '${sqlEsc(resolvedCurrency)}',
         ${resolvedTaxRate},
         'admin',
         '${nowStr}',
         '${bizId}',
         '${storeId || 'main'}'
       )
-    `, `Registration: Create blank enterprise account [${newBizName}] with Admin privileges`);
+    `, `Registration: Create isolated enterprise workspace [${newBizName}] with Owner privileges`);
 
     // Provision isolated chart of accounts for this business
     seedChartOfAccountsOnly(bizId);
 
-    // 3. Provision primary store outlet ONLY if the admin specified a branch name during setup (no pre-seeded branch)
+    // 3. Provision primary store outlet if specified
     if (hasInitialStore && storeId) {
       runSql(`
         INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
           '${storeId}',
           '${bizId}',
-          '${rawStoreName.replace(/'/g, "''")}',
-          '${rawLocation.replace(/'/g, "''")}',
-          '${newBizBillingPhone.trim().replace(/'/g, "''")}',
-          '${(newBizBillingEmail.trim() || newBizEmail.trim()).replace(/'/g, "''")}',
+          '${sqlEsc(rawStoreName)}',
+          '${sqlEsc(rawLocation)}',
+          '${sqlEsc(newBizBillingPhone.trim())}',
+          '${sqlEsc(newBizBillingEmail.trim() || cleanEmail)}',
           1, 1, 1, 0, '${storeId}'
         )
       `, `Registration: Provision initial store outlet [${rawStoreName}]`);
     }
 
-    // 4. Automatically register the first account as the Admin user in the STAFF table
-    const existingStaffRes = runSql(`SELECT * FROM staff WHERE email = '${newBizEmail.trim().replace(/'/g, "''")}' AND business_id = '${bizId}'`, 'Registration: Check admin staff entry');
-    if (!existingStaffRes.data || existingStaffRes.data.length === 0) {
-      const nextStaffId = Date.now() % 1000000;
-      runSql(`
-        INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id, business_id) VALUES (
-          '${nextStaffId}',
-          '${newBizOwner.trim().replace(/'/g, "''")}',
-          'owner',
-          0,
-          '0000',
-          '${newBizEmail.trim().replace(/'/g, "''")}',
-          '${newBizPassword.replace(/'/g, "''")}',
-          '${storeId}',
-          '${bizId}'
-        )
-      `, `Registration: Provision first account [${newBizOwner.trim()}] as Admin (owner)`);
-    }
+    // 4. Register Owner in STAFF & decoupled USERS + BUSINESS_MEMBERSHIPS
+    const nextStaffId = Date.now() % 1000000;
+    runSql(`
+      INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id, business_id) VALUES (
+        '${nextStaffId}',
+        '${sqlEsc(newBizOwner.trim())}',
+        'owner',
+        0,
+        '0000',
+        '${sqlEsc(cleanEmail)}',
+        '${sqlEsc(rawPass)}',
+        '${storeId}',
+        '${bizId}'
+      )
+    `, `Registration: Provision first account [${newBizOwner.trim()}] as Owner`);
 
-    // 5. Update StoreSettings with the new business configuration & billing address
+    const ownerPerms = buildUserPermissions({ role: 'owner' });
+    const ownerMem = upsertUserAndMembership({
+      businessId: bizId,
+      email: cleanEmail,
+      fullName: newBizOwner.trim(),
+      password: rawPass,
+      credentialHash: credHash,
+      role: 'owner',
+      storeId: storeId || 'main',
+      accessibleBranches: [],
+      permissionsJson: JSON.stringify(ownerPerms),
+      status: 'ACTIVE',
+    });
+
+    // 5. Update isolated StoreSettings & ZRA config strictly for this business
+    const bizZra = switchZraConfigForBusiness(bizId);
     const updatedSettings: StoreSettings = {
-      ...settings,
+      ...DEFAULT_SETTINGS,
       storeName: newBizName.trim(),
       currency: resolvedCurrency,
       taxRate: resolvedTaxRate,
@@ -732,47 +894,69 @@ export default function App() {
       billingCity: newBizBillingCity.trim(),
       billingCountry: newBizBillingCountry.trim(),
       billingPhone: newBizBillingPhone.trim(),
-      billingEmail: newBizBillingEmail.trim() || newBizEmail.trim(),
-      receiptHeader: settings.receiptHeader || 'Official Tax Invoice & Sales Receipt',
-      receiptFooter: settings.receiptFooter || 'Thank you for your business!'
+      billingEmail: newBizBillingEmail.trim() || cleanEmail,
+      receiptHeader: 'Official Tax Invoice & Sales Receipt',
+      receiptFooter: 'Thank you for your business!',
+      zraConfig: bizZra,
     };
     setSettings(updatedSettings);
-    localStorage.setItem('android_pos_settings', JSON.stringify(updatedSettings));
+    saveScopedBusinessSettings(bizId, updatedSettings);
 
     const newlyRegisteredBusiness = {
       id: bizId,
       name: newBizName.trim(),
       owner: newBizOwner.trim(),
-      email: newBizEmail.trim()
+      email: cleanEmail,
     };
 
-    // 6. Save authenticated Admin session
+    // 6. Save authenticated Admin session & register into Unlocked Workspaces
     const openCashNum = Math.max(0, parseFloat(newBizOpeningCash || '0') || 0);
     localStorage.setItem('active_business_profile', JSON.stringify(newlyRegisteredBusiness));
     localStorage.setItem('pos_authenticated_session', 'true');
     localStorage.setItem('pos_shift_active', 'true');
     if (storeId) {
+      saveScopedActiveBranch(bizId, storeId);
       localStorage.setItem('shift_active_' + storeId, 'true');
       localStorage.setItem('shift_opening_cash_' + storeId, openCashNum.toFixed(2));
+    } else {
+      saveScopedActiveBranch(bizId, '');
     }
     localStorage.setItem('shift_opening_cash_global', openCashNum.toFixed(2));
-    localStorage.setItem('logged_in_user_email', newBizEmail.trim());
+    localStorage.setItem('logged_in_user_email', cleanEmail);
     localStorage.setItem('logged_in_user_name', newBizOwner.trim());
     localStorage.setItem('quick_salesperson_name', newBizOwner.trim());
     localStorage.setItem('logged_in_user_role', 'owner');
-    const ownerPerms = buildUserPermissions({ role: 'owner' });
+    localStorage.setItem('logged_in_accessible_branches', JSON.stringify([]));
     saveSessionPermissionsToStorage(ownerPerms, 'owner');
 
+    const nextUnlocked = upsertUnlockedWorkspace({
+      businessId: bizId,
+      businessName: newBizName.trim(),
+      membershipId: String(ownerMem?.id || deriveMembershipId(bizId, deriveUserId(cleanEmail), 'owner')),
+      userId: String(ownerMem?.user_id || deriveUserId(cleanEmail)),
+      email: cleanEmail,
+      fullName: newBizOwner.trim(),
+      role: 'owner',
+      credentialHash: credHash,
+      accessibleBranches: [],
+      permissionsJson: JSON.stringify(ownerPerms),
+      storeId: storeId || 'main',
+      unlockedAt: nowStr,
+    });
+    setUnlockedWorkspaces(nextUnlocked);
+
     setActiveBusiness(newlyRegisteredBusiness);
+    setAccessibleStoreIds([]);
     setActiveStore(storeId);
     setUserRole('owner');
     setAuthenticatedRole('owner');
     setUserPermissions(ownerPerms);
     setIsAuthenticatedSession(true);
+    setIsCreatingNewWorkspace(false);
     persistTablesToStorage();
     setSqlSeedTrigger(prev => prev + 1);
 
-    // 7. Synchronize new business & store immediately to Cloud SQL + Firebase Firestore & Firebase Storage
+    // 7. Synchronize new business & store immediately to Cloud SQL + Firebase Firestore & Credential Directory
     pushDatabaseToServer(bizId).catch(err => console.warn('Initial Cloud SQL push warning:', err));
     if (auth.currentUser) {
       backupToCloud(bizId).catch(err => console.warn('Initial Firebase backup warning:', err));
@@ -795,15 +979,346 @@ export default function App() {
     setNewBizBillingPhone('');
     setNewBizBillingEmail('');
 
-    // Open unified Settings & Admin Business Control Panel if they haven't created a store yet so they can set up stores, users, stock & billing
     if (!storeId) {
       openUnifiedSettings('stores');
+    } else {
+      setActiveTab2('billing');
     }
 
     window.dispatchEvent(new Event('pos_data_updated'));
   };
 
-  // Sign In & Pull Existing Business or Staff Account from Firebase Auth + Cloud SQL / Firestore / Storage
+  // Switch cleanly to an already-unlocked business workspace session
+  const activateUnlockedWorkspaceSession = async (
+    ws: UnlockedWorkspaceSession,
+    options?: { explicitBranch?: string; promptBranchGate?: boolean; skipFirebaseReauth?: boolean }
+  ) => {
+    const bRes = runSql(`SELECT * FROM businesses WHERE id = '${sqlEsc(ws.businessId)}'`, 'Workspace Switch: Load business profile');
+    const bizRow = (bRes.success && Array.isArray(bRes.data) && bRes.data.length > 0)
+      ? bRes.data[0]
+      : { id: ws.businessId, name: ws.businessName, owner: ws.fullName, email: ws.email };
+
+    const normRole = normalizeRole(ws.role);
+    const resolvedPerms: UserPermissions =
+      normRole === 'owner'
+        ? buildUserPermissions({ role: 'owner' })
+        : parseStaffPermissions(ws.permissionsJson, normRole);
+
+    let allowedBranches: string[] = [];
+    if (normRole !== 'owner') {
+      allowedBranches = Array.isArray(ws.accessibleBranches) && ws.accessibleBranches.length > 0
+        ? ws.accessibleBranches
+        : (resolvedPerms.accessible_branches || []);
+      if (allowedBranches.length === 0 && ws.storeId && ws.storeId !== 'main') {
+        allowedBranches = [ws.storeId];
+      }
+    }
+
+    const activeBizObj = {
+      id: bizRow.id,
+      name: bizRow.name || ws.businessName,
+      owner: bizRow.owner || ws.fullName,
+      email: bizRow.email || ws.email,
+    };
+
+    const allStores = getCentralBranches(bizRow.id);
+    const permittedStores = (normRole !== 'owner' && allowedBranches.length > 0)
+      ? allStores.filter((s: any) => allowedBranches.includes(s.id))
+      : allStores;
+    const availableStores = permittedStores.length > 0 ? permittedStores : allStores;
+
+    let chosenBranch = '';
+    if (availableStores.length > 0) {
+      const savedScopedBranch = loadScopedActiveBranch(bizRow.id);
+      if (options?.explicitBranch && availableStores.some((s: any) => s.id === options.explicitBranch)) {
+        chosenBranch = options.explicitBranch;
+      } else if (savedScopedBranch && availableStores.some((s: any) => s.id === savedScopedBranch)) {
+        chosenBranch = savedScopedBranch;
+      } else if (ws.storeId && availableStores.some((s: any) => s.id === ws.storeId)) {
+        chosenBranch = ws.storeId;
+      } else {
+        chosenBranch = availableStores[0].id;
+      }
+    }
+
+    // Isolate settings & ZRA config strictly to this businessId
+    const scopedSettings = loadScopedBusinessSettings(bizRow.id, DEFAULT_SETTINGS, bizRow);
+    const scopedZra = switchZraConfigForBusiness(bizRow.id, scopedSettings.zraConfig);
+    scopedSettings.zraConfig = scopedZra;
+
+    saveScopedBusinessSettings(bizRow.id, scopedSettings);
+    saveScopedActiveBranch(bizRow.id, chosenBranch);
+
+    localStorage.setItem('active_business_profile', JSON.stringify(activeBizObj));
+    localStorage.setItem('pos_authenticated_session', 'true');
+    localStorage.setItem('logged_in_accessible_branches', JSON.stringify(allowedBranches));
+    localStorage.setItem('logged_in_user_role', normRole);
+    localStorage.setItem('logged_in_user_email', ws.email);
+    localStorage.setItem('logged_in_user_name', ws.fullName);
+    localStorage.setItem('quick_salesperson_name', ws.fullName);
+    saveSessionPermissionsToStorage(resolvedPerms, normRole);
+
+    if (chosenBranch) {
+      localStorage.setItem('pos_shift_active', 'true');
+      localStorage.setItem('shift_active_' + chosenBranch, 'true');
+    }
+
+    setSettings(scopedSettings);
+    setActiveBusiness(activeBizObj);
+    setAccessibleStoreIds(allowedBranches);
+    setStores(allStores);
+    setActiveStore(chosenBranch);
+    setUserRole(normRole);
+    setAuthenticatedRole(normRole);
+    setUserPermissions(resolvedPerms);
+    setIsAuthenticatedSession(true);
+    setIsCreatingNewWorkspace(false);
+    setShowWorkspaceDropdown(false);
+    setActiveTab2('billing');
+
+    if (options?.promptBranchGate && !options?.explicitBranch && availableStores.length > 0) {
+      setShowBranchChoiceGate(true);
+    }
+
+    if (!options?.skipFirebaseReauth && ws.credentialHash) {
+      void signInWithCredentialHash(ws.credentialHash, ws.fullName);
+    }
+
+    setSqlSeedTrigger(prev => prev + 1);
+    window.dispatchEvent(new Event('pos_data_updated'));
+  };
+
+  // Strict (email + password) authentication resolver used for both Log In & Unlock Another Workspace
+  const authenticateAndResolveWorkspace = async (
+    targetEmailRaw: string,
+    targetPassRaw: string,
+    options?: { targetBranch?: string; preserveExistingUnlocked?: boolean }
+  ): Promise<{ success: boolean; error?: string; workspace?: UnlockedWorkspaceSession }> => {
+    const cleanEmail = normalizeAuthEmail(targetEmailRaw);
+    const rawPass = String(targetPassRaw || '').trim();
+    if (!cleanEmail || !rawPass) {
+      return { success: false, error: 'Please enter both Email and Password.' };
+    }
+
+    const credHash = computeCredentialHashSync(cleanEmail, rawPass);
+    const previousActiveWs = unlockedWorkspaces.find((w) => w.businessId === activeBusiness?.id);
+    const restorePreviousAuthIfNeeded = async () => {
+      if (options?.preserveExistingUnlocked && previousActiveWs?.credentialHash) {
+        await signInWithCredentialHash(previousActiveWs.credentialHash, previousActiveWs.fullName);
+      } else if (!options?.preserveExistingUnlocked) {
+        await googleSignOut();
+      }
+    };
+
+    try {
+      // 1. Pull strictly matching (email, credentialHash) records from Cloud SQL
+      await pullDatabaseFromServer(undefined, cleanEmail, credHash).catch(() => ({ success: false, found: false }));
+
+      // 2. Query local decoupled memberships strictly by (email, password)
+      let credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+
+      // 3. Authenticate with strict credential-scoped Firebase Auth
+      let fbAuthRes: Awaited<ReturnType<typeof signInOrCreateCredentialAuth>> | null = null;
+      try {
+        fbAuthRes = await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+          allowCreate: credMatches.length > 0,
+          displayName: credMatches[0]?.fullName,
+          allowLegacyFallback: credMatches.length === 0,
+        });
+      } catch (fbErr: any) {
+        if (credMatches.length === 0) {
+          await restorePreviousAuthIfNeeded();
+          return { success: false, error: fbErr?.message || 'Authentication failed for these credentials.' };
+        }
+      }
+
+      // 4. Discover & claim invited staff / multi-tenant owner memberships from Cloud Firestore (/credential_directory/{credId})
+      if (auth.currentUser) {
+        try {
+          const claimRes = await claimCredentialInviteAndRestore(cleanEmail, rawPass);
+          if (claimRes.found && claimRes.suspended) {
+            await restorePreviousAuthIfNeeded();
+            return {
+              success: false,
+              error: 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
+            };
+          }
+          if (claimRes.found && claimRes.businessId) {
+            credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+          } else if (fbAuthRes?.isLegacyAuth && credMatches.length === 0) {
+            await restoreFromCloud(undefined, { silentIfUnlinked: true }).catch(() => {});
+            const bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check legacy owned business');
+            const bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
+            const ownedLegacyBiz = bizList.find((b: any) => normalizeAuthEmail(b?.email || '') === cleanEmail);
+            if (ownedLegacyBiz) {
+              upsertUserAndMembership({
+                businessId: String(ownedLegacyBiz.id),
+                email: cleanEmail,
+                fullName: String(ownedLegacyBiz.owner || 'Owner'),
+                password: rawPass,
+                credentialHash: credHash,
+                role: 'owner',
+                storeId: String(ownedLegacyBiz.store_id || 'main'),
+                status: 'ACTIVE',
+              });
+              credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+            }
+          } else if (credMatches.length > 0 && navigator.onLine !== false) {
+            const primaryMatch = credMatches[0];
+            const primaryBizId = String(primaryMatch.business.id);
+            let fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
+            if (!fsAccess.hasAccess && primaryMatch.role === 'owner') {
+              const migrated = await tryMigrateLegacyOwnerToCredentialAuth({
+                email: cleanEmail,
+                password: rawPass,
+                businessId: primaryBizId,
+                businessName: String(primaryMatch.business.name || primaryBizId),
+                fullName: primaryMatch.fullName,
+                storeId: String(primaryMatch.business?.store_id || 'main'),
+                permissionsJson: primaryMatch.permissionsJson,
+              });
+              if (migrated) {
+                fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
+              }
+            }
+            if (fsAccess.hasAccess) {
+              await restoreFromCloud(primaryBizId, { silentIfUnlinked: true }).catch(() => {});
+            }
+            upsertUserAndMembership({
+              id: primaryMatch.membership?.id,
+              businessId: primaryBizId,
+              email: cleanEmail,
+              fullName: primaryMatch.fullName,
+              password: rawPass,
+              credentialHash: credHash,
+              role: primaryMatch.role,
+              storeId: String(primaryMatch.staffRow?.store_id || primaryMatch.business?.store_id || 'main'),
+              accessibleBranches: primaryMatch.accessibleBranches,
+              permissionsJson: primaryMatch.permissionsJson,
+              status: primaryMatch.isSuspended ? 'SUSPENDED' : 'ACTIVE',
+            });
+            credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+          }
+        } catch (cloudErr) {
+          console.warn('Credential directory restore notice:', cloudErr);
+        }
+      }
+
+      if (credMatches.length === 0) {
+        await restorePreviousAuthIfNeeded();
+        return {
+          success: false,
+          error: `No registered business or staff membership matched [${cleanEmail}] with that password. Check your password or create a new business account.`,
+        };
+      }
+
+      const activeMatches = credMatches.filter(
+        (m) => !m.isSuspended && !(m.role !== 'owner' && isUserSuspended(m.permissionsJson))
+      );
+      if (activeMatches.length === 0) {
+        await restorePreviousAuthIfNeeded();
+        return {
+          success: false,
+          error: 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
+        };
+      }
+
+      const chosen = activeMatches[0];
+      const chosenPerms: UserPermissions =
+        chosen.role === 'owner' && !chosen.staffRow
+          ? buildUserPermissions({ role: 'owner' })
+          : parseStaffPermissions(chosen.permissionsJson, chosen.role);
+
+      let userAllowedBranches: string[] = [];
+      if (chosen.role !== 'owner') {
+        userAllowedBranches = chosen.accessibleBranches.length > 0
+          ? chosen.accessibleBranches
+          : (chosenPerms.accessible_branches || []);
+        if (userAllowedBranches.length === 0 && chosen.staffRow?.store_id) {
+          userAllowedBranches = [String(chosen.staffRow.store_id)];
+        }
+      }
+
+      if (options?.targetBranch && userAllowedBranches.length > 0 && !userAllowedBranches.includes(options.targetBranch)) {
+        await restorePreviousAuthIfNeeded();
+        return {
+          success: false,
+          error: `Access Denied: Account [${cleanEmail}] does not have permission to access branch [${options.targetBranch.toUpperCase()}].`,
+        };
+      }
+
+      if (!options?.preserveExistingUnlocked) {
+        clearUnlockedWorkspaces();
+      }
+
+      let updatedList = getUnlockedWorkspaces();
+      let activatedWs: UnlockedWorkspaceSession | null = null;
+      const nowIso = new Date().toISOString();
+
+      for (const m of activeMatches) {
+        const mPerms: UserPermissions =
+          m.role === 'owner' && !m.staffRow
+            ? buildUserPermissions({ role: 'owner' })
+            : parseStaffPermissions(m.permissionsJson, m.role);
+        const wsEntry: UnlockedWorkspaceSession = {
+          businessId: String(m.business.id),
+          businessName: String(m.business.name || m.business.id),
+          membershipId: String(m.membership?.id || deriveMembershipId(String(m.business.id), deriveUserId(cleanEmail), m.role)),
+          userId: String(m.membership?.user_id || deriveUserId(cleanEmail)),
+          email: cleanEmail,
+          fullName: m.fullName,
+          role: m.role,
+          credentialHash: credHash,
+          accessibleBranches: m.role === 'owner' ? [] : (m.accessibleBranches.length > 0 ? m.accessibleBranches : (mPerms.accessible_branches || [])),
+          permissionsJson: m.permissionsJson,
+          storeId: String(m.staffRow?.store_id || m.business?.store_id || 'main'),
+          unlockedAt: nowIso,
+        };
+        updatedList = upsertUnlockedWorkspace(wsEntry);
+        if (!activatedWs) activatedWs = wsEntry;
+      }
+
+      setUnlockedWorkspaces(updatedList);
+
+      if (activatedWs) {
+        await activateUnlockedWorkspaceSession(activatedWs, {
+          explicitBranch: options?.targetBranch,
+          promptBranchGate: !options?.preserveExistingUnlocked,
+          skipFirebaseReauth: true,
+        });
+
+        // Ensure owner credentials & backup are published when Firestore access is active
+        if (auth.currentUser && activatedWs.role === 'owner') {
+          void hasVerifiedFirestoreAccessToBusiness(activatedWs.businessId).then((fsAccess) => {
+            if (!fsAccess.hasAccess) return;
+            publishCredentialMembershipToCloud({
+              businessId: activatedWs.businessId,
+              businessName: activatedWs.businessName,
+              membershipId: activatedWs.membershipId,
+              userId: activatedWs.userId,
+              email: activatedWs.email,
+              fullName: activatedWs.fullName,
+              role: 'owner',
+              password: rawPass,
+              credentialHash: credHash,
+              storeId: activatedWs.storeId,
+              accessibleBranches: [],
+              permissionsJson: activatedWs.permissionsJson,
+              status: 'ACTIVE',
+            }).catch(() => {});
+            backupToCloud(activatedWs.businessId, { silentIfNotOwner: true }).catch(() => {});
+          });
+        }
+      }
+
+      return { success: true, workspace: activatedWs || undefined };
+    } catch (err: any) {
+      await restorePreviousAuthIfNeeded();
+      return { success: false, error: err?.message || String(err) };
+    }
+  };
+
+  // Sign In & Pull Existing Business or Staff Account from Firebase Auth + Cloud SQL / Firestore
   const handleSyncExistingAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthFeedback(null);
@@ -816,195 +1331,17 @@ export default function App() {
 
     setIsHeaderSyncing(true);
     try {
-      // 1. Pull from Cloud SQL by email
-      const pullRes = await pullDatabaseFromServer(undefined, targetEmail);
-      let bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check businesses');
-      let bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
-      let matchedBiz = bizList.find((b: any) => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase());
-
-      // Also check if logging in as a Staff/User account created by Admin
-      let stRes = runSql(`SELECT * FROM staff`, 'Cloud Login: Check staff accounts');
-      let staffList = (stRes.success && Array.isArray(stRes.data)) ? stRes.data : [];
-      let matchedStaff = staffList.find(
-        (u: any) =>
-          (u.email && u.email.trim().toLowerCase() === targetEmail.toLowerCase()) ||
-          (u.name && u.name.trim().toLowerCase() === targetEmail.toLowerCase())
-      );
-
-      // 2. Authenticate with Firebase Email/Password Auth
-      const isLocallyVerified = Boolean(
-        (matchedBiz && (!matchedBiz.password || matchedBiz.password === targetPass)) ||
-        (matchedStaff && (matchedStaff.password === targetPass || matchedStaff.pin === targetPass))
-      );
-      try {
-        await signInWithEmailPasswordAccount(targetEmail, targetPass, isLocallyVerified, matchedBiz?.owner || matchedStaff?.name);
-      } catch (fbErr: any) {
-        if (!matchedBiz && !matchedStaff) {
-          throw new Error(fbErr?.message || 'Invalid email or password.');
-        }
-      }
-
-      // 3. If not found in Cloud SQL yet, restore from Firebase Firestore & Storage via authenticated UID
-      if (!matchedBiz && !matchedStaff && auth.currentUser) {
-        try {
-          await restoreFromCloud();
-          bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check businesses after Firebase restore');
-          bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
-          matchedBiz =
-            bizList.find((b: any) => b.email && b.email.trim().toLowerCase() === targetEmail.toLowerCase()) ||
-            bizList[0];
-
-          stRes = runSql(`SELECT * FROM staff`, 'Cloud Login: Check staff after Firebase restore');
-          staffList = (stRes.success && Array.isArray(stRes.data)) ? stRes.data : [];
-          matchedStaff = staffList.find(
-            (u: any) =>
-              (u.email && u.email.trim().toLowerCase() === targetEmail.toLowerCase()) ||
-              (u.name && u.name.trim().toLowerCase() === targetEmail.toLowerCase())
-          );
-        } catch (restoreErr) {
-          console.warn('Firebase restore lookup notice:', restoreErr);
-        }
-      }
-
-      // If matched a Staff user and there's a business in DB
-      if (!matchedBiz && matchedStaff && bizList.length > 0) {
-        if (matchedStaff.password && matchedStaff.password !== targetPass && matchedStaff.pin !== targetPass) {
-          setAuthFeedback({ type: 'error', text: 'Invalid password or PIN for this user account.' });
-          setIsHeaderSyncing(false);
-          return;
-        }
-        matchedBiz = bizList[0];
-      }
-
-      if (!matchedBiz) {
-        setAuthFeedback({ type: 'error', text: `No account found for [${targetEmail}]. Please check your credentials or switch to "Create Account" to set up your business.` });
-        setIsHeaderSyncing(false);
+      const res = await authenticateAndResolveWorkspace(targetEmail, targetPass, {
+        targetBranch: syncLoginBranch || undefined,
+        preserveExistingUnlocked: false,
+      });
+      if (!res.success) {
+        setAuthFeedback({ type: 'error', text: res.error || 'Invalid credentials.' });
         return;
       }
-
-      if (!matchedStaff && matchedBiz.password && matchedBiz.password !== 'cloud_recovered' && matchedBiz.password !== targetPass) {
-        setAuthFeedback({ type: 'error', text: 'Invalid password for this business account.' });
-        setIsHeaderSyncing(false);
-        return;
-      }
-
-      const resolvedRole = matchedStaff && matchedBiz.email?.toLowerCase() !== targetEmail.toLowerCase()
-        ? (matchedStaff.role || 'sales')
-        : 'owner';
-      const normalizedResolvedRole = normalizeRole(resolvedRole);
-
-      // Block suspended staff accounts from signing in
-      if (matchedStaff && normalizedResolvedRole !== 'owner' && isUserSuspended(matchedStaff.permissions_json)) {
-        setAuthFeedback({
-          type: 'error',
-          text: 'Account Suspended: Your staff access has been suspended by an Administrator. Please contact your Business Owner.',
-        });
-        setIsHeaderSyncing(false);
-        return;
-      }
-
-      const resolvedUserName = matchedStaff?.name || (matchedStaff?.first_name ? `${matchedStaff.first_name} ${matchedStaff.surname || ''}`.trim() : '') || matchedBiz.owner || 'Admin';
-
-      const resolvedPermissions: UserPermissions =
-        normalizedResolvedRole === 'owner' && !matchedStaff
-          ? buildUserPermissions({ role: 'owner' })
-          : parseStaffPermissions(matchedStaff?.permissions_json, normalizedResolvedRole);
-
-      // Extract accessible branches for this account
-      let userAllowedBranches: string[] = [];
-      if (normalizedResolvedRole !== 'owner' && matchedStaff) {
-        if (resolvedPermissions.accessible_branches.length > 0) {
-          userAllowedBranches = resolvedPermissions.accessible_branches;
-        }
-        if (userAllowedBranches.length === 0 && matchedStaff.store_id) {
-          userAllowedBranches = [matchedStaff.store_id];
-        }
-      }
-
-      const allStores = getCentralBranches(matchedBiz.id);
-
-      // Check branch authorization if user picked a branch on the login form
-      if (syncLoginBranch && userAllowedBranches.length > 0 && !userAllowedBranches.includes(syncLoginBranch)) {
-        setAuthFeedback({
-          type: 'error',
-          text: `Access Denied: Account [${targetEmail}] does not have permission to access branch [${syncLoginBranch.toUpperCase()}]. Accessible: ${userAllowedBranches.join(', ').toUpperCase()}`,
-        });
-        setIsHeaderSyncing(false);
-        return;
-      }
-
-      setAccessibleStoreIds(userAllowedBranches);
-      localStorage.setItem('logged_in_accessible_branches', JSON.stringify(userAllowedBranches));
-      localStorage.setItem('logged_in_user_role', normalizedResolvedRole);
-      saveSessionPermissionsToStorage(resolvedPermissions, normalizedResolvedRole);
-
-      const activeBizObj = {
-        id: matchedBiz.id,
-        name: matchedBiz.name,
-        owner: matchedBiz.owner || 'Admin',
-        email: matchedBiz.email
-      };
-      setActiveBusiness(activeBizObj);
-      localStorage.setItem('active_business_profile', JSON.stringify(activeBizObj));
-      localStorage.setItem('pos_authenticated_session', 'true');
-      setIsAuthenticatedSession(true);
-
-      const updatedSettings: StoreSettings = {
-        ...settings,
-        storeName: matchedBiz.name || settings.storeName,
-        currency: matchedBiz.currency || settings.currency || 'K',
-        taxRate: matchedBiz.tax_rate !== undefined ? Number(matchedBiz.tax_rate) : settings.taxRate,
-        tpin: matchedBiz.tpin || settings.tpin || '',
-        billingAddress: matchedBiz.billing_address || settings.billingAddress || '',
-        billingCity: matchedBiz.billing_city || settings.billingCity || '',
-        billingCountry: matchedBiz.billing_country || settings.billingCountry || '',
-        billingPhone: matchedBiz.billing_phone || settings.billingPhone || '',
-        billingEmail: matchedBiz.billing_email || matchedBiz.email || settings.billingEmail || ''
-      };
-      setSettings(updatedSettings);
-      localStorage.setItem('android_pos_settings', JSON.stringify(updatedSettings));
-
-      const permittedStores = (resolvedRole !== 'owner' && userAllowedBranches.length > 0)
-        ? allStores.filter((s: any) => userAllowedBranches.includes(s.id))
-        : allStores;
-      const availableStores = permittedStores.length > 0 ? permittedStores : allStores;
-      setStores(allStores);
-
-      if (Array.isArray(availableStores) && availableStores.length > 0) {
-        const chosenBranch = (syncLoginBranch && availableStores.some((s: any) => s.id === syncLoginBranch))
-          ? syncLoginBranch
-          : (matchedStaff?.store_id && availableStores.some((s: any) => s.id === matchedStaff.store_id))
-            ? matchedStaff.store_id
-            : availableStores[0].id;
-        setActiveStore(chosenBranch);
-        localStorage.setItem('active_store_branch', chosenBranch);
-        localStorage.setItem('pos_shift_active', 'true');
-        localStorage.setItem('shift_active_' + chosenBranch, 'true');
-        // Prompt user to confirm/choose their branch when logging in if they didn't explicitly pick one in the dropdown
-        if (!syncLoginBranch) {
-          setShowBranchChoiceGate(true);
-        }
-      } else {
-        setActiveStore('');
-      }
-
-      // Ensure Firebase Firestore + Storage mirror is up to date after Owner sign-in
-      if (auth.currentUser && resolvedRole === 'owner' && !matchedStaff) {
-        backupToCloud(matchedBiz.id, { silentIfNotOwner: true }).catch(() => {});
-      }
-
-      localStorage.setItem('logged_in_user_email', targetEmail);
-      localStorage.setItem('logged_in_user_name', resolvedUserName);
-      localStorage.setItem('quick_salesperson_name', resolvedUserName);
-      setUserRole(normalizedResolvedRole);
-      setAuthenticatedRole(normalizedResolvedRole);
-      setUserPermissions(resolvedPermissions);
-      setActiveTab2('billing');
       setSyncLoginEmail('');
       setSyncLoginPassword('');
       setSyncLoginBranch('');
-      setSqlSeedTrigger(prev => prev + 1);
-      window.dispatchEvent(new Event('pos_data_updated'));
     } catch (err: any) {
       setAuthFeedback({ type: 'error', text: `Sign-In Error: ${err?.message || String(err)}` });
     } finally {
@@ -1012,7 +1349,41 @@ export default function App() {
     }
   };
 
+  // Unlock and add an additional Business Workspace strictly by (email, password) while staying signed in
+  const handleUnlockAnotherWorkspace = async (
+    emailInput: string,
+    passwordInput: string
+  ): Promise<{ success: boolean; error?: string }> => {
+    setIsUnlockingWorkspace(true);
+    try {
+      const res = await authenticateAndResolveWorkspace(emailInput, passwordInput, {
+        preserveExistingUnlocked: true,
+      });
+      if (!res.success) {
+        return { success: false, error: res.error || 'Could not unlock workspace with these credentials.' };
+      }
+      return { success: true };
+    } finally {
+      setIsUnlockingWorkspace(false);
+    }
+  };
+
   const handleLogoutAccount = async () => {
+    const logoutBizId = activeBusiness?.id;
+    if (
+      logoutBizId &&
+      logoutBizId !== 'default_biz' &&
+      auth.currentUser &&
+      (typeof navigator === 'undefined' || navigator.onLine !== false)
+    ) {
+      try {
+        await Promise.race([
+          backupToCloud(logoutBizId, { silentIfNotOwner: true }),
+          new Promise((resolve) => setTimeout(resolve, 2500)),
+        ]);
+      } catch {}
+    }
+
     localStorage.removeItem('pos_authenticated_session');
     localStorage.removeItem('active_business_profile');
     localStorage.removeItem('active_store_branch');
@@ -1024,7 +1395,13 @@ export default function App() {
     localStorage.removeItem('quick_salesperson_name');
     localStorage.removeItem('android_pos_settings');
     clearSessionPermissionsFromStorage();
+    clearUnlockedWorkspaces();
+    switchZraConfigForBusiness('');
 
+    setUnlockedWorkspaces([]);
+    setShowWorkspaceDropdown(false);
+    setShowUnlockWorkspaceModal(false);
+    setIsCreatingNewWorkspace(false);
     setSettings(DEFAULT_SETTINGS);
     setActiveBusiness({ id: '', name: '', owner: '', email: '' });
     setActiveStore('');
@@ -1048,33 +1425,25 @@ export default function App() {
   };
 
   // Switch workspace immediately and isolate branch/tenant data
-  const handleSelectBusinessWorkspace = (biz: any) => {
-    setActiveBusiness(biz);
-    localStorage.setItem('active_business_profile', JSON.stringify(biz));
-    const bizBranches = getCentralBranches(biz?.id);
-    const nextBranch = bizBranches.length > 0 ? String(bizBranches[0].id) : '';
-    setStores(bizBranches);
-    setActiveStore(nextBranch);
-    if (nextBranch) {
-      localStorage.setItem('active_store_branch', nextBranch);
-    } else {
-      localStorage.removeItem('active_store_branch');
+  const handleSelectBusinessWorkspace = async (target: any) => {
+    // Prefer strict UnlockedWorkspaceSession entry
+    if (target?.businessId && target?.credentialHash) {
+      await activateUnlockedWorkspaceSession(target as UnlockedWorkspaceSession);
+      return;
     }
-    if (biz?.name) {
-      setSettings(prev => {
-        const next = {
-          ...prev,
-          storeName: biz.name,
-          currency: biz.currency || prev.currency,
-          taxRate: biz.tax_rate !== undefined ? Number(biz.tax_rate) : prev.taxRate,
-          tpin: biz.tpin || prev.tpin,
-        };
-        localStorage.setItem('android_pos_settings', JSON.stringify(next));
-        return next;
-      });
+    const matchingWs = unlockedWorkspaces.find((w) => w.businessId === target?.id);
+    if (matchingWs) {
+      await activateUnlockedWorkspaceSession(matchingWs);
+      return;
     }
-    setSqlSeedTrigger(prev => prev + 1);
-    window.dispatchEvent(new Event('pos_data_updated'));
+    // Never switch to an unverified business without credentials
+    setUnlockEmail(activeBusiness?.email || '');
+    setUnlockPassword('');
+    setUnlockFeedback({
+      type: 'error',
+      text: `Enter the password for [${target?.name || 'this business'}] to verify and switch workspaces.`,
+    });
+    setShowUnlockWorkspaceModal(true);
   };
 
   // Compute branches accessible to the currently logged-in account
@@ -1084,7 +1453,7 @@ export default function App() {
 
   const handleSwitchBranch = (branchId: string) => {
     setActiveStore(branchId);
-    localStorage.setItem('active_store_branch', branchId);
+    saveScopedActiveBranch(activeBusiness?.id || '', branchId);
     localStorage.setItem('pos_shift_active', 'true');
     localStorage.setItem('shift_active_' + branchId, 'true');
     setSqlSeedTrigger(prev => prev + 1);
@@ -1108,7 +1477,7 @@ export default function App() {
       setShowSqlSplit={setShowSqlSplit}
       storeName={isAuthenticatedSession && activeBusiness.id ? (settings.storeName || activeBusiness.name || '') : ''}
     >
-      {!isAuthenticatedSession || !activeBusiness.id ? (
+      {!isAuthenticatedSession || !activeBusiness.id || isCreatingNewWorkspace ? (
         /* FULL-SCREEN LOG IN OR CREATE ACCOUNT ONBOARDING GATE (NO PRE-SEEDED DETAILS, BRANCHES, OR STOCK) */
         <div className="flex-1 flex flex-col items-center justify-center bg-slate-950 text-slate-100 p-4 sm:p-6 overflow-y-auto select-none">
           <motion.div
@@ -1129,39 +1498,53 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Switch between Log In & Create Account */}
+              {/* Switch between Log In & Create Account (or return to active workspace) */}
               <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                {isCreatingNewWorkspace && isAuthenticatedSession && activeBusiness.id && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsCreatingNewWorkspace(false);
+                      setAuthFeedback(null);
+                    }}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-extrabold uppercase tracking-wider cursor-pointer"
+                  >
+                    ← Back to {activeBusiness.name}
+                  </button>
+                )}
                 <PWAInstallButton variant="header" />
-                <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthFeedback(null);
-                    setAuthScreenMode('login');
-                  }}
-                  className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
-                    authScreenMode === 'login'
-                      ? 'bg-emerald-600 text-white shadow-md'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  Log In
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthFeedback(null);
-                    setAuthScreenMode('register');
-                  }}
-                  className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
-                    authScreenMode === 'register'
-                      ? 'bg-indigo-600 text-white shadow-md'
-                      : 'text-slate-400 hover:text-white'
-                  }`}
-                >
-                  Create Account
-                </button>
-              </div>
+                {!isCreatingNewWorkspace && (
+                  <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthFeedback(null);
+                      setAuthScreenMode('login');
+                    }}
+                    className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
+                      authScreenMode === 'login'
+                        ? 'bg-emerald-600 text-white shadow-md'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Log In
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthFeedback(null);
+                      setAuthScreenMode('register');
+                    }}
+                    className={`px-3.5 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider transition-all cursor-pointer ${
+                      authScreenMode === 'register'
+                        ? 'bg-indigo-600 text-white shadow-md'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Create Account
+                  </button>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1465,27 +1848,123 @@ export default function App() {
               <Menu size={18} className="group-hover:scale-110 transition-transform" />
             </button>
 
-            {/* Active Business / Settings & Admin Control Panel Button */}
-            <button
-              type="button"
-              onClick={() => {
-                if (hasAnySettingsAccess) {
-                  openUnifiedSettings(permittedSettingsTabs[0] || 'general');
-                }
-              }}
-              disabled={!hasAnySettingsAccess}
-              className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-xs font-extrabold transition-all shadow-sm font-sans border ${
-                hasAnySettingsAccess ? 'cursor-pointer' : 'cursor-default opacity-90'
-              } ${
-                activeTab === 'settings'
-                  ? 'bg-indigo-600 text-white border-indigo-400'
-                  : 'bg-indigo-950/80 text-indigo-200 border-indigo-800/80 hover:bg-indigo-900 hover:text-white'
-              }`}
-              title={hasAnySettingsAccess ? 'Open Settings (Permitted Sections)' : 'Business Workspace'}
-            >
-              <Building2 size={13} className="text-emerald-400 animate-pulse shrink-0" />
-              <span className="truncate max-w-[90px] sm:max-w-[160px]">{activeBusiness.name || 'Business Settings'}</span>
-            </button>
+            {/* Multi-Tenant Workspace Switcher Dropdown */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowWorkspaceDropdown((prev) => !prev)}
+                className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-xs font-extrabold transition-all shadow-sm font-sans border cursor-pointer ${
+                  showWorkspaceDropdown
+                    ? 'bg-indigo-600 text-white border-indigo-400'
+                    : 'bg-indigo-950/80 text-indigo-200 border-indigo-800/80 hover:bg-indigo-900 hover:text-white'
+                }`}
+                title="Switch Business Workspace or Unlock Another Shop"
+              >
+                <Building2 size={13} className="text-emerald-400 shrink-0" />
+                <span className="truncate max-w-[90px] sm:max-w-[150px]">{activeBusiness.name || 'Workspace'}</span>
+                <span className="px-1.5 py-0.2 bg-slate-950/70 text-emerald-300 border border-indigo-500/40 rounded text-[9px] font-black uppercase">
+                  {authenticatedRole === 'owner' ? 'Owner' : authenticatedRole === 'manager' ? 'Mgr' : 'Cashier'}
+                </span>
+                <ChevronRight size={12} className={`transition-transform ${showWorkspaceDropdown ? 'rotate-90' : ''}`} />
+              </button>
+
+              {showWorkspaceDropdown && (
+                <div className="fixed inset-0 z-40" onClick={() => setShowWorkspaceDropdown(false)} />
+              )}
+
+              {showWorkspaceDropdown && (
+                <div className="absolute left-0 mt-1.5 w-72 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-2 z-50 flex flex-col gap-1.5">
+                  <div className="px-2 py-1 border-b border-slate-800 flex items-center justify-between">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">
+                      Unlocked Workspaces ({unlockedWorkspaces.length})
+                    </span>
+                    {hasAnySettingsAccess && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowWorkspaceDropdown(false);
+                          openUnifiedSettings(permittedSettingsTabs[0] || 'general');
+                        }}
+                        className="text-[10px] font-bold text-indigo-400 hover:text-indigo-300 cursor-pointer"
+                      >
+                        Settings
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col gap-1 max-h-56 overflow-y-auto">
+                    {unlockedWorkspaces.map((ws) => {
+                      const isCurrentWs = ws.businessId === activeBusiness.id;
+                      const roleBadge = ws.role === 'owner' ? 'Owner' : ws.role === 'manager' ? 'Manager' : 'Cashier';
+                      return (
+                        <button
+                          key={`${ws.businessId}_${ws.membershipId}`}
+                          type="button"
+                          onClick={() => {
+                            setShowWorkspaceDropdown(false);
+                            if (!isCurrentWs) {
+                              void activateUnlockedWorkspaceSession(ws);
+                            }
+                          }}
+                          className={`w-full text-left px-2.5 py-2 rounded-lg border flex items-center justify-between gap-2 transition-all cursor-pointer ${
+                            isCurrentWs
+                              ? 'bg-indigo-950/90 border-indigo-500 text-white'
+                              : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-extrabold truncate">{ws.businessName}</div>
+                            <div className="text-[9.5px] font-mono text-slate-400 truncate">{ws.email}</div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase ${
+                              ws.role === 'owner'
+                                ? 'bg-indigo-600/30 text-indigo-300 border border-indigo-500/40'
+                                : ws.role === 'manager'
+                                  ? 'bg-amber-600/20 text-amber-300 border border-amber-500/40'
+                                  : 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/40'
+                            }`}>
+                              {roleBadge}
+                            </span>
+                            {isCurrentWs && <Check size={13} className="text-emerald-400" />}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="pt-1 border-t border-slate-800 flex flex-col gap-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowWorkspaceDropdown(false);
+                        setUnlockEmail(localStorage.getItem('logged_in_user_email') || activeBusiness.email || '');
+                        setUnlockPassword('');
+                        setUnlockFeedback(null);
+                        setShowUnlockWorkspaceModal(true);
+                      }}
+                      className="w-full py-2 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-black uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Key size={13} />
+                      <span>Unlock / Switch Business</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowWorkspaceDropdown(false);
+                        setAuthFeedback(null);
+                        setAuthScreenMode('register');
+                        setIsCreatingNewWorkspace(true);
+                      }}
+                      className="w-full py-1.5 px-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10.5px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus size={12} />
+                      <span>Create New Business Workspace</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
 
             {/* Direct Sale Register Navigation Button */}
             <button
@@ -1808,6 +2287,14 @@ export default function App() {
                       activeBusiness={activeBusiness}
                       setActiveBusiness={setActiveBusiness}
                       businesses={businesses}
+                      unlockedWorkspaces={unlockedWorkspaces}
+                      onSwitchUnlockedWorkspace={(ws) => activateUnlockedWorkspaceSession(ws)}
+                      onUnlockWorkspace={handleUnlockAnotherWorkspace}
+                      onCreateNewWorkspace={() => {
+                        setAuthFeedback(null);
+                        setAuthScreenMode('register');
+                        setIsCreatingNewWorkspace(true);
+                      }}
                       onSelectBusinessWorkspace={handleSelectBusinessWorkspace}
                       onSyncExistingAccount={handleSyncExistingAccount}
                       syncLoginEmail={syncLoginEmail}
@@ -1960,6 +2447,51 @@ export default function App() {
                       <X size={18} />
                     </button>
                   </div>
+                </div>
+
+                {/* Active Business Workspace Switcher inside Drawer */}
+                <div className="bg-white p-2.5 rounded-xl border border-indigo-200 flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between text-[10px] font-extrabold uppercase text-slate-500">
+                    <span className="flex items-center gap-1">
+                      <Building2 size={12} className="text-indigo-600" /> Workspace ({authenticatedRole === 'owner' ? 'Owner' : authenticatedRole === 'manager' ? 'Manager' : 'Cashier'})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowNavDrawer(false);
+                        setUnlockEmail(localStorage.getItem('logged_in_user_email') || activeBusiness.email || '');
+                        setUnlockPassword('');
+                        setUnlockFeedback(null);
+                        setShowUnlockWorkspaceModal(true);
+                      }}
+                      className="text-indigo-600 hover:text-indigo-800 font-black cursor-pointer"
+                    >
+                      + Unlock Shop
+                    </button>
+                  </div>
+                  {unlockedWorkspaces.length > 1 ? (
+                    <select
+                      value={activeBusiness.id}
+                      onChange={(e) => {
+                        const target = unlockedWorkspaces.find((w) => w.businessId === e.target.value);
+                        if (target) {
+                          setShowNavDrawer(false);
+                          void activateUnlockedWorkspaceSession(target);
+                        }
+                      }}
+                      className="w-full px-2.5 py-1.5 bg-indigo-50 border border-indigo-300 rounded-lg text-xs font-extrabold text-indigo-950 uppercase cursor-pointer focus:outline-hidden focus:border-indigo-500"
+                    >
+                      {unlockedWorkspaces.map((ws) => (
+                        <option key={`${ws.businessId}_${ws.membershipId}`} value={ws.businessId}>
+                          {ws.businessName} ({ws.role === 'owner' ? 'Owner' : ws.role === 'manager' ? 'Manager' : 'Cashier'})
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <div className="text-xs font-extrabold text-slate-900 truncate px-1">
+                      {activeBusiness.name}
+                    </div>
+                  )}
                 </div>
 
                 {/* Active Branch Switcher inside Drawer */}
@@ -2953,6 +3485,112 @@ export default function App() {
           </motion.div>
         </div>
       )}
+      {/* UNLOCK & SWITCH BUSINESS WORKSPACE MODAL (Strict Email + Password Identity) */}
+      {showUnlockWorkspaceModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-none">
+          <motion.div
+            initial={{ scale: 0.95, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="w-full max-w-md bg-slate-900 border border-slate-700 text-slate-100 rounded-2xl p-5 flex flex-col gap-4 shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-indigo-600/20 border border-indigo-500/40 text-indigo-400">
+                  <Key size={18} />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black uppercase tracking-wider text-white">
+                    Unlock &amp; Switch Business Workspace
+                  </h3>
+                  <p className="text-[10px] text-slate-400">
+                    Each business uses strict (Email + Password) verification with 100% isolated data.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowUnlockWorkspaceModal(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg bg-slate-800 cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {unlockFeedback && (
+              <div className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-2 ${
+                unlockFeedback.type === 'error'
+                  ? 'bg-rose-950/70 border-rose-500/50 text-rose-200'
+                  : 'bg-emerald-950/70 border-emerald-500/50 text-emerald-200'
+              }`}>
+                <AlertCircle size={14} className="shrink-0" />
+                <span>{unlockFeedback.text}</span>
+              </div>
+            )}
+
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setUnlockFeedback(null);
+                const res = await handleUnlockAnotherWorkspace(unlockEmail, unlockPassword);
+                if (res.success) {
+                  setUnlockPassword('');
+                  setShowUnlockWorkspaceModal(false);
+                } else {
+                  setUnlockFeedback({ type: 'error', text: res.error || 'Invalid credentials.' });
+                }
+              }}
+              className="flex flex-col gap-3"
+            >
+              <div>
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                  Account Email Address *
+                </label>
+                <input
+                  type="email"
+                  value={unlockEmail}
+                  onChange={(e) => setUnlockEmail(e.target.value)}
+                  placeholder="Enter your email address"
+                  required
+                  className="w-full px-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                  Workspace Password / Staff PIN *
+                </label>
+                <input
+                  type="password"
+                  value={unlockPassword}
+                  onChange={(e) => setUnlockPassword(e.target.value)}
+                  placeholder="Enter the password for the shop you want to open"
+                  required
+                  className="w-full px-3 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-slate-100 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                />
+              </div>
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowUnlockWorkspaceModal(false)}
+                  className="flex-1 py-2.5 px-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl text-xs cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isUnlockingWorkspace}
+                  className="flex-1 py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-black uppercase rounded-xl text-xs tracking-wider cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <RefreshCw size={14} className={isUnlockingWorkspace ? 'animate-spin' : ''} />
+                  <span>{isUnlockingWorkspace ? 'Unlocking...' : 'Unlock & Switch'}</span>
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+
       <ShareAppApkModal
         isOpen={showShareAppModal}
         onClose={() => setShowShareAppModal(false)}

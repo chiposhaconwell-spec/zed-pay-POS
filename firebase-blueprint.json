@@ -2,7 +2,7 @@
   "entities": {
     "Business": {
       "title": "Business",
-      "description": "Enterprise business profile linked to Firebase Auth ownerUid with explicit business_id and store_id tags",
+      "description": "Permanent central enterprise business profile linked to Firebase Auth ownerUid with explicit business_id and store_id tags",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique identifier for the business" },
@@ -12,10 +12,63 @@
         "owner": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Owner Full Name" },
         "email": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Business Corporate Email" },
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "currency": { "type": "string", "maxLength": 20, "description": "Default currency code or symbol" },
+        "tax_rate": { "type": "number", "description": "Default VAT/tax percentage" },
+        "tpin": { "type": "string", "maxLength": 100, "description": "Corporate Tax Identification Number (TPIN)" },
+        "billing_address": { "type": "string", "maxLength": 500, "description": "Registered billing street address" },
+        "billing_city": { "type": "string", "maxLength": 200, "description": "Registered billing city" },
+        "billing_country": { "type": "string", "maxLength": 200, "description": "Registered billing country" },
+        "billing_phone": { "type": "string", "maxLength": 100, "description": "Registered billing phone number" },
+        "billing_email": { "type": "string", "maxLength": 200, "description": "Registered billing email" },
+        "admin_role": { "type": "string", "maxLength": 50, "description": "Primary account role" },
         "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
         "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
       },
-      "required": ["id", "business_id", "store_id", "name", "owner", "email", "ownerUid", "createdAt", "updatedAt"]
+      "required": [
+        "id", "business_id", "store_id", "name", "owner", "email", "ownerUid",
+        "currency", "tax_rate", "tpin", "billing_address", "billing_city",
+        "billing_country", "billing_phone", "billing_email", "admin_role",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "BusinessSettings": {
+      "title": "Business Settings",
+      "description": "Permanent Cloud Firestore backup of store settings, receipt formatting, branding, payment methods, and ZRA fiscal configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Settings document ID (default)" },
+        "business_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Parent business ID" },
+        "store_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Primary store ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "storeName": { "type": "string", "maxLength": 200, "description": "Configured trading store name" },
+        "currency": { "type": "string", "maxLength": 20, "description": "Store currency symbol or code" },
+        "taxRate": { "type": "number", "description": "Default tax percentage" },
+        "loyaltyRatio": { "type": "number", "description": "Loyalty points ratio per unit spend" },
+        "receiptHeader": { "type": "string", "maxLength": 1000, "description": "Receipt header copy" },
+        "receiptFooter": { "type": "string", "maxLength": 1000, "description": "Receipt footer copy" },
+        "paperWidth": { "type": "string", "maxLength": 20, "description": "Thermal paper width (58mm/80mm)" },
+        "logoUrl": { "type": "string", "maxLength": 300000, "description": "Business logo URL or data URI" },
+        "tpin": { "type": "string", "maxLength": 100, "description": "Corporate TPIN" },
+        "billingAddress": { "type": "string", "maxLength": 500, "description": "Billing street address" },
+        "billingCity": { "type": "string", "maxLength": 200, "description": "Billing city" },
+        "billingCountry": { "type": "string", "maxLength": 200, "description": "Billing country" },
+        "billingPhone": { "type": "string", "maxLength": 100, "description": "Billing phone" },
+        "billingEmail": { "type": "string", "maxLength": 200, "description": "Billing email" },
+        "termsAndConditions": { "type": "string", "maxLength": 4000, "description": "Invoice terms and conditions" },
+        "printerName": { "type": "string", "maxLength": 200, "description": "Configured printer device name" },
+        "printerInterface": { "type": "string", "maxLength": 100, "description": "Configured printer interface" },
+        "printerStatus": { "type": "string", "maxLength": 100, "description": "Configured printer connection status" },
+        "customPaymentMethods": { "type": "array", "description": "Configured custom payment tender methods (up to 50)" },
+        "zraConfig": { "type": "object", "description": "ZRA Smart Invoice VSDC configuration map" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp of settings backup" }
+      },
+      "required": [
+        "id", "business_id", "store_id", "ownerUid", "storeName", "currency", "taxRate",
+        "loyaltyRatio", "receiptHeader", "receiptFooter", "paperWidth", "logoUrl", "tpin",
+        "billingAddress", "billingCity", "billingCountry", "billingPhone", "billingEmail",
+        "termsAndConditions", "printerName", "printerInterface", "printerStatus",
+        "customPaymentMethods", "zraConfig", "updatedAt"
+      ]
     },
     "Store": {
       "title": "Store Branch",
@@ -28,12 +81,14 @@
         "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
         "name": { "type": "string", "minLength": 1, "maxLength": 200, "description": "Outlet Name" },
         "location": { "type": "string", "maxLength": 200, "description": "City/Region location" },
+        "phone": { "type": "string", "maxLength": 100, "description": "Branch contact phone" },
+        "email": { "type": "string", "maxLength": 200, "description": "Branch contact email" },
         "allow_discounts": { "type": "integer", "description": "Is discount enabled (1/0)" },
         "allow_refunds": { "type": "integer", "description": "Is refund allowed (1/0)" },
         "allow_laybys": { "type": "integer", "description": "Is layaway support enabled (1/0)" },
         "require_manager_discount": { "type": "integer", "description": "Is manager level signature needed for discount (1/0)" }
       },
-      "required": ["id", "business_id", "store_id", "ownerUid", "name", "location", "allow_discounts", "allow_refunds", "allow_laybys", "require_manager_discount"]
+      "required": ["id", "business_id", "store_id", "ownerUid", "name", "location", "phone", "email", "allow_discounts", "allow_refunds", "allow_laybys", "require_manager_discount"]
     },
     "Product": {
       "title": "Product Asset",
@@ -54,9 +109,27 @@
         "imageUrl": { "type": "string", "maxLength": 300000, "description": "Base64 or external photo URL" },
         "is_service": { "type": "integer", "description": "Whether item is a service (1/0)" },
         "batch_number": { "type": "string", "maxLength": 100, "description": "Batch or lot identifier" },
-        "expiry_date": { "type": "string", "maxLength": 100, "description": "Expiry date string" }
+        "expiry_date": { "type": "string", "maxLength": 100, "description": "Expiry date string" },
+        "item_cls_cd": { "type": "string", "maxLength": 100, "description": "ZRA UNSPSC item classification code" },
+        "tax_ty_cd": { "type": "string", "maxLength": 50, "description": "ZRA tax type code" }
       },
       "required": ["id", "business_id", "store_id", "ownerUid", "name", "sku", "category", "price", "cost", "stock", "imageUrl"]
+    },
+    "StoreProduct": {
+      "title": "Branch Stock Level",
+      "description": "Per-branch stock balance and selling price override for each product",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Unique branch stock record ID" },
+        "product_id": { "type": "integer", "description": "Referenced Product ID" },
+        "business_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Parent business ID" },
+        "store_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Branch store ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the owner" },
+        "stock": { "type": "integer", "description": "Available quantity in this branch" },
+        "price": { "type": "number", "description": "Branch selling price" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last stock update server timestamp" }
+      },
+      "required": ["id", "product_id", "business_id", "store_id", "ownerUid", "stock", "price", "updatedAt"]
     },
     "Customer": {
       "title": "Customer CRM",
@@ -116,7 +189,7 @@
     },
     "LedgerBackup": {
       "title": "Accounting & Client Relational Ledger Backup",
-      "description": "Synchronized double-entry journal, EOD cash-up, cash flow, receipt/refund, layby, and staff ledgers",
+      "description": "Synchronized double-entry journal, EOD cash-up, stock transfers, stock takes, payroll, loans, and client ledgers",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Ledger table key" },
@@ -129,12 +202,68 @@
         "updatedAt": { "type": "string", "format": "date-time", "description": "Server timestamp of backup" }
       },
       "required": ["id", "business_id", "store_id", "ownerUid", "ledger_type", "record_count", "records", "updatedAt"]
+    },
+    "BusinessMembership": {
+      "title": "Decoupled Business Membership",
+      "description": "Many-to-Many membership record linking a user email identity to a specific Business with role, branch scope, permissions, and credential ID",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Membership document ID (membership ID or claimed Firebase UID)" },
+        "business_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Parent business ID" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Primary assigned store branch ID" },
+        "user_id": { "type": "string", "maxLength": 128, "description": "Decoupled global user identity ID" },
+        "memberUid": { "type": "string", "maxLength": 128, "description": "Claimed credential-scoped Firebase Auth UID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID of the Business Owner" },
+        "cred_id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "SHA-256 credential prefix tying email+password strictly to this business membership" },
+        "email": { "type": "string", "maxLength": 200, "description": "Normalized user email address" },
+        "full_name": { "type": "string", "maxLength": 200, "description": "Member full display name" },
+        "role": { "type": "string", "enum": ["owner", "manager", "sales"], "maxLength": 30, "description": "Role strictly within this business" },
+        "accessible_branches": { "type": "array", "description": "Permitted store branch IDs (up to 50)" },
+        "permissions_json": { "type": "string", "maxLength": 8000, "description": "Serialized granular permissions & suspension status" },
+        "status": { "type": "string", "enum": ["ACTIVE", "SUSPENDED"], "maxLength": 30, "description": "Active or suspended membership state" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
+      },
+      "required": ["id", "business_id", "store_id", "user_id", "memberUid", "ownerUid", "cred_id", "email", "full_name", "role", "accessible_branches", "permissions_json", "status", "createdAt", "updatedAt"]
+    },
+    "CredentialInvite": {
+      "title": "Credential Directory Entry",
+      "description": "Strict (email, password)-derived credential directory mapping cred_id to a single isolated business membership",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Credential ID matching cred_<cred_id>@mt-pos.auth" },
+        "cred_id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Credential ID prefix" },
+        "auth_email": { "type": "string", "maxLength": 150, "description": "Derived credential-scoped auth email" },
+        "business_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Target isolated business ID" },
+        "business_name": { "type": "string", "maxLength": 200, "description": "Target business trading name" },
+        "membership_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Membership record ID inside the target business" },
+        "user_id": { "type": "string", "maxLength": 128, "description": "Decoupled user identity ID" },
+        "ownerUid": { "type": "string", "maxLength": 128, "description": "Business Owner UID" },
+        "memberUid": { "type": "string", "maxLength": 128, "description": "Claimed member Firebase Auth UID" },
+        "email": { "type": "string", "maxLength": 200, "description": "Member corporate/login email" },
+        "full_name": { "type": "string", "maxLength": 200, "description": "Member full name" },
+        "role": { "type": "string", "enum": ["owner", "manager", "sales"], "maxLength": 30, "description": "Assigned role in target business" },
+        "store_id": { "type": "string", "maxLength": 128, "description": "Primary assigned store branch ID" },
+        "accessible_branches": { "type": "array", "description": "Permitted store branch IDs (up to 50)" },
+        "permissions_json": { "type": "string", "maxLength": 8000, "description": "Serialized granular permissions" },
+        "status": { "type": "string", "enum": ["ACTIVE", "SUSPENDED"], "maxLength": 30, "description": "Credential status" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
+      },
+      "required": ["id", "cred_id", "auth_email", "business_id", "business_name", "membership_id", "user_id", "ownerUid", "memberUid", "email", "full_name", "role", "store_id", "accessible_branches", "permissions_json", "status", "updatedAt"]
     }
   },
   "firestore": {
     "/businesses/{businessId}": {
       "schema": "Business",
-      "description": "Core client business collection keyed by businessId"
+      "description": "Permanent central business profile collection keyed by businessId"
+    },
+    "/businesses/{businessId}/settings/{settingId}": {
+      "schema": "BusinessSettings",
+      "description": "Permanent central store settings, branding, receipt configuration, custom payment methods, and ZRA config"
+    },
+    "/businesses/{businessId}/memberships/{membershipId}": {
+      "schema": "BusinessMembership",
+      "description": "Decoupled Many-to-Many memberships authorizing verified users per business with isolated roles"
     },
     "/businesses/{businessId}/stores/{storeId}": {
       "schema": "Store",
@@ -142,7 +271,11 @@
     },
     "/businesses/{businessId}/products/{productId}": {
       "schema": "Product",
-      "description": "Inventory listings and batches of specific businesses"
+      "description": "Inventory product catalog and batch stock belonging to a business"
+    },
+    "/businesses/{businessId}/store_products/{storeProductId}": {
+      "schema": "StoreProduct",
+      "description": "Per-branch stock levels and price overrides for every product across all outlets"
     },
     "/businesses/{businessId}/customers/{customerId}": {
       "schema": "Customer",
@@ -158,7 +291,11 @@
     },
     "/businesses/{businessId}/ledgers/{ledgerId}": {
       "schema": "LedgerBackup",
-      "description": "Double-entry accounting ledgers, EOD cash-ups, cash flow, laybys, and client backups"
+      "description": "Double-entry accounting ledgers, EOD cash-ups, stock transfers, stock takes, laybys, and operational backups"
+    },
+    "/credential_directory/{credId}": {
+      "schema": "CredentialInvite",
+      "description": "Zero-plaintext credential lookup index mapping SHA-256(email+password) cred_id strictly to its authorized business membership"
     }
   }
 }
