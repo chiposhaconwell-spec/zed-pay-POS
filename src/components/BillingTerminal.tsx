@@ -38,7 +38,8 @@ import {
   UserCheck,
   UserX,
   AlertTriangle,
-  Zap
+  Zap,
+  Bluetooth
 } from 'lucide-react';
 import { runSql, getCentralBranches, persistTablesToStorage, triggerLoanSweep, upsertCustomerSync, logEmployeeAudit, syncAllAccountingSystems, pullDatabaseFromServer, pushDatabaseToServer, toLocalDateKey, resolvePaymentMethodBucket, getCustomPaymentMethods, getMobileMoneyOptions, resolveSplitMobileProvider, calculateLoyaltyPoints, isWalkInCustomerName, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
 import { Product, Customer, StoreSettings, CustomPaymentMethod } from '../types';
@@ -58,6 +59,17 @@ import { getTransportSecurityStatus, signInWithEmailPasswordAccount, restoreFrom
 import { FiscalService, ZraFiscalReceiptData } from '../zra/fiscalService';
 import { getZraConfig, subscribeZraConfig, ZraConfig } from '../zra/zraConfig';
 import { ActiveShift } from '../services/terminalAuthService';
+import {
+  listPairedBluetoothDevicesOnGadget,
+  pairOrPickBluetoothDeviceOnGadget,
+  connectWebBluetoothGattPrinter,
+  sendEscPosToHardwarePrinter,
+  getSelectedPrinterMetadata,
+  saveSelectedPrinterMetadata,
+  formatHardwarePrinterValue,
+  isNativeAndroidPlatform,
+  PairedBluetoothPrinter,
+} from '../services/bluetoothPrinterService';
 
 const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
@@ -665,6 +677,10 @@ export default function BillingTerminal({
   const [btSuccess, setBtSuccess] = useState(false);
   const [pairedBluetoothDevice, setPairedBluetoothDevice] = useState<any>(null);
   const [pairedBluetoothChar, setPairedBluetoothChar] = useState<any>(null);
+  const [pairedGadgetBtList, setPairedGadgetBtList] = useState<PairedBluetoothPrinter[]>([]);
+  const [btListLoading, setBtListLoading] = useState<boolean>(false);
+  const [btListNotice, setBtListNotice] = useState<string>('');
+  const [selectedGadgetBtPrinter, setSelectedGadgetBtPrinter] = useState<PairedBluetoothPrinter | null>(null);
   const [bluetoothStatus, setBluetoothStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   const [bluetoothErrorMessage, setBluetoothErrorMessage] = useState<string>('');
   const [showBluetoothPanel, setShowBluetoothPanel] = useState<boolean>(false);
@@ -1465,55 +1481,90 @@ export default function BillingTerminal({
     return { bytes, textPreview };
   };
 
-  const connectBluetoothPrinter = async () => {
-    setBluetoothErrorMessage('');
-    setBluetoothStatus('connecting');
+  const refreshTerminalPairedBluetooth = async () => {
+    setBtListLoading(true);
     try {
-      const nav = navigator as any;
-      if (!nav.bluetooth) {
-        throw new Error("Web Bluetooth API is not supported in this frame or browser. To connect a real thermal printer, please open this sandbox app in a new browser tab.");
-      }
+      const res = await listPairedBluetoothDevicesOnGadget();
+      setPairedGadgetBtList(res.devices);
+      setBtListNotice(res.notice || '');
 
-      const device = await nav.bluetooth.requestDevice({
-        acceptAllDevices: true,
-        optionalServices: [
-          '000018f0-0000-1000-8000-00805f9b34fb', // standard BLE Printer service ID
-          '0000e7e1-0000-1000-8000-00805f9b34fb', // custom printers IDs
-          '49535343-fe7d-4ae5-8fa9-9fafd205e455'  // ISSC custom service
-        ]
-      });
-
-      const server = await device.gatt?.connect();
-      if (!server) {
-        throw new Error("Target GATT Server pairing handshake failed.");
-      }
-
-      const services = await server.getPrimaryServices();
-      let foundCharacteristics: any[] = [];
-      for (const service of services) {
-        try {
-          const chars = await service.getCharacteristics();
-          foundCharacteristics = [...foundCharacteristics, ...chars];
-        } catch (e) {
-          // ignore service-specific discovery exceptions
+      const meta = getSelectedPrinterMetadata(getActiveBusinessId());
+      const configuredName = settings.printerName || meta?.optionValue || meta?.name || '';
+      if (configuredName || meta?.id) {
+        const matched = res.devices.find(
+          (d) =>
+            (meta?.id && d.id === meta.id) ||
+            formatHardwarePrinterValue(d) === configuredName ||
+            d.name === configuredName ||
+            d.address === configuredName
+        );
+        if (matched) {
+          setSelectedGadgetBtPrinter(matched);
+          if (isNativeAndroidPlatform()) {
+            setBluetoothStatus('connected');
+          }
         }
       }
+    } catch (err: any) {
+      setBtListNotice(err?.message || 'Unable to inspect paired Bluetooth devices on this gadget.');
+    } finally {
+      setBtListLoading(false);
+    }
+  };
 
-      // Find any writable characteristic
-      const writeChar = foundCharacteristics.find(c => c.properties.write || c.properties.writeWithoutResponse);
-      if (!writeChar) {
-        throw new Error("Identified device but no ESC/POS raw write characteristics were found.");
-      }
+  useEffect(() => {
+    if (showBluetoothPanel) {
+      refreshTerminalPairedBluetooth();
+    }
+  }, [showBluetoothPanel, settings.printerName]);
 
+  const selectAndConnectPairedPrinter = async (printer: PairedBluetoothPrinter) => {
+    setBluetoothErrorMessage('');
+    setSelectedGadgetBtPrinter(printer);
+    saveSelectedPrinterMetadata(getActiveBusinessId(), printer);
+
+    if (isNativeAndroidPlatform()) {
+      setPairedBluetoothDevice({ id: printer.address, name: printer.name });
+      setPairedBluetoothChar(null);
+      setBluetoothStatus('connected');
+      return;
+    }
+
+    setBluetoothStatus('connecting');
+    try {
+      const { device, writeChar } = await connectWebBluetoothGattPrinter(printer);
       setPairedBluetoothDevice(device);
       setPairedBluetoothChar(writeChar);
       setBluetoothStatus('connected');
 
-      device.addEventListener('gattserverdisconnected', () => {
+      device.addEventListener?.('gattserverdisconnected', () => {
         setPairedBluetoothDevice(null);
         setPairedBluetoothChar(null);
         setBluetoothStatus('disconnected');
       });
+    } catch (err: any) {
+      console.error(err);
+      setBluetoothStatus('error');
+      setBluetoothErrorMessage(err.message || String(err));
+    }
+  };
+
+  const connectBluetoothPrinter = async () => {
+    setBluetoothErrorMessage('');
+    setBluetoothStatus('connecting');
+    try {
+      const picked = await pairOrPickBluetoothDeviceOnGadget();
+      if (picked.discovery) {
+        setPairedGadgetBtList(picked.discovery.devices);
+        setBtListNotice(picked.discovery.notice || '');
+      }
+      if (!picked.printer) {
+        setBluetoothStatus(pairedBluetoothDevice ? 'connected' : 'disconnected');
+        if (picked.error) setBluetoothErrorMessage(picked.error);
+        return;
+      }
+
+      await selectAndConnectPairedPrinter(picked.printer);
     } catch (err: any) {
       console.error(err);
       setBluetoothStatus('error');
@@ -1527,6 +1578,7 @@ export default function BillingTerminal({
     }
     setPairedBluetoothDevice(null);
     setPairedBluetoothChar(null);
+    setSelectedGadgetBtPrinter(null);
     setBluetoothStatus('disconnected');
   };
 
@@ -1543,20 +1595,27 @@ export default function BillingTerminal({
     setBtEscPosHex(hex);
 
     try {
-      if (pairedBluetoothChar) {
-        // Chunk bytes to fit BLE MTU payload windows (20 byte safe standard writes)
-        const chunkSize = 20;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-          const chunk = bytes.slice(i, i + chunkSize);
-          await pairedBluetoothChar.writeValue(chunk);
+      const savedMeta = getSelectedPrinterMetadata(getActiveBusinessId());
+      const targetPrinter =
+        selectedGadgetBtPrinter ||
+        pairedGadgetBtList.find((d) => savedMeta?.id && d.id === savedMeta.id) ||
+        null;
+
+      if (pairedBluetoothChar || (isNativeAndroidPlatform() && (targetPrinter?.address || savedMeta?.address))) {
+        const dispatch = await sendEscPosToHardwarePrinter({
+          printer: targetPrinter,
+          addressOrId: targetPrinter?.address || savedMeta?.address || savedMeta?.id,
+          writeChar: pairedBluetoothChar,
+          bytes,
+        });
+        if (!dispatch.dispatched) {
+          throw new Error(dispatch.error || 'Bluetooth print transmission failed.');
         }
         setBtSuccess(true);
       } else {
-        // If no paired accessory, we pop the custom simulated printer helper panel
+        // Refresh paired devices and open the Bluetooth Printer Center so cashier can pick/connect any paired Bluetooth device on the gadget
         setShowBluetoothPanel(true);
-        setTimeout(() => {
-          setBtSuccess(true);
-        }, 1000);
+        refreshTerminalPairedBluetooth();
       }
     } catch (err: any) {
       console.error("BLE printing failed", err);
@@ -6340,48 +6399,115 @@ export default function BillingTerminal({
                 </button>
               </div>
 
-              {/* Connected accessory state / pairing banner */}
+              {/* Connected accessory state / paired Bluetooth devices on gadget */}
               <div className="bg-slate-950/60 border border-slate-850 p-4 rounded-xl flex flex-col gap-3">
                 <div className="flex items-center justify-between">
                   <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Device Status:</span>
                   <div className="flex items-center gap-1.5">
                     <span className={`w-2 h-2 rounded-full ${
-                      pairedBluetoothDevice ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+                      pairedBluetoothDevice || selectedGadgetBtPrinter ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
                     }`}></span>
                     <span className="text-[11px] font-mono font-black uppercase">
-                      {pairedBluetoothDevice ? 'Connected / Paired' : 'Hardware Disconnected'}
+                      {pairedBluetoothDevice
+                        ? 'Connected / Paired'
+                        : selectedGadgetBtPrinter
+                        ? 'Selected on Gadget'
+                        : 'Hardware Disconnected'}
                     </span>
                   </div>
                 </div>
 
-                {pairedBluetoothDevice ? (
+                {(pairedBluetoothDevice || selectedGadgetBtPrinter) && (
                   <div className="flex items-center justify-between bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
-                    <div className="flex flex-col gap-0.5">
-                      <span className="text-xs font-bold text-indigo-300">{pairedBluetoothDevice.name || 'Unnamed BLE Printer'}</span>
-                      <span className="text-[9px] font-mono text-slate-500">ID: {pairedBluetoothDevice.id.slice(0, 16)}...</span>
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-xs font-bold text-indigo-300 truncate">
+                        {pairedBluetoothDevice?.name || selectedGadgetBtPrinter?.name || 'Unnamed Bluetooth Printer'}
+                      </span>
+                      <span className="text-[9px] font-mono text-slate-500 truncate">
+                        ID: {(pairedBluetoothDevice?.id || selectedGadgetBtPrinter?.address || '').slice(0, 24)}
+                      </span>
                     </div>
                     <button
                       onClick={disconnectBluetoothPrinter}
-                      className="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900/80 border border-rose-900 rounded-md text-[10px] font-bold text-rose-300 cursor-pointer transition-colors"
+                      className="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900/80 border border-rose-900 rounded-md text-[10px] font-bold text-rose-300 cursor-pointer transition-colors shrink-0"
                     >
                       Disconnect
                     </button>
                   </div>
-                ) : (
-                  <div className="flex flex-col gap-2">
-                    <p className="text-[10.5px] text-slate-400 leading-relaxed font-medium">
-                      Pair with any portable BLE thermal receipt printer to directly trigger physical paper ticket feeds from your terminal checkout sales!
-                    </p>
+                )}
+
+                {/* Paired Bluetooth devices list on this gadget */}
+                <div className="flex flex-col gap-2 border-t border-slate-850 pt-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-indigo-300 uppercase tracking-wider flex items-center gap-1.5">
+                      <Bluetooth size={12} />
+                      Paired Bluetooth on Gadget ({pairedGadgetBtList.length})
+                    </span>
                     <button
-                      onClick={connectBluetoothPrinter}
-                      disabled={bluetoothStatus === 'connecting'}
-                      className="w-full py-2 bg-indigo-600 hover:bg-indigo-505 text-white text-[11px] font-extrabold rounded-lg cursor-pointer transition-all flex items-center justify-center gap-1.5 shadow-sm shadow-indigo-600/30 active:scale-98"
+                      type="button"
+                      onClick={refreshTerminalPairedBluetooth}
+                      disabled={btListLoading}
+                      className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-[9px] font-bold text-slate-300 cursor-pointer disabled:opacity-50"
                     >
-                      <Smartphone size={12} className={bluetoothStatus === 'connecting' ? 'animate-spin' : ''} />
-                      {bluetoothStatus === 'connecting' ? 'PAIRING CHANNELS...' : 'SEARCH & PAIR BLE PRINTER'}
+                      {btListLoading ? 'Scanning...' : 'Refresh'}
                     </button>
                   </div>
-                )}
+
+                  {pairedGadgetBtList.length > 0 ? (
+                    <div className="flex flex-col gap-1.5 max-h-36 overflow-y-auto pr-0.5">
+                      {pairedGadgetBtList.map((dev) => {
+                        const isActive =
+                          selectedGadgetBtPrinter?.id === dev.id ||
+                          pairedBluetoothDevice?.id === dev.id;
+                        return (
+                          <button
+                            key={dev.id}
+                            type="button"
+                            onClick={() => selectAndConnectPairedPrinter(dev)}
+                            className={`w-full text-left flex items-center justify-between gap-2 p-2 rounded-lg border cursor-pointer transition-colors ${
+                              isActive
+                                ? 'bg-indigo-950/70 border-indigo-500'
+                                : 'bg-slate-900/70 hover:bg-slate-800 border-slate-800'
+                            }`}
+                          >
+                            <div className="flex flex-col min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-[11px] font-bold text-slate-100 truncate">{dev.name}</span>
+                                <span className="text-[8px] font-mono uppercase px-1 py-0.2 bg-slate-800 text-slate-400 rounded">
+                                  {dev.transport.toUpperCase()}
+                                </span>
+                                {dev.isLikelyPrinter && (
+                                  <span className="text-[8px] font-bold uppercase px-1 py-0.2 bg-emerald-950 text-emerald-400 border border-emerald-800 rounded">
+                                    Printer
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-[9px] font-mono text-slate-500 truncate">{dev.address}</span>
+                            </div>
+                            <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded shrink-0 ${
+                              isActive ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-300'
+                            }`}>
+                              {isActive ? 'Active' : 'Connect'}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-slate-400 leading-relaxed font-medium">
+                      {btListNotice || 'Pair or select any Bluetooth thermal printer from your gadget to print ESC/POS tickets.'}
+                    </p>
+                  )}
+
+                  <button
+                    onClick={connectBluetoothPrinter}
+                    disabled={bluetoothStatus === 'connecting'}
+                    className="w-full py-2 bg-indigo-600 hover:bg-indigo-505 text-white text-[11px] font-extrabold rounded-lg cursor-pointer transition-all flex items-center justify-center gap-1.5 shadow-sm shadow-indigo-600/30 active:scale-98"
+                  >
+                    <Smartphone size={12} className={bluetoothStatus === 'connecting' ? 'animate-spin' : ''} />
+                    {bluetoothStatus === 'connecting' ? 'PAIRING CHANNELS...' : 'SHOW / PAIR GADGET BLUETOOTH'}
+                  </button>
+                </div>
 
                 {/* Error Box */}
                 {bluetoothErrorMessage && (
