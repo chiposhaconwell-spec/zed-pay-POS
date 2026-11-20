@@ -8,7 +8,10 @@
 - **Identity Integrity**: `ownerUid` must strictly match `request.auth.uid` on creation and remain immutable on update.
 - **ID Sizing & Regex Guard**: All document IDs (`businessId`, `storeId`, `productId`, `customerId`, `orderId`, `itemId`, `ledgerId`) must match `^[a-zA-Z0-9_\-]+$` and be `<= 128` characters.
 - **Strict Keys & Anti-Update-Gap**: Standalone `isValid[Entity]` helpers validate both `create` and `update`, combined with `affectedKeys().hasOnly(...)` on every update action.
-- **Temporal Strictness**: `createdAt` and `updatedAt` timestamps on `Business` and `LedgerBackup` are validated against `request.time`.
+- **Temporal Strictness**: `createdAt` and `updatedAt` timestamps on `Business`, `LedgerBackup`, `SuperAdmin`, and `PlatformAuditLog` are validated against `request.time`.
+- **Platform Super Admin Separation (`/super_admins/{adminUid}`)**: Super Admins sit completely above tenant `BusinessMembership` roles. Tenant owners can only update business profile/billing fields and are strictly blocked from modifying moderation fields (`status`, `suspended_reason`, `flagged_for_fraud`, `plan_tier`, `subscription_status`).
+- **Suspended/Fraud Hard Delete Guard**: `/businesses/{businessId}` only permits `delete` by verified `isAdmin()` AND only when `existing().status == 'SUSPENDED' || existing().flagged_for_fraud == true`.
+- **Immutable Platform Audit Trail (`/platform_audit_logs/{logId}`)**: Every moderation action (`SUSPEND_BUSINESS`, `RESTORE_BUSINESS`, `FLAG_FRAUD`, `CLEAR_FRAUD`, `UPDATE_PLAN`, `HARD_DELETE_BUSINESS`) is append-only (`allow update, delete: if false;`) and strictly readable/creatable only by `isAdmin()`.
 
 ---
 
@@ -22,7 +25,7 @@
 6. **Relational Link Mutation (Change `business_id` or `ownerUid` during update)**: Rejected (`incoming().business_id == existing().business_id && incoming().ownerUid == existing().ownerUid` fails).
 7. **Denial of Wallet (1MB string payload in `imageUrl` or unbounded array in `ledgers`)**: Rejected (`imageUrl.size() <= 300000` and `records.size() <= 500` checks fail).
 8. **Shadow Field Injection (Inject `isAdmin: true` or `systemVerified: true` on Order)**: Rejected (`keys().hasOnly(...)` fails).
-9. **Email Spoofing Attack (Unverified email claiming admin)**: Rejected (`request.auth.token.email_verified == true` required for admin email check).
+9. **Email Spoofing Attack (Unverified email claiming admin)**: Rejected (`request.auth.token.email_verified == true` required for admin email check, and `/super_admins` self-provisioning strictly checks deterministic `cred_id` + `auth_email`).
 10. **Anonymous Write Attempt**: Rejected (`isSignedIn()` fails).
-11. **Order History Tampering (Mutating immutable `orderDate` or `store_id` on Order update)**: Rejected (`incoming().orderDate == existing().orderDate && incoming().store_id == existing().store_id` fails).
-12. **Cross-Tenant List Scraping (Querying `/customers` or `/orders` without `ownerUid == request.auth.uid` and `business_id == businessId`)**: Rejected (`allow list` enforces `existing().ownerUid == request.auth.uid && existing().business_id == businessId`).
+11. **Order History Tampering (Mutating immutable `orderDate` or `store_id` on Order update, or tenant owner attempting to clear `SUSPENDED` status)**: Rejected (`affectedKeys().hasOnly(...)` blocks non-admin mutation of `status`, `flagged_for_fraud`, and `plan_tier`).
+12. **Cross-Tenant List Scraping (Querying `/customers` or `/orders` without `ownerUid == request.auth.uid` and `business_id == businessId`)**: Rejected (`allow list` enforces tenant membership or verified `isAdmin()`).

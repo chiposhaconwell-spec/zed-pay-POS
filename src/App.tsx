@@ -45,6 +45,7 @@ import {
   backupToCloud,
   restoreFromCloud,
   googleSignOut,
+  checkBusinessCloudModerationStatus,
 } from './firebase';
 import { StoreSettings, ActiveTab } from './types';
 import {
@@ -95,6 +96,14 @@ import EmployeeAuditTrail from './components/EmployeeAuditTrail';
 import ShareAppApkModal from './components/ShareAppApkModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { OfflineIndicator } from './components/OfflineIndicator';
+import SuperAdminDashboard from './components/SuperAdminDashboard';
+import {
+  SuperAdminSession,
+  authenticateSuperAdmin,
+  getSavedSuperAdminSession,
+  isSuperAdminEmail,
+  logoutSuperAdmin,
+} from './services/superAdminService';
 
 export const DEFAULT_COMPANY_LOGO = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'><rect width='120' height='120' rx='28' fill='%233730A3'/><path d='M60 22 L92 38 L92 70 C92 86 60 96 60 96 C60 96 28 88 28 72 L28 38 Z' fill='none' stroke='white' stroke-width='6' stroke-linejoin='round'/><path d='M44 58 L56 70 L78 48' fill='none' stroke='white' stroke-linecap='round' stroke-linejoin='round'/></svg>";
 
@@ -140,9 +149,15 @@ export default function App() {
   const [showNavDrawer, setShowNavDrawer] = useState(false);
   const [showShareAppModal, setShowShareAppModal] = useState(false);
 
+  // Platform-Level Super Admin Session (100% isolated from tenant BusinessMembership roles)
+  const [superAdminSession, setSuperAdminSession] = useState<SuperAdminSession | null>(() =>
+    getSavedSuperAdminSession()
+  );
+
   // Dynamic Enterprise & Multi-Business Gating State (100% Blank on default — no pre-seeded details, branches, or stock)
   const [isAuthenticatedSession, setIsAuthenticatedSession] = useState<boolean>(() => {
     return (
+      !getSavedSuperAdminSession() &&
       localStorage.getItem('pos_authenticated_session') === 'true' &&
       Boolean(localStorage.getItem('active_business_profile'))
     );
@@ -348,6 +363,12 @@ export default function App() {
     const isSessionAuth = localStorage.getItem('pos_authenticated_session') === 'true';
 
     const checkActiveStaffAccessStatus = (bizCandidate?: any): { valid: boolean; reason?: string } => {
+      if (bizCandidate && String(bizCandidate.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
+        return {
+          valid: false,
+          reason: `Business Account Suspended: ${bizCandidate.suspended_reason || 'This business account has been suspended by the Platform Super Admin.'}`,
+        };
+      }
       const loggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || '');
       if (!loggedEmail) return { valid: true };
       const bizEmail = normalizeAuthEmail(bizCandidate?.email || '');
@@ -405,7 +426,9 @@ export default function App() {
       return { valid: true };
     };
 
-    if (isSessionAuth && savedBiz && existingBusinesses.length > 0) {
+    if (getSavedSuperAdminSession()) {
+      // Isolated Platform Super Admin active: skip tenant auto-login and do not sign out Firebase Auth
+    } else if (isSessionAuth && savedBiz && existingBusinesses.length > 0) {
       try {
         const parsed = JSON.parse(savedBiz);
         const match = existingBusinesses.find((b: any) => b.id === parsed.id);
@@ -462,6 +485,23 @@ export default function App() {
           }
 
           setIsAuthenticatedSession(true);
+          void checkBusinessCloudModerationStatus(match.id).then((cloudMod) => {
+            if (cloudMod.status === 'SUSPENDED') {
+              localStorage.removeItem('pos_authenticated_session');
+              localStorage.removeItem('active_business_profile');
+              clearSessionPermissionsFromStorage();
+              clearUnlockedWorkspaces();
+              setUnlockedWorkspaces([]);
+              setActiveBusiness({ id: '', name: '', owner: '', email: '' });
+              setIsAuthenticatedSession(false);
+              setAuthScreenMode('login');
+              setAuthFeedback({
+                type: 'error',
+                text: `Business Account Suspended: ${cloudMod.suspendedReason || 'This business account has been suspended by the Platform Super Admin.'}`,
+              });
+              void googleSignOut();
+            }
+          }).catch(() => {});
         } else {
           localStorage.removeItem('active_business_profile');
           localStorage.removeItem('pos_authenticated_session');
@@ -491,7 +531,7 @@ export default function App() {
         setIsAuthenticatedSession(false);
         void googleSignOut();
       }
-    } else {
+    } else if (!getSavedSuperAdminSession()) {
       // No authenticated session: start on Log In / Create Account screen (blank state)
       localStorage.removeItem('active_business_profile');
       localStorage.removeItem('pos_authenticated_session');
@@ -998,6 +1038,14 @@ export default function App() {
       ? bRes.data[0]
       : { id: ws.businessId, name: ws.businessName, owner: ws.fullName, email: ws.email };
 
+    if (String(bizRow?.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
+      setAuthFeedback({
+        type: 'error',
+        text: `Business Account Suspended: ${bizRow.suspended_reason || 'This business account has been suspended by the Platform Super Admin.'}`,
+      });
+      return;
+    }
+
     const normRole = normalizeRole(ws.role);
     const resolvedPerms: UserPermissions =
       normRole === 'owner'
@@ -1098,6 +1146,12 @@ export default function App() {
     const rawPass = String(targetPassRaw || '').trim();
     if (!cleanEmail || !rawPass) {
       return { success: false, error: 'Please enter both Email and Password.' };
+    }
+    if (isSuperAdminEmail(cleanEmail)) {
+      return {
+        success: false,
+        error: 'Super Admin credentials operate exclusively at the platform level and cannot be linked as a tenant workspace.',
+      };
     }
 
     const credHash = computeCredentialHashSync(cleanEmail, rawPass);
@@ -1212,14 +1266,37 @@ export default function App() {
         };
       }
 
-      const activeMatches = credMatches.filter(
-        (m) => !m.isSuspended && !(m.role !== 'owner' && isUserSuspended(m.permissionsJson))
-      );
+      const unSuspendedMatches: typeof credMatches = [];
+      let bizSuspendedMessage = '';
+      for (const m of credMatches) {
+        if (m.isSuspended || (m.role !== 'owner' && isUserSuspended(m.permissionsJson))) {
+          continue;
+        }
+        if (String(m.business?.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
+          bizSuspendedMessage = String(
+            m.business?.suspended_reason ||
+              'This business account has been suspended by the Platform Super Admin.'
+          );
+          continue;
+        }
+        const cloudMod = await checkBusinessCloudModerationStatus(String(m.business.id));
+        if (cloudMod.status === 'SUSPENDED') {
+          bizSuspendedMessage =
+            cloudMod.suspendedReason ||
+            'This business account has been suspended by the Platform Super Admin.';
+          continue;
+        }
+        unSuspendedMatches.push(m);
+      }
+
+      const activeMatches = unSuspendedMatches;
       if (activeMatches.length === 0) {
         await restorePreviousAuthIfNeeded();
         return {
           success: false,
-          error: 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
+          error: bizSuspendedMessage
+            ? `Business Account Suspended: ${bizSuspendedMessage}`
+            : 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
         };
       }
 
@@ -1331,6 +1408,24 @@ export default function App() {
 
     setIsHeaderSyncing(true);
     try {
+      // Platform-level Super Admin Authentication (strictly decoupled from tenant BusinessMembership)
+      if (isSuperAdminEmail(targetEmail)) {
+        const saRes = await authenticateSuperAdmin(targetEmail, targetPass);
+        if (!saRes.success || !saRes.session) {
+          setAuthFeedback({
+            type: 'error',
+            text: saRes.error || 'Invalid Super Admin credentials.',
+          });
+          return;
+        }
+        setSyncLoginEmail('');
+        setSyncLoginPassword('');
+        setSyncLoginBranch('');
+        setIsAuthenticatedSession(false);
+        setSuperAdminSession(saRes.session);
+        return;
+      }
+
       const res = await authenticateAndResolveWorkspace(targetEmail, targetPass, {
         targetBranch: syncLoginBranch || undefined,
         preserveExistingUnlocked: false,
@@ -1424,6 +1519,15 @@ export default function App() {
     await googleSignOut();
   };
 
+  const handleLogoutSuperAdmin = async () => {
+    await logoutSuperAdmin();
+    setSuperAdminSession(null);
+    setSyncLoginEmail('');
+    setSyncLoginPassword('');
+    setAuthFeedback(null);
+    setAuthScreenMode('login');
+  };
+
   // Switch workspace immediately and isolate branch/tenant data
   const handleSelectBusinessWorkspace = async (target: any) => {
     // Prefer strict UnlockedWorkspaceSession entry
@@ -1468,6 +1572,15 @@ export default function App() {
     allow_laybys: 1,
     require_manager_discount: 0
   };
+
+  if (superAdminSession) {
+    return (
+      <SuperAdminDashboard
+        session={superAdminSession}
+        onLogout={handleLogoutSuperAdmin}
+      />
+    );
+  }
 
   return (
     <AndroidShell

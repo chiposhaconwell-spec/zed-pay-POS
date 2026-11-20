@@ -151,7 +151,7 @@ async function setFirestoreOfflineMode(): Promise<void> {
   }
 }
 
-async function ensureFirestoreOnlineIfReachable(): Promise<boolean> {
+export async function ensureFirestoreOnlineIfReachable(): Promise<boolean> {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     await setFirestoreOfflineMode();
     return false;
@@ -501,7 +501,7 @@ export function getTransportSecurityStatus() {
   };
 }
 
-function sanitizeIdForFirestore(rawId: any, fallbackPrefix: string = 'doc'): string {
+export function sanitizeIdForFirestore(rawId: any, fallbackPrefix: string = 'doc'): string {
   const str = String(rawId ?? '').trim().replace(/[^a-zA-Z0-9_\-]/g, '_');
   if (!str) return `${fallbackPrefix}_${Date.now()}`;
   return str.slice(0, 120);
@@ -1964,10 +1964,22 @@ export async function backupToCloud(
       const existingData = existingSnap.data();
       resolvedParentOwnerUid = String(existingData.ownerUid || resolvedParentOwnerUid);
       setBusinessCloudUnlinkedFlag(safeBizId, false);
+      const preservedModeration: Record<string, any> = {};
+      if (existingData.status !== undefined) preservedModeration.status = existingData.status;
+      if (existingData.suspended_reason !== undefined) preservedModeration.suspended_reason = existingData.suspended_reason;
+      if (existingData.suspended_at !== undefined) preservedModeration.suspended_at = existingData.suspended_at;
+      if (existingData.suspended_by !== undefined) preservedModeration.suspended_by = existingData.suspended_by;
+      if (existingData.flagged_for_fraud !== undefined) preservedModeration.flagged_for_fraud = existingData.flagged_for_fraud;
+      if (existingData.fraud_flag_reason !== undefined) preservedModeration.fraud_flag_reason = existingData.fraud_flag_reason;
+      if (existingData.flagged_at !== undefined) preservedModeration.flagged_at = existingData.flagged_at;
+      if (existingData.plan_tier !== undefined) preservedModeration.plan_tier = existingData.plan_tier;
+      if (existingData.subscription_status !== undefined) preservedModeration.subscription_status = existingData.subscription_status;
+
       isOnline = await writeDocOfflineAware(
         bizRef,
         {
           ...fullBizFields,
+          ...preservedModeration,
           ownerUid: resolvedParentOwnerUid,
           createdAt: existingData.createdAt || serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -1981,6 +1993,10 @@ export async function backupToCloud(
         bizRef,
         {
           ...fullBizFields,
+          status: 'ACTIVE',
+          flagged_for_fraud: false,
+          plan_tier: 'PAID',
+          subscription_status: 'ACTIVE',
           ownerUid: currentUid,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
@@ -2525,6 +2541,56 @@ export async function backupToCloud(
   };
 }
 
+export async function checkBusinessCloudModerationStatus(
+  businessId: string
+): Promise<{ status: 'ACTIVE' | 'SUSPENDED'; suspendedReason?: string; deleted?: boolean }> {
+  const safeBizId = sanitizeIdForFirestore(businessId, 'biz');
+  if (!safeBizId || safeBizId === 'default_biz') return { status: 'ACTIVE' };
+
+  const localRes = runSql(
+    `SELECT status, suspended_reason FROM businesses WHERE id = '${sqlEsc(safeBizId)}'`,
+    'Moderation check: Read local business status',
+    true
+  );
+  const localRow = localRes.success && Array.isArray(localRes.data) ? localRes.data[0] : null;
+  if (localRow && String(localRow.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
+    return {
+      status: 'SUSPENDED',
+      suspendedReason: String(localRow.suspended_reason || 'Account suspended by Platform Super Admin.'),
+    };
+  }
+
+  if (!auth.currentUser) return { status: 'ACTIVE' };
+  const bizPath = `businesses/${safeBizId}`;
+  try {
+    const isOnline = await ensureFirestoreOnlineIfReachable();
+    if (!isOnline) return { status: 'ACTIVE' };
+    const snap = await getDocFromServer(doc(db, 'businesses', safeBizId)).catch(() =>
+      getDoc(doc(db, 'businesses', safeBizId))
+    );
+    if (!snap.exists()) {
+      return { status: 'ACTIVE' };
+    }
+    const data = snap.data();
+    const st = String(data?.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
+    const reason = String(data?.suspended_reason || '');
+    if (st === 'SUSPENDED') {
+      runSql(
+        `UPDATE businesses SET status = 'SUSPENDED', suspended_reason = '${sqlEsc(reason)}' WHERE id = '${sqlEsc(safeBizId)}'`,
+        'Sync suspended status from Firestore',
+        true
+      );
+      return { status: 'SUSPENDED', suspendedReason: reason || 'Account suspended by Platform Super Admin.' };
+    }
+    return { status: 'ACTIVE' };
+  } catch (err: any) {
+    if (err?.code === 'permission-denied') return { status: 'ACTIVE' };
+    if (isNetworkOrOfflineAuthError(err)) return { status: 'ACTIVE' };
+    handleFirestoreError(err, OperationType.GET, bizPath);
+    return { status: 'ACTIVE' };
+  }
+}
+
 // ============================================================================
 // CLOUD RESTORE (Firestore -> AlaSQL Local, with Firebase Storage archive supplement)
 // ============================================================================
@@ -2622,7 +2688,9 @@ export async function restoreFromCloud(
     `INSERT INTO businesses (
       id, name, owner, email, password,
       billing_address, billing_city, billing_country, billing_phone, billing_email,
-      tpin, currency, tax_rate, admin_role, created_at, business_id, store_id
+      tpin, currency, tax_rate, admin_role, created_at, business_id, store_id,
+      status, suspended_reason, suspended_at, suspended_by,
+      flagged_for_fraud, fraud_flag_reason, flagged_at, plan_tier, subscription_status
     ) VALUES (
       '${sqlEsc(targetBizId)}',
       '${sqlEsc(bizData.name || 'Business')}',
@@ -2640,7 +2708,16 @@ export async function restoreFromCloud(
       '${sqlEsc(bizData.admin_role || 'admin')}',
       '${new Date().toISOString()}',
       '${sqlEsc(targetBizId)}',
-      '${sqlEsc(restoredPrimaryStoreId)}'
+      '${sqlEsc(restoredPrimaryStoreId)}',
+      '${sqlEsc(String(bizData.status || 'ACTIVE').toUpperCase())}',
+      '${sqlEsc(String(bizData.suspended_reason || ''))}',
+      '${sqlEsc(String(bizData.suspended_at || ''))}',
+      '${sqlEsc(String(bizData.suspended_by || ''))}',
+      ${bizData.flagged_for_fraud ? 1 : 0},
+      '${sqlEsc(String(bizData.fraud_flag_reason || ''))}',
+      '${sqlEsc(String(bizData.flagged_at || ''))}',
+      '${sqlEsc(String(bizData.plan_tier || 'PAID').toUpperCase())}',
+      '${sqlEsc(String(bizData.subscription_status || 'ACTIVE').toUpperCase())}'
     )`,
     'Restore: Insert backed up business workspace',
     true

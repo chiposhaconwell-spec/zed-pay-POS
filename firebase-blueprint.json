@@ -21,6 +21,15 @@
         "billing_phone": { "type": "string", "maxLength": 100, "description": "Registered billing phone number" },
         "billing_email": { "type": "string", "maxLength": 200, "description": "Registered billing email" },
         "admin_role": { "type": "string", "maxLength": 50, "description": "Primary account role" },
+        "status": { "type": "string", "enum": ["ACTIVE", "SUSPENDED"], "maxLength": 30, "description": "Platform moderation status" },
+        "suspended_reason": { "type": "string", "maxLength": 1000, "description": "Super Admin suspension reason" },
+        "suspended_at": { "type": "string", "maxLength": 100, "description": "ISO timestamp when suspended" },
+        "suspended_by": { "type": "string", "maxLength": 200, "description": "Super Admin email who suspended the business" },
+        "flagged_for_fraud": { "type": "boolean", "description": "Whether flagged for fraud review" },
+        "fraud_flag_reason": { "type": "string", "maxLength": 1000, "description": "Fraud review notes" },
+        "flagged_at": { "type": "string", "maxLength": 100, "description": "ISO timestamp when flagged for fraud" },
+        "plan_tier": { "type": "string", "enum": ["PAID", "TRIAL", "FREE"], "maxLength": 30, "description": "Platform subscription tier" },
+        "subscription_status": { "type": "string", "enum": ["ACTIVE", "PAST_DUE", "CANCELLED"], "maxLength": 30, "description": "Subscription billing state" },
         "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
         "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
       },
@@ -250,6 +259,41 @@
         "updatedAt": { "type": "string", "format": "date-time", "description": "Last update server timestamp" }
       },
       "required": ["id", "cred_id", "auth_email", "business_id", "business_name", "membership_id", "user_id", "ownerUid", "memberUid", "email", "full_name", "role", "store_id", "accessible_branches", "permissions_json", "status", "updatedAt"]
+    },
+    "SuperAdmin": {
+      "title": "Platform Super Admin",
+      "description": "Platform-level administrator identity completely separate from tenant BusinessMembership records",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Firebase Auth UID" },
+        "uid": { "type": "string", "maxLength": 128, "description": "Firebase Auth UID" },
+        "cred_id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Credential hash prefix" },
+        "email": { "type": "string", "maxLength": 200, "description": "Super Admin email address" },
+        "full_name": { "type": "string", "maxLength": 200, "description": "Super Admin display name" },
+        "role": { "type": "string", "enum": ["SUPER_ADMIN"], "maxLength": 30, "description": "Platform role" },
+        "status": { "type": "string", "enum": ["ACTIVE", "SUSPENDED"], "maxLength": 30, "description": "Super Admin active state" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Update server timestamp" }
+      },
+      "required": ["id", "uid", "cred_id", "email", "full_name", "role", "status", "createdAt", "updatedAt"]
+    },
+    "PlatformAuditLog": {
+      "title": "Super Admin Moderation Audit Log",
+      "description": "Immutable chronological log of Super Admin moderation and lifecycle actions across businesses",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Audit event ID" },
+        "action": { "type": "string", "enum": ["SUSPEND_BUSINESS", "RESTORE_BUSINESS", "FLAG_FRAUD", "CLEAR_FRAUD", "UPDATE_PLAN", "HARD_DELETE_BUSINESS"], "maxLength": 60, "description": "Moderation action type" },
+        "target_business_id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$", "description": "Target Business ID" },
+        "target_business_name": { "type": "string", "maxLength": 200, "description": "Target Business trading name at time of action" },
+        "reason": { "type": "string", "maxLength": 1000, "description": "Mandatory reason or context recorded by Super Admin" },
+        "performed_by_uid": { "type": "string", "maxLength": 128, "description": "Super Admin Firebase Auth UID" },
+        "performed_by_email": { "type": "string", "maxLength": 200, "description": "Super Admin email address" },
+        "metadata_json": { "type": "string", "maxLength": 4000, "description": "Optional serialized snapshot metadata" },
+        "timestamp": { "type": "string", "maxLength": 100, "description": "ISO timestamp string" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server creation timestamp" }
+      },
+      "required": ["id", "action", "target_business_id", "target_business_name", "reason", "performed_by_uid", "performed_by_email", "metadata_json", "timestamp", "createdAt"]
     }
   },
   "firestore": {
@@ -296,6 +340,14 @@
     "/credential_directory/{credId}": {
       "schema": "CredentialInvite",
       "description": "Zero-plaintext credential lookup index mapping SHA-256(email+password) cred_id strictly to its authorized business membership"
+    },
+    "/super_admins/{adminUid}": {
+      "schema": "SuperAdmin",
+      "description": "Platform-level Super Admin accounts strictly isolated from tenant memberships"
+    },
+    "/platform_audit_logs/{logId}": {
+      "schema": "PlatformAuditLog",
+      "description": "Immutable chronological audit log of every Super Admin moderation action"
     }
   }
 }

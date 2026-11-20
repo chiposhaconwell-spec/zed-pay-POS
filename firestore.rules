@@ -13,9 +13,11 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isSignedIn() &&
-        request.auth.token.email == 'chiposhaconwell@gmail.com' &&
-        request.auth.token.email_verified == true;
+      return isSignedIn() && (
+        (request.auth.token.email == 'chiposhaconwell@gmail.com' && request.auth.token.email_verified == true) ||
+        (request.auth.token.email == 'cornbtechnologies@gmail.com' && request.auth.token.email_verified == true) ||
+        exists(/databases/$(database)/documents/super_admins/$(request.auth.uid))
+      );
     }
 
     function isValidId(id) {
@@ -71,6 +73,9 @@ service cloud.firestore {
                'id', 'business_id', 'store_id', 'name', 'owner', 'email', 'ownerUid',
                'currency', 'tax_rate', 'tpin', 'billing_address', 'billing_city',
                'billing_country', 'billing_phone', 'billing_email', 'admin_role',
+               'status', 'suspended_reason', 'suspended_at', 'suspended_by',
+               'flagged_for_fraud', 'fraud_flag_reason', 'flagged_at',
+               'plan_tier', 'subscription_status',
                'createdAt', 'updatedAt'
              ]) &&
              isValidId(data.id) &&
@@ -90,6 +95,15 @@ service cloud.firestore {
              data.billing_phone is string && data.billing_phone.size() <= 100 &&
              data.billing_email is string && data.billing_email.size() <= 200 &&
              data.admin_role is string && data.admin_role.size() <= 50 &&
+             (!('status' in data) || data.status in ['ACTIVE', 'SUSPENDED']) &&
+             (!('suspended_reason' in data) || (data.suspended_reason is string && data.suspended_reason.size() <= 1000)) &&
+             (!('suspended_at' in data) || (data.suspended_at is string && data.suspended_at.size() <= 100)) &&
+             (!('suspended_by' in data) || (data.suspended_by is string && data.suspended_by.size() <= 200)) &&
+             (!('flagged_for_fraud' in data) || data.flagged_for_fraud is bool) &&
+             (!('fraud_flag_reason' in data) || (data.fraud_flag_reason is string && data.fraud_flag_reason.size() <= 1000)) &&
+             (!('flagged_at' in data) || (data.flagged_at is string && data.flagged_at.size() <= 100)) &&
+             (!('plan_tier' in data) || data.plan_tier in ['PAID', 'TRIAL', 'FREE']) &&
+             (!('subscription_status' in data) || data.subscription_status in ['ACTIVE', 'PAST_DUE', 'CANCELLED']) &&
              data.createdAt is timestamp &&
              data.updatedAt is timestamp;
     }
@@ -314,6 +328,41 @@ service cloud.firestore {
              data.updatedAt is timestamp;
     }
 
+    function isValidSuperAdmin(data) {
+      return data.keys().hasAll(['id', 'uid', 'cred_id', 'email', 'full_name', 'role', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'uid', 'cred_id', 'email', 'full_name', 'role', 'status', 'createdAt', 'updatedAt']) &&
+             isValidId(data.id) &&
+             data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 &&
+             isValidId(data.cred_id) &&
+             data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+             data.full_name is string && data.full_name.size() >= 1 && data.full_name.size() <= 200 &&
+             data.role == 'SUPER_ADMIN' &&
+             data.status in ['ACTIVE', 'SUSPENDED'] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidPlatformAuditLog(data) {
+      return data.keys().hasAll([
+               'id', 'action', 'target_business_id', 'target_business_name', 'reason',
+               'performed_by_uid', 'performed_by_email', 'metadata_json', 'timestamp', 'createdAt'
+             ]) &&
+             data.keys().hasOnly([
+               'id', 'action', 'target_business_id', 'target_business_name', 'reason',
+               'performed_by_uid', 'performed_by_email', 'metadata_json', 'timestamp', 'createdAt'
+             ]) &&
+             isValidId(data.id) &&
+             data.action in ['SUSPEND_BUSINESS', 'RESTORE_BUSINESS', 'FLAG_FRAUD', 'CLEAR_FRAUD', 'UPDATE_PLAN', 'HARD_DELETE_BUSINESS'] &&
+             isValidId(data.target_business_id) &&
+             data.target_business_name is string && data.target_business_name.size() >= 1 && data.target_business_name.size() <= 200 &&
+             data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 1000 &&
+             data.performed_by_uid is string && data.performed_by_uid.size() >= 1 && data.performed_by_uid.size() <= 128 &&
+             data.performed_by_email is string && data.performed_by_email.size() >= 3 && data.performed_by_email.size() <= 200 &&
+             data.metadata_json is string && data.metadata_json.size() <= 4000 &&
+             data.timestamp is string && data.timestamp.size() >= 1 && data.timestamp.size() <= 100 &&
+             data.createdAt is timestamp;
+    }
+
     // 4. Collection & Relational Subcollection Match Rules
 
     // Credential Directory: Zero-plaintext (email + password) SHA-256 prefix index
@@ -369,11 +418,55 @@ service cloud.firestore {
       );
     }
 
+    // Platform-Level Super Admins (Strictly separated from regular BusinessMembership)
+    match /super_admins/{adminUid} {
+      allow get: if isSignedIn() && isValidId(adminUid) && (request.auth.uid == adminUid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn() &&
+                       isValidId(adminUid) &&
+                       isValidSuperAdmin(incoming()) &&
+                       incoming().id == adminUid &&
+                       incoming().uid == adminUid &&
+                       incoming().status == 'ACTIVE' &&
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time && (
+                         isAdmin() ||
+                         (
+                           request.auth.uid == adminUid &&
+                           request.auth.token.firebase.sign_in_provider == 'password' &&
+                           incoming().email == 'cornbtechnologies@gmail.com' &&
+                           incoming().cred_id == '14502f2917bd7baffecafd15a60218ad4c6a666a73d3c9c89f5ed487' &&
+                           request.auth.token.email == 'cred_14502f2917bd7baffecafd15a60218ad4c6a666a73d3c9c89f5ed487@mt-pos.auth'
+                         )
+                       );
+      allow update: if isAdmin() &&
+                       isValidId(adminUid) &&
+                       isValidSuperAdmin(incoming()) &&
+                       incoming().id == existing().id &&
+                       incoming().uid == existing().uid &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Immutable Chronological Super Admin Moderation Audit Logs
+    match /platform_audit_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isAdmin() &&
+                       isValidId(logId) &&
+                       isValidPlatformAuditLog(incoming()) &&
+                       incoming().id == logId &&
+                       incoming().performed_by_uid == request.auth.uid &&
+                       incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
     match /businesses/{businessId} {
       allow get: if isSignedIn() && isValidId(businessId) && (
         resource == null ||
         existing().ownerUid == request.auth.uid ||
-        isBusinessMember(businessId)
+        isBusinessMember(businessId) ||
+        isAdmin()
       );
       allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isAdmin());
       allow create: if isSignedIn() &&
@@ -382,23 +475,42 @@ service cloud.firestore {
                        incoming().id == businessId &&
                        incoming().business_id == businessId &&
                        incoming().ownerUid == request.auth.uid &&
+                       (!('status' in incoming()) || incoming().status == 'ACTIVE') &&
+                       (!('flagged_for_fraud' in incoming()) || incoming().flagged_for_fraud == false) &&
                        incoming().createdAt == request.time &&
                        incoming().updatedAt == request.time;
       allow update: if isSignedIn() &&
                        isValidId(businessId) &&
                        isValidBusiness(incoming()) &&
-                       (existing().ownerUid == request.auth.uid || isActiveOwnerMember(businessId) || isAdmin()) &&
                        incoming().id == existing().id &&
                        incoming().business_id == businessId &&
                        incoming().ownerUid == existing().ownerUid &&
                        incoming().createdAt == existing().createdAt &&
-                       incoming().updatedAt == request.time &&
-                       incoming().diff(existing()).affectedKeys().hasOnly([
-                         'business_id', 'store_id', 'name', 'owner', 'email',
-                         'currency', 'tax_rate', 'tpin', 'billing_address', 'billing_city',
-                         'billing_country', 'billing_phone', 'billing_email', 'admin_role', 'updatedAt'
-                       ]);
-      allow delete: if false;
+                       incoming().updatedAt == request.time && (
+                         (
+                           (existing().ownerUid == request.auth.uid || isActiveOwnerMember(businessId)) &&
+                           incoming().diff(existing()).affectedKeys().hasOnly([
+                             'business_id', 'store_id', 'name', 'owner', 'email',
+                             'currency', 'tax_rate', 'tpin', 'billing_address', 'billing_city',
+                             'billing_country', 'billing_phone', 'billing_email', 'admin_role', 'updatedAt'
+                           ])
+                         ) ||
+                         (
+                           isAdmin() &&
+                           incoming().diff(existing()).affectedKeys().hasOnly([
+                             'business_id', 'store_id', 'name', 'owner', 'email',
+                             'currency', 'tax_rate', 'tpin', 'billing_address', 'billing_city',
+                             'billing_country', 'billing_phone', 'billing_email', 'admin_role',
+                             'status', 'suspended_reason', 'suspended_at', 'suspended_by',
+                             'flagged_for_fraud', 'fraud_flag_reason', 'flagged_at',
+                             'plan_tier', 'subscription_status', 'updatedAt'
+                           ])
+                         )
+                       );
+      allow delete: if isAdmin() &&
+                       isValidId(businessId) &&
+                       resource != null &&
+                       (existing().status == 'SUSPENDED' || existing().flagged_for_fraud == true);
 
       // Subcollection: Decoupled Many-to-Many Business Memberships
       match /memberships/{membershipId} {
@@ -407,10 +519,13 @@ service cloud.firestore {
           (resource != null && existing().memberUid == request.auth.uid) ||
           isBusinessOwner(businessId)
         );
-        allow list: if isSignedIn() && existing().business_id == businessId && (
-          existing().ownerUid == request.auth.uid ||
-          existing().memberUid == request.auth.uid ||
-          isAdmin()
+        allow list: if isSignedIn() && (
+          isAdmin() || (
+            existing().business_id == businessId && (
+              existing().ownerUid == request.auth.uid ||
+              existing().memberUid == request.auth.uid
+            )
+          )
         );
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
@@ -470,7 +585,7 @@ service cloud.firestore {
       // Subcollection: Business Settings & Configuration
       match /settings/{settingId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(settingId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(settingId) &&
@@ -505,7 +620,7 @@ service cloud.firestore {
       // Subcollection: Store Branches
       match /stores/{storeId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(storeId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(storeId) &&
@@ -534,7 +649,7 @@ service cloud.firestore {
       // Subcollection: Product Catalog & Batches
       match /products/{productId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(productId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(productId) &&
@@ -563,7 +678,7 @@ service cloud.firestore {
       // Subcollection: Per-Branch Store Stock Levels
       match /store_products/{storeProductId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(storeProductId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(storeProductId) &&
@@ -593,7 +708,7 @@ service cloud.firestore {
       // Subcollection: Client CRM Data
       match /customers/{customerId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(customerId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(customerId) &&
@@ -616,7 +731,7 @@ service cloud.firestore {
       // Subcollection: POS Sales & Refund Orders (Transactions)
       match /orders/{orderId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(orderId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(orderId) &&
@@ -636,13 +751,13 @@ service cloud.firestore {
                          incoming().store_id == existing().store_id &&
                          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentMethod', 'total', 'subtotal', 'tax', 'discount', 'customerId', 'performed_by']) &&
                          isBusinessMember(businessId);
-        allow delete: if false;
+        allow delete: if isAdmin() && isValidId(businessId) && isValidId(orderId);
       }
 
       // Subcollection: Order Line Items (Relational link between Orders and Products)
       match /order_items/{itemId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(itemId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(itemId) &&
@@ -668,7 +783,7 @@ service cloud.firestore {
       // Subcollection: Double-Entry Accounting & Client Relational Ledger Backups
       match /ledgers/{ledgerId} {
         allow get: if isSignedIn() && isValidId(businessId) && isValidId(ledgerId) && isBusinessMember(businessId);
-        allow list: if isSignedIn() && existing().business_id == businessId && isBusinessMember(businessId);
+        allow list: if isSignedIn() && (isAdmin() || (existing().business_id == businessId && isBusinessMember(businessId)));
         allow create: if isSignedIn() &&
                          isValidId(businessId) &&
                          isValidId(ledgerId) &&

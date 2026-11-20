@@ -785,6 +785,10 @@ export function rehydrateAlasqlFromRecords(
           if (table === 'businesses') {
             if (!copy.business_id && copy.id) copy.business_id = String(copy.id);
             if (!copy.store_id) copy.store_id = inferredStoreId || 'main';
+            if (!copy.status) copy.status = 'ACTIVE';
+            if (copy.flagged_for_fraud === undefined) copy.flagged_for_fraud = 0;
+            if (!copy.plan_tier) copy.plan_tier = 'PAID';
+            if (!copy.subscription_status) copy.subscription_status = 'ACTIVE';
           } else if (table === 'stores') {
             if (!copy.business_id && inferredBizId) copy.business_id = inferredBizId;
             if (!copy.store_id && copy.id) copy.store_id = String(copy.id);
@@ -1053,6 +1057,27 @@ let isDbSchemaCreated = false;
 
 export function initializeDatabase(template: SeedTemplate = 'blank', forceReset: boolean = false) {
   if (!forceReset && isDbSchemaCreated && alasql.tables && alasql.tables.businesses && alasql.tables.accounts) {
+    // Ensure moderation/plan columns exist on already-initialized businesses table
+    const bizTbl = alasql.tables.businesses as any;
+    if (Array.isArray(bizTbl?.columns)) {
+      const existingCols = new Set(bizTbl.columns.map((c: any) => c.columnid));
+      const extraCols = [
+        { columnid: 'status', dbtypeid: 'STRING' },
+        { columnid: 'suspended_reason', dbtypeid: 'STRING' },
+        { columnid: 'suspended_at', dbtypeid: 'STRING' },
+        { columnid: 'suspended_by', dbtypeid: 'STRING' },
+        { columnid: 'flagged_for_fraud', dbtypeid: 'INT' },
+        { columnid: 'fraud_flag_reason', dbtypeid: 'STRING' },
+        { columnid: 'flagged_at', dbtypeid: 'STRING' },
+        { columnid: 'plan_tier', dbtypeid: 'STRING' },
+        { columnid: 'subscription_status', dbtypeid: 'STRING' },
+      ];
+      for (const col of extraCols) {
+        if (!existingCols.has(col.columnid)) {
+          bizTbl.columns.push(col);
+        }
+      }
+    }
     return;
   }
   if (isDbInitializing) return;
@@ -1136,7 +1161,7 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       )
     `, 'Multi-Tenant Membership Schema: Create BUSINESS_MEMBERSHIPS table');
 
-    // Create Business Identity container (with billing address, tax & admin role metadata)
+    // Create Business Identity container (with billing address, tax, admin role & platform moderation metadata)
     runSql(`
       CREATE TABLE businesses (
         id STRING PRIMARY KEY,
@@ -1157,7 +1182,16 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         role STRING,
         admin_role STRING,
         business_id STRING,
-        store_id STRING
+        store_id STRING,
+        status STRING,
+        suspended_reason STRING,
+        suspended_at STRING,
+        suspended_by STRING,
+        flagged_for_fraud INT,
+        fraud_flag_reason STRING,
+        flagged_at STRING,
+        plan_tier STRING,
+        subscription_status STRING
       )
     `, 'Multi-Business Schema: Create BUSINESSES table');
 
