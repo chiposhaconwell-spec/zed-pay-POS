@@ -38,8 +38,6 @@ function dedupeByKey<T>(rows: T[], getKey: (row: T) => string | number | null | 
 }
 
 const serverDeletedBusinessIds = new Set<string>([
-  'biz_3539',
-  'biz_3126',
   'default_biz',
   '__latest__',
   '__global__',

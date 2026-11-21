@@ -58,6 +58,11 @@ import {
   isBusinessPermanentlyDeleted,
   markBusinessPermanentlyDeleted,
   purgeBusinessFromLocalDatabase,
+  getNextSequentialCompanyId,
+  getPermanentCompanyIdForUser,
+  setPermanentCompanyIdForUser,
+  isHydratingOrRestoringDatabase,
+  runWithHydrationGuard,
 } from './db';
 import { getZraConfig, saveZraConfig, switchZraConfigForBusiness } from './zra/zraConfig';
 import {
@@ -347,7 +352,6 @@ export const initAuth = (
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
       syncFirebaseUserWithBackend(user).catch(() => {});
-      void purgeAllDeletedBusinessesFromCloudOnce();
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
       } else if (!isSigningIn) {
@@ -1803,6 +1807,13 @@ export async function claimCredentialInviteAndRestore(
         permissionsJson: String(inv.permissions_json || '{}'),
         status: 'ACTIVE',
       });
+      setPermanentCompanyIdForUser({
+        userId: String(inv.user_id || deriveUserId(cleanEmail)),
+        credId,
+        credentialHash: credHash,
+        email: cleanEmail,
+        companyId: safeBizId,
+      });
 
       if (options?.deferFullRestore) {
         void restoreFromCloud(safeBizId, { silentIfUnlinked: true, skipAccessCheck: true }).catch(() => {});
@@ -1829,17 +1840,18 @@ export async function claimCredentialInviteAndRestore(
 
     // Fallback: Check if user owns any Business directly under this credential-scoped UID
     if (ownedSnap && !ownedSnap.empty) {
-      const validOwnedDocs = ownedSnap.docs.filter((d) => {
-        if (isBusinessPermanentlyDeleted(d.id)) {
-          void purgeBusinessFromFirestoreAndStorage(d.id);
-          return false;
-        }
-        return true;
-      });
+      const validOwnedDocs = ownedSnap.docs.filter((d) => !isBusinessPermanentlyDeleted(d.id));
       if (validOwnedDocs.length > 0) {
         const bizDoc = validOwnedDocs[0];
         const bizData = bizDoc.data();
         const targetBizId = bizDoc.id;
+        setPermanentCompanyIdForUser({
+          userId: deriveUserId(cleanEmail),
+          credId,
+          credentialHash: credHash,
+          email: cleanEmail,
+          companyId: targetBizId,
+        });
         if (options?.deferFullRestore) {
           void restoreFromCloud(targetBizId, { silentIfUnlinked: true, skipAccessCheck: true, preloadedBizData: bizData }).catch(() => {});
         } else {
@@ -1950,19 +1962,266 @@ async function purgeAllDeletedBusinessesFromCloudOnce(): Promise<void> {
 }
 
 // ============================================================================
+// IDEMPOTENT COMPANY REGISTRATION & SEQUENTIAL COMPANY ID ALLOCATOR (1, 2, 3...)
+// ============================================================================
+let activeCompanyRegistrationPromise: Promise<{
+  alreadyExists: boolean;
+  companyId: string;
+  companyName?: string;
+  restoredFromCloud?: boolean;
+  credId: string;
+  credHash: string;
+}> | null = null;
+
+export async function prepareIdempotentCompanyRegistration(params: {
+  email: string;
+  password: string;
+  companyName: string;
+  ownerName: string;
+}): Promise<{
+  alreadyExists: boolean;
+  companyId: string;
+  companyName?: string;
+  restoredFromCloud?: boolean;
+  credId: string;
+  credHash: string;
+}> {
+  if (activeCompanyRegistrationPromise) {
+    return activeCompanyRegistrationPromise;
+  }
+
+  activeCompanyRegistrationPromise = (async () => {
+    const cleanEmail = normalizeAuthEmail(params.email);
+    const rawPass = String(params.password || '').trim();
+    const cleanCompanyName = String(params.companyName || '').trim();
+    const normalizedName = cleanCompanyName.toLowerCase().replace(/\s+/g, ' ');
+    const { credHash, credId } = deriveFirebaseCredentialIdentity(cleanEmail, rawPass);
+    const userId = deriveUserId(cleanEmail);
+
+    // 1. Check local database for an existing business with the same credential hash or (email + company name)
+    const localBusinesses = dedupeAndCleanBusinessesTable();
+    const localSameNameAndEmail = localBusinesses.find(
+      (b: any) =>
+        !isBusinessPermanentlyDeleted(b?.id) &&
+        String(b?.name || '').trim().toLowerCase().replace(/\s+/g, ' ') === normalizedName &&
+        normalizeAuthEmail(b?.email || '') === cleanEmail
+    );
+    if (localSameNameAndEmail) {
+      const existingId = String(localSameNameAndEmail.id).trim();
+      setPermanentCompanyIdForUser({
+        userId,
+        credId,
+        credentialHash: credHash,
+        email: cleanEmail,
+        companyId: existingId,
+      });
+      return {
+        alreadyExists: true,
+        companyId: existingId,
+        companyName: String(localSameNameAndEmail.name || existingId),
+        credId,
+        credHash,
+      };
+    }
+
+    const existingPermForCred = getPermanentCompanyIdForUser({
+      credId,
+      credentialHash: credHash,
+    });
+    if (existingPermForCred) {
+      const matchedLocal = localBusinesses.find((b: any) => String(b?.id || '').trim() === existingPermForCred);
+      if (matchedLocal) {
+        return {
+          alreadyExists: true,
+          companyId: existingPermForCred,
+          companyName: String(matchedLocal.name || existingPermForCred),
+          credId,
+          credHash,
+        };
+      }
+    }
+
+    // 2. Authenticate credential identity in Firebase Auth
+    try {
+      await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+        allowCreate: true,
+        displayName: params.ownerName.trim(),
+      });
+    } catch (fbAuthErr) {
+      console.warn('Firebase Credential Auth registration notice:', fbAuthErr);
+    }
+
+    const discoveredExistingIds = new Set<string>(
+      localBusinesses.map((b: any) => String(b?.id || '').trim()).filter(Boolean)
+    );
+
+    // 3. Check Cloud Firestore (credential_directory & owned businesses) before creating any company
+    if (auth.currentUser) {
+      try {
+        const isOnline = await ensureFirestoreOnlineIfReachable();
+        if (isOnline) {
+          const currentUid = auth.currentUser.uid;
+          const credRef = doc(db, 'credential_directory', credId);
+          const [credSnap, ownedSnap] = await Promise.all([
+            getDoc(credRef).catch(() => getDocFromCache(credRef).catch(() => null)),
+            getDocs(query(collection(db, 'businesses'), where('ownerUid', '==', currentUid))).catch(() => null),
+          ]);
+
+          if (ownedSnap && !ownedSnap.empty) {
+            for (const d of ownedSnap.docs) {
+              if (!isBusinessPermanentlyDeleted(d.id)) {
+                discoveredExistingIds.add(d.id);
+              }
+            }
+          }
+
+          if (credSnap && credSnap.exists()) {
+            const cData = credSnap.data();
+            const remoteBizId = String(cData?.business_id || '').trim();
+            if (remoteBizId && !isBusinessPermanentlyDeleted(remoteBizId)) {
+              discoveredExistingIds.add(remoteBizId);
+              setPermanentCompanyIdForUser({
+                userId,
+                credId,
+                credentialHash: credHash,
+                email: cleanEmail,
+                companyId: remoteBizId,
+              });
+              await restoreFromCloud(remoteBizId, {
+                silentIfUnlinked: true,
+                skipAccessCheck: true,
+              }).catch(() => {});
+              return {
+                alreadyExists: true,
+                companyId: remoteBizId,
+                companyName: String(cData?.business_name || cleanCompanyName || remoteBizId),
+                restoredFromCloud: true,
+                credId,
+                credHash,
+              };
+            }
+          }
+
+          if (ownedSnap && !ownedSnap.empty) {
+            const validDocs = ownedSnap.docs.filter((d) => !isBusinessPermanentlyDeleted(d.id));
+            const matchingDoc =
+              validDocs.find(
+                (d) =>
+                  String(d.data()?.name || '').trim().toLowerCase().replace(/\s+/g, ' ') === normalizedName
+              ) || validDocs[0];
+            if (matchingDoc) {
+              const remoteBizId = matchingDoc.id;
+              const remoteData = matchingDoc.data();
+              setPermanentCompanyIdForUser({
+                userId,
+                credId,
+                credentialHash: credHash,
+                email: cleanEmail,
+                companyId: remoteBizId,
+              });
+              await restoreFromCloud(remoteBizId, {
+                silentIfUnlinked: true,
+                skipAccessCheck: true,
+                preloadedBizData: remoteData,
+              }).catch(() => {});
+              return {
+                alreadyExists: true,
+                companyId: remoteBizId,
+                companyName: String(remoteData?.name || cleanCompanyName || remoteBizId),
+                restoredFromCloud: true,
+                credId,
+                credHash,
+              };
+            }
+          }
+        }
+      } catch (fsCheckErr) {
+        console.warn('Firestore pre-registration idempotency check notice:', fsCheckErr);
+      }
+    }
+
+    // 4. Also check Cloud SQL /api/sync/status for existing sequential company IDs & same-name company under this email
+    if (typeof fetch !== 'undefined' && (typeof navigator === 'undefined' || navigator.onLine !== false)) {
+      try {
+        const statusRes = await fetch('/api/sync/status');
+        if (statusRes.ok) {
+          const statusData = await statusRes.json().catch(() => null);
+          const avail = Array.isArray(statusData?.availableBusinesses)
+            ? statusData.availableBusinesses
+            : [];
+          for (const b of avail) {
+            const bId = String(b?.businessId || b?.id || '').trim();
+            if (bId && !isBusinessPermanentlyDeleted(bId)) {
+              discoveredExistingIds.add(bId);
+              const bName = String(b?.businessName || b?.name || '')
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/g, ' ');
+              const bEmail = normalizeAuthEmail(b?.ownerEmail || b?.email || '');
+              if (bName === normalizedName && bEmail === cleanEmail) {
+                return {
+                  alreadyExists: true,
+                  companyId: bId,
+                  companyName: String(b?.businessName || b?.name || bId),
+                  credId,
+                  credHash,
+                };
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 5. Allocate the next sequential Company ID starting from 1 ("1", "2", "3", ...)
+    const nextSequentialId = getNextSequentialCompanyId(discoveredExistingIds);
+    setPermanentCompanyIdForUser({
+      userId,
+      credId,
+      credentialHash: credHash,
+      email: cleanEmail,
+      companyId: nextSequentialId,
+    });
+
+    return {
+      alreadyExists: false,
+      companyId: nextSequentialId,
+      credId,
+      credHash,
+    };
+  })().finally(() => {
+    activeCompanyRegistrationPromise = null;
+  });
+
+  return activeCompanyRegistrationPromise;
+}
+
+// ============================================================================
 // CLOUD BACKUP (AlaSQL Local -> Firestore Relational + Firebase Storage)
 // ============================================================================
+const inFlightCloudBackups = new Map<string, Promise<{ success: boolean; details: string }>>();
+
 export async function backupToCloud(
   businessId: string,
-  options?: { silentIfNotOwner?: boolean }
+  options?: { silentIfNotOwner?: boolean; allowCreateCompanyDoc?: boolean }
 ): Promise<{ success: boolean; details: string }> {
-  if (!businessId || isBusinessPermanentlyDeleted(businessId)) {
-    if (businessId) purgeBusinessFromLocalDatabase(businessId);
+  const cleanTargetId = String(businessId || '').trim();
+  if (!cleanTargetId || cleanTargetId === 'default_biz' || isBusinessPermanentlyDeleted(cleanTargetId)) {
+    if (cleanTargetId && isBusinessPermanentlyDeleted(cleanTargetId)) {
+      purgeBusinessFromLocalDatabase(cleanTargetId);
+    }
     return {
       success: false,
-      details: 'Backup skipped: business was permanently deleted.',
+      details: 'Backup skipped: invalid or deleted company ID.',
     };
   }
+
+  const existingInFlight = inFlightCloudBackups.get(cleanTargetId);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const backupPromise = (async (): Promise<{ success: boolean; details: string }> => {
   if (!auth.currentUser) {
     throw new Error('You must be signed in (Email/Password or Google) to sync with Firebase Cloud.');
   }
@@ -1986,7 +2245,7 @@ export async function backupToCloud(
   const currentUid = auth.currentUser.uid;
   const primaryStoreId = sanitizeIdForFirestore(getActiveStoreId(undefined, businessId), 'store');
 
-  // 1. Fetch current business profile locally
+  // 1. Fetch current business profile locally — NEVER synthesize a fallback company record if missing locally!
   const localBizRes = runSql(
     `SELECT * FROM businesses WHERE id = '${cleanBizId}'`,
     'Cloud Sync: Read local profile',
@@ -1995,12 +2254,14 @@ export async function backupToCloud(
   const biz =
     localBizRes.success && Array.isArray(localBizRes.data) && localBizRes.data.length > 0
       ? localBizRes.data[0]
-      : {
-          id: safeBizId,
-          name: 'POS Enterprise',
-          owner: auth.currentUser.displayName || 'Business Owner',
-          email: auth.currentUser.email || 'owner@pos.app',
-        };
+      : null;
+
+  if (!biz) {
+    return {
+      success: false,
+      details: 'Backup skipped: company profile is not loaded in local database.',
+    };
+  }
 
   let settingsObj: any = null;
   try {
@@ -2096,6 +2357,13 @@ export async function backupToCloud(
         isOnline
       );
     } else {
+      // NEVER create a new company document automatically during login, refresh, dashboard init, or background auto-backup!
+      if (!options?.allowCreateCompanyDoc) {
+        return {
+          success: false,
+          details: 'Skipped automatic company creation: company documents can only be created during intentional registration.',
+        };
+      }
       resolvedParentOwnerUid = currentUid;
       isOnline = await writeDocOfflineAware(
         bizRef,
@@ -2291,7 +2559,7 @@ export async function backupToCloud(
       }
     }
   }
-  if (isOnline && !isFirestoreNetworkDisabled) {
+  if (isOnline && !isFirestoreNetworkDisabled && activeStoreDocIds.size > 0) {
     for (const [remoteId, entry] of existingStoresMap.entries()) {
       if (!activeStoreDocIds.has(remoteId)) {
         await deleteDoc(entry.ref).catch(() => {});
@@ -2351,7 +2619,7 @@ export async function backupToCloud(
       }
     }
   }
-  if (isOnline && !isFirestoreNetworkDisabled) {
+  if (isOnline && !isFirestoreNetworkDisabled && activeProductDocIds.size > 0) {
     for (const [remoteId, entry] of existingProductsMap.entries()) {
       if (!activeProductDocIds.has(remoteId)) {
         await deleteDoc(entry.ref).catch(() => {});
@@ -2403,7 +2671,7 @@ export async function backupToCloud(
       }
     }
   }
-  if (isOnline && !isFirestoreNetworkDisabled) {
+  if (isOnline && !isFirestoreNetworkDisabled && activeSpDocIds.size > 0) {
     for (const [remoteId, entry] of existingSpMap.entries()) {
       if (!activeSpDocIds.has(remoteId)) {
         await deleteDoc(entry.ref).catch(() => {});
@@ -2457,7 +2725,7 @@ export async function backupToCloud(
       }
     }
   }
-  if (isOnline && !isFirestoreNetworkDisabled) {
+  if (isOnline && !isFirestoreNetworkDisabled && activeCustomerDocIds.size > 0) {
     for (const [remoteId, entry] of existingCustMap.entries()) {
       if (!activeCustomerDocIds.has(remoteId)) {
         await deleteDoc(entry.ref).catch(() => {});
@@ -2591,6 +2859,11 @@ export async function backupToCloud(
     const ledgerPath = `businesses/${safeBizId}/ledgers/${ledgerDocId}`;
     const ledgerOwnerUid = existingLedgersMap.get(ledgerDocId)?.ownerUid || resolvedParentOwnerUid;
 
+    // Never overwrite an existing cloud ledger document with an empty array during background sync
+    if (boundedRecords.length === 0 && existingLedgersMap.has(ledgerDocId) && !options?.allowCreateCompanyDoc) {
+      continue;
+    }
+
     try {
       isOnline = await writeDocOfflineAware(
         doc(db, 'businesses', safeBizId, 'ledgers', ledgerDocId),
@@ -2647,6 +2920,12 @@ export async function backupToCloud(
     success: true,
     details: `Backed up to Cloud Firestore${storageNote}: ${settingsSynced ? 'settings & profile, ' : ''}${totalStoresSynced} branches, ${totalProductsSynced} catalog items (${totalStoreProductsSynced} branch stock records), ${totalCustomersSynced} clients, ${totalOrdersSynced} transactions (${totalOrderItemsSynced} line items), and ${totalLedgersSynced} operational ledgers.`,
   };
+  })().finally(() => {
+    inFlightCloudBackups.delete(cleanTargetId);
+  });
+
+  inFlightCloudBackups.set(cleanTargetId, backupPromise);
+  return backupPromise;
 }
 
 const recentBusinessModerationCache = new Map<
@@ -2801,13 +3080,7 @@ export async function restoreFromCloud(
       const q = query(collection(db, 'businesses'), where('ownerUid', '==', currentUid));
       const qSnap = await getDocs(q);
       if (!qSnap.empty) {
-        const validDocs = qSnap.docs.filter((d) => {
-          if (isBusinessPermanentlyDeleted(d.id)) {
-            void purgeBusinessFromFirestoreAndStorage(d.id);
-            return false;
-          }
-          return true;
-        });
+        const validDocs = qSnap.docs.filter((d) => !isBusinessPermanentlyDeleted(d.id));
         const matchedDoc = targetBizId
           ? validDocs.find((d) => d.id === targetBizId)
           : validDocs[0];
@@ -3246,22 +3519,30 @@ export async function restoreFromCloud(
       } catch {}
 
       if (updatedFromArchive) {
-        persistTablesToStorage(true);
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(new Event('pos_data_updated'));
-        }
+        await runWithHydrationGuard(() => {
+          persistTablesToStorage(true);
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new Event('local_db_restored'));
+          }
+        });
       }
     })();
   }
 
-  syncUsersAndMembershipsFromLegacyTables(targetBizId);
-  syncAllAccountingSystems('Firebase Cloud Restore');
-  persistTablesToStorage(true);
+  await runWithHydrationGuard(() => {
+    setPermanentCompanyIdForUser({
+      userId: deriveUserId(String(bizData.email || auth.currentUser?.email || '')),
+      email: String(bizData.email || auth.currentUser?.email || ''),
+      companyId: targetBizId,
+    });
+    syncUsersAndMembershipsFromLegacyTables(targetBizId);
+    syncAllAccountingSystems('Firebase Cloud Restore');
+    persistTablesToStorage(true);
 
-  if (typeof window !== 'undefined') {
-    window.dispatchEvent(new Event('local_db_restored'));
-    window.dispatchEvent(new Event('pos_data_updated'));
-  }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('local_db_restored'));
+    }
+  });
 
   return {
     success: true,
@@ -3276,36 +3557,50 @@ let autoFirebaseBackupTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function triggerAutoFirebaseBackup(businessId?: string) {
   if (!auth.currentUser) return;
+  if (isHydratingOrRestoringDatabase()) return;
   if (typeof localStorage !== 'undefined' && localStorage.getItem('pos_authenticated_session') !== 'true') return;
   if (autoFirebaseBackupTimer) {
     clearTimeout(autoFirebaseBackupTimer);
   }
   autoFirebaseBackupTimer = setTimeout(async () => {
     try {
-      let targetBizId = businessId || '';
+      if (!auth.currentUser || isHydratingOrRestoringDatabase()) return;
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('pos_authenticated_session') !== 'true') return;
+
+      let targetBizId = String(businessId || '').trim();
       if (!targetBizId && typeof localStorage !== 'undefined') {
         const saved = localStorage.getItem('active_business_profile');
         if (saved) {
           const parsed = JSON.parse(saved);
           if (parsed?.id && parsed.id !== 'default_biz') {
-            targetBizId = parsed.id;
+            targetBizId = String(parsed.id).trim();
           }
         }
       }
-      if (!targetBizId) {
-        const bRes = runSql('SELECT * FROM businesses', 'Auto Firebase Backup: Check business', true);
-        if (bRes.success && Array.isArray(bRes.data) && bRes.data.length > 0) {
-          targetBizId = bRes.data[0].id;
-        }
+
+      if (!targetBizId || targetBizId === 'default_biz' || isBusinessPermanentlyDeleted(targetBizId)) {
+        return;
       }
+
+      // Verify the company actually exists in the local businesses table before attempting auto-backup
+      const localCheck = runSql(
+        `SELECT id FROM businesses WHERE id = '${sqlEsc(targetBizId)}'`,
+        'Auto Firebase Backup: Verify local business exists',
+        true
+      );
+      if (!localCheck.success || !Array.isArray(localCheck.data) || localCheck.data.length === 0) {
+        return;
+      }
+
       if (
-        targetBizId &&
-        targetBizId !== 'default_biz' &&
-        !isBusinessPermanentlyDeleted(targetBizId) &&
         isCurrentUserAuthorizedBusinessOwner(targetBizId) &&
         !isBusinessCloudMarkedUnlinked(targetBizId)
       ) {
-        await backupToCloud(targetBizId, { silentIfNotOwner: true });
+        // NEVER allow auto-backup to create a new company document in Firestore
+        await backupToCloud(targetBizId, {
+          silentIfNotOwner: true,
+          allowCreateCompanyDoc: false,
+        });
       }
     } catch (err) {
       console.warn('Auto Firebase background backup notice:', err);
@@ -3318,17 +3613,18 @@ if (typeof window !== 'undefined') {
     void setFirestoreOfflineMode();
   });
   window.addEventListener('pos_data_updated', () => {
-    triggerAutoFirebaseBackup();
-  });
-  window.addEventListener('pos_sync_status_changed', () => {
-    triggerAutoFirebaseBackup();
+    if (!isHydratingOrRestoringDatabase()) {
+      triggerAutoFirebaseBackup();
+    }
   });
   window.addEventListener('online', () => {
     lastAuthNetworkFailureAt = 0;
     void ensureFirestoreOnlineIfReachable().then((online) => {
       if (online) {
         void flushPendingFinalizedTxMirrors();
-        triggerAutoFirebaseBackup();
+        if (!isHydratingOrRestoringDatabase()) {
+          triggerAutoFirebaseBackup();
+        }
       }
     });
   });

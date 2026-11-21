@@ -453,14 +453,6 @@ export async function fetchPlatformBusinesses(
   const isOnline = await ensureFirestoreOnlineIfReachable();
   const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
   if (hasAdminAuth && auth.currentUser) {
-    // Proactively erase any permanently-deleted business IDs (e.g., biz_3539, biz_3126) from Firestore/Storage/Cloud SQL
-    for (const delId of getDeletedBusinessIds()) {
-      if (delId && delId !== 'default_biz' && delId !== '__latest__' && delId !== '__global__') {
-        void purgeBusinessFromFirestoreAndStorage(delId);
-        void deleteBusinessFromServer(delId);
-      }
-    }
-
     const listPath = 'businesses';
     try {
       const bizSnap = await getDocs(collection(db, 'businesses'));
@@ -470,10 +462,6 @@ export async function fetchPlatformBusinesses(
         bizSnap.docs.map(async (bizDoc) => {
           const id = String(bizDoc.id || '').trim();
           if (!id || id === 'default_biz' || isBusinessPermanentlyDeleted(id)) {
-            if (id && id !== 'default_biz') {
-              void purgeBusinessFromFirestoreAndStorage(id);
-              void deleteBusinessFromServer(id);
-            }
             return null;
           }
           const d = bizDoc.data();

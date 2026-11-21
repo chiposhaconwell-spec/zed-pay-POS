@@ -28,13 +28,238 @@ export {
 };
 
 const PERMANENTLY_ERASED_BUSINESS_IDS = new Set<string>([
-  'biz_3539',
-  'biz_3126',
   'default_biz',
   '__latest__',
   '__global__',
 ]);
 const DELETED_BUSINESSES_STORAGE_KEY = 'pos_deleted_business_ids_v1';
+const COMPANY_ID_SEQ_STORAGE_KEY = 'pos_company_id_seq_v1';
+const PERMANENT_USER_COMPANY_MAP_KEY = 'pos_user_permanent_company_map_v1';
+
+let hydrationGuardDepth = 0;
+
+export function isHydratingOrRestoringDatabase(): boolean {
+  return hydrationGuardDepth > 0 || isDbInitializing;
+}
+
+export async function runWithHydrationGuard<T>(fn: () => Promise<T> | T): Promise<T> {
+  hydrationGuardDepth++;
+  try {
+    return await fn();
+  } finally {
+    hydrationGuardDepth = Math.max(0, hydrationGuardDepth - 1);
+  }
+}
+
+export function getNextSequentialCompanyId(additionalExistingIds?: Iterable<string>): string {
+  const existingIds = new Set<string>();
+  let maxNumericId = 0;
+
+  const inspectId = (raw: any) => {
+    const clean = String(raw ?? '').trim();
+    if (!clean || clean === 'default_biz' || clean === '__latest__' || clean === '__global__') return;
+    existingIds.add(clean);
+    if (/^[1-9]\d*$/.test(clean)) {
+      const num = parseInt(clean, 10);
+      if (Number.isFinite(num) && num > maxNumericId) {
+        maxNumericId = num;
+      }
+    }
+  };
+
+  if (alasql?.tables?.businesses && Array.isArray(alasql.tables.businesses.data)) {
+    for (const row of alasql.tables.businesses.data as any[]) {
+      if (!row || typeof row !== 'object') continue;
+      inspectId(row.id);
+      inspectId(row.business_id);
+    }
+  }
+
+  if (alasql?.tables?.business_memberships && Array.isArray(alasql.tables.business_memberships.data)) {
+    for (const row of alasql.tables.business_memberships.data as any[]) {
+      if (!row || typeof row !== 'object') continue;
+      inspectId(row.business_id);
+    }
+  }
+
+  if (additionalExistingIds) {
+    for (const extId of additionalExistingIds) {
+      inspectId(extId);
+    }
+  }
+
+  let candidate = maxNumericId + 1;
+  if (candidate < 1) candidate = 1;
+  while (existingIds.has(String(candidate)) || isBusinessPermanentlyDeleted(String(candidate))) {
+    candidate++;
+  }
+
+  const nextId = String(candidate);
+  if (typeof localStorage !== 'undefined') {
+    try {
+      localStorage.setItem(COMPANY_ID_SEQ_STORAGE_KEY, nextId);
+    } catch {}
+  }
+  return nextId;
+}
+
+function readPermanentCompanyMap(): Record<string, string> {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(PERMANENT_USER_COMPANY_MAP_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePermanentCompanyMap(map: Record<string, string>): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(PERMANENT_USER_COMPANY_MAP_KEY, JSON.stringify(map));
+  } catch {}
+}
+
+export function setPermanentCompanyIdForUser(params: {
+  userId?: string;
+  credId?: string;
+  credentialHash?: string;
+  email?: string;
+  companyId: string;
+}): void {
+  const cleanCompanyId = String(params.companyId || '').trim();
+  if (
+    !cleanCompanyId ||
+    cleanCompanyId === 'default_biz' ||
+    cleanCompanyId === '__latest__' ||
+    cleanCompanyId === '__global__' ||
+    isBusinessPermanentlyDeleted(cleanCompanyId)
+  ) {
+    return;
+  }
+
+  const cleanEmail = normalizeAuthEmail(params.email || '');
+  const cleanUserId = String(params.userId || (cleanEmail ? deriveUserId(cleanEmail) : '')).trim();
+  const cleanHash = String(params.credentialHash || '').trim();
+  const cleanCredId = String(params.credId || (cleanHash ? cleanHash.slice(0, 56) : '')).trim();
+
+  const map = readPermanentCompanyMap();
+  if (cleanCredId) {
+    map[`cred:${cleanCredId}`] = cleanCompanyId;
+  }
+  if (cleanHash) {
+    map[`hash:${cleanHash}`] = cleanCompanyId;
+  }
+  if (cleanUserId) {
+    map[`uid:${cleanUserId}`] = cleanCompanyId;
+  }
+  if (cleanEmail) {
+    map[`email:${cleanEmail}`] = cleanCompanyId;
+  }
+  writePermanentCompanyMap(map);
+
+  if (alasql?.tables?.users && Array.isArray(alasql.tables.users.data)) {
+    for (const u of alasql.tables.users.data as any[]) {
+      if (!u || typeof u !== 'object') continue;
+      if (
+        (cleanUserId && String(u.id || '').trim() === cleanUserId) ||
+        (cleanEmail && normalizeAuthEmail(u.email || '') === cleanEmail)
+      ) {
+        if (!u.business_id || u.business_id === 'default_biz') {
+          u.business_id = cleanCompanyId;
+        }
+      }
+    }
+  }
+}
+
+export function getPermanentCompanyIdForUser(params: {
+  userId?: string;
+  credId?: string;
+  credentialHash?: string;
+  email?: string;
+}): string {
+  const cleanEmail = normalizeAuthEmail(params.email || '');
+  const cleanUserId = String(params.userId || (cleanEmail ? deriveUserId(cleanEmail) : '')).trim();
+  const cleanHash = String(params.credentialHash || '').trim();
+  const cleanCredId = String(params.credId || (cleanHash ? cleanHash.slice(0, 56) : '')).trim();
+
+  const isValidCompanyId = (id?: string | null): id is string => {
+    const clean = String(id || '').trim();
+    return Boolean(
+      clean &&
+        clean !== 'default_biz' &&
+        clean !== '__latest__' &&
+        clean !== '__global__' &&
+        !isBusinessPermanentlyDeleted(clean)
+    );
+  };
+
+  const map = readPermanentCompanyMap();
+  if (cleanCredId && isValidCompanyId(map[`cred:${cleanCredId}`])) {
+    return String(map[`cred:${cleanCredId}`]).trim();
+  }
+  if (cleanHash && isValidCompanyId(map[`hash:${cleanHash}`])) {
+    return String(map[`hash:${cleanHash}`]).trim();
+  }
+
+  // Check decoupled business_memberships by credential_hash first
+  const memRows = (alasql?.tables?.business_memberships?.data || []) as any[];
+  if (cleanHash) {
+    const matchedByHash = memRows.find(
+      (m: any) =>
+        String(m?.credential_hash || '').trim() === cleanHash && isValidCompanyId(m?.business_id)
+    );
+    if (matchedByHash) {
+      return String(matchedByHash.business_id).trim();
+    }
+  }
+
+  if (cleanUserId && isValidCompanyId(map[`uid:${cleanUserId}`])) {
+    return String(map[`uid:${cleanUserId}`]).trim();
+  }
+  if (cleanEmail && isValidCompanyId(map[`email:${cleanEmail}`])) {
+    return String(map[`email:${cleanEmail}`]).trim();
+  }
+
+  // Check users table permanent business_id
+  const userRows = (alasql?.tables?.users?.data || []) as any[];
+  const matchedUser = userRows.find(
+    (u: any) =>
+      ((cleanUserId && String(u?.id || '').trim() === cleanUserId) ||
+        (cleanEmail && normalizeAuthEmail(u?.email || '') === cleanEmail)) &&
+      isValidCompanyId(u?.business_id)
+  );
+  if (matchedUser) {
+    return String(matchedUser.business_id).trim();
+  }
+
+  // Check business_memberships by userId / email
+  const matchedMem = memRows.find(
+    (m: any) =>
+      ((cleanUserId && String(m?.user_id || '').trim() === cleanUserId) ||
+        (cleanEmail && normalizeAuthEmail(m?.email || '') === cleanEmail)) &&
+      isValidCompanyId(m?.business_id)
+  );
+  if (matchedMem) {
+    return String(matchedMem.business_id).trim();
+  }
+
+  // Check businesses table by owner email
+  const bizRows = (alasql?.tables?.businesses?.data || []) as any[];
+  if (cleanEmail) {
+    const matchedBiz = bizRows.find(
+      (b: any) => normalizeAuthEmail(b?.email || '') === cleanEmail && isValidCompanyId(b?.id)
+    );
+    if (matchedBiz) {
+      return String(matchedBiz.id).trim();
+    }
+  }
+
+  return '';
+}
 
 export function getDeletedBusinessIds(): Set<string> {
   const combined = new Set<string>(PERMANENTLY_ERASED_BUSINESS_IDS);
@@ -2184,13 +2409,14 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
         const persistentData = rawPersistentData ? scrubLegacyPreseededRows(rawPersistentData) : null;
         if (persistentData && !isLegacyPreseededSnapshot(rawPersistentData || {}) && hasAnyUserCreatedData(persistentData)) {
           console.log('[DB] Hydrated on-device catalog & receipt cache from SQLite');
-          rehydrateAlasqlFromRecords(persistentData);
-          syncAllAccountingSystems('SQLite Cache Rehydration');
-          notifySqlLogsUpdated();
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('database-rehydrated'));
-            window.dispatchEvent(new Event('pos_data_updated'));
-          }
+          await runWithHydrationGuard(() => {
+            rehydrateAlasqlFromRecords(persistentData);
+            syncAllAccountingSystems('SQLite Cache Rehydration');
+            notifySqlLogsUpdated();
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('database-rehydrated'));
+            }
+          });
         }
       } catch (sqErr) {
         console.warn('[DB] SQLite cache background rehydrate error:', sqErr);
@@ -4790,22 +5016,24 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
       } catch {}
     }
 
+    let matchedBiz: any = null;
     if (bizId) {
-      const matchedBiz = bizRows.find((b: any) => b.id === bizId);
+      matchedBiz = bizRows.find((b: any) => String(b?.id || '').trim() === bizId) || null;
       if (matchedBiz) {
-        bizName = bizName || matchedBiz.name || '';
-        ownerEmail = ownerEmail || matchedBiz.email || '';
+        bizName = matchedBiz.name || bizName || '';
+        ownerEmail = matchedBiz.email || ownerEmail || '';
       }
     } else if (bizRows.length > 0) {
-      bizId = bizRows[0].id;
-      bizName = bizRows[0].name || '';
-      ownerEmail = bizRows[0].email || '';
+      matchedBiz = bizRows[0];
+      bizId = String(matchedBiz.id || '').trim();
+      bizName = matchedBiz.name || '';
+      ownerEmail = matchedBiz.email || '';
     }
 
-    if (!bizId || isBusinessPermanentlyDeleted(bizId)) {
+    if (!bizId || !matchedBiz || isBusinessPermanentlyDeleted(bizId)) {
       return {
         success: false,
-        details: 'Skipped Cloud SQL push for deleted or uninitialized business.',
+        details: 'Skipped Cloud SQL push: company record is not loaded in local database.',
       };
     }
 
@@ -4930,7 +5158,9 @@ export async function pullDatabaseFromServer(
     const bizRows = (Array.isArray(cleanedTables.businesses) ? cleanedTables.businesses : []).filter(
       (b: any) => b?.id && !isBusinessPermanentlyDeleted(b.id)
     );
+    const requestedBizId = businessId ? businessId.trim() : '';
     const targetBiz =
+      (requestedBizId ? bizRows.find((b: any) => String(b.id).trim() === requestedBizId) : null) ||
       bizRows.find((b: any) => b.id === data.businessId) ||
       (email ? bizRows.find((b: any) => String(b.email || '').toLowerCase() === email.toLowerCase()) : null) ||
       bizRows[0] ||
@@ -4950,37 +5180,49 @@ export async function pullDatabaseFromServer(
       };
     }
 
-    if (targetBiz && typeof localStorage !== 'undefined') {
-      localStorage.setItem('active_business_profile', JSON.stringify(targetBiz));
-    }
-
-    rehydrateAlasqlFromRecords(cleanedTables, {
-      businessId: targetBiz?.id || data.businessId,
-      preserveOtherBusinesses: true,
-    });
-    dedupeAndCleanBusinessesTable();
-    syncUsersAndMembershipsFromLegacyTables(targetBiz?.id || data.businessId);
-    syncAllAccountingSystems('Cloud SQL Pull Rehydration');
-    persistTablesToStorage(true);
-
-    if (data.settings && typeof localStorage !== 'undefined') {
-      const targetBizId = String(targetBiz?.id || data.businessId || '').trim();
-      const serialized = JSON.stringify(data.settings);
-      if (targetBizId && targetBizId !== 'default_biz') {
-        localStorage.setItem(`android_pos_settings_${targetBizId}`, serialized);
+    await runWithHydrationGuard(() => {
+      if (targetBiz && typeof localStorage !== 'undefined') {
+        // Only update active_business_profile if it matches the active session's permanent company ID or no company is currently active
+        let existingActiveId = '';
+        try {
+          const rawActive = localStorage.getItem('active_business_profile');
+          if (rawActive) {
+            const parsedActive = JSON.parse(rawActive);
+            existingActiveId = String(parsedActive?.id || '').trim();
+          }
+        } catch {}
+        if (!existingActiveId || existingActiveId === String(targetBiz.id).trim() || requestedBizId === String(targetBiz.id).trim()) {
+          localStorage.setItem('active_business_profile', JSON.stringify(targetBiz));
+        }
       }
-      localStorage.setItem('android_pos_settings', serialized);
-    }
 
-    if (data.updatedAt && typeof localStorage !== 'undefined') {
-      localStorage.setItem('pos_last_cloud_sync', data.updatedAt);
-    }
+      rehydrateAlasqlFromRecords(cleanedTables, {
+        businessId: targetBiz?.id || data.businessId,
+        preserveOtherBusinesses: true,
+      });
+      dedupeAndCleanBusinessesTable();
+      syncUsersAndMembershipsFromLegacyTables(targetBiz?.id || data.businessId);
+      syncAllAccountingSystems('Cloud SQL Pull Rehydration');
+      persistTablesToStorage(true);
 
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new Event('local_db_restored'));
-      window.dispatchEvent(new Event('pos_data_updated'));
-      window.dispatchEvent(new CustomEvent('pos_sync_status_changed', { detail: { syncedAt: data.updatedAt, status: 'synced' } }));
-    }
+      if (data.settings && typeof localStorage !== 'undefined') {
+        const targetBizId = String(targetBiz?.id || data.businessId || '').trim();
+        const serialized = JSON.stringify(data.settings);
+        if (targetBizId && targetBizId !== 'default_biz') {
+          localStorage.setItem(`android_pos_settings_${targetBizId}`, serialized);
+        }
+        localStorage.setItem('android_pos_settings', serialized);
+      }
+
+      if (data.updatedAt && typeof localStorage !== 'undefined') {
+        localStorage.setItem('pos_last_cloud_sync', data.updatedAt);
+      }
+
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('local_db_restored'));
+        window.dispatchEvent(new CustomEvent('pos_sync_status_changed', { detail: { syncedAt: data.updatedAt, status: 'synced' } }));
+      }
+    });
 
     const prodCount = (cleanedTables.products || []).length;
     const storeCount = (cleanedTables.stores || []).length;
@@ -5155,6 +5397,15 @@ export function upsertUserAndMembership(params: {
       true
     );
   }
+
+  // Persist permanent company ID on the authenticated user's profile
+  setPermanentCompanyIdForUser({
+    userId,
+    credentialHash: rowPayload.credential_hash,
+    email: cleanEmail,
+    companyId: cleanBizId,
+  });
+
   return rowPayload;
 }
 

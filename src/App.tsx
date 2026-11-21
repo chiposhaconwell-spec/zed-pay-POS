@@ -34,6 +34,8 @@ import {
   dedupeAndCleanBusinessesTable,
   isBusinessPermanentlyDeleted,
   purgeBusinessFromLocalDatabase,
+  getPermanentCompanyIdForUser,
+  setPermanentCompanyIdForUser,
 } from './db';
 import {
   auth,
@@ -45,6 +47,7 @@ import {
   publishCredentialMembershipToCloud,
   hasVerifiedFirestoreAccessToBusiness,
   tryMigrateLegacyOwnerToCredentialAuth,
+  prepareIdempotentCompanyRegistration,
   backupToCloud,
   restoreFromCloud,
   googleSignOut,
@@ -431,12 +434,50 @@ export default function App() {
 
     if (getSavedSuperAdminSession()) {
       // Isolated Platform Super Admin active: skip tenant auto-login and do not sign out Firebase Auth
-    } else if (isSessionAuth && savedBiz && existingBusinesses.length > 0) {
+    } else if (isSessionAuth && savedBiz) {
       try {
         const parsed = JSON.parse(savedBiz);
-        const match = existingBusinesses.find((b: any) => b.id === parsed.id);
+        const loggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || parsed?.email || '');
+        const permanentCompanyId = String(
+          parsed?.id ||
+          getPermanentCompanyIdForUser({ email: loggedEmail }) ||
+          ''
+        ).trim();
+
+        let match = existingBusinesses.find((b: any) => String(b?.id || '').trim() === permanentCompanyId);
+
+        // If async SQLite / Cloud rehydration has not completed yet on refresh, keep the authenticated user's
+        // permanent company record in local state so refresh NEVER wipes the session or creates a new company ID
+        if (!match && permanentCompanyId && !isBusinessPermanentlyDeleted(permanentCompanyId)) {
+          runSql(
+            `INSERT INTO businesses (id, name, owner, email, status, created_at, business_id, store_id) VALUES (
+              '${sqlEsc(permanentCompanyId)}',
+              '${sqlEsc(String(parsed?.name || ''))}',
+              '${sqlEsc(String(parsed?.owner || localStorage.getItem('logged_in_user_name') || 'Owner'))}',
+              '${sqlEsc(loggedEmail)}',
+              'ACTIVE',
+              '${new Date().toISOString()}',
+              '${sqlEsc(permanentCompanyId)}',
+              'main'
+            )`,
+            'Startup: Preserve authenticated user permanent company record across refresh'
+          );
+          const refreshedList = dedupeAndCleanBusinessesTable();
+          match = refreshedList.find((b: any) => String(b?.id || '').trim() === permanentCompanyId) || {
+            id: permanentCompanyId,
+            name: String(parsed?.name || ''),
+            owner: String(parsed?.owner || 'Owner'),
+            email: loggedEmail,
+          };
+        }
+
         const accessCheck = match ? checkActiveStaffAccessStatus(match) : { valid: false };
         if (match && accessCheck.valid) {
+          setPermanentCompanyIdForUser({
+            userId: deriveUserId(loggedEmail || match.email || ''),
+            email: loggedEmail || match.email || '',
+            companyId: String(match.id),
+          });
           setActiveBusiness(match);
           const savedRole = localStorage.getItem('logged_in_user_role') || 'owner';
           const savedAuthRole = normalizeRole(localStorage.getItem(AUTH_ROLE_STORAGE_KEY) || savedRole);
@@ -456,7 +497,6 @@ export default function App() {
           }
 
           // Ensure active session appears in unlockedWorkspaces if credential_hash exists
-          const loggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || match.email || '');
           const currentUnlocked = getUnlockedWorkspaces();
           if (currentUnlocked.length === 0 && loggedEmail) {
             const mRes = runSql(
@@ -488,6 +528,28 @@ export default function App() {
           }
 
           setIsAuthenticatedSession(true);
+
+          // Wait for Firebase Auth state restoration, then read-only restore existing company data by permanentCompanyId
+          // NEVER create a company during refresh or startup initialization
+          const targetPermanentBizId = String(match.id);
+          void (async () => {
+            try {
+              if (typeof (auth as any).authStateReady === 'function') {
+                await (auth as any).authStateReady();
+              }
+              if (auth.currentUser && targetPermanentBizId) {
+                const localProdCountRes = runSql(
+                  `SELECT COUNT(*) as cnt FROM products WHERE business_id = '${sqlEsc(targetPermanentBizId)}'`,
+                  'Startup: Check local product count for permanent company'
+                );
+                const localProdCnt = Number(localProdCountRes?.data?.[0]?.cnt || 0);
+                if (localProdCnt === 0) {
+                  await restoreFromCloud(targetPermanentBizId, { silentIfUnlinked: true });
+                }
+              }
+            } catch {}
+          })();
+
           void checkBusinessCloudModerationStatus(match.id).then((cloudMod) => {
             if (cloudMod.status === 'SUSPENDED') {
               localStorage.removeItem('pos_authenticated_session');
@@ -535,7 +597,7 @@ export default function App() {
         void googleSignOut();
       }
     } else if (!getSavedSuperAdminSession()) {
-      // No authenticated session: start on Log In / Create Account screen (blank state)
+      // No authenticated session: start on Log In screen (never auto-switch to register on refresh)
       localStorage.removeItem('active_business_profile');
       localStorage.removeItem('pos_authenticated_session');
       localStorage.removeItem('android_pos_settings');
@@ -547,7 +609,7 @@ export default function App() {
       setActiveBusiness({ id: '', name: '', owner: '', email: '' });
       setIsAuthenticatedSession(false);
       void googleSignOut();
-      setAuthScreenMode(existingBusinesses.length === 0 ? 'register' : 'login');
+      setAuthScreenMode('login');
     }
 
     updateBadgeCounts();
@@ -700,9 +762,14 @@ export default function App() {
         currentBiz = matched;
       }
     } else if (bizRows.length === 0 && activeBusiness.id) {
-      currentBiz = { id: '', name: '', owner: '', email: '' };
-      setActiveBusiness(currentBiz);
-      setIsAuthenticatedSession(false);
+      const hasSavedAuthSession =
+        localStorage.getItem('pos_authenticated_session') === 'true' &&
+        Boolean(localStorage.getItem('active_business_profile'));
+      if (!hasSavedAuthSession) {
+        currentBiz = { id: '', name: '', owner: '', email: '' };
+        setActiveBusiness(currentBiz);
+        setIsAuthenticatedSession(false);
+      }
     }
 
     // 2. Fetch stores from the single central branches database (strictly scoped to currentBiz.id)
@@ -726,7 +793,10 @@ export default function App() {
 
   useEffect(() => {
     loadBusinessData();
+  }, [sqlSeedTrigger, activeBusiness.id]);
 
+  // Register local_db_restored listener once on mount to avoid repeated re-binding
+  useEffect(() => {
     const handleDbRestored = () => {
       try {
         const rawBiz = localStorage.getItem('active_business_profile');
@@ -741,14 +811,13 @@ export default function App() {
         }
       } catch {}
       setSqlSeedTrigger(prev => prev + 1);
-      loadBusinessData();
       updateBadgeCounts();
     };
     window.addEventListener('local_db_restored', handleDbRestored);
     return () => {
       window.removeEventListener('local_db_restored', handleDbRestored);
     };
-  }, [sqlSeedTrigger, activeBusiness.id]);
+  }, []);
 
   // Enforce role & ticked module access whenever permissions or active tab changes
   useEffect(() => {
@@ -774,7 +843,7 @@ export default function App() {
         let fbSuccess = false;
         if (auth.currentUser) {
           try {
-            const fbRes = await backupToCloud(targetBizId, { silentIfNotOwner: true });
+            const fbRes = await backupToCloud(targetBizId, { silentIfNotOwner: true, allowCreateCompanyDoc: false });
             fbSuccess = fbRes.success;
           } catch (fbErr) {
             console.warn('Header Firebase backup notice:', fbErr);
@@ -800,7 +869,7 @@ export default function App() {
             activeWs?.email || localStorage.getItem('logged_in_user_email') || auth.currentUser?.email || ''
           );
           if (sessionEmail && activeWs?.credentialHash) {
-            const pullRes = await pullDatabaseFromServer(undefined, sessionEmail, activeWs.credentialHash);
+            const pullRes = await pullDatabaseFromServer(activeBusiness?.id || undefined, sessionEmail, activeWs.credentialHash);
             restored = pullRes.success && pullRes.found;
           }
         }
@@ -827,7 +896,7 @@ export default function App() {
     }
   };
 
-  // Register New Business Account (100% Isolated Workspace + Strict Credential Auth, Duplicate-Safe)
+  // Register New Business Account (Intentional Registration Only — Idempotent, Sequential IDs 1, 2, 3...)
   const handleRegisterBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isRegisteringBusinessRef.current) return;
@@ -845,42 +914,40 @@ export default function App() {
     try {
       const cleanEmail = normalizeAuthEmail(newBizEmail.trim());
       const rawPass = newBizPassword.trim();
-      const credHash = computeCredentialHashSync(cleanEmail, rawPass);
-      const normalizedNewName = newBizName.trim().toLowerCase().replace(/\s+/g, ' ');
 
-      // Prevent duplicate business creation: check existing local businesses and credential matches
-      const existingBusinesses = dedupeAndCleanBusinessesTable();
-      const existingSameNameAndEmail = existingBusinesses.find(
-        (b: any) =>
-          !isBusinessPermanentlyDeleted(b?.id) &&
-          String(b?.name || '').trim().toLowerCase().replace(/\s+/g, ' ') === normalizedNewName &&
-          normalizeAuthEmail(b?.email || '') === cleanEmail
-      );
-      if (existingSameNameAndEmail) {
+      // 1. Idempotent pre-flight check (local DB + Cloud Firestore + Cloud SQL) and sequential ID allocation starting at "1"
+      const regCheck = await prepareIdempotentCompanyRegistration({
+        email: cleanEmail,
+        password: rawPass,
+        companyName: newBizName.trim(),
+        ownerName: newBizOwner.trim(),
+      });
+
+      if (regCheck.alreadyExists) {
+        if (regCheck.restoredFromCloud) {
+          // Existing company was found in Cloud Firestore / Cloud SQL and restored safely without overwriting stock/sales/settings
+          const loginRes = await authenticateAndResolveWorkspace(cleanEmail, rawPass, {
+            preserveExistingUnlocked: isCreatingNewWorkspace,
+          });
+          if (loginRes.success) {
+            setAuthFeedback({
+              type: 'success',
+              text: `Restored your existing company "${regCheck.companyName}" (Company ID: ${regCheck.companyId}) without creating a duplicate.`,
+            });
+            return;
+          }
+        }
+        setAuthScreenMode('login');
+        setSyncLoginEmail(cleanEmail);
         setAuthFeedback({
           type: 'error',
-          text: `A business named "${existingSameNameAndEmail.name}" is already registered under [${cleanEmail}] (ID: ${existingSameNameAndEmail.id}). Duplicate business accounts are blocked — please switch to Log In.`,
+          text: `A company account for "${regCheck.companyName || newBizName.trim()}" (Company ID: ${regCheck.companyId}) already exists. Duplicate company creation is blocked — please sign in to retrieve your existing company.`,
         });
         return;
       }
 
-      const existingCredMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
-      if (existingCredMatches.length > 0) {
-        const existingBiz = existingCredMatches[0].business;
-        setAuthFeedback({
-          type: 'error',
-          text: `These exact email and password credentials are already assigned to business "${existingBiz?.name || existingBiz?.id}". Please use a different password for a separate business workspace or Log In.`,
-        });
-        return;
-      }
-
-      let bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
-      while (
-        isBusinessPermanentlyDeleted(bizId) ||
-        existingBusinesses.some((b: any) => String(b?.id || '').trim() === bizId)
-      ) {
-        bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
-      }
+      const bizId = regCheck.companyId; // Sequential Company ID starting from "1" ("1", "2", "3", ...)
+      const credHash = regCheck.credHash;
 
       const hasInitialStore = Boolean(newBizFirstStore.trim());
       const storeId = hasInitialStore ? ('store_' + Math.floor(1000 + Math.random() * 9000)) : '';
@@ -890,195 +957,193 @@ export default function App() {
       const resolvedTaxRate = !isNaN(parseFloat(newBizTaxRate)) ? parseFloat(newBizTaxRate) : 0;
       const nowStr = new Date().toISOString();
 
-      // 1. Register / Authenticate Admin using strict (email + password) credential identity
-      try {
-        await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
-          allowCreate: true,
-          displayName: newBizOwner.trim(),
-        });
-      } catch (fbAuthErr: any) {
-        console.warn('Firebase Credential Auth registration notice:', fbAuthErr);
-      }
-
-      // 2. Insert registration record into BUSINESSES
-    runSql(`
-      INSERT INTO businesses (
-        id, name, owner, email, password, billing_address, billing_city, billing_country,
-        billing_phone, billing_email, tpin, currency, tax_rate, admin_role, created_at, business_id, store_id
-      ) VALUES (
-        '${bizId}',
-        '${sqlEsc(newBizName.trim())}',
-        '${sqlEsc(newBizOwner.trim())}',
-        '${sqlEsc(cleanEmail)}',
-        '${sqlEsc(rawPass)}',
-        '${sqlEsc(newBizBillingAddress.trim())}',
-        '${sqlEsc(newBizBillingCity.trim())}',
-        '${sqlEsc(newBizBillingCountry.trim())}',
-        '${sqlEsc(newBizBillingPhone.trim())}',
-        '${sqlEsc(newBizBillingEmail.trim() || cleanEmail)}',
-        '${sqlEsc(newBizTpin.trim())}',
-        '${sqlEsc(resolvedCurrency)}',
-        ${resolvedTaxRate},
-        'admin',
-        '${nowStr}',
-        '${bizId}',
-        '${storeId || 'main'}'
-      )
-    `, `Registration: Create isolated enterprise workspace [${newBizName}] with Owner privileges`);
-
-    // Provision isolated chart of accounts for this business
-    seedChartOfAccountsOnly(bizId);
-
-    // 3. Provision primary store outlet if specified
-    if (hasInitialStore && storeId) {
+      // 2. Insert registration record into BUSINESSES using sequential primary ID (bizId)
       runSql(`
-        INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
-          '${storeId}',
-          '${bizId}',
-          '${sqlEsc(rawStoreName)}',
-          '${sqlEsc(rawLocation)}',
+        INSERT INTO businesses (
+          id, name, owner, email, password, billing_address, billing_city, billing_country,
+          billing_phone, billing_email, tpin, currency, tax_rate, admin_role, created_at, business_id, store_id
+        ) VALUES (
+          '${sqlEsc(bizId)}',
+          '${sqlEsc(newBizName.trim())}',
+          '${sqlEsc(newBizOwner.trim())}',
+          '${sqlEsc(cleanEmail)}',
+          '${sqlEsc(rawPass)}',
+          '${sqlEsc(newBizBillingAddress.trim())}',
+          '${sqlEsc(newBizBillingCity.trim())}',
+          '${sqlEsc(newBizBillingCountry.trim())}',
           '${sqlEsc(newBizBillingPhone.trim())}',
           '${sqlEsc(newBizBillingEmail.trim() || cleanEmail)}',
-          1, 1, 1, 0, '${storeId}'
+          '${sqlEsc(newBizTpin.trim())}',
+          '${sqlEsc(resolvedCurrency)}',
+          ${resolvedTaxRate},
+          'admin',
+          '${nowStr}',
+          '${sqlEsc(bizId)}',
+          '${storeId || 'main'}'
         )
-      `, `Registration: Provision initial store outlet [${rawStoreName}]`);
-    }
+      `, `Registration: Create isolated enterprise workspace [${newBizName}] (Company ID: ${bizId}) with Owner privileges`);
 
-    // 4. Register Owner in STAFF & decoupled USERS + BUSINESS_MEMBERSHIPS
-    const nextStaffId = Date.now() % 1000000;
-    runSql(`
-      INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id, business_id) VALUES (
-        '${nextStaffId}',
-        '${sqlEsc(newBizOwner.trim())}',
-        'owner',
-        0,
-        '0000',
-        '${sqlEsc(cleanEmail)}',
-        '${sqlEsc(rawPass)}',
-        '${storeId}',
-        '${bizId}'
-      )
-    `, `Registration: Provision first account [${newBizOwner.trim()}] as Owner`);
+      // Provision isolated chart of accounts for this business
+      seedChartOfAccountsOnly(bizId);
 
-    const ownerPerms = buildUserPermissions({ role: 'owner' });
-    const ownerMem = upsertUserAndMembership({
-      businessId: bizId,
-      email: cleanEmail,
-      fullName: newBizOwner.trim(),
-      password: rawPass,
-      credentialHash: credHash,
-      role: 'owner',
-      storeId: storeId || 'main',
-      accessibleBranches: [],
-      permissionsJson: JSON.stringify(ownerPerms),
-      status: 'ACTIVE',
-    });
+      // 3. Provision primary store outlet if specified
+      if (hasInitialStore && storeId) {
+        runSql(`
+          INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
+            '${storeId}',
+            '${sqlEsc(bizId)}',
+            '${sqlEsc(rawStoreName)}',
+            '${sqlEsc(rawLocation)}',
+            '${sqlEsc(newBizBillingPhone.trim())}',
+            '${sqlEsc(newBizBillingEmail.trim() || cleanEmail)}',
+            1, 1, 1, 0, '${storeId}'
+          )
+        `, `Registration: Provision initial store outlet [${rawStoreName}]`);
+      }
 
-    // 5. Update isolated StoreSettings & ZRA config strictly for this business
-    const bizZra = switchZraConfigForBusiness(bizId);
-    const updatedSettings: StoreSettings = {
-      ...DEFAULT_SETTINGS,
-      storeName: newBizName.trim(),
-      currency: resolvedCurrency,
-      taxRate: resolvedTaxRate,
-      tpin: newBizTpin.trim(),
-      billingAddress: newBizBillingAddress.trim(),
-      billingCity: newBizBillingCity.trim(),
-      billingCountry: newBizBillingCountry.trim(),
-      billingPhone: newBizBillingPhone.trim(),
-      billingEmail: newBizBillingEmail.trim() || cleanEmail,
-      receiptHeader: 'Official Tax Invoice & Sales Receipt',
-      receiptFooter: 'Thank you for your business!',
-      zraConfig: bizZra,
-    };
-    setSettings(updatedSettings);
-    saveScopedBusinessSettings(bizId, updatedSettings);
+      // 4. Register Owner in STAFF & decoupled USERS + BUSINESS_MEMBERSHIPS and bind permanent Company ID
+      const nextStaffId = Date.now() % 1000000;
+      runSql(`
+        INSERT INTO staff (id, name, role, hourly_rate, pin, email, password, store_id, business_id) VALUES (
+          '${nextStaffId}',
+          '${sqlEsc(newBizOwner.trim())}',
+          'owner',
+          0,
+          '0000',
+          '${sqlEsc(cleanEmail)}',
+          '${sqlEsc(rawPass)}',
+          '${storeId}',
+          '${sqlEsc(bizId)}'
+        )
+      `, `Registration: Provision first account [${newBizOwner.trim()}] as Owner`);
 
-    const newlyRegisteredBusiness = {
-      id: bizId,
-      name: newBizName.trim(),
-      owner: newBizOwner.trim(),
-      email: cleanEmail,
-    };
+      const ownerPerms = buildUserPermissions({ role: 'owner' });
+      const ownerMem = upsertUserAndMembership({
+        businessId: bizId,
+        email: cleanEmail,
+        fullName: newBizOwner.trim(),
+        password: rawPass,
+        credentialHash: credHash,
+        role: 'owner',
+        storeId: storeId || 'main',
+        accessibleBranches: [],
+        permissionsJson: JSON.stringify(ownerPerms),
+        status: 'ACTIVE',
+      });
 
-    // 6. Save authenticated Admin session & register into Unlocked Workspaces
-    const openCashNum = Math.max(0, parseFloat(newBizOpeningCash || '0') || 0);
-    localStorage.setItem('active_business_profile', JSON.stringify(newlyRegisteredBusiness));
-    localStorage.setItem('pos_authenticated_session', 'true');
-    localStorage.setItem('pos_shift_active', 'true');
-    if (storeId) {
-      saveScopedActiveBranch(bizId, storeId);
-      localStorage.setItem('shift_active_' + storeId, 'true');
-      localStorage.setItem('shift_opening_cash_' + storeId, openCashNum.toFixed(2));
-    } else {
-      saveScopedActiveBranch(bizId, '');
-    }
-    localStorage.setItem('shift_opening_cash_global', openCashNum.toFixed(2));
-    localStorage.setItem('logged_in_user_email', cleanEmail);
-    localStorage.setItem('logged_in_user_name', newBizOwner.trim());
-    localStorage.setItem('quick_salesperson_name', newBizOwner.trim());
-    localStorage.setItem('logged_in_user_role', 'owner');
-    localStorage.setItem('logged_in_accessible_branches', JSON.stringify([]));
-    saveSessionPermissionsToStorage(ownerPerms, 'owner');
+      setPermanentCompanyIdForUser({
+        userId: String(ownerMem?.user_id || deriveUserId(cleanEmail)),
+        credId: regCheck.credId,
+        credentialHash: credHash,
+        email: cleanEmail,
+        companyId: bizId,
+      });
 
-    const nextUnlocked = upsertUnlockedWorkspace({
-      businessId: bizId,
-      businessName: newBizName.trim(),
-      membershipId: String(ownerMem?.id || deriveMembershipId(bizId, deriveUserId(cleanEmail), 'owner')),
-      userId: String(ownerMem?.user_id || deriveUserId(cleanEmail)),
-      email: cleanEmail,
-      fullName: newBizOwner.trim(),
-      role: 'owner',
-      credentialHash: credHash,
-      accessibleBranches: [],
-      permissionsJson: JSON.stringify(ownerPerms),
-      storeId: storeId || 'main',
-      unlockedAt: nowStr,
-    });
-    setUnlockedWorkspaces(nextUnlocked);
+      // 5. Update isolated StoreSettings & ZRA config strictly for this business
+      const bizZra = switchZraConfigForBusiness(bizId);
+      const updatedSettings: StoreSettings = {
+        ...DEFAULT_SETTINGS,
+        storeName: newBizName.trim(),
+        currency: resolvedCurrency,
+        taxRate: resolvedTaxRate,
+        tpin: newBizTpin.trim(),
+        billingAddress: newBizBillingAddress.trim(),
+        billingCity: newBizBillingCity.trim(),
+        billingCountry: newBizBillingCountry.trim(),
+        billingPhone: newBizBillingPhone.trim(),
+        billingEmail: newBizBillingEmail.trim() || cleanEmail,
+        receiptHeader: 'Official Tax Invoice & Sales Receipt',
+        receiptFooter: 'Thank you for your business!',
+        zraConfig: bizZra,
+      };
+      setSettings(updatedSettings);
+      saveScopedBusinessSettings(bizId, updatedSettings);
 
-    setActiveBusiness(newlyRegisteredBusiness);
-    setAccessibleStoreIds([]);
-    setActiveStore(storeId);
-    setUserRole('owner');
-    setAuthenticatedRole('owner');
-    setUserPermissions(ownerPerms);
-    setIsAuthenticatedSession(true);
-    setIsCreatingNewWorkspace(false);
-    persistTablesToStorage();
-    setSqlSeedTrigger(prev => prev + 1);
+      const newlyRegisteredBusiness = {
+        id: bizId,
+        name: newBizName.trim(),
+        owner: newBizOwner.trim(),
+        email: cleanEmail,
+      };
 
-    // 7. Synchronize new business & store immediately to Cloud SQL + Firebase Firestore & Credential Directory
-    pushDatabaseToServer(bizId).catch(err => console.warn('Initial Cloud SQL push warning:', err));
-    if (auth.currentUser) {
-      backupToCloud(bizId).catch(err => console.warn('Initial Firebase backup warning:', err));
-    }
+      // 6. Save authenticated Admin session & register into Unlocked Workspaces
+      const openCashNum = Math.max(0, parseFloat(newBizOpeningCash || '0') || 0);
+      localStorage.setItem('active_business_profile', JSON.stringify(newlyRegisteredBusiness));
+      localStorage.setItem('pos_authenticated_session', 'true');
+      localStorage.setItem('pos_shift_active', 'true');
+      if (storeId) {
+        saveScopedActiveBranch(bizId, storeId);
+        localStorage.setItem('shift_active_' + storeId, 'true');
+        localStorage.setItem('shift_opening_cash_' + storeId, openCashNum.toFixed(2));
+      } else {
+        saveScopedActiveBranch(bizId, '');
+      }
+      localStorage.setItem('shift_opening_cash_global', openCashNum.toFixed(2));
+      localStorage.setItem('logged_in_user_email', cleanEmail);
+      localStorage.setItem('logged_in_user_name', newBizOwner.trim());
+      localStorage.setItem('quick_salesperson_name', newBizOwner.trim());
+      localStorage.setItem('logged_in_user_role', 'owner');
+      localStorage.setItem('logged_in_accessible_branches', JSON.stringify([]));
+      saveSessionPermissionsToStorage(ownerPerms, 'owner');
 
-    // Reset form fields
-    setNewBizName('');
-    setNewBizOwner('');
-    setNewBizEmail('');
-    setNewBizPassword('');
-    setNewBizFirstStore('');
-    setNewBizLocation('');
-    setNewBizCurrency('');
-    setNewBizTaxRate('');
-    setNewBizTpin('');
-    setNewBizOpeningCash('');
-    setNewBizBillingAddress('');
-    setNewBizBillingCity('');
-    setNewBizBillingCountry('');
-    setNewBizBillingPhone('');
-    setNewBizBillingEmail('');
+      const nextUnlocked = upsertUnlockedWorkspace({
+        businessId: bizId,
+        businessName: newBizName.trim(),
+        membershipId: String(ownerMem?.id || deriveMembershipId(bizId, deriveUserId(cleanEmail), 'owner')),
+        userId: String(ownerMem?.user_id || deriveUserId(cleanEmail)),
+        email: cleanEmail,
+        fullName: newBizOwner.trim(),
+        role: 'owner',
+        credentialHash: credHash,
+        accessibleBranches: [],
+        permissionsJson: JSON.stringify(ownerPerms),
+        storeId: storeId || 'main',
+        unlockedAt: nowStr,
+      });
+      setUnlockedWorkspaces(nextUnlocked);
 
-    if (!storeId) {
-      openUnifiedSettings('stores');
-    } else {
-      setActiveTab2('billing');
-    }
+      setActiveBusiness(newlyRegisteredBusiness);
+      setAccessibleStoreIds([]);
+      setActiveStore(storeId);
+      setUserRole('owner');
+      setAuthenticatedRole('owner');
+      setUserPermissions(ownerPerms);
+      setIsAuthenticatedSession(true);
+      setIsCreatingNewWorkspace(false);
+      persistTablesToStorage();
+      dedupeAndCleanBusinessesTable();
+      setSqlSeedTrigger(prev => prev + 1);
 
-    dedupeAndCleanBusinessesTable();
-    window.dispatchEvent(new Event('pos_data_updated'));
+      // 7. Create the company document in Cloud SQL + Firebase Firestore ONLY here during intentional registration
+      pushDatabaseToServer(bizId).catch(err => console.warn('Initial Cloud SQL push warning:', err));
+      if (auth.currentUser) {
+        backupToCloud(bizId, { allowCreateCompanyDoc: true }).catch(err =>
+          console.warn('Initial Firebase backup warning:', err)
+        );
+      }
+
+      // Reset form fields
+      setNewBizName('');
+      setNewBizOwner('');
+      setNewBizEmail('');
+      setNewBizPassword('');
+      setNewBizFirstStore('');
+      setNewBizLocation('');
+      setNewBizCurrency('');
+      setNewBizTaxRate('');
+      setNewBizTpin('');
+      setNewBizOpeningCash('');
+      setNewBizBillingAddress('');
+      setNewBizBillingCity('');
+      setNewBizBillingCountry('');
+      setNewBizBillingPhone('');
+      setNewBizBillingEmail('');
+
+      if (!storeId) {
+        openUnifiedSettings('stores');
+      } else {
+        setActiveTab2('billing');
+      }
     } finally {
       isRegisteringBusinessRef.current = false;
     }
@@ -1189,10 +1254,10 @@ export default function App() {
     }
 
     setSqlSeedTrigger(prev => prev + 1);
-    window.dispatchEvent(new Event('pos_data_updated'));
   };
 
   // Strict (email + password) authentication resolver used for both Log In & Unlock Another Workspace
+  // Always retrieves the existing company by permanent Company ID and NEVER creates a company during login
   const authenticateAndResolveWorkspace = async (
     targetEmailRaw: string,
     targetPassRaw: string,
@@ -1211,6 +1276,11 @@ export default function App() {
     }
 
     const credHash = computeCredentialHashSync(cleanEmail, rawPass);
+    const permanentCompanyIdForCred = getPermanentCompanyIdForUser({
+      userId: deriveUserId(cleanEmail),
+      credentialHash: credHash,
+      email: cleanEmail,
+    });
     const previousActiveWs = unlockedWorkspaces.find((w) => w.businessId === activeBusiness?.id);
     const restorePreviousAuthIfNeeded = async () => {
       if (options?.preserveExistingUnlocked && previousActiveWs?.credentialHash) {
@@ -1243,7 +1313,7 @@ export default function App() {
       } else {
         // Fresh-Device / New-Invite Path: Run Cloud SQL pull & Firebase Auth IN PARALLEL
         const [, authSettled] = await Promise.allSettled([
-          pullDatabaseFromServer(undefined, cleanEmail, credHash, { timeoutMs: 3500 }).catch(() => ({
+          pullDatabaseFromServer(permanentCompanyIdForCred || undefined, cleanEmail, credHash, { timeoutMs: 3500 }).catch(() => ({
             success: false,
             found: false,
           })),
@@ -1292,10 +1362,12 @@ export default function App() {
             if (claimRes.found && claimRes.businessId) {
               credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
             } else if (fbAuthRes?.isLegacyAuth) {
-              await restoreFromCloud(undefined, { silentIfUnlinked: true }).catch(() => {});
+              await restoreFromCloud(permanentCompanyIdForCred || undefined, { silentIfUnlinked: true }).catch(() => {});
               const bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check legacy owned business');
               const bizList = bRes.success && Array.isArray(bRes.data) ? bRes.data : [];
-              const ownedLegacyBiz = bizList.find((b: any) => normalizeAuthEmail(b?.email || '') === cleanEmail);
+              const ownedLegacyBiz =
+                (permanentCompanyIdForCred && bizList.find((b: any) => String(b?.id) === permanentCompanyIdForCred)) ||
+                bizList.find((b: any) => normalizeAuthEmail(b?.email || '') === cleanEmail);
               if (ownedLegacyBiz) {
                 upsertUserAndMembership({
                   businessId: String(ownedLegacyBiz.id),
@@ -1322,6 +1394,15 @@ export default function App() {
           success: false,
           error: `No registered business or staff membership matched [${cleanEmail}] with that password. Check your password or create a new business account.`,
         };
+      }
+
+      // Prioritize the user's permanent company ID if multiple matches exist
+      if (permanentCompanyIdForCred && credMatches.length > 1) {
+        credMatches.sort((a, b) => {
+          const aIsPerm = String(a.business?.id || '') === permanentCompanyIdForCred ? 0 : 1;
+          const bIsPerm = String(b.business?.id || '') === permanentCompanyIdForCred ? 0 : 1;
+          return aIsPerm - bIsPerm;
+        });
       }
 
       // 2. Enforce staff & business suspension checks in parallel (bounded so login stays snappy)
@@ -1377,6 +1458,13 @@ export default function App() {
       }
 
       const chosen = activeMatches[0];
+      setPermanentCompanyIdForUser({
+        userId: String(chosen.membership?.user_id || deriveUserId(cleanEmail)),
+        credentialHash: credHash,
+        email: cleanEmail,
+        companyId: String(chosen.business.id),
+      });
+
       const chosenPerms: UserPermissions =
         chosen.role === 'owner' && !chosen.staffRow
           ? buildUserPermissions({ role: 'owner' })
@@ -1452,7 +1540,8 @@ export default function App() {
           skipFirebaseReauth: true,
         });
 
-        // Non-blocking background cloud reconciliation so login completes immediately while data stays fresh
+        // Non-blocking background cloud READ-ONLY reconciliation using the permanent company ID
+        // Never calls backupToCloud or creates a company document during login
         const primaryMatch = chosen;
         const wsSnapshot = activatedWs;
         void (async () => {
@@ -1462,15 +1551,16 @@ export default function App() {
             }
             if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
+            const primaryBizId = wsSnapshot.businessId;
+
             if (hadLocalMatchesAtStart) {
-              await pullDatabaseFromServer(undefined, cleanEmail, credHash, { timeoutMs: 5000 }).catch(
+              await pullDatabaseFromServer(primaryBizId, cleanEmail, credHash, { timeoutMs: 5000 }).catch(
                 () => null
               );
             }
 
             if (!auth.currentUser) return;
 
-            const primaryBizId = wsSnapshot.businessId;
             let fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
 
             if (!fsAccess.hasAccess) {
@@ -1520,10 +1610,10 @@ export default function App() {
                 permissionsJson: wsSnapshot.permissionsJson,
                 status: 'ACTIVE',
               }).catch(() => {});
-              void backupToCloud(wsSnapshot.businessId, { silentIfNotOwner: true }).catch(() => {});
             }
 
-            window.dispatchEvent(new Event('pos_data_updated'));
+            loadBusinessData();
+            updateBadgeCounts();
           } catch (bgErr) {
             console.warn('Background workspace sync notice:', bgErr);
           }
