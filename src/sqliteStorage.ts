@@ -620,3 +620,74 @@ export async function getCachedReceiptsFromSqlite(
     })
     .slice(0, limit);
 }
+
+export async function purgeBusinessFromSqliteCache(businessId: string): Promise<void> {
+  const cleanBizId = String(businessId || '').trim();
+  if (!cleanBizId) return;
+
+  // 1. Purge from web receipt cache
+  try {
+    const remainingReceipts = readWebReceiptCache().filter(
+      (r) => String(r?.business_id || '').trim() !== cleanBizId
+    );
+    writeWebReceiptCache(remainingReceipts);
+  } catch {}
+
+  // 2. Purge from native SQLite database tables if open
+  if (isSqliteReady && dbConnection) {
+    try {
+      const isOpened = await dbConnection.isDBOpen();
+      if (!isOpened.result) await dbConnection.open();
+      for (const table of SQLITE_SCOPED_TABLES) {
+        try {
+          if (table === 'businesses') {
+            await dbConnection.run(
+              `DELETE FROM businesses WHERE id = ? OR business_id = ?;`,
+              [cleanBizId, cleanBizId]
+            );
+          } else {
+            await dbConnection.run(`DELETE FROM ${table} WHERE business_id = ?;`, [cleanBizId]);
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // 3. Purge from Capacitor Filesystem cache files if present
+  for (const filename of [CACHE_FILENAME, LEGACY_SNAPSHOT_FILENAME]) {
+    try {
+      const file = await Filesystem.readFile({
+        path: filename,
+        directory: Directory.Data,
+        encoding: Encoding.UTF8,
+      });
+      if (file && typeof file.data === 'string') {
+        const parsed = JSON.parse(file.data);
+        if (parsed && typeof parsed === 'object') {
+          let modified = false;
+          for (const [tbl, rows] of Object.entries(parsed)) {
+            if (!Array.isArray(rows)) continue;
+            const filtered = rows.filter(
+              (r: any) =>
+                String(r?.id || '').trim() !== cleanBizId &&
+                String(r?.business_id || '').trim() !== cleanBizId
+            );
+            if (filtered.length !== rows.length) {
+              parsed[tbl] = filtered;
+              modified = true;
+            }
+          }
+          if (modified) {
+            await Filesystem.writeFile({
+              path: filename,
+              data: JSON.stringify(parsed),
+              directory: Directory.Data,
+              encoding: Encoding.UTF8,
+            });
+          }
+        }
+      }
+    } catch {}
+  }
+}
+

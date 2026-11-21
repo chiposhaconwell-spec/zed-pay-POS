@@ -31,6 +31,9 @@ import {
   sqlEsc,
   resolveMembershipsByCredential,
   upsertUserAndMembership,
+  dedupeAndCleanBusinessesTable,
+  isBusinessPermanentlyDeleted,
+  purgeBusinessFromLocalDatabase,
 } from './db';
 import {
   auth,
@@ -662,11 +665,22 @@ export default function App() {
     };
   }, []);
 
+  const isRegisteringBusinessRef = useRef(false);
+
   const loadBusinessData = () => {
-    // 1. Fetch businesses which exist in DB (no preseeded fallback)
-    const bResult = runSql(`SELECT * FROM businesses`, 'App: Query registered corporate business accounts');
-    const bizRows = (bResult.success && Array.isArray(bResult.data)) ? bResult.data : [];
+    // 1. Fetch deduplicated, non-deleted businesses which exist in DB (no preseeded fallback)
+    const bizRows = dedupeAndCleanBusinessesTable();
     setBusinesses(bizRows);
+
+    if (activeBusiness?.id && isBusinessPermanentlyDeleted(activeBusiness.id)) {
+      purgeBusinessFromLocalDatabase(activeBusiness.id);
+      const cleared = { id: '', name: '', owner: '', email: '' };
+      setActiveBusiness(cleared);
+      setIsAuthenticatedSession(false);
+      setStores([]);
+      setActiveStore('');
+      return;
+    }
 
     // Scope staff members strictly to active business
     const targetBizId = getActiveBusinessId(activeBusiness?.id);
@@ -813,9 +827,10 @@ export default function App() {
     }
   };
 
-  // Register New Business Account (100% Isolated Workspace + Strict Credential Auth)
+  // Register New Business Account (100% Isolated Workspace + Strict Credential Auth, Duplicate-Safe)
   const handleRegisterBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isRegisteringBusinessRef.current) return;
     setAuthFeedback(null);
     if (!newBizName.trim() || !newBizOwner.trim() || !newBizEmail.trim() || !newBizPassword) {
       setAuthFeedback({ type: 'error', text: 'Please fill out Business Name, Admin/Owner Full Name, Admin Email, and Password.' });
@@ -826,29 +841,66 @@ export default function App() {
       return;
     }
 
-    const cleanEmail = normalizeAuthEmail(newBizEmail.trim());
-    const rawPass = newBizPassword.trim();
-    const credHash = computeCredentialHashSync(cleanEmail, rawPass);
-    const bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
-    const hasInitialStore = Boolean(newBizFirstStore.trim());
-    const storeId = hasInitialStore ? ('store_' + Math.floor(1000 + Math.random() * 9000)) : '';
-    const rawStoreName = newBizFirstStore.trim();
-    const rawLocation = newBizLocation.trim();
-    const resolvedCurrency = newBizCurrency.trim() || 'K';
-    const resolvedTaxRate = !isNaN(parseFloat(newBizTaxRate)) ? parseFloat(newBizTaxRate) : 0;
-    const nowStr = new Date().toISOString();
-
-    // 1. Register / Authenticate Admin using strict (email + password) credential identity
+    isRegisteringBusinessRef.current = true;
     try {
-      await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
-        allowCreate: true,
-        displayName: newBizOwner.trim(),
-      });
-    } catch (fbAuthErr: any) {
-      console.warn('Firebase Credential Auth registration notice:', fbAuthErr);
-    }
+      const cleanEmail = normalizeAuthEmail(newBizEmail.trim());
+      const rawPass = newBizPassword.trim();
+      const credHash = computeCredentialHashSync(cleanEmail, rawPass);
+      const normalizedNewName = newBizName.trim().toLowerCase().replace(/\s+/g, ' ');
 
-    // 2. Insert registration record into BUSINESSES
+      // Prevent duplicate business creation: check existing local businesses and credential matches
+      const existingBusinesses = dedupeAndCleanBusinessesTable();
+      const existingSameNameAndEmail = existingBusinesses.find(
+        (b: any) =>
+          !isBusinessPermanentlyDeleted(b?.id) &&
+          String(b?.name || '').trim().toLowerCase().replace(/\s+/g, ' ') === normalizedNewName &&
+          normalizeAuthEmail(b?.email || '') === cleanEmail
+      );
+      if (existingSameNameAndEmail) {
+        setAuthFeedback({
+          type: 'error',
+          text: `A business named "${existingSameNameAndEmail.name}" is already registered under [${cleanEmail}] (ID: ${existingSameNameAndEmail.id}). Duplicate business accounts are blocked — please switch to Log In.`,
+        });
+        return;
+      }
+
+      const existingCredMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+      if (existingCredMatches.length > 0) {
+        const existingBiz = existingCredMatches[0].business;
+        setAuthFeedback({
+          type: 'error',
+          text: `These exact email and password credentials are already assigned to business "${existingBiz?.name || existingBiz?.id}". Please use a different password for a separate business workspace or Log In.`,
+        });
+        return;
+      }
+
+      let bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
+      while (
+        isBusinessPermanentlyDeleted(bizId) ||
+        existingBusinesses.some((b: any) => String(b?.id || '').trim() === bizId)
+      ) {
+        bizId = 'biz_' + Math.floor(1000 + Math.random() * 9000);
+      }
+
+      const hasInitialStore = Boolean(newBizFirstStore.trim());
+      const storeId = hasInitialStore ? ('store_' + Math.floor(1000 + Math.random() * 9000)) : '';
+      const rawStoreName = newBizFirstStore.trim();
+      const rawLocation = newBizLocation.trim();
+      const resolvedCurrency = newBizCurrency.trim() || 'K';
+      const resolvedTaxRate = !isNaN(parseFloat(newBizTaxRate)) ? parseFloat(newBizTaxRate) : 0;
+      const nowStr = new Date().toISOString();
+
+      // 1. Register / Authenticate Admin using strict (email + password) credential identity
+      try {
+        await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+          allowCreate: true,
+          displayName: newBizOwner.trim(),
+        });
+      } catch (fbAuthErr: any) {
+        console.warn('Firebase Credential Auth registration notice:', fbAuthErr);
+      }
+
+      // 2. Insert registration record into BUSINESSES
     runSql(`
       INSERT INTO businesses (
         id, name, owner, email, password, billing_address, billing_city, billing_country,
@@ -1025,7 +1077,11 @@ export default function App() {
       setActiveTab2('billing');
     }
 
+    dedupeAndCleanBusinessesTable();
     window.dispatchEvent(new Event('pos_data_updated'));
+    } finally {
+      isRegisteringBusinessRef.current = false;
+    }
   };
 
   // Switch cleanly to an already-unlocked business workspace session
@@ -1165,96 +1221,98 @@ export default function App() {
     };
 
     try {
-      // 1. Pull strictly matching (email, credentialHash) records from Cloud SQL
-      await pullDatabaseFromServer(undefined, cleanEmail, credHash).catch(() => ({ success: false, found: false }));
-
-      // 2. Query local decoupled memberships strictly by (email, password)
+      // 1. Check locally cached decoupled memberships FIRST (0ms) so returning users never wait on Cloud SQL cold starts
       let credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
-
-      // 3. Authenticate with strict credential-scoped Firebase Auth
+      const hadLocalMatchesAtStart = credMatches.length > 0;
       let fbAuthRes: Awaited<ReturnType<typeof signInOrCreateCredentialAuth>> | null = null;
-      try {
-        fbAuthRes = await signInOrCreateCredentialAuth(cleanEmail, rawPass, {
-          allowCreate: credMatches.length > 0,
-          displayName: credMatches[0]?.fullName,
-          allowLegacyFallback: credMatches.length === 0,
-        });
-      } catch (fbErr: any) {
-        if (credMatches.length === 0) {
-          await restorePreviousAuthIfNeeded();
-          return { success: false, error: fbErr?.message || 'Authentication failed for these credentials.' };
-        }
-      }
+      let bgFbAuthPromise: Promise<Awaited<ReturnType<typeof signInOrCreateCredentialAuth>> | null> | null = null;
 
-      // 4. Discover & claim invited staff / multi-tenant owner memberships from Cloud Firestore (/credential_directory/{credId})
-      if (auth.currentUser) {
-        try {
-          const claimRes = await claimCredentialInviteAndRestore(cleanEmail, rawPass);
-          if (claimRes.found && claimRes.suspended) {
-            await restorePreviousAuthIfNeeded();
-            return {
-              success: false,
-              error: 'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
-            };
-          }
-          if (claimRes.found && claimRes.businessId) {
-            credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
-          } else if (fbAuthRes?.isLegacyAuth && credMatches.length === 0) {
-            await restoreFromCloud(undefined, { silentIfUnlinked: true }).catch(() => {});
-            const bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check legacy owned business');
-            const bizList = (bRes.success && Array.isArray(bRes.data)) ? bRes.data : [];
-            const ownedLegacyBiz = bizList.find((b: any) => normalizeAuthEmail(b?.email || '') === cleanEmail);
-            if (ownedLegacyBiz) {
-              upsertUserAndMembership({
-                businessId: String(ownedLegacyBiz.id),
-                email: cleanEmail,
-                fullName: String(ownedLegacyBiz.owner || 'Owner'),
-                password: rawPass,
-                credentialHash: credHash,
-                role: 'owner',
-                storeId: String(ownedLegacyBiz.store_id || 'main'),
-                status: 'ACTIVE',
-              });
-              credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+      if (hadLocalMatchesAtStart) {
+        // Fast Path: Credentials already verified locally on this device.
+        // Authenticate Firebase Auth (bounded so a slow network cannot stall local access) and defer heavy SQL/Firestore pulls to background.
+        bgFbAuthPromise = signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+          allowCreate: true,
+          displayName: credMatches[0]?.fullName,
+          allowLegacyFallback: false,
+        }).catch(() => null);
+
+        fbAuthRes = await Promise.race([
+          bgFbAuthPromise,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+        ]);
+      } else {
+        // Fresh-Device / New-Invite Path: Run Cloud SQL pull & Firebase Auth IN PARALLEL
+        const [, authSettled] = await Promise.allSettled([
+          pullDatabaseFromServer(undefined, cleanEmail, credHash, { timeoutMs: 3500 }).catch(() => ({
+            success: false,
+            found: false,
+          })),
+          signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+            allowCreate: false,
+            allowLegacyFallback: true,
+          }),
+        ]);
+
+        credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+
+        if (authSettled.status === 'fulfilled') {
+          fbAuthRes = authSettled.value;
+        } else if (credMatches.length === 0) {
+          await restorePreviousAuthIfNeeded();
+          const fbErr: any = authSettled.reason;
+          return {
+            success: false,
+            error: fbErr?.message || 'Authentication failed for these credentials.',
+          };
+        } else {
+          // Found in Cloud SQL but Firebase Auth credential account doesn't exist yet — create in background
+          bgFbAuthPromise = signInOrCreateCredentialAuth(cleanEmail, rawPass, {
+            allowCreate: true,
+            displayName: credMatches[0]?.fullName,
+            allowLegacyFallback: false,
+          }).catch(() => null);
+          fbAuthRes = await Promise.race([
+            bgFbAuthPromise,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+          ]);
+        }
+
+        // Discover & claim invited staff / multi-tenant owner memberships from Cloud Firestore if not yet resolved locally
+        if (credMatches.length === 0 && auth.currentUser) {
+          try {
+            const claimRes = await claimCredentialInviteAndRestore(cleanEmail, rawPass);
+            if (claimRes.found && claimRes.suspended) {
+              await restorePreviousAuthIfNeeded();
+              return {
+                success: false,
+                error:
+                  'Account Suspended: Your access has been suspended by an Administrator. Please contact your Business Owner.',
+              };
             }
-          } else if (credMatches.length > 0 && navigator.onLine !== false) {
-            const primaryMatch = credMatches[0];
-            const primaryBizId = String(primaryMatch.business.id);
-            let fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
-            if (!fsAccess.hasAccess && primaryMatch.role === 'owner') {
-              const migrated = await tryMigrateLegacyOwnerToCredentialAuth({
-                email: cleanEmail,
-                password: rawPass,
-                businessId: primaryBizId,
-                businessName: String(primaryMatch.business.name || primaryBizId),
-                fullName: primaryMatch.fullName,
-                storeId: String(primaryMatch.business?.store_id || 'main'),
-                permissionsJson: primaryMatch.permissionsJson,
-              });
-              if (migrated) {
-                fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
+            if (claimRes.found && claimRes.businessId) {
+              credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+            } else if (fbAuthRes?.isLegacyAuth) {
+              await restoreFromCloud(undefined, { silentIfUnlinked: true }).catch(() => {});
+              const bRes = runSql(`SELECT * FROM businesses`, 'Cloud Login: Check legacy owned business');
+              const bizList = bRes.success && Array.isArray(bRes.data) ? bRes.data : [];
+              const ownedLegacyBiz = bizList.find((b: any) => normalizeAuthEmail(b?.email || '') === cleanEmail);
+              if (ownedLegacyBiz) {
+                upsertUserAndMembership({
+                  businessId: String(ownedLegacyBiz.id),
+                  email: cleanEmail,
+                  fullName: String(ownedLegacyBiz.owner || 'Owner'),
+                  password: rawPass,
+                  credentialHash: credHash,
+                  role: 'owner',
+                  storeId: String(ownedLegacyBiz.store_id || 'main'),
+                  status: 'ACTIVE',
+                });
+                credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
               }
             }
-            if (fsAccess.hasAccess) {
-              await restoreFromCloud(primaryBizId, { silentIfUnlinked: true }).catch(() => {});
-            }
-            upsertUserAndMembership({
-              id: primaryMatch.membership?.id,
-              businessId: primaryBizId,
-              email: cleanEmail,
-              fullName: primaryMatch.fullName,
-              password: rawPass,
-              credentialHash: credHash,
-              role: primaryMatch.role,
-              storeId: String(primaryMatch.staffRow?.store_id || primaryMatch.business?.store_id || 'main'),
-              accessibleBranches: primaryMatch.accessibleBranches,
-              permissionsJson: primaryMatch.permissionsJson,
-              status: primaryMatch.isSuspended ? 'SUSPENDED' : 'ACTIVE',
-            });
-            credMatches = resolveMembershipsByCredential(cleanEmail, rawPass);
+          } catch (cloudErr) {
+            console.warn('Credential directory restore notice:', cloudErr);
           }
-        } catch (cloudErr) {
-          console.warn('Credential directory restore notice:', cloudErr);
         }
       }
 
@@ -1266,30 +1324,48 @@ export default function App() {
         };
       }
 
-      const unSuspendedMatches: typeof credMatches = [];
+      // 2. Enforce staff & business suspension checks in parallel (bounded so login stays snappy)
       let bizSuspendedMessage = '';
-      for (const m of credMatches) {
-        if (m.isSuspended || (m.role !== 'owner' && isUserSuspended(m.permissionsJson))) {
-          continue;
+      const modChecks = await Promise.all(
+        credMatches.map(async (m) => {
+          if (m.isSuspended || (m.role !== 'owner' && isUserSuspended(m.permissionsJson))) {
+            return { match: m, allowed: false, reason: '' };
+          }
+          if (String(m.business?.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
+            return {
+              match: m,
+              allowed: false,
+              reason: String(
+                m.business?.suspended_reason ||
+                  'This business account has been suspended by the Platform Super Admin.'
+              ),
+            };
+          }
+          const cloudMod = await checkBusinessCloudModerationStatus(String(m.business.id), {
+            timeoutMs: 2000,
+          });
+          if (cloudMod.status === 'SUSPENDED') {
+            return {
+              match: m,
+              allowed: false,
+              reason:
+                cloudMod.suspendedReason ||
+                'This business account has been suspended by the Platform Super Admin.',
+            };
+          }
+          return { match: m, allowed: true, reason: '' };
+        })
+      );
+
+      const activeMatches: typeof credMatches = [];
+      for (const check of modChecks) {
+        if (check.allowed) {
+          activeMatches.push(check.match);
+        } else if (check.reason && !bizSuspendedMessage) {
+          bizSuspendedMessage = check.reason;
         }
-        if (String(m.business?.status || 'ACTIVE').toUpperCase() === 'SUSPENDED') {
-          bizSuspendedMessage = String(
-            m.business?.suspended_reason ||
-              'This business account has been suspended by the Platform Super Admin.'
-          );
-          continue;
-        }
-        const cloudMod = await checkBusinessCloudModerationStatus(String(m.business.id));
-        if (cloudMod.status === 'SUSPENDED') {
-          bizSuspendedMessage =
-            cloudMod.suspendedReason ||
-            'This business account has been suspended by the Platform Super Admin.';
-          continue;
-        }
-        unSuspendedMatches.push(m);
       }
 
-      const activeMatches = unSuspendedMatches;
       if (activeMatches.length === 0) {
         await restorePreviousAuthIfNeeded();
         return {
@@ -1308,15 +1384,20 @@ export default function App() {
 
       let userAllowedBranches: string[] = [];
       if (chosen.role !== 'owner') {
-        userAllowedBranches = chosen.accessibleBranches.length > 0
-          ? chosen.accessibleBranches
-          : (chosenPerms.accessible_branches || []);
+        userAllowedBranches =
+          chosen.accessibleBranches.length > 0
+            ? chosen.accessibleBranches
+            : chosenPerms.accessible_branches || [];
         if (userAllowedBranches.length === 0 && chosen.staffRow?.store_id) {
           userAllowedBranches = [String(chosen.staffRow.store_id)];
         }
       }
 
-      if (options?.targetBranch && userAllowedBranches.length > 0 && !userAllowedBranches.includes(options.targetBranch)) {
+      if (
+        options?.targetBranch &&
+        userAllowedBranches.length > 0 &&
+        !userAllowedBranches.includes(options.targetBranch)
+      ) {
         await restorePreviousAuthIfNeeded();
         return {
           success: false,
@@ -1340,13 +1421,20 @@ export default function App() {
         const wsEntry: UnlockedWorkspaceSession = {
           businessId: String(m.business.id),
           businessName: String(m.business.name || m.business.id),
-          membershipId: String(m.membership?.id || deriveMembershipId(String(m.business.id), deriveUserId(cleanEmail), m.role)),
+          membershipId: String(
+            m.membership?.id || deriveMembershipId(String(m.business.id), deriveUserId(cleanEmail), m.role)
+          ),
           userId: String(m.membership?.user_id || deriveUserId(cleanEmail)),
           email: cleanEmail,
           fullName: m.fullName,
           role: m.role,
           credentialHash: credHash,
-          accessibleBranches: m.role === 'owner' ? [] : (m.accessibleBranches.length > 0 ? m.accessibleBranches : (mPerms.accessible_branches || [])),
+          accessibleBranches:
+            m.role === 'owner'
+              ? []
+              : m.accessibleBranches.length > 0
+                ? m.accessibleBranches
+                : mPerms.accessible_branches || [],
           permissionsJson: m.permissionsJson,
           storeId: String(m.staffRow?.store_id || m.business?.store_id || 'main'),
           unlockedAt: nowIso,
@@ -1364,28 +1452,82 @@ export default function App() {
           skipFirebaseReauth: true,
         });
 
-        // Ensure owner credentials & backup are published when Firestore access is active
-        if (auth.currentUser && activatedWs.role === 'owner') {
-          void hasVerifiedFirestoreAccessToBusiness(activatedWs.businessId).then((fsAccess) => {
-            if (!fsAccess.hasAccess) return;
-            publishCredentialMembershipToCloud({
-              businessId: activatedWs.businessId,
-              businessName: activatedWs.businessName,
-              membershipId: activatedWs.membershipId,
-              userId: activatedWs.userId,
-              email: activatedWs.email,
-              fullName: activatedWs.fullName,
-              role: 'owner',
-              password: rawPass,
-              credentialHash: credHash,
-              storeId: activatedWs.storeId,
-              accessibleBranches: [],
-              permissionsJson: activatedWs.permissionsJson,
-              status: 'ACTIVE',
-            }).catch(() => {});
-            backupToCloud(activatedWs.businessId, { silentIfNotOwner: true }).catch(() => {});
-          });
-        }
+        // Non-blocking background cloud reconciliation so login completes immediately while data stays fresh
+        const primaryMatch = chosen;
+        const wsSnapshot = activatedWs;
+        void (async () => {
+          try {
+            if (bgFbAuthPromise) {
+              await bgFbAuthPromise;
+            }
+            if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+            if (hadLocalMatchesAtStart) {
+              await pullDatabaseFromServer(undefined, cleanEmail, credHash, { timeoutMs: 5000 }).catch(
+                () => null
+              );
+            }
+
+            if (!auth.currentUser) return;
+
+            const primaryBizId = wsSnapshot.businessId;
+            let fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
+
+            if (!fsAccess.hasAccess) {
+              const claimRes = await claimCredentialInviteAndRestore(cleanEmail, rawPass).catch(
+                () => ({ found: false, suspended: false })
+              );
+              if (claimRes.found) {
+                fsAccess = {
+                  hasAccess: true,
+                  via: primaryMatch.role === 'owner' ? 'ownerUid' : 'membership',
+                  role: primaryMatch.role,
+                };
+              } else if (primaryMatch.role === 'owner') {
+                const migrated = await tryMigrateLegacyOwnerToCredentialAuth({
+                  email: cleanEmail,
+                  password: rawPass,
+                  businessId: primaryBizId,
+                  businessName: wsSnapshot.businessName,
+                  fullName: wsSnapshot.fullName,
+                  storeId: wsSnapshot.storeId,
+                  permissionsJson: wsSnapshot.permissionsJson,
+                });
+                if (migrated) {
+                  fsAccess = await hasVerifiedFirestoreAccessToBusiness(primaryBizId);
+                }
+              }
+            } else if (hadLocalMatchesAtStart) {
+              await restoreFromCloud(primaryBizId, {
+                silentIfUnlinked: true,
+                skipAccessCheck: true,
+              }).catch(() => {});
+            }
+
+            if (fsAccess.hasAccess && wsSnapshot.role === 'owner') {
+              void publishCredentialMembershipToCloud({
+                businessId: wsSnapshot.businessId,
+                businessName: wsSnapshot.businessName,
+                membershipId: wsSnapshot.membershipId,
+                userId: wsSnapshot.userId,
+                email: wsSnapshot.email,
+                fullName: wsSnapshot.fullName,
+                role: 'owner',
+                password: rawPass,
+                credentialHash: credHash,
+                storeId: wsSnapshot.storeId,
+                accessibleBranches: [],
+                permissionsJson: wsSnapshot.permissionsJson,
+                status: 'ACTIVE',
+              }).catch(() => {});
+              void backupToCloud(wsSnapshot.businessId, { silentIfNotOwner: true }).catch(() => {});
+            }
+
+            window.dispatchEvent(new Event('pos_data_updated'));
+          } catch (bgErr) {
+            console.warn('Background workspace sync notice:', bgErr);
+          }
+        })();
       }
 
       return { success: true, workspace: activatedWs || undefined };

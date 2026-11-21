@@ -16,6 +16,8 @@ service cloud.firestore {
       return isSignedIn() && (
         (request.auth.token.email == 'chiposhaconwell@gmail.com' && request.auth.token.email_verified == true) ||
         (request.auth.token.email == 'cornbtechnologies@gmail.com' && request.auth.token.email_verified == true) ||
+        (request.auth.token.firebase.sign_in_provider == 'password' &&
+         request.auth.token.email == 'cred_14502f2917bd7baffecafd15a60218ad4c6a666a73d3c9c89f5ed487@mt-pos.auth') ||
         exists(/databases/$(database)/documents/super_admins/$(request.auth.uid))
       );
     }
@@ -42,21 +44,27 @@ service cloud.firestore {
 
     function isBusinessOwner(businessId) {
       return isSignedIn() && (
-        get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid ||
-        isActiveOwnerMember(businessId) ||
-        isAdmin()
+        isAdmin() ||
+        (
+          exists(/databases/$(database)/documents/businesses/$(businessId)) &&
+          get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid
+        ) ||
+        isActiveOwnerMember(businessId)
       );
     }
 
     function isBusinessMember(businessId) {
       return isSignedIn() && (
-        get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid ||
+        isAdmin() ||
+        (
+          exists(/databases/$(database)/documents/businesses/$(businessId)) &&
+          get(/databases/$(database)/documents/businesses/$(businessId)).data.ownerUid == request.auth.uid
+        ) ||
         (
           exists(/databases/$(database)/documents/businesses/$(businessId)/memberships/$(request.auth.uid)) &&
           get(/databases/$(database)/documents/businesses/$(businessId)/memberships/$(request.auth.uid)).data.status == 'ACTIVE' &&
           get(/databases/$(database)/documents/businesses/$(businessId)/memberships/$(request.auth.uid)).data.memberUid == request.auth.uid
-        ) ||
-        isAdmin()
+        )
       );
     }
 
@@ -412,9 +420,9 @@ service cloud.firestore {
                          isAdmin()
                        );
       allow delete: if isSignedIn() && isValidId(credId) && resource != null && (
+        isAdmin() ||
         existing().ownerUid == request.auth.uid ||
-        isBusinessOwner(existing().business_id) ||
-        isAdmin()
+        isBusinessOwner(existing().business_id)
       );
     }
 
@@ -507,10 +515,10 @@ service cloud.firestore {
                            ])
                          )
                        );
-      allow delete: if isAdmin() &&
+      allow delete: if isSignedIn() &&
                        isValidId(businessId) &&
                        resource != null &&
-                       (existing().status == 'SUSPENDED' || existing().flagged_for_fraud == true);
+                       (isAdmin() || existing().ownerUid == request.auth.uid);
 
       // Subcollection: Decoupled Many-to-Many Business Memberships
       match /memberships/{membershipId} {
@@ -751,7 +759,7 @@ service cloud.firestore {
                          incoming().store_id == existing().store_id &&
                          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentMethod', 'total', 'subtotal', 'tax', 'discount', 'customerId', 'performed_by']) &&
                          isBusinessMember(businessId);
-        allow delete: if isAdmin() && isValidId(businessId) && isValidId(orderId);
+        allow delete: if isSignedIn() && isValidId(businessId) && isValidId(orderId) && isBusinessOwner(businessId);
       }
 
       // Subcollection: Order Line Items (Relational link between Orders and Products)

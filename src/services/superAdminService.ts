@@ -17,12 +17,19 @@ import {
   googleSignOut,
   handleFirestoreError,
   OperationType,
+  purgeBusinessFromFirestoreAndStorage,
   sanitizeIdForFirestore,
   signInOrCreateCredentialAuth,
+  signInWithCredentialHash,
 } from '../firebase';
 import {
-  ALL_TABLE_NAMES,
+  dedupeAndCleanBusinessesTable,
+  deleteBusinessFromServer,
+  getDeletedBusinessIds,
+  isBusinessPermanentlyDeleted,
+  markBusinessPermanentlyDeleted,
   persistTablesToStorage,
+  purgeBusinessFromLocalDatabase,
   runSql,
   sqlEsc,
 } from '../db';
@@ -39,6 +46,7 @@ export const SUPER_ADMIN_CRED_ID =
 
 const SUPER_ADMIN_SESSION_KEY = 'pos_super_admin_session_v1';
 const LOCAL_PLATFORM_AUDIT_KEY = 'pos_super_admin_audit_logs_v1';
+const verifiedSuperAdminUids = new Set<string>();
 
 export type BusinessStatus = 'ACTIVE' | 'SUSPENDED';
 export type PlanTier = 'PAID' | 'TRIAL' | 'FREE';
@@ -202,6 +210,8 @@ export async function ensureSuperAdminCloudDoc(session: SuperAdminSession): Prom
     throw new Error('Firebase authentication session is not active.');
   }
   const uid = auth.currentUser.uid;
+  if (verifiedSuperAdminUids.has(uid)) return uid;
+
   const isOnline = await ensureFirestoreOnlineIfReachable();
   if (!isOnline) return uid;
 
@@ -222,6 +232,7 @@ export async function ensureSuperAdminCloudDoc(session: SuperAdminSession): Prom
         updatedAt: serverTimestamp(),
       });
     }
+    verifiedSuperAdminUids.add(uid);
     return uid;
   } catch (err: any) {
     if (isSoftOfflineOrPermissionReadNotice(err)) return uid;
@@ -274,7 +285,10 @@ export async function authenticateSuperAdmin(
   };
 
   if (auth.currentUser) {
-    await ensureSuperAdminCloudDoc(session).catch(() => {});
+    await Promise.race([
+      ensureSuperAdminCloudDoc(session).catch(() => {}),
+      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+    ]);
   }
 
   saveSuperAdminSession(session);
@@ -282,26 +296,63 @@ export async function authenticateSuperAdmin(
 }
 
 export async function logoutSuperAdmin(): Promise<void> {
+  verifiedSuperAdminUids.clear();
   saveSuperAdminSession(null);
   await googleSignOut().catch(() => {});
 }
 
 async function ensureActiveSuperAdminFirebaseSession(session: SuperAdminSession): Promise<boolean> {
-  if (!auth.currentUser) {
-    return false;
+  const expectedAuthEmail = `cred_${SUPER_ADMIN_CRED_ID}@mt-pos.auth`.toLowerCase();
+  const currentEmail = String(auth.currentUser?.email || '').trim().toLowerCase();
+  if (!auth.currentUser || currentEmail !== expectedAuthEmail) {
+    const signedUser = await signInWithCredentialHash(
+      SUPER_ADMIN_CRED_HASH,
+      session.fullName || 'Platform Super Admin'
+    ).catch(() => null);
+    if (!signedUser && !auth.currentUser) {
+      return false;
+    }
   }
   await ensureSuperAdminCloudDoc(session);
-  return true;
+  return Boolean(auth.currentUser);
+}
+
+function buildNormalizedBusinessUpdatePayload(
+  existingData: Record<string, any> | undefined,
+  business: PlatformBusinessRecord,
+  safeBizId: string,
+  overrides: Record<string, any>
+): Record<string, any> {
+  const d = existingData || {};
+  return {
+    id: safeBizId,
+    business_id: safeBizId,
+    store_id: String(d.store_id || 'main').slice(0, 128),
+    name: String(d.name || business.name || safeBizId).slice(0, 200),
+    owner: String(d.owner || business.owner || 'Owner').slice(0, 200),
+    email: String(d.email || business.email || 'owner@pos.app').slice(0, 200),
+    ownerUid: String(d.ownerUid || business.ownerUid || auth.currentUser?.uid || 'super_admin').slice(0, 128),
+    currency: String(d.currency || business.currency || 'K').slice(0, 20),
+    tax_rate: Math.max(0, Number.isFinite(Number(d.tax_rate)) ? Number(d.tax_rate) : 0),
+    tpin: String(d.tpin ?? business.tpin ?? '').slice(0, 100),
+    billing_address: String(d.billing_address ?? business.billing_address ?? '').slice(0, 500),
+    billing_city: String(d.billing_city ?? business.billing_city ?? '').slice(0, 200),
+    billing_country: String(d.billing_country ?? business.billing_country ?? '').slice(0, 200),
+    billing_phone: String(d.billing_phone ?? business.billing_phone ?? '').slice(0, 100),
+    billing_email: String(d.billing_email ?? business.billing_email ?? d.email ?? business.email ?? '').slice(0, 200),
+    admin_role: String(d.admin_role || 'admin').slice(0, 50),
+    ...overrides,
+  };
 }
 
 function readLocalBusinessesSnapshot(): Map<string, PlatformBusinessRecord> {
+  for (const delId of getDeletedBusinessIds()) {
+    if (delId && delId !== 'default_biz' && delId !== '__latest__' && delId !== '__global__') {
+      purgeBusinessFromLocalDatabase(delId);
+    }
+  }
+  const bizRows = dedupeAndCleanBusinessesTable();
   const map = new Map<string, PlatformBusinessRecord>();
-  const bizRes = runSql(
-    `SELECT * FROM businesses`,
-    'Super Admin: Read local registered businesses',
-    true
-  );
-  const bizRows = bizRes.success && Array.isArray(bizRes.data) ? bizRes.data : [];
 
   const ordersRes = runSql(`SELECT business_id, total, status, orderDate FROM orders`, 'Super Admin: Read local orders', true);
   const orderRows = ordersRes.success && Array.isArray(ordersRes.data) ? ordersRes.data : [];
@@ -323,7 +374,7 @@ function readLocalBusinessesSnapshot(): Map<string, PlatformBusinessRecord> {
 
   for (const b of bizRows) {
     const id = String(b?.id || '').trim();
-    if (!id || id === 'default_biz') continue;
+    if (!id || id === 'default_biz' || isBusinessPermanentlyDeleted(id)) continue;
 
     const bizOrders = orderRows.filter((o: any) => String(o?.business_id || '') === id);
     const gmv = bizOrders.reduce((acc: number, o: any) => {
@@ -400,8 +451,16 @@ export async function fetchPlatformBusinesses(
   let cloudSynced = false;
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
+  if (hasAdminAuth && auth.currentUser) {
+    // Proactively erase any permanently-deleted business IDs (e.g., biz_3539, biz_3126) from Firestore/Storage/Cloud SQL
+    for (const delId of getDeletedBusinessIds()) {
+      if (delId && delId !== 'default_biz' && delId !== '__latest__' && delId !== '__global__') {
+        void purgeBusinessFromFirestoreAndStorage(delId);
+        void deleteBusinessFromServer(delId);
+      }
+    }
+
     const listPath = 'businesses';
     try {
       const bizSnap = await getDocs(collection(db, 'businesses'));
@@ -409,7 +468,14 @@ export async function fetchPlatformBusinesses(
 
       const cloudEntries = await Promise.all(
         bizSnap.docs.map(async (bizDoc) => {
-          const id = bizDoc.id;
+          const id = String(bizDoc.id || '').trim();
+          if (!id || id === 'default_biz' || isBusinessPermanentlyDeleted(id)) {
+            if (id && id !== 'default_biz') {
+              void purgeBusinessFromFirestoreAndStorage(id);
+              void deleteBusinessFromServer(id);
+            }
+            return null;
+          }
           const d = bizDoc.data();
 
           const [ordersSnap, storesSnap, productsSnap, membershipsSnap, customersSnap] = await Promise.all([
@@ -487,7 +553,9 @@ export async function fetchPlatformBusinesses(
       );
 
       for (const entry of cloudEntries) {
-        merged.set(entry.id, entry);
+        if (entry && !isBusinessPermanentlyDeleted(entry.id)) {
+          merged.set(entry.id, entry);
+        }
       }
     } catch (err: any) {
       if (!isSoftOfflineOrPermissionReadNotice(err)) {
@@ -546,8 +614,8 @@ async function recordPlatformAuditLog(params: {
   appendLocalAuditCache(entry);
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(params.session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(params.session) : false;
+  if (hasAdminAuth && auth.currentUser) {
     const logPath = `platform_audit_logs/${logId}`;
     try {
       await setDoc(doc(db, 'platform_audit_logs', logId), {
@@ -574,8 +642,8 @@ export async function fetchPlatformAuditLogs(
   }
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
+  if (hasAdminAuth && auth.currentUser) {
     const logsPath = 'platform_audit_logs';
     try {
       const snap = await getDocs(collection(db, 'platform_audit_logs'));
@@ -637,20 +705,23 @@ export async function suspendBusinessAccount(
   const safeBizId = sanitizeIdForFirestore(business.id, 'biz');
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
+  if (hasAdminAuth && auth.currentUser) {
     const bizPath = `businesses/${safeBizId}`;
     try {
       const bizRef = doc(db, 'businesses', safeBizId);
       const snap = await getDoc(bizRef);
       if (snap.exists()) {
-        await updateDoc(bizRef, {
-          status: 'SUSPENDED',
-          suspended_reason: cleanReason.slice(0, 1000),
-          suspended_at: nowIso,
-          suspended_by: session.email.slice(0, 200),
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          bizRef,
+          buildNormalizedBusinessUpdatePayload(snap.data(), business, safeBizId, {
+            status: 'SUSPENDED',
+            suspended_reason: cleanReason.slice(0, 1000),
+            suspended_at: nowIso,
+            suspended_by: session.email.slice(0, 200),
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     } catch (err: any) {
       if (!isSoftOfflineOrPermissionReadNotice(err)) {
@@ -685,20 +756,23 @@ export async function restoreBusinessAccount(
   const safeBizId = sanitizeIdForFirestore(business.id, 'biz');
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
+  if (hasAdminAuth && auth.currentUser) {
     const bizPath = `businesses/${safeBizId}`;
     try {
       const bizRef = doc(db, 'businesses', safeBizId);
       const snap = await getDoc(bizRef);
       if (snap.exists()) {
-        await updateDoc(bizRef, {
-          status: 'ACTIVE',
-          suspended_reason: '',
-          suspended_at: '',
-          suspended_by: '',
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          bizRef,
+          buildNormalizedBusinessUpdatePayload(snap.data(), business, safeBizId, {
+            status: 'ACTIVE',
+            suspended_reason: '',
+            suspended_at: '',
+            suspended_by: '',
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     } catch (err: any) {
       if (!isSoftOfflineOrPermissionReadNotice(err)) {
@@ -739,19 +813,22 @@ export async function setBusinessFraudFlag(
   const safeBizId = sanitizeIdForFirestore(business.id, 'biz');
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
+  if (hasAdminAuth && auth.currentUser) {
     const bizPath = `businesses/${safeBizId}`;
     try {
       const bizRef = doc(db, 'businesses', safeBizId);
       const snap = await getDoc(bizRef);
       if (snap.exists()) {
-        await updateDoc(bizRef, {
-          flagged_for_fraud: flagged,
-          fraud_flag_reason: flagged ? finalReason.slice(0, 1000) : '',
-          flagged_at: flagged ? nowIso : '',
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          bizRef,
+          buildNormalizedBusinessUpdatePayload(snap.data(), business, safeBizId, {
+            flagged_for_fraud: flagged,
+            fraud_flag_reason: flagged ? finalReason.slice(0, 1000) : '',
+            flagged_at: flagged ? nowIso : '',
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     } catch (err: any) {
       if (!isSoftOfflineOrPermissionReadNotice(err)) {
@@ -785,17 +862,20 @@ export async function updateBusinessPlanTier(
   const reason = `Subscription plan updated from ${business.plan_tier} to ${planTier}`;
 
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
+  if (hasAdminAuth && auth.currentUser) {
     const bizPath = `businesses/${safeBizId}`;
     try {
       const bizRef = doc(db, 'businesses', safeBizId);
       const snap = await getDoc(bizRef);
       if (snap.exists()) {
-        await updateDoc(bizRef, {
-          plan_tier: planTier,
-          updatedAt: serverTimestamp(),
-        });
+        await updateDoc(
+          bizRef,
+          buildNormalizedBusinessUpdatePayload(snap.data(), business, safeBizId, {
+            plan_tier: planTier,
+            updatedAt: serverTimestamp(),
+          })
+        );
       }
     } catch (err: any) {
       if (!isSoftOfflineOrPermissionReadNotice(err)) {
@@ -837,7 +917,11 @@ export async function hardDeleteBusinessAccount(
     `Permanently hard-deleted (${business.status === 'SUSPENDED' ? 'Suspended' : 'Flagged for Fraud'})`;
   const safeBizId = sanitizeIdForFirestore(business.id, 'biz');
 
-  // 1. Write immutable audit log FIRST so record survives deletion of business documents
+  // 1. Immediately mark tombstone and purge from local AlaSQL, localStorage, and on-device SQLite cache
+  markBusinessPermanentlyDeleted(business.id);
+  purgeBusinessFromLocalDatabase(business.id);
+
+  // 2. Write immutable audit log so record survives deletion of business documents
   await recordPlatformAuditLog({
     action: 'HARD_DELETE_BUSINESS',
     businessId: business.id,
@@ -853,79 +937,76 @@ export async function hardDeleteBusinessAccount(
     },
   });
 
-  // 2. Cascade-delete Firestore subcollections, credential_directory links, and parent business doc
+  // 3. Delete completely from Cloud SQL (PostgreSQL) server AND Cloud Firestore + Firebase Storage
   const isOnline = await ensureFirestoreOnlineIfReachable();
-  if (isOnline && auth.currentUser) {
-    await ensureActiveSuperAdminFirebaseSession(session);
-    const subcollections = [
-      'settings',
-      'memberships',
-      'stores',
-      'products',
-      'store_products',
-      'customers',
-      'orders',
-      'order_items',
-      'ledgers',
-    ];
+  const hasAdminAuth = isOnline ? await ensureActiveSuperAdminFirebaseSession(session) : false;
 
-    for (const sub of subcollections) {
-      const subPath = `businesses/${safeBizId}/${sub}`;
+  await Promise.allSettled([
+    deleteBusinessFromServer(business.id),
+    (async () => {
+      if (!hasAdminAuth || !auth.currentUser) return;
+      const subcollections = [
+        'settings',
+        'memberships',
+        'stores',
+        'products',
+        'store_products',
+        'customers',
+        'orders',
+        'order_items',
+        'ledgers',
+      ];
+
+      await Promise.allSettled(
+        subcollections.map(async (sub) => {
+          const subPath = `businesses/${safeBizId}/${sub}`;
+          try {
+            const subSnap = await getDocs(collection(db, 'businesses', safeBizId, sub));
+            await Promise.all(
+              subSnap.docs.map((d) =>
+                deleteDoc(doc(db, 'businesses', safeBizId, sub, d.id)).catch((err) => {
+                  if (!isSoftOfflineOrPermissionReadNotice(err)) {
+                    handleFirestoreError(err, OperationType.DELETE, `${subPath}/${d.id}`);
+                  }
+                })
+              )
+            );
+          } catch (err: any) {
+            if (!isSoftOfflineOrPermissionReadNotice(err)) {
+              handleFirestoreError(err, OperationType.LIST, subPath);
+            }
+          }
+        })
+      );
+
+      // Delete credential_directory entries pointing to this business
       try {
-        const subSnap = await getDocs(collection(db, 'businesses', safeBizId, sub));
+        const credSnap = await getDocs(
+          query(collection(db, 'credential_directory'), where('business_id', '==', safeBizId))
+        );
         await Promise.all(
-          subSnap.docs.map((d) =>
-            deleteDoc(doc(db, 'businesses', safeBizId, sub, d.id)).catch((err) => {
-              if (!isSoftOfflineOrPermissionReadNotice(err)) {
-                handleFirestoreError(err, OperationType.DELETE, `${subPath}/${d.id}`);
-              }
-            })
+          credSnap.docs.map((d) =>
+            deleteDoc(doc(db, 'credential_directory', d.id)).catch(() => {})
           )
         );
+      } catch {}
+
+      // Delete parent business document
+      const bizPath = `businesses/${safeBizId}`;
+      try {
+        await deleteDoc(doc(db, 'businesses', safeBizId));
       } catch (err: any) {
         if (!isSoftOfflineOrPermissionReadNotice(err)) {
-          handleFirestoreError(err, OperationType.LIST, subPath);
+          handleFirestoreError(err, OperationType.DELETE, bizPath);
         }
       }
-    }
 
-    // Delete credential_directory entries pointing to this business
-    try {
-      const credSnap = await getDocs(
-        query(collection(db, 'credential_directory'), where('business_id', '==', safeBizId))
-      );
-      await Promise.all(
-        credSnap.docs.map((d) =>
-          deleteDoc(doc(db, 'credential_directory', d.id)).catch(() => {})
-        )
-      );
-    } catch {}
+      // Also purge any remaining Firebase Storage archive files
+      await purgeBusinessFromFirestoreAndStorage(safeBizId);
+    })(),
+  ]);
 
-    // Delete parent business document
-    const bizPath = `businesses/${safeBizId}`;
-    try {
-      const bizSnap = await getDoc(doc(db, 'businesses', safeBizId));
-      if (bizSnap.exists()) {
-        await deleteDoc(doc(db, 'businesses', safeBizId));
-      }
-    } catch (err: any) {
-      if (!isSoftOfflineOrPermissionReadNotice(err)) {
-        handleFirestoreError(err, OperationType.DELETE, bizPath);
-      }
-    }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('pos_data_updated'));
   }
-
-  // 3. Purge tenant rows from local SQL storage cleanly without touching other tenants
-  for (const tbl of ALL_TABLE_NAMES) {
-    if (tbl === 'businesses') {
-      runSql(`DELETE FROM businesses WHERE id = '${sqlEsc(business.id)}'`, 'Hard Delete: Purge local business row', true);
-    } else if (tbl !== 'accounts') {
-      runSql(
-        `DELETE FROM ${tbl} WHERE business_id = '${sqlEsc(business.id)}'`,
-        `Hard Delete: Purge local ${tbl} rows`,
-        true
-      );
-    }
-  }
-  persistTablesToStorage(true);
 }

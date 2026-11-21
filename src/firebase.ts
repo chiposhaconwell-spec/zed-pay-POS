@@ -36,6 +36,7 @@ import {
   ref as storageRef,
   uploadString,
   getBytes,
+  deleteObject,
 } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json';
 import {
@@ -51,6 +52,12 @@ import {
   markReceiptMirroredInSqlite,
   upsertUserAndMembership,
   syncUsersAndMembershipsFromLegacyTables,
+  dedupeAndCleanBusinessesTable,
+  deleteBusinessFromServer,
+  getDeletedBusinessIds,
+  isBusinessPermanentlyDeleted,
+  markBusinessPermanentlyDeleted,
+  purgeBusinessFromLocalDatabase,
 } from './db';
 import { getZraConfig, saveZraConfig, switchZraConfigForBusiness } from './zra/zraConfig';
 import {
@@ -183,10 +190,12 @@ export async function ensureFirestoreOnlineIfReachable(): Promise<boolean> {
   }
 }
 
-// Sync authenticated Firebase user with backend Cloud SQL users table
+// Sync authenticated Firebase user with backend Cloud SQL users table (bounded timeout, non-blocking)
 export async function syncFirebaseUserWithBackend(user: User | null) {
   if (!user) return;
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), 4000);
   try {
     const idToken = await user.getIdToken();
     await fetch('/api/auth/sync', {
@@ -195,14 +204,18 @@ export async function syncFirebaseUserWithBackend(user: User | null) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${idToken}`,
       },
+      signal: controller.signal,
     });
   } catch (err: any) {
+    if (err?.name === 'AbortError') return;
     if (isNetworkOrOfflineAuthError(err)) {
       lastAuthNetworkFailureAt = Date.now();
       void setFirestoreOfflineMode();
       return;
     }
     console.warn('Backend user token sync notice:', err);
+  } finally {
+    clearTimeout(timerId);
   }
 }
 
@@ -223,16 +236,16 @@ export async function signInWithCredentialHash(
 
   try {
     const res = await signInWithEmailAndPassword(auth, authEmail, authSecret);
-    await syncFirebaseUserWithBackend(res.user);
+    void syncFirebaseUserWithBackend(res.user);
     return res.user;
   } catch (err: any) {
     if (err?.code === 'auth/user-not-found' || err?.code === 'auth/invalid-credential') {
       try {
         const created = await createUserWithEmailAndPassword(auth, authEmail, authSecret);
         if (displayName && displayName.trim()) {
-          await updateProfile(created.user, { displayName: displayName.trim() }).catch(() => {});
+          void updateProfile(created.user, { displayName: displayName.trim() }).catch(() => {});
         }
-        await syncFirebaseUserWithBackend(created.user);
+        void syncFirebaseUserWithBackend(created.user);
         return created.user;
       } catch {
         return null;
@@ -257,45 +270,42 @@ export async function signInOrCreateCredentialAuth(
   const { cleanEmail, credHash, credId, authEmail, authSecret } = deriveFirebaseCredentialIdentity(email, password);
   const displayName = options?.displayName?.trim();
 
-  if (options?.allowCreate) {
-    try {
-      const created = await createUserWithEmailAndPassword(auth, authEmail, authSecret);
-      if (displayName) {
-        await updateProfile(created.user, { displayName }).catch(() => {});
-      }
-      await syncFirebaseUserWithBackend(created.user);
-      return { user: created.user, credId, credHash, authEmail, isLegacyAuth: false };
-    } catch (err: any) {
-      if (err?.code === 'auth/email-already-in-use') {
-        const signed = await signInWithEmailAndPassword(auth, authEmail, authSecret);
-        await syncFirebaseUserWithBackend(signed.user);
-        return { user: signed.user, credId, credHash, authEmail, isLegacyAuth: false };
-      }
-      throw err;
-    }
+  // Fast-path: already signed in to the exact credential-scoped identity
+  if (auth.currentUser && (auth.currentUser.email || '').toLowerCase() === authEmail.toLowerCase()) {
+    return { user: auth.currentUser, credId, credHash, authEmail, isLegacyAuth: false };
   }
 
+  // Always try signInWithEmailAndPassword FIRST to avoid a guaranteed failed createUser round-trip for returning accounts
   try {
     const signed = await signInWithEmailAndPassword(auth, authEmail, authSecret);
-    await syncFirebaseUserWithBackend(signed.user);
+    void syncFirebaseUserWithBackend(signed.user);
     return { user: signed.user, credId, credHash, authEmail, isLegacyAuth: false };
   } catch (err: any) {
     if (err?.code === 'auth/user-not-found' || err?.code === 'auth/invalid-credential') {
       if (options?.allowLegacyFallback) {
         try {
           const legacySigned = await signInWithEmailAndPassword(auth, cleanEmail, normalizeFirebasePassword(password));
-          await syncFirebaseUserWithBackend(legacySigned.user);
+          void syncFirebaseUserWithBackend(legacySigned.user);
           return { user: legacySigned.user, credId, credHash, authEmail: cleanEmail, isLegacyAuth: true };
         } catch {
           // Proceed to credential-scoped provisioning so remote /credential_directory/{credId} invites can be read
         }
       }
-      const created = await createUserWithEmailAndPassword(auth, authEmail, authSecret);
-      if (displayName) {
-        await updateProfile(created.user, { displayName }).catch(() => {});
+      try {
+        const created = await createUserWithEmailAndPassword(auth, authEmail, authSecret);
+        if (displayName) {
+          void updateProfile(created.user, { displayName }).catch(() => {});
+        }
+        void syncFirebaseUserWithBackend(created.user);
+        return { user: created.user, credId, credHash, authEmail, isLegacyAuth: false };
+      } catch (createErr: any) {
+        if (createErr?.code === 'auth/email-already-in-use') {
+          const retrySigned = await signInWithEmailAndPassword(auth, authEmail, authSecret);
+          void syncFirebaseUserWithBackend(retrySigned.user);
+          return { user: retrySigned.user, credId, credHash, authEmail, isLegacyAuth: false };
+        }
+        throw createErr;
       }
-      await syncFirebaseUserWithBackend(created.user);
-      return { user: created.user, credId, credHash, authEmail, isLegacyAuth: false };
     }
     throw err;
   }
@@ -337,6 +347,7 @@ export const initAuth = (
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
       syncFirebaseUserWithBackend(user).catch(() => {});
+      void purgeAllDeletedBusinessesFromCloudOnce();
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
       } else if (!isSigningIn) {
@@ -1289,42 +1300,38 @@ export async function hasVerifiedFirestoreAccessToBusiness(businessId: string): 
     return { hasAccess: true, via: 'admin', role: 'owner' };
   }
 
-  // 1. Check /businesses/{safeBizId}/memberships/{currentUid} (always permitted for currentUid)
-  try {
-    const memRef = doc(db, 'businesses', safeBizId, 'memberships', currentUid);
-    const memSnap = await getDoc(memRef).catch(() => getDocFromCache(memRef).catch(() => null));
-    if (memSnap && memSnap.exists()) {
-      const m = memSnap.data();
-      if (String(m.status || 'ACTIVE').toUpperCase() === 'ACTIVE' && String(m.memberUid || '') === currentUid) {
-        setBusinessCloudUnlinkedFlag(safeBizId, false);
-        return {
-          hasAccess: true,
-          via: 'membership',
-          ownerUid: String(m.ownerUid || ''),
-          role: String(m.role || ''),
-        };
-      }
-    }
-  } catch {}
+  // Run membership check and direct ownerUid check in parallel to halve Firestore round-trips
+  const memRef = doc(db, 'businesses', safeBizId, 'memberships', currentUid);
+  const [memSnap, ownedSnap] = await Promise.all([
+    getDoc(memRef).catch(() => getDocFromCache(memRef).catch(() => null)),
+    getDocs(query(collection(db, 'businesses'), where('ownerUid', '==', currentUid))).catch(() => null),
+  ]);
 
-  // 2. Check businesses owned directly by currentUid (always permitted by list rule)
-  try {
-    const ownedSnap = await getDocs(
-      query(collection(db, 'businesses'), where('ownerUid', '==', currentUid))
-    ).catch(() => null);
-    if (ownedSnap && !ownedSnap.empty) {
-      const match = ownedSnap.docs.find((d) => d.id === safeBizId);
-      if (match) {
-        setBusinessCloudUnlinkedFlag(safeBizId, false);
-        return {
-          hasAccess: true,
-          via: 'ownerUid',
-          ownerUid: currentUid,
-          role: 'owner',
-        };
-      }
+  if (memSnap && memSnap.exists()) {
+    const m = memSnap.data();
+    if (String(m.status || 'ACTIVE').toUpperCase() === 'ACTIVE' && String(m.memberUid || '') === currentUid) {
+      setBusinessCloudUnlinkedFlag(safeBizId, false);
+      return {
+        hasAccess: true,
+        via: 'membership',
+        ownerUid: String(m.ownerUid || ''),
+        role: String(m.role || ''),
+      };
     }
-  } catch {}
+  }
+
+  if (ownedSnap && !ownedSnap.empty) {
+    const match = ownedSnap.docs.find((d) => d.id === safeBizId);
+    if (match) {
+      setBusinessCloudUnlinkedFlag(safeBizId, false);
+      return {
+        hasAccess: true,
+        via: 'ownerUid',
+        ownerUid: currentUid,
+        role: 'owner',
+      };
+    }
+  }
 
   return { hasAccess: false, via: 'none' };
 }
@@ -1699,7 +1706,8 @@ export async function revokeCredentialMembershipInCloud(params: {
 
 export async function claimCredentialInviteAndRestore(
   email: string,
-  password: string
+  password: string,
+  options?: { deferFullRestore?: boolean }
 ): Promise<{
   found: boolean;
   suspended?: boolean;
@@ -1723,16 +1731,22 @@ export async function claimCredentialInviteAndRestore(
   try {
     await ensureFirestoreOnlineIfReachable();
     const credRef = doc(db, 'credential_directory', credId);
-    let credSnap: any = null;
-    try {
-      credSnap = await getDoc(credRef);
-    } catch {
-      credSnap = await getDocFromCache(credRef).catch(() => null);
-    }
+    // Query credential_directory AND directly-owned businesses in parallel
+    const [credSnap, ownedSnap] = await Promise.all([
+      getDoc(credRef).catch(() => getDocFromCache(credRef).catch(() => null)),
+      getDocs(query(collection(db, 'businesses'), where('ownerUid', '==', currentUid))).catch(() => null),
+    ]);
 
     if (credSnap && credSnap.exists()) {
       const inv = credSnap.data();
-      const targetBizId = String(inv.business_id || '');
+      const targetBizId = String(inv.business_id || '').trim();
+      if (!targetBizId || isBusinessPermanentlyDeleted(targetBizId)) {
+        if (targetBizId) {
+          purgeBusinessFromLocalDatabase(targetBizId);
+          void deleteDoc(credRef).catch(() => {});
+        }
+        return { found: false };
+      }
       const status = String(inv.status || 'ACTIVE').toUpperCase();
       if (status === 'SUSPENDED') {
         return {
@@ -1768,7 +1782,8 @@ export async function claimCredentialInviteAndRestore(
           createdAt: existingClaimData?.createdAt ? existingClaimData.createdAt : serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
-        await updateDoc(credRef, {
+        // Non-blocking credential directory memberUid stamp
+        void updateDoc(credRef, {
           memberUid: currentUid,
           updatedAt: serverTimestamp(),
         }).catch(() => {});
@@ -1789,9 +1804,10 @@ export async function claimCredentialInviteAndRestore(
         status: 'ACTIVE',
       });
 
-      const accessCheck = await hasVerifiedFirestoreAccessToBusiness(safeBizId);
-      if (accessCheck.hasAccess) {
-        await restoreFromCloud(safeBizId, { silentIfUnlinked: true }).catch((e) =>
+      if (options?.deferFullRestore) {
+        void restoreFromCloud(safeBizId, { silentIfUnlinked: true, skipAccessCheck: true }).catch(() => {});
+      } else {
+        await restoreFromCloud(safeBizId, { silentIfUnlinked: true, skipAccessCheck: true }).catch((e) =>
           console.warn('Cloud restore after invite claim notice:', e)
         );
       }
@@ -1812,39 +1828,124 @@ export async function claimCredentialInviteAndRestore(
     }
 
     // Fallback: Check if user owns any Business directly under this credential-scoped UID
-    const ownedSnap = await getDocs(query(collection(db, 'businesses'), where('ownerUid', '==', currentUid)));
-    if (!ownedSnap.empty) {
-      const bizDoc = ownedSnap.docs[0];
-      const bizData = bizDoc.data();
-      const targetBizId = bizDoc.id;
-      await restoreFromCloud(targetBizId).catch(() => {});
-      upsertUserAndMembership({
-        businessId: targetBizId,
-        email: cleanEmail,
-        fullName: String(bizData.owner || 'Owner'),
-        password,
-        role: 'owner',
-        storeId: String(bizData.store_id || 'main'),
-        status: 'ACTIVE',
+    if (ownedSnap && !ownedSnap.empty) {
+      const validOwnedDocs = ownedSnap.docs.filter((d) => {
+        if (isBusinessPermanentlyDeleted(d.id)) {
+          void purgeBusinessFromFirestoreAndStorage(d.id);
+          return false;
+        }
+        return true;
       });
-      return {
-        found: true,
-        suspended: false,
-        businessId: targetBizId,
-        businessName: String(bizData.name || targetBizId),
-        role: 'owner',
-        userId: deriveUserId(cleanEmail),
-        fullName: String(bizData.owner || 'Owner'),
-        storeId: String(bizData.store_id || 'main'),
-        accessibleBranches: [],
-        permissionsJson: '{}',
-      };
+      if (validOwnedDocs.length > 0) {
+        const bizDoc = validOwnedDocs[0];
+        const bizData = bizDoc.data();
+        const targetBizId = bizDoc.id;
+        if (options?.deferFullRestore) {
+          void restoreFromCloud(targetBizId, { silentIfUnlinked: true, skipAccessCheck: true, preloadedBizData: bizData }).catch(() => {});
+        } else {
+          await restoreFromCloud(targetBizId, { silentIfUnlinked: true, skipAccessCheck: true, preloadedBizData: bizData }).catch(() => {});
+        }
+        upsertUserAndMembership({
+          businessId: targetBizId,
+          email: cleanEmail,
+          fullName: String(bizData.owner || 'Owner'),
+          password,
+          role: 'owner',
+          storeId: String(bizData.store_id || 'main'),
+          status: 'ACTIVE',
+        });
+        return {
+          found: true,
+          suspended: false,
+          businessId: targetBizId,
+          businessName: String(bizData.name || targetBizId),
+          role: 'owner',
+          userId: deriveUserId(cleanEmail),
+          fullName: String(bizData.owner || 'Owner'),
+          storeId: String(bizData.store_id || 'main'),
+          accessibleBranches: [],
+          permissionsJson: '{}',
+        };
+      }
     }
 
     return { found: false };
   } catch (err) {
     console.warn('Credential invite lookup notice:', err);
     return { found: false };
+  }
+}
+
+export async function purgeBusinessFromFirestoreAndStorage(businessId: string): Promise<void> {
+  const safeBizId = sanitizeIdForFirestore(businessId, 'biz');
+  if (!safeBizId || safeBizId === 'default_biz') return;
+  markBusinessPermanentlyDeleted(safeBizId);
+  purgeBusinessFromLocalDatabase(safeBizId);
+
+  if (!auth.currentUser) return;
+  const isOnline = await ensureFirestoreOnlineIfReachable();
+  if (!isOnline) return;
+
+  const subcollections = [
+    'settings',
+    'memberships',
+    'stores',
+    'products',
+    'store_products',
+    'customers',
+    'orders',
+    'order_items',
+    'ledgers',
+  ];
+
+  await Promise.allSettled(
+    subcollections.map(async (sub) => {
+      try {
+        const subSnap = await getDocs(collection(db, 'businesses', safeBizId, sub));
+        await Promise.allSettled(subSnap.docs.map((d) => deleteDoc(d.ref)));
+      } catch {
+        // ignore subcollection errors if already empty or inaccessible
+      }
+    })
+  );
+
+  try {
+    const credSnap = await getDocs(
+      query(collection(db, 'credential_directory'), where('business_id', '==', safeBizId))
+    );
+    await Promise.allSettled(credSnap.docs.map((d) => deleteDoc(d.ref)));
+  } catch {
+    // ignore
+  }
+
+  try {
+    await deleteDoc(doc(db, 'businesses', safeBizId));
+  } catch {
+    // ignore
+  }
+
+  const storagePaths = [
+    `backups/${safeBizId}/clients_data.json`,
+    `backups/${safeBizId}/transactions_and_ledgers.json`,
+    `backups/${safeBizId}/full_workspace_backup.json`,
+  ];
+  await Promise.allSettled(
+    storagePaths.map((p) => deleteObject(storageRef(storage, p)).catch(() => {}))
+  );
+}
+
+let purgedDeletedIdsThisSession = new Set<string>();
+async function purgeAllDeletedBusinessesFromCloudOnce(): Promise<void> {
+  if (!auth.currentUser) return;
+  const deletedIds = Array.from(getDeletedBusinessIds()).filter(
+    (id) => id && id !== 'default_biz' && id !== '__latest__' && id !== '__global__'
+  );
+  for (const delId of deletedIds) {
+    purgeBusinessFromLocalDatabase(delId);
+    if (purgedDeletedIdsThisSession.has(delId)) continue;
+    purgedDeletedIdsThisSession.add(delId);
+    void purgeBusinessFromFirestoreAndStorage(delId);
+    void deleteBusinessFromServer(delId);
   }
 }
 
@@ -1855,6 +1956,13 @@ export async function backupToCloud(
   businessId: string,
   options?: { silentIfNotOwner?: boolean }
 ): Promise<{ success: boolean; details: string }> {
+  if (!businessId || isBusinessPermanentlyDeleted(businessId)) {
+    if (businessId) purgeBusinessFromLocalDatabase(businessId);
+    return {
+      success: false,
+      details: 'Backup skipped: business was permanently deleted.',
+    };
+  }
   if (!auth.currentUser) {
     throw new Error('You must be signed in (Email/Password or Google) to sync with Firebase Cloud.');
   }
@@ -2541,11 +2649,37 @@ export async function backupToCloud(
   };
 }
 
+const recentBusinessModerationCache = new Map<
+  string,
+  { status: 'ACTIVE' | 'SUSPENDED'; suspendedReason?: string; checkedAt: number }
+>();
+
+function cacheBusinessModerationStatus(
+  businessId: string,
+  status: 'ACTIVE' | 'SUSPENDED',
+  suspendedReason?: string
+) {
+  recentBusinessModerationCache.set(businessId, {
+    status,
+    suspendedReason,
+    checkedAt: Date.now(),
+  });
+}
+
 export async function checkBusinessCloudModerationStatus(
-  businessId: string
+  businessId: string,
+  options?: { forceServer?: boolean; timeoutMs?: number }
 ): Promise<{ status: 'ACTIVE' | 'SUSPENDED'; suspendedReason?: string; deleted?: boolean }> {
   const safeBizId = sanitizeIdForFirestore(businessId, 'biz');
   if (!safeBizId || safeBizId === 'default_biz') return { status: 'ACTIVE' };
+  if (isBusinessPermanentlyDeleted(safeBizId)) {
+    purgeBusinessFromLocalDatabase(safeBizId);
+    return {
+      status: 'SUSPENDED',
+      suspendedReason: 'This business account has been permanently deleted by Platform Super Admin.',
+      deleted: true,
+    };
+  }
 
   const localRes = runSql(
     `SELECT status, suspended_reason FROM businesses WHERE id = '${sqlEsc(safeBizId)}'`,
@@ -2560,20 +2694,32 @@ export async function checkBusinessCloudModerationStatus(
     };
   }
 
+  // Reuse very recent server check (e.g., from restoreFromCloud seconds earlier) to avoid duplicate round-trips on login
+  const cached = recentBusinessModerationCache.get(safeBizId);
+  if (!options?.forceServer && cached && Date.now() - cached.checkedAt < 15000) {
+    return { status: cached.status, suspendedReason: cached.suspendedReason };
+  }
+
   if (!auth.currentUser) return { status: 'ACTIVE' };
   const bizPath = `businesses/${safeBizId}`;
   try {
     const isOnline = await ensureFirestoreOnlineIfReachable();
     if (!isOnline) return { status: 'ACTIVE' };
-    const snap = await getDocFromServer(doc(db, 'businesses', safeBizId)).catch(() =>
+    const timeoutMs = Math.max(800, options?.timeoutMs ?? 2500);
+    const serverRead = getDocFromServer(doc(db, 'businesses', safeBizId)).catch(() =>
       getDoc(doc(db, 'businesses', safeBizId))
     );
-    if (!snap.exists()) {
+    const snap = await Promise.race([
+      serverRead,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+    if (!snap || !snap.exists()) {
       return { status: 'ACTIVE' };
     }
     const data = snap.data();
     const st = String(data?.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
     const reason = String(data?.suspended_reason || '');
+    cacheBusinessModerationStatus(safeBizId, st, reason || undefined);
     if (st === 'SUSPENDED') {
       runSql(
         `UPDATE businesses SET status = 'SUSPENDED', suspended_reason = '${sqlEsc(reason)}' WHERE id = '${sqlEsc(safeBizId)}'`,
@@ -2592,25 +2738,39 @@ export async function checkBusinessCloudModerationStatus(
 }
 
 // ============================================================================
-// CLOUD RESTORE (Firestore -> AlaSQL Local, with Firebase Storage archive supplement)
+// CLOUD RESTORE (Firestore -> AlaSQL Local, with non-blocking Storage archive supplement)
 // ============================================================================
 export async function restoreFromCloud(
   businessId?: string,
-  options?: { silentIfUnlinked?: boolean }
+  options?: { silentIfUnlinked?: boolean; skipAccessCheck?: boolean; preloadedBizData?: any }
 ): Promise<{ success: boolean; details: string }> {
   if (!auth.currentUser) {
     throw new Error('You must be signed in (Email/Password or Google) to restore from Firebase Cloud.');
   }
 
+  if (businessId && isBusinessPermanentlyDeleted(businessId)) {
+    purgeBusinessFromLocalDatabase(businessId);
+    void purgeBusinessFromFirestoreAndStorage(businessId);
+    return {
+      success: false,
+      details: 'Business was permanently deleted.',
+    };
+  }
+
   const isOnline = await ensureFirestoreOnlineIfReachable();
   const currentUid = auth.currentUser.uid;
-  let targetBizId = businessId && businessId !== 'default_biz' ? sanitizeIdForFirestore(businessId, 'biz') : '';
-  let bizData: any = null;
+  let targetBizId =
+    businessId && businessId !== 'default_biz' && !isBusinessPermanentlyDeleted(businessId)
+      ? sanitizeIdForFirestore(businessId, 'biz')
+      : '';
+  let bizData: any = options?.preloadedBizData || null;
 
   // 1. Verify permission via memberships/{uid} or ownerUid query BEFORE calling getDoc(businesses/{targetBizId})
-  if (targetBizId) {
-    const access = await hasVerifiedFirestoreAccessToBusiness(targetBizId);
-    if (access.hasAccess) {
+  if (targetBizId && !bizData) {
+    const hasAccess = options?.skipAccessCheck
+      ? true
+      : (await hasVerifiedFirestoreAccessToBusiness(targetBizId)).hasAccess;
+    if (hasAccess) {
       const bizPath = `businesses/${targetBizId}`;
       try {
         const bizDocSnap = await getDoc(doc(db, 'businesses', targetBizId));
@@ -2641,7 +2801,16 @@ export async function restoreFromCloud(
       const q = query(collection(db, 'businesses'), where('ownerUid', '==', currentUid));
       const qSnap = await getDocs(q);
       if (!qSnap.empty) {
-        const matchedDoc = targetBizId ? qSnap.docs.find((d) => d.id === targetBizId) : qSnap.docs[0];
+        const validDocs = qSnap.docs.filter((d) => {
+          if (isBusinessPermanentlyDeleted(d.id)) {
+            void purgeBusinessFromFirestoreAndStorage(d.id);
+            return false;
+          }
+          return true;
+        });
+        const matchedDoc = targetBizId
+          ? validDocs.find((d) => d.id === targetBizId)
+          : validDocs[0];
         if (matchedDoc) {
           targetBizId = matchedDoc.id;
           bizData = matchedDoc.data();
@@ -2657,7 +2826,7 @@ export async function restoreFromCloud(
     }
   }
 
-  if (!bizData || !targetBizId) {
+  if (!bizData || !targetBizId || isBusinessPermanentlyDeleted(targetBizId)) {
     const msg = !isOnline
       ? 'No offline cached business backup found while offline.'
       : 'No business backup found in Cloud Firestore linked to this sign-in credential yet.';
@@ -2722,6 +2891,7 @@ export async function restoreFromCloud(
     'Restore: Insert backed up business workspace',
     true
   );
+  dedupeAndCleanBusinessesTable();
 
   if (typeof localStorage !== 'undefined') {
     localStorage.setItem(
@@ -2744,414 +2914,344 @@ export async function restoreFromCloud(
   let totalOrderItemsRestored = 0;
   let totalLedgersRestored = 0;
 
-  // 1B. Restore Business Settings from Firestore subcollection
+  // Cache freshly fetched business moderation status so login doesn't run a redundant getDocFromServer immediately after
+  const fetchedModStatus = String(bizData.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
+  cacheBusinessModerationStatus(targetBizId, fetchedModStatus, String(bizData.suspended_reason || '') || undefined);
+
+  // Fetch all 8 subcollections in parallel instead of 8 sequential network waterfalls
   const settingsPath = `businesses/${targetBizId}/settings/default`;
-  try {
-    let settingsSnap: any = null;
-    try {
-      settingsSnap = await getDoc(doc(db, 'businesses', targetBizId, 'settings', 'default'));
-    } catch (err: any) {
+  const storesPath = `businesses/${targetBizId}/stores`;
+  const productsPath = `businesses/${targetBizId}/products`;
+  const storeProductsPath = `businesses/${targetBizId}/store_products`;
+  const customersPath = `businesses/${targetBizId}/customers`;
+  const ordersPath = `businesses/${targetBizId}/orders`;
+  const orderItemsPath = `businesses/${targetBizId}/order_items`;
+  const ledgersPath = `businesses/${targetBizId}/ledgers`;
+
+  const handleReadErr = async (err: any, op: OperationType, path: string) => {
+    if (isNetworkOrOfflineAuthError(err)) {
+      lastAuthNetworkFailureAt = Date.now();
+      await setFirestoreOfflineMode();
+      return null;
+    }
+    handleFirestoreError(err, op, path);
+    return null;
+  };
+
+  const [settingsSnap, sSnap, pSnap, spSnap, cSnap, oSnap, oiSnap, lSnap] = await Promise.all([
+    getDoc(doc(db, 'businesses', targetBizId, 'settings', 'default')).catch(async (err: any) => {
       if (isNetworkOrOfflineAuthError(err)) {
         lastAuthNetworkFailureAt = Date.now();
         await setFirestoreOfflineMode();
-        settingsSnap = await getDocFromCache(doc(db, 'businesses', targetBizId, 'settings', 'default')).catch(() => null);
-      } else {
-        handleFirestoreError(err, OperationType.GET, settingsPath);
+        return getDocFromCache(doc(db, 'businesses', targetBizId, 'settings', 'default')).catch(() => null);
       }
-    }
+      return handleReadErr(err, OperationType.GET, settingsPath);
+    }),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'stores'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, storesPath)
+    ),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'products'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, productsPath)
+    ),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'store_products'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, storeProductsPath)
+    ),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'customers'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, customersPath)
+    ),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'orders'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, ordersPath)
+    ),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'order_items'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, orderItemsPath)
+    ),
+    getDocs(query(collection(db, 'businesses', targetBizId, 'ledgers'), where('business_id', '==', targetBizId))).catch(
+      (err) => handleReadErr(err, OperationType.LIST, ledgersPath)
+    ),
+  ]);
 
-    if (settingsSnap && settingsSnap.exists()) {
-      const s = settingsSnap.data();
-      let restoredZra: any = undefined;
-      if (s.zraConfig && typeof s.zraConfig === 'object') {
-        restoredZra = switchZraConfigForBusiness(targetBizId, s.zraConfig);
-      }
-      const restoredCustomMethods = Array.isArray(s.customPaymentMethods) ? s.customPaymentMethods : undefined;
-      const restoredSettingsObj = {
-        storeName: String(s.storeName || bizData.name || ''),
-        currency: String(s.currency || bizData.currency || 'K'),
-        taxRate: Number.isFinite(Number(s.taxRate)) ? Number(s.taxRate) : Number(bizData.tax_rate || 0),
-        loyaltyRatio: Number.isFinite(Number(s.loyaltyRatio)) ? Number(s.loyaltyRatio) : 0,
-        receiptHeader: String(s.receiptHeader || ''),
-        receiptFooter: String(s.receiptFooter || ''),
-        paperWidth: (s.paperWidth === '80mm' ? '80mm' : '58mm') as '58mm' | '80mm',
-        logoUrl: String(s.logoUrl || ''),
-        tpin: String(s.tpin || bizData.tpin || ''),
-        billingAddress: String(s.billingAddress || bizData.billing_address || ''),
-        billingCity: String(s.billingCity || bizData.billing_city || ''),
-        billingCountry: String(s.billingCountry || bizData.billing_country || ''),
-        billingPhone: String(s.billingPhone || bizData.billing_phone || ''),
-        billingEmail: String(s.billingEmail || bizData.billing_email || bizData.email || ''),
-        termsAndConditions: String(s.termsAndConditions || ''),
-        printerName: String(s.printerName || ''),
-        printerInterface: String(s.printerInterface || ''),
-        printerStatus: (s.printerStatus === 'Linked' ? 'Linked' : 'Not Linked') as 'Linked' | 'Not Linked',
-        customPaymentMethods: restoredCustomMethods,
-        zraConfig: restoredZra,
-      };
-      saveScopedBusinessSettings(targetBizId, restoredSettingsObj);
-      if (restoredCustomMethods && restoredCustomMethods.length > 0) {
-        rehydrateAlasqlFromRecords(
-          { payment_methods: restoredCustomMethods },
-          { businessId: targetBizId, storeId: restoredPrimaryStoreId, preserveOtherBusinesses: true }
-        );
-      }
-      settingsRestoredFromFirestore = true;
+  // 1B. Apply Business Settings from Firestore subcollection
+  if (settingsSnap && settingsSnap.exists()) {
+    const s = settingsSnap.data();
+    let restoredZra: any = undefined;
+    if (s.zraConfig && typeof s.zraConfig === 'object') {
+      restoredZra = switchZraConfigForBusiness(targetBizId, s.zraConfig);
     }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.GET, settingsPath);
+    const restoredCustomMethods = Array.isArray(s.customPaymentMethods) ? s.customPaymentMethods : undefined;
+    const restoredSettingsObj = {
+      storeName: String(s.storeName || bizData.name || ''),
+      currency: String(s.currency || bizData.currency || 'K'),
+      taxRate: Number.isFinite(Number(s.taxRate)) ? Number(s.taxRate) : Number(bizData.tax_rate || 0),
+      loyaltyRatio: Number.isFinite(Number(s.loyaltyRatio)) ? Number(s.loyaltyRatio) : 0,
+      receiptHeader: String(s.receiptHeader || ''),
+      receiptFooter: String(s.receiptFooter || ''),
+      paperWidth: (s.paperWidth === '80mm' ? '80mm' : '58mm') as '58mm' | '80mm',
+      logoUrl: String(s.logoUrl || ''),
+      tpin: String(s.tpin || bizData.tpin || ''),
+      billingAddress: String(s.billingAddress || bizData.billing_address || ''),
+      billingCity: String(s.billingCity || bizData.billing_city || ''),
+      billingCountry: String(s.billingCountry || bizData.billing_country || ''),
+      billingPhone: String(s.billingPhone || bizData.billing_phone || ''),
+      billingEmail: String(s.billingEmail || bizData.billing_email || bizData.email || ''),
+      termsAndConditions: String(s.termsAndConditions || ''),
+      printerName: String(s.printerName || ''),
+      printerInterface: String(s.printerInterface || ''),
+      printerStatus: (s.printerStatus === 'Linked' ? 'Linked' : 'Not Linked') as 'Linked' | 'Not Linked',
+      customPaymentMethods: restoredCustomMethods,
+      zraConfig: restoredZra,
+    };
+    saveScopedBusinessSettings(targetBizId, restoredSettingsObj);
+    if (restoredCustomMethods && restoredCustomMethods.length > 0) {
+      rehydrateAlasqlFromRecords(
+        { payment_methods: restoredCustomMethods },
+        { businessId: targetBizId, storeId: restoredPrimaryStoreId, preserveOtherBusinesses: true }
+      );
     }
+    settingsRestoredFromFirestore = true;
   }
 
-  // 2. Pull Store outlets (member-authorized business_id filter for strict tenant isolation)
-  const storesPath = `businesses/${targetBizId}/stores`;
-  try {
-    const sSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'stores'),
-        where('business_id', '==', targetBizId)
-      )
-    );
-    if (!sSnap.empty) {
-      runSql(`DELETE FROM stores WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old stores', true);
-      sSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        runSql(
-          `INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
-            '${sqlEsc(docSnap.id)}',
-            '${sqlEsc(targetBizId)}',
-            '${sqlEsc(d.name || docSnap.id)}',
-            '${sqlEsc(d.location || 'Main')}',
-            '${sqlEsc(d.phone || '')}',
-            '${sqlEsc(d.email || '')}',
-            ${d.allow_discounts || 0},
-            ${d.allow_refunds || 0},
-            ${d.allow_laybys || 0},
-            ${d.require_manager_discount || 0},
-            '${sqlEsc(d.store_id || docSnap.id)}'
-          )`,
-          'Restore: Sink branch outlets',
-          true
-        );
-        totalStoresRestored++;
-      });
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, storesPath);
-    }
-  }
-
-  // 3. Pull Products catalog & batches
-  const productsPath = `businesses/${targetBizId}/products`;
-  try {
-    const pSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'products'),
-        where('business_id', '==', targetBizId)
-      )
-    );
-    if (!pSnap.empty) {
-      runSql(`DELETE FROM products WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old products', true);
-      pSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        const cleanImgUrl = d.imageUrl ? sqlEsc(d.imageUrl) : '';
-        const cleanDesc = d.description ? sqlEsc(d.description) : '';
-        const cleanBatch = d.batch_number ? sqlEsc(d.batch_number) : '';
-        const cleanExpiry = d.expiry_date ? sqlEsc(d.expiry_date) : '';
-        const cleanClsCd = d.item_cls_cd ? sqlEsc(d.item_cls_cd) : '';
-        const cleanTaxTyCd = d.tax_ty_cd ? sqlEsc(d.tax_ty_cd) : 'A';
-        const cleanStore = sqlEsc(d.store_id || restoredPrimaryStoreId);
-        runSql(
-          `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, store_id, item_cls_cd, tax_ty_cd) VALUES (
-            ${d.id},
-            '${sqlEsc(d.name || 'Item')}',
-            '${cleanDesc}',
-            '${sqlEsc(d.sku || '')}',
-            '${sqlEsc(d.category || 'General')}',
-            ${d.price || 0.0},
-            ${d.cost || 0.0},
-            ${d.stock || 0},
-            '${cleanImgUrl}',
-            '${sqlEsc(targetBizId)}',
-            ${d.is_service || 0},
-            '${cleanBatch}',
-            '${cleanExpiry}',
-            '${cleanStore}',
-            '${cleanClsCd}',
-            '${cleanTaxTyCd}'
-          )`,
-          'Restore: Sink catalog products',
-          true
-        );
-        totalProductsRestored++;
-      });
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, productsPath);
-    }
-  }
-
-  // 3B. Pull Per-Branch Store Stock Levels (store_products subcollection)
-  const storeProductsPath = `businesses/${targetBizId}/store_products`;
-  try {
-    const spSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'store_products'),
-        where('business_id', '==', targetBizId)
-      )
-    );
-    if (!spSnap.empty) {
+  // 2. Apply Store outlets
+  if (sSnap && !sSnap.empty) {
+    runSql(`DELETE FROM stores WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old stores', true);
+    sSnap.forEach((docSnap) => {
+      const d = docSnap.data();
       runSql(
-        `DELETE FROM store_products WHERE business_id = '${sqlEsc(targetBizId)}'`,
-        'Restore: Clean old branch stocks',
+        `INSERT INTO stores (id, business_id, name, location, phone, email, allow_discounts, allow_refunds, allow_laybys, require_manager_discount, store_id) VALUES (
+          '${sqlEsc(docSnap.id)}',
+          '${sqlEsc(targetBizId)}',
+          '${sqlEsc(d.name || docSnap.id)}',
+          '${sqlEsc(d.location || 'Main')}',
+          '${sqlEsc(d.phone || '')}',
+          '${sqlEsc(d.email || '')}',
+          ${d.allow_discounts || 0},
+          ${d.allow_refunds || 0},
+          ${d.allow_laybys || 0},
+          ${d.require_manager_discount || 0},
+          '${sqlEsc(d.store_id || docSnap.id)}'
+        )`,
+        'Restore: Sink branch outlets',
         true
       );
-      spSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        const prodIdNum = parseInt(d.product_id as any, 10) || 0;
-        const spStoreId = sqlEsc(d.store_id || restoredPrimaryStoreId);
-        const spId = sqlEsc(d.id || docSnap.id || `sp_${prodIdNum}_${spStoreId}`);
-        runSql(
-          `INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
-            '${spId}',
-            ${prodIdNum},
-            '${spStoreId}',
-            ${parseInt(d.stock as any, 10) || 0},
-            ${parseFloat(d.price as any) || 0.0},
-            '${sqlEsc(targetBizId)}'
-          )`,
-          'Restore: Sink per-branch stock quantities',
-          true
-        );
-        totalStoreProductsRestored++;
-      });
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, storeProductsPath);
-    }
+      totalStoresRestored++;
+    });
   }
 
-  // 4. Pull Client CRM list
-  const customersPath = `businesses/${targetBizId}/customers`;
-  try {
-    const cSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'customers'),
-        where('business_id', '==', targetBizId)
-      )
-    );
-    if (!cSnap.empty) {
-      runSql(`DELETE FROM customers WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old customers', true);
-      cSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        const cleanStore = sqlEsc(d.store_id || restoredPrimaryStoreId);
-        runSql(
-          `INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id) VALUES (
-            ${d.id},
-            '${sqlEsc(d.name || 'Client')}',
-            '${sqlEsc(d.phone || '')}',
-            '${sqlEsc(d.email || '')}',
-            ${d.loyalPoints || 0},
-            '${sqlEsc(d.tpin || '')}',
-            ${d.zra_connected || 0},
-            '${sqlEsc(d.tax_band || 'A - Standard Rate (16%)')}',
-            '${sqlEsc(targetBizId)}',
-            '${cleanStore}'
-          )`,
-          'Restore: Sink customer CRM registry',
-          true
-        );
-        totalCustomersRestored++;
-      });
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, customersPath);
-    }
+  // 3. Apply Products catalog & batches
+  if (pSnap && !pSnap.empty) {
+    runSql(`DELETE FROM products WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old products', true);
+    pSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const cleanImgUrl = d.imageUrl ? sqlEsc(d.imageUrl) : '';
+      const cleanDesc = d.description ? sqlEsc(d.description) : '';
+      const cleanBatch = d.batch_number ? sqlEsc(d.batch_number) : '';
+      const cleanExpiry = d.expiry_date ? sqlEsc(d.expiry_date) : '';
+      const cleanClsCd = d.item_cls_cd ? sqlEsc(d.item_cls_cd) : '';
+      const cleanTaxTyCd = d.tax_ty_cd ? sqlEsc(d.tax_ty_cd) : 'A';
+      const cleanStore = sqlEsc(d.store_id || restoredPrimaryStoreId);
+      runSql(
+        `INSERT INTO products (id, name, description, sku, category, price, cost, stock, imageUrl, business_id, is_service, batch_number, expiry_date, store_id, item_cls_cd, tax_ty_cd) VALUES (
+          ${d.id},
+          '${sqlEsc(d.name || 'Item')}',
+          '${cleanDesc}',
+          '${sqlEsc(d.sku || '')}',
+          '${sqlEsc(d.category || 'General')}',
+          ${d.price || 0.0},
+          ${d.cost || 0.0},
+          ${d.stock || 0},
+          '${cleanImgUrl}',
+          '${sqlEsc(targetBizId)}',
+          ${d.is_service || 0},
+          '${cleanBatch}',
+          '${cleanExpiry}',
+          '${cleanStore}',
+          '${cleanClsCd}',
+          '${cleanTaxTyCd}'
+        )`,
+        'Restore: Sink catalog products',
+        true
+      );
+      totalProductsRestored++;
+    });
   }
 
-  // 5. Pull Order invoices (scoped to targetBizId)
-  const ordersPath = `businesses/${targetBizId}/orders`;
-  try {
-    const oSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'orders'),
-        where('business_id', '==', targetBizId)
-      )
+  // 3B. Apply Per-Branch Store Stock Levels
+  if (spSnap && !spSnap.empty) {
+    runSql(
+      `DELETE FROM store_products WHERE business_id = '${sqlEsc(targetBizId)}'`,
+      'Restore: Clean old branch stocks',
+      true
     );
-    if (!oSnap.empty) {
-      runSql(`DELETE FROM orders WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old orders data', true);
-      oSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        const custVal = d.customerId ? d.customerId : 'NULL';
-        runSql(
-          `INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
-            '${sqlEsc(d.id)}',
-            ${custVal},
-            '${sqlEsc(d.orderDate)}',
-            ${d.subtotal || 0},
-            ${d.tax || 0},
-            ${d.discount || 0},
-            ${d.total || 0},
-            '${sqlEsc(d.paymentMethod || 'CASH')}',
-            '${sqlEsc(d.status || 'Completed')}',
-            '${sqlEsc(d.store_id || restoredPrimaryStoreId)}',
-            '${sqlEsc(d.performed_by || 'owner')}',
-            '${sqlEsc(targetBizId)}'
-          )`,
-          'Restore: Sink invoice receipt elements',
-          true
-        );
-        totalOrdersRestored++;
-      });
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, ordersPath);
-    }
+    spSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const prodIdNum = parseInt(d.product_id as any, 10) || 0;
+      const spStoreId = sqlEsc(d.store_id || restoredPrimaryStoreId);
+      const spId = sqlEsc(d.id || docSnap.id || `sp_${prodIdNum}_${spStoreId}`);
+      runSql(
+        `INSERT INTO store_products (id, product_id, store_id, stock, price, business_id) VALUES (
+          '${spId}',
+          ${prodIdNum},
+          '${spStoreId}',
+          ${parseInt(d.stock as any, 10) || 0},
+          ${parseFloat(d.price as any) || 0.0},
+          '${sqlEsc(targetBizId)}'
+        )`,
+        'Restore: Sink per-branch stock quantities',
+        true
+      );
+      totalStoreProductsRestored++;
+    });
   }
 
-  // 6. Pull Order Line Items (scoped to targetBizId)
-  const orderItemsPath = `businesses/${targetBizId}/order_items`;
-  try {
-    const oiSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'order_items'),
-        where('business_id', '==', targetBizId)
-      )
-    );
-    if (!oiSnap.empty) {
-      runSql(`DELETE FROM order_items WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old order_items', true);
-      oiSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        runSql(
-          `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
-            '${sqlEsc(d.id)}',
-            '${sqlEsc(d.orderId)}',
-            ${d.productId || 0},
-            ${d.quantity || 1},
-            ${d.unitPrice || 0},
-            '${sqlEsc(targetBizId)}',
-            '${sqlEsc(d.store_id || restoredPrimaryStoreId)}'
-          )`,
-          'Restore: Sink order line item',
-          true
-        );
-        totalOrderItemsRestored++;
-      });
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, orderItemsPath);
-    }
+  // 4. Apply Client CRM list
+  if (cSnap && !cSnap.empty) {
+    runSql(`DELETE FROM customers WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old customers', true);
+    cSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const cleanStore = sqlEsc(d.store_id || restoredPrimaryStoreId);
+      runSql(
+        `INSERT INTO customers (id, name, phone, email, loyalPoints, tpin, zra_connected, tax_band, business_id, store_id) VALUES (
+          ${d.id},
+          '${sqlEsc(d.name || 'Client')}',
+          '${sqlEsc(d.phone || '')}',
+          '${sqlEsc(d.email || '')}',
+          ${d.loyalPoints || 0},
+          '${sqlEsc(d.tpin || '')}',
+          ${d.zra_connected || 0},
+          '${sqlEsc(d.tax_band || 'A - Standard Rate (16%)')}',
+          '${sqlEsc(targetBizId)}',
+          '${cleanStore}'
+        )`,
+        'Restore: Sink customer CRM registry',
+        true
+      );
+      totalCustomersRestored++;
+    });
   }
 
-  // 7. Pull Operational & Accounting Ledgers (including quotations, stock_transfers, stock_takes, expenses, staff)
-  const ledgersPath = `businesses/${targetBizId}/ledgers`;
-  try {
-    const lSnap = await getDocs(
-      query(
-        collection(db, 'businesses', targetBizId, 'ledgers'),
-        where('business_id', '==', targetBizId)
-      )
-    );
-    if (!lSnap.empty) {
-      const restoredLedgers: Record<string, any[]> = {};
-      lSnap.forEach((docSnap) => {
-        const d = docSnap.data();
-        const tableName = String(d.ledger_type || docSnap.id);
-        if (tableName === 'store_products' && totalStoreProductsRestored > 0) {
-          return;
-        }
-        const rows = Array.isArray(d.records) ? d.records : [];
-        if (rows.length > 0) {
-          restoredLedgers[tableName] = rows.map((r: any) => ({
-            ...r,
-            business_id: targetBizId,
-            store_id: String(r?.store_id || d.store_id || restoredPrimaryStoreId),
-          }));
-          totalLedgersRestored++;
-        }
-      });
-      if (Object.keys(restoredLedgers).length > 0) {
-        rehydrateAlasqlFromRecords(restoredLedgers, {
-          businessId: targetBizId,
-          storeId: restoredPrimaryStoreId,
-          preserveOtherBusinesses: true,
-        });
+  // 5. Apply Order invoices
+  if (oSnap && !oSnap.empty) {
+    runSql(`DELETE FROM orders WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old orders data', true);
+    oSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const custVal = d.customerId ? d.customerId : 'NULL';
+      runSql(
+        `INSERT INTO orders (id, customerId, orderDate, subtotal, tax, discount, total, paymentMethod, status, store_id, performed_by, business_id) VALUES (
+          '${sqlEsc(d.id)}',
+          ${custVal},
+          '${sqlEsc(d.orderDate)}',
+          ${d.subtotal || 0},
+          ${d.tax || 0},
+          ${d.discount || 0},
+          ${d.total || 0},
+          '${sqlEsc(d.paymentMethod || 'CASH')}',
+          '${sqlEsc(d.status || 'Completed')}',
+          '${sqlEsc(d.store_id || restoredPrimaryStoreId)}',
+          '${sqlEsc(d.performed_by || 'owner')}',
+          '${sqlEsc(targetBizId)}'
+        )`,
+        'Restore: Sink invoice receipt elements',
+        true
+      );
+      totalOrdersRestored++;
+    });
+  }
+
+  // 6. Apply Order Line Items
+  if (oiSnap && !oiSnap.empty) {
+    runSql(`DELETE FROM order_items WHERE business_id = '${sqlEsc(targetBizId)}'`, 'Restore: Clean old order_items', true);
+    oiSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      runSql(
+        `INSERT INTO order_items (id, orderId, productId, quantity, unitPrice, business_id, store_id) VALUES (
+          '${sqlEsc(d.id)}',
+          '${sqlEsc(d.orderId)}',
+          ${d.productId || 0},
+          ${d.quantity || 1},
+          ${d.unitPrice || 0},
+          '${sqlEsc(targetBizId)}',
+          '${sqlEsc(d.store_id || restoredPrimaryStoreId)}'
+        )`,
+        'Restore: Sink order line item',
+        true
+      );
+      totalOrderItemsRestored++;
+    });
+  }
+
+  // 7. Apply Operational & Accounting Ledgers
+  if (lSnap && !lSnap.empty) {
+    const restoredLedgers: Record<string, any[]> = {};
+    lSnap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const tableName = String(d.ledger_type || docSnap.id);
+      if (tableName === 'store_products' && totalStoreProductsRestored > 0) {
+        return;
       }
-    }
-  } catch (err: any) {
-    if (isNetworkOrOfflineAuthError(err)) {
-      lastAuthNetworkFailureAt = Date.now();
-      await setFirestoreOfflineMode();
-    } else {
-      handleFirestoreError(err, OperationType.LIST, ledgersPath);
+      const rows = Array.isArray(d.records) ? d.records : [];
+      if (rows.length > 0) {
+        restoredLedgers[tableName] = rows.map((r: any) => ({
+          ...r,
+          business_id: targetBizId,
+          store_id: String(r?.store_id || d.store_id || restoredPrimaryStoreId),
+        }));
+        totalLedgersRestored++;
+      }
+    });
+    if (Object.keys(restoredLedgers).length > 0) {
+      rehydrateAlasqlFromRecords(restoredLedgers, {
+        businessId: targetBizId,
+        storeId: restoredPrimaryStoreId,
+        preserveOtherBusinesses: true,
+      });
     }
   }
 
-  // 8. When online, also check Firebase Cloud Storage archive for full untruncated quotations & fallback settings
+  // 8. Supplement optional Firebase Storage archives asynchronously in the background so missing Storage files never slow login
   if (isOnline && !isFirestoreNetworkDisabled) {
-    try {
-      const clientsRef = storageRef(storage, `backups/${targetBizId}/clients_data.json`);
-      const cBytes = await getBytes(clientsRef);
-      const cText = new TextDecoder().decode(cBytes);
-      const cParsed = JSON.parse(cText);
-      if (cParsed?.clients && Array.isArray(cParsed.clients.quotations) && cParsed.clients.quotations.length > 0) {
-        rehydrateAlasqlFromRecords(
-          { quotations: cParsed.clients.quotations },
-          { businessId: targetBizId, storeId: restoredPrimaryStoreId, preserveOtherBusinesses: true }
-        );
-      }
-    } catch {
-      // Clients archive optional
-    }
+    void (async () => {
+      let updatedFromArchive = false;
+      try {
+        const clientsRef = storageRef(storage, `backups/${targetBizId}/clients_data.json`);
+        const cBytes = await getBytes(clientsRef);
+        const cText = new TextDecoder().decode(cBytes);
+        const cParsed = JSON.parse(cText);
+        if (cParsed?.clients && Array.isArray(cParsed.clients.quotations) && cParsed.clients.quotations.length > 0) {
+          rehydrateAlasqlFromRecords(
+            { quotations: cParsed.clients.quotations },
+            { businessId: targetBizId, storeId: restoredPrimaryStoreId, preserveOtherBusinesses: true }
+          );
+          updatedFromArchive = true;
+        }
+      } catch {}
 
-    try {
-      const fullRef = storageRef(storage, `backups/${targetBizId}/full_workspace_backup.json`);
-      const bytes = await getBytes(fullRef);
-      const text = new TextDecoder().decode(bytes);
-      const parsed = JSON.parse(text);
-      if (!settingsRestoredFromFirestore && parsed && parsed.settings) {
-        saveScopedBusinessSettings(targetBizId, parsed.settings);
-        if (parsed.settings.zraConfig) {
-          switchZraConfigForBusiness(targetBizId, parsed.settings.zraConfig);
+      try {
+        const fullRef = storageRef(storage, `backups/${targetBizId}/full_workspace_backup.json`);
+        const bytes = await getBytes(fullRef);
+        const text = new TextDecoder().decode(bytes);
+        const parsed = JSON.parse(text);
+        if (!settingsRestoredFromFirestore && parsed && parsed.settings) {
+          saveScopedBusinessSettings(targetBizId, parsed.settings);
+          if (parsed.settings.zraConfig) {
+            switchZraConfigForBusiness(targetBizId, parsed.settings.zraConfig);
+          }
+          updatedFromArchive = true;
+        }
+        if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
+          rehydrateAlasqlFromRecords(
+            { quotations: parsed.quotations },
+            { businessId: targetBizId, storeId: restoredPrimaryStoreId, preserveOtherBusinesses: true }
+          );
+          updatedFromArchive = true;
+        }
+      } catch {}
+
+      if (updatedFromArchive) {
+        persistTablesToStorage(true);
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('pos_data_updated'));
         }
       }
-      if (Array.isArray(parsed?.quotations) && parsed.quotations.length > 0) {
-        rehydrateAlasqlFromRecords(
-          { quotations: parsed.quotations },
-          { businessId: targetBizId, storeId: restoredPrimaryStoreId, preserveOtherBusinesses: true }
-        );
-      }
-    } catch {
-      // Storage archive optional on restore if Firestore succeeded
-    }
+    })();
   }
 
   syncUsersAndMembershipsFromLegacyTables(targetBizId);
@@ -3201,6 +3301,7 @@ export function triggerAutoFirebaseBackup(businessId?: string) {
       if (
         targetBizId &&
         targetBizId !== 'default_biz' &&
+        !isBusinessPermanentlyDeleted(targetBizId) &&
         isCurrentUserAuthorizedBusinessOwner(targetBizId) &&
         !isBusinessCloudMarkedUnlinked(targetBizId)
       ) {

@@ -37,6 +37,14 @@ function dedupeByKey<T>(rows: T[], getKey: (row: T) => string | number | null | 
   return Array.from(map.values());
 }
 
+const serverDeletedBusinessIds = new Set<string>([
+  'biz_3539',
+  'biz_3126',
+  'default_biz',
+  '__latest__',
+  '__global__',
+]);
+
 function scrubCloudSnapshotTables(rawTables: Record<string, any[]>): Record<string, any[]> {
   const t: Record<string, any[]> = { ...(rawTables || {}) };
   const legacyStores = new Set(['lusaka', 'kitwe', 'ndola', 'store_main']);
@@ -46,10 +54,22 @@ function scrubCloudSnapshotTables(rawTables: Record<string, any[]>): Record<stri
   const legacyLoans = new Set(['LOAN-001', 'LOAN-002']);
 
   if (Array.isArray(t.businesses)) {
-    t.businesses = t.businesses.filter((b: any) => b?.id !== 'default_biz' && b?.email !== 'owner@pos.zm');
+    t.businesses = dedupeByKey(
+      t.businesses.filter(
+        (b: any) =>
+          b?.id &&
+          !serverDeletedBusinessIds.has(String(b.id).trim()) &&
+          b?.email !== 'owner@pos.zm'
+      ),
+      (b: any) => String(b.id).trim()
+    );
   }
   if (Array.isArray(t.stores)) {
-    t.stores = t.stores.filter((s: any) => s?.business_id !== 'default_biz' && !legacyStores.has(String(s?.id || '').toLowerCase()));
+    t.stores = t.stores.filter(
+      (s: any) =>
+        !serverDeletedBusinessIds.has(String(s?.business_id || '').trim()) &&
+        !legacyStores.has(String(s?.id || '').toLowerCase())
+    );
   }
   if (Array.isArray(t.store_products)) {
     t.store_products = t.store_products.filter((sp: any) => !legacyStores.has(String(sp?.store_id || '').toLowerCase()));
@@ -222,6 +242,15 @@ function namespaceKey(bizId: string, rawKey: string): string {
 export async function pushPosSyncToCloudSql(payload: SyncPushPayload) {
   const nowIso = new Date().toISOString();
   const bizId = (payload.businessId || '__global__').trim();
+  if (serverDeletedBusinessIds.has(bizId)) {
+    return {
+      success: false,
+      businessId: bizId,
+      businessName: payload.businessName || bizId,
+      updatedAt: nowIso,
+      ignoredDeletedBusiness: true,
+    };
+  }
   const { tables, primaryStoreId } = scopeTablesToBusiness(payload.tables || {}, bizId);
   const tablesJsonStr = JSON.stringify(tables);
   const settingsJsonStr = payload.settings ? JSON.stringify(payload.settings) : null;
@@ -769,7 +798,7 @@ export async function pullPosSyncFromCloudSql(businessId?: string, email?: strin
   }
 
   const realBusinessSnapshots = allSnapshots.filter(
-    (s) => s.businessId !== '__latest__' && s.businessId !== '__global__'
+    (s) => !serverDeletedBusinessIds.has(String(s.businessId || '').trim())
   );
 
   const availableBusinesses = realBusinessSnapshots.map((s) => ({
@@ -1386,3 +1415,81 @@ export async function getCentralSqlReportingSummary(params: {
   };
 }
 
+export async function deleteBusinessFromCloudSql(businessId: string) {
+  const cleanBizId = String(businessId || '').trim();
+  if (!cleanBizId) {
+    throw new Error('businessId is required to delete business from Cloud SQL.');
+  }
+  serverDeletedBusinessIds.add(cleanBizId);
+  const bizPrefix = `${cleanBizId}::`;
+
+  await db.delete(posSyncSnapshots).where(eq(posSyncSnapshots.businessId, cleanBizId));
+  await db.delete(orderItems).where(eq(orderItems.businessId, cleanBizId));
+  await db.delete(orders).where(eq(orders.businessId, cleanBizId));
+  await db.delete(products).where(eq(products.businessId, cleanBizId));
+  await db.delete(customers).where(eq(customers.businessId, cleanBizId));
+  await db.delete(stores).where(eq(stores.businessId, cleanBizId));
+  await db.delete(auditLogs).where(eq(auditLogs.businessId, cleanBizId));
+  await db.delete(cashUps).where(eq(cashUps.businessId, cleanBizId));
+  await db
+    .delete(doubleEntryJournal)
+    .where(
+      sql`${doubleEntryJournal.businessId} = ${cleanBizId} OR LEFT(${doubleEntryJournal.id}, ${bizPrefix.length}) = ${bizPrefix}`
+    );
+  await db
+    .delete(receiptRefundLedger)
+    .where(
+      sql`${receiptRefundLedger.businessId} = ${cleanBizId} OR LEFT(${receiptRefundLedger.id}, ${bizPrefix.length}) = ${bizPrefix}`
+    );
+  await db
+    .delete(cashFlowLedger)
+    .where(
+      sql`${cashFlowLedger.businessId} = ${cleanBizId} OR LEFT(${cashFlowLedger.id}, ${bizPrefix.length}) = ${bizPrefix}`
+    );
+  await db
+    .delete(paymentMethodLedger)
+    .where(
+      sql`${paymentMethodLedger.businessId} = ${cleanBizId} OR LEFT(${paymentMethodLedger.methodKey}, ${bizPrefix.length}) = ${bizPrefix}`
+    );
+  await db
+    .delete(financialStatementsLedger)
+    .where(
+      sql`${financialStatementsLedger.businessId} = ${cleanBizId} OR LEFT(${financialStatementsLedger.statementKey}, ${bizPrefix.length}) = ${bizPrefix}`
+    );
+  await db
+    .delete(finalizedTransactionEvents)
+    .where(
+      sql`${finalizedTransactionEvents.businessId} = ${cleanBizId} OR LEFT(${finalizedTransactionEvents.eventId}, ${bizPrefix.length}) = ${bizPrefix}`
+    );
+  await db.delete(businesses).where(eq(businesses.id, cleanBizId));
+
+  // Scrub deleted businessId out of any remaining posSyncSnapshots JSON payloads
+  try {
+    const remainingSnaps = await db.select().from(posSyncSnapshots);
+    for (const snap of remainingSnaps) {
+      if (!snap.tablesJson || !snap.tablesJson.includes(cleanBizId)) continue;
+      try {
+        const parsed = JSON.parse(snap.tablesJson);
+        const cleaned: Record<string, any[]> = {};
+        for (const [tbl, rows] of Object.entries(parsed || {})) {
+          if (!Array.isArray(rows)) continue;
+          cleaned[tbl] = rows.filter(
+            (r: any) =>
+              String(r?.id || '').trim() !== cleanBizId &&
+              String(r?.business_id || '').trim() !== cleanBizId
+          );
+        }
+        await db
+          .update(posSyncSnapshots)
+          .set({ tablesJson: JSON.stringify(cleaned) })
+          .where(eq(posSyncSnapshots.businessId, snap.businessId));
+      } catch {}
+    }
+  } catch {}
+
+  return {
+    success: true,
+    deletedBusinessId: cleanBizId,
+    deletedAt: new Date().toISOString(),
+  };
+}

@@ -10,6 +10,7 @@ import {
   pullPosSyncFromCloudSql,
   mirrorFinalizedTransactionToCloudSql,
   getCentralSqlReportingSummary,
+  deleteBusinessFromCloudSql,
 } from './src/db/sync.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -215,6 +216,21 @@ app.get('/api/sync/status', async (_req, res) => {
       hasCloudData: false,
       error: error.message || 'Cloud SQL unavailable',
     });
+  }
+});
+
+// API: Permanently erase a business and all its child tables/snapshots from Cloud SQL
+app.post('/api/sync/delete-business', async (req, res) => {
+  try {
+    const businessId = String(req.body?.businessId || '').trim();
+    if (!businessId) {
+      return res.status(400).json({ error: 'businessId is required' });
+    }
+    const result = await deleteBusinessFromCloudSql(businessId);
+    return res.json(result);
+  } catch (error: any) {
+    console.warn('Cloud SQL business deletion error:', error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Failed to delete business from Cloud SQL' });
   }
 });
 

@@ -282,8 +282,7 @@ export async function loginOwner(
     throw new Error('Please provide your Owner/Manager email and password.');
   }
 
-  await pullDatabaseFromServer(undefined, cleanEmail).catch(() => null);
-
+  // 1. Check local SQL businesses first (0ms) so returning devices don't wait on Cloud SQL before signing in
   let bizRes = runSql('SELECT * FROM businesses', 'TerminalAuth: Lookup business', true);
   let bizList: any[] = bizRes.success && Array.isArray(bizRes.data) ? bizRes.data : [];
   let matchedBiz = bizList.find((b) => String(b?.email || '').trim().toLowerCase() === cleanEmail);
@@ -292,22 +291,42 @@ export async function loginOwner(
     matchedBiz && (!matchedBiz.password || matchedBiz.password === cleanPassword)
   );
 
-  try {
-    await signInWithEmailPasswordAccount(cleanEmail, cleanPassword, locallyVerified, matchedBiz?.owner);
-  } catch (authErr: any) {
-    if (!matchedBiz || !locallyVerified) {
+  if (locallyVerified) {
+    try {
+      await Promise.race([
+        signInWithEmailPasswordAccount(cleanEmail, cleanPassword, true, matchedBiz?.owner),
+        new Promise<void>((resolve) => setTimeout(resolve, 3500)),
+      ]);
+    } catch {
+      // Allow local offline access when locally verified
+    }
+  } else {
+    // Fresh device: run Cloud SQL pull & Firebase Auth in parallel
+    const [, authSettled] = await Promise.allSettled([
+      pullDatabaseFromServer(undefined, cleanEmail, undefined, { timeoutMs: 3500 }).catch(() => null),
+      signInWithEmailPasswordAccount(cleanEmail, cleanPassword, false, matchedBiz?.owner),
+    ]);
+
+    bizRes = runSql('SELECT * FROM businesses', 'TerminalAuth: Lookup business after pull', true);
+    bizList = bizRes.success && Array.isArray(bizRes.data) ? bizRes.data : [];
+    matchedBiz = bizList.find((b) => String(b?.email || '').trim().toLowerCase() === cleanEmail);
+
+    const verifiedAfterPull = Boolean(
+      matchedBiz && (!matchedBiz.password || matchedBiz.password === cleanPassword)
+    );
+
+    if (authSettled.status === 'rejected' && !verifiedAfterPull) {
+      const authErr: any = authSettled.reason;
       throw new Error(authErr?.message || 'Invalid email or password.');
     }
-  }
 
-  if (auth.currentUser && (!matchedBiz || navigator.onLine !== false)) {
-    await restoreFromCloud(matchedBiz?.id, { silentIfUnlinked: true }).catch(() => null);
-    bizRes = runSql('SELECT * FROM businesses', 'TerminalAuth: Reload business after restore', true);
-    bizList = bizRes.success && Array.isArray(bizRes.data) ? bizRes.data : [];
-    matchedBiz =
-      bizList.find((b) => String(b?.email || '').trim().toLowerCase() === cleanEmail) ||
-      (matchedBiz?.id ? bizList.find((b) => b.id === matchedBiz.id) : undefined) ||
-      bizList[0];
+    if (auth.currentUser && !matchedBiz) {
+      await restoreFromCloud(undefined, { silentIfUnlinked: true }).catch(() => null);
+      bizRes = runSql('SELECT * FROM businesses', 'TerminalAuth: Reload business after restore', true);
+      bizList = bizRes.success && Array.isArray(bizRes.data) ? bizRes.data : [];
+      matchedBiz =
+        bizList.find((b) => String(b?.email || '').trim().toLowerCase() === cleanEmail) || bizList[0];
+    }
   }
 
   if (!matchedBiz) {
@@ -330,7 +349,21 @@ export async function loginOwner(
   });
 
   clearActiveShiftStorage();
-  await fetchStaffMembers(session.businessId).catch(() => []);
+
+  // Refresh staff roster & latest cloud data in background so terminal authorizes immediately
+  void (async () => {
+    try {
+      await fetchStaffMembers(session.businessId).catch(() => []);
+      if (locallyVerified && navigator.onLine !== false) {
+        await pullDatabaseFromServer(undefined, cleanEmail, undefined, { timeoutMs: 5000 }).catch(
+          () => null
+        );
+        if (auth.currentUser) {
+          await restoreFromCloud(session.businessId, { silentIfUnlinked: true }).catch(() => null);
+        }
+      }
+    } catch {}
+  })();
 
   return { session, business: matchedBiz };
 }
