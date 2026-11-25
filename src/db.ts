@@ -1020,7 +1020,18 @@ export function persistTablesToStorage(_skipCloudSync: boolean = false) {
             try {
               localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${tableName}`, JSON.stringify(rows));
             } catch {
-              // quota exceeded or restricted in WebView
+              // If large binary attachments (e.g. NRC/contract base64 on staff) blow storage quota,
+              // retry without oversized attachment blobs so employee accounts still survive refresh.
+              if (tableName === 'staff') {
+                try {
+                  const compactRows = rows.map((r: any) => ({
+                    ...r,
+                    nrc_file: typeof r?.nrc_file === 'string' && r.nrc_file.length > 20000 ? '' : r?.nrc_file,
+                    contract_file: typeof r?.contract_file === 'string' && r.contract_file.length > 20000 ? '' : r?.contract_file,
+                  }));
+                  localStorage.setItem(`${LOCAL_STORAGE_KEY_PREFIX}${tableName}`, JSON.stringify(compactRows));
+                } catch {}
+              }
             }
           } catch {
             // ignore table query errors
@@ -5190,13 +5201,16 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
   details: string;
 }> {
   if (activeCloudPushPromise) {
-    return activeCloudPushPromise;
+    await activeCloudPushPromise.catch(() => null);
   }
 
   activeCloudPushPromise = (async () => {
   try {
-    syncAllAccountingSystems('Pre-Cloud Push Sync');
     const resolvedBizId = getActiveBusinessId(explicitBusinessId);
+    if (resolvedBizId) {
+      syncUsersAndMembershipsFromLegacyTables(resolvedBizId);
+    }
+    syncAllAccountingSystems('Pre-Cloud Push Sync');
     const allSnapshot = extractAllTablesSnapshot();
     const bizRows = allSnapshot['businesses'] || [];
     let bizId = resolvedBizId || '';
@@ -5237,6 +5251,7 @@ export async function pushDatabaseToServer(explicitBusinessId?: string): Promise
       };
     }
 
+    syncUsersAndMembershipsFromLegacyTables(bizId);
     const tables = extractAllTablesSnapshot(bizId !== '__global__' ? bizId : undefined);
 
     let settingsObj: any = null;
@@ -5661,6 +5676,84 @@ export function syncUsersAndMembershipsFromLegacyTables(explicitBusinessId?: str
       permissionsJson: String(st.permissions_json || '{}'),
       status: isSusp ? 'SUSPENDED' : 'ACTIVE',
     });
+  }
+
+  // 3. Backfill missing non-owner employee records from business_memberships -> staff
+  // Ensures employees restored from Firestore memberships or Cloud SQL always appear in Staff Directory & Settings
+  if (alasql?.tables?.staff) {
+    const currentStaffRows = (alasql.tables.staff.data || []) as any[];
+    const memRowsAll = ((alasql.tables.business_memberships.data || []) as any[]).filter(
+      (m: any) =>
+        m?.business_id &&
+        m.business_id !== 'default_biz' &&
+        (!filterBiz || m.business_id === filterBiz) &&
+        String(m.role || '').toLowerCase() !== 'owner'
+    );
+    for (const mem of memRowsAll) {
+      const mBizId = String(mem.business_id || '').trim();
+      const mEmail = normalizeAuthEmail(mem.email || '');
+      if (!mBizId || !mEmail) continue;
+      const alreadyInStaff = currentStaffRows.some(
+        (s: any) =>
+          String(s?.business_id || '').trim() === mBizId &&
+          normalizeAuthEmail(s?.email || '') === mEmail
+      );
+      if (alreadyInStaff) continue;
+
+      const fullName = String(mem.full_name || mEmail).trim();
+      const parts = fullName.split(/\s+/);
+      const firstName = parts[0] || 'Staff';
+      const surname = parts.slice(1).join(' ');
+      const memRole = String(mem.role || '').toLowerCase() === 'manager' ? 'manager' : 'sales';
+      const memPass = String(mem.password || '').trim();
+      const memStoreId = String(mem.store_id || 'main').trim() || 'main';
+      let permsStr = String(mem.permissions_json || '{}');
+      try {
+        const parsed = JSON.parse(permsStr || '{}');
+        if (parsed && typeof parsed === 'object') {
+          if (String(mem.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' && !parsed.suspended) {
+            parsed.suspended = true;
+            permsStr = JSON.stringify(parsed);
+          }
+        }
+      } catch {}
+
+      let derivedStaffId = `staff-${String(mem.id || Date.now()).replace(/[^a-zA-Z0-9_-]/g, '')}`;
+      if (String(mem.id || '').startsWith('mem_staff_')) {
+        const prefixStripped = String(mem.id).slice('mem_staff_'.length);
+        const suffix = `_${mBizId}`;
+        if (prefixStripped.endsWith(suffix) && prefixStripped.length > suffix.length) {
+          derivedStaffId = prefixStripped.slice(0, prefixStripped.length - suffix.length);
+        }
+      }
+      if (currentStaffRows.some((s: any) => String(s?.id || '') === derivedStaffId)) {
+        derivedStaffId = `staff-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+      }
+
+      runSql(
+        `INSERT INTO staff (id, name, role, hourly_rate, pin, store_id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password) VALUES (
+          '${sqlEsc(derivedStaffId)}',
+          '${sqlEsc(fullName)}',
+          '${sqlEsc(memRole)}',
+          0,
+          '${sqlEsc(memPass.slice(0, 6))}',
+          '${sqlEsc(memStoreId)}',
+          '${sqlEsc(firstName)}',
+          '${sqlEsc(surname)}',
+          '',
+          '${sqlEsc(mEmail)}',
+          '',
+          '${new Date().toISOString().split('T')[0]}',
+          '', '', '', '',
+          0,
+          '${sqlEsc(permsStr)}',
+          '${sqlEsc(mBizId)}',
+          '${sqlEsc(memPass)}'
+        )`,
+        `MultiTenant: Backfill staff record from membership ${mEmail}`,
+        true
+      );
+    }
   }
 }
 

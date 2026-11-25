@@ -529,7 +529,17 @@ function sanitizeRecordMap(row: any): Record<string, any> {
   for (const [k, v] of Object.entries(row)) {
     if (v === undefined || typeof v === 'function') continue;
     if (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-      clean[k] = typeof v === 'string' ? v.slice(0, 2000) : v;
+      if (typeof v === 'string') {
+        if ((k === 'nrc_file' || k === 'contract_file') && v.length > 40000) {
+          clean[k] = '';
+        } else if (k === 'permissions_json') {
+          clean[k] = v.slice(0, 8000);
+        } else {
+          clean[k] = v.slice(0, 2000);
+        }
+      } else {
+        clean[k] = v;
+      }
     } else {
       clean[k] = JSON.stringify(v).slice(0, 2000);
     }
@@ -1571,6 +1581,7 @@ export async function publishCredentialMembershipToCloud(params: {
   let existingMemberUid = '';
   let existingMemCreatedAt: any = null;
   let existingMemOwnerUid = parentOwnerUid;
+  let existingMemUserId = String(resolvedUserId).slice(0, 128);
   try {
     const existingMemSnap = await getDoc(doc(db, 'businesses', safeBizId, 'memberships', safeMemId));
     if (existingMemSnap.exists()) {
@@ -1578,16 +1589,19 @@ export async function publishCredentialMembershipToCloud(params: {
       existingMemberUid = String(mData.memberUid || '');
       existingMemCreatedAt = mData.createdAt || null;
       existingMemOwnerUid = String(mData.ownerUid || parentOwnerUid);
+      if (mData.user_id) existingMemUserId = String(mData.user_id).slice(0, 128);
     }
   } catch {}
 
   let existingCredOwnerUid = parentOwnerUid;
+  let existingCredUserId = existingMemUserId;
   try {
     const existingCredSnap = await getDoc(doc(db, 'credential_directory', credId));
     if (existingCredSnap.exists()) {
       const cData = existingCredSnap.data();
       if (!existingMemberUid) existingMemberUid = String(cData.memberUid || '');
       existingCredOwnerUid = String(cData.ownerUid || parentOwnerUid);
+      if (cData.user_id) existingCredUserId = String(cData.user_id).slice(0, 128);
     }
   } catch {}
 
@@ -1599,7 +1613,7 @@ export async function publishCredentialMembershipToCloud(params: {
     id: safeMemId,
     business_id: safeBizId,
     store_id: safeStoreId,
-    user_id: String(resolvedUserId).slice(0, 128),
+    user_id: existingMemUserId,
     memberUid: existingMemberUid.slice(0, 128),
     ownerUid: existingMemOwnerUid,
     cred_id: credId,
@@ -1625,14 +1639,16 @@ export async function publishCredentialMembershipToCloud(params: {
       try {
         const claimedSnap = await getDoc(doc(db, 'businesses', safeBizId, 'memberships', existingMemberUid));
         if (claimedSnap.exists()) {
+          const cData = claimedSnap.data();
           await writeDocOfflineAware(
             doc(db, 'businesses', safeBizId, 'memberships', existingMemberUid),
             {
               ...membershipPayload,
               id: existingMemberUid,
+              user_id: String(cData?.user_id || existingMemUserId).slice(0, 128),
               memberUid: existingMemberUid,
-              ownerUid: String(claimedSnap.data()?.ownerUid || parentOwnerUid),
-              createdAt: claimedSnap.data().createdAt || serverTimestamp(),
+              ownerUid: String(cData?.ownerUid || parentOwnerUid),
+              createdAt: cData?.createdAt || serverTimestamp(),
             },
             `businesses/${safeBizId}/memberships/${existingMemberUid}`,
             isOnline
@@ -1650,7 +1666,7 @@ export async function publishCredentialMembershipToCloud(params: {
         business_id: safeBizId,
         business_name: String(params.businessName || safeBizId).slice(0, 200),
         membership_id: safeMemId,
-        user_id: String(resolvedUserId).slice(0, 128),
+        user_id: existingCredUserId,
         ownerUid: existingCredOwnerUid,
         memberUid: existingMemberUid.slice(0, 128),
         email: cleanEmail.slice(0, 200),
@@ -1671,6 +1687,164 @@ export async function publishCredentialMembershipToCloud(params: {
     console.warn('Credential directory publish notice:', err);
     return { published: false, credId };
   }
+}
+
+export async function syncStaffAndMembershipsToCloud(
+  businessId: string
+): Promise<{ success: boolean; details: string }> {
+  const cleanTargetId = String(businessId || '').trim();
+  if (!cleanTargetId || cleanTargetId === 'default_biz' || isBusinessPermanentlyDeleted(cleanTargetId)) {
+    return { success: false, details: 'Skipped: invalid business ID.' };
+  }
+
+  try {
+    if (!auth.currentUser && typeof (auth as any).authStateReady === 'function') {
+      await (auth as any).authStateReady();
+    }
+  } catch {}
+
+  if (!auth.currentUser) {
+    return { success: false, details: 'Skipped Firestore staff sync: no signed-in Firebase user.' };
+  }
+  if (!isCurrentUserAuthorizedBusinessOwner(cleanTargetId)) {
+    return { success: false, details: 'Skipped Firestore staff sync: non-owner session.' };
+  }
+
+  const safeBizId = sanitizeIdForFirestore(cleanTargetId, 'biz');
+  const cleanBizId = sqlEsc(cleanTargetId);
+  const primaryStoreId = sanitizeIdForFirestore(getActiveStoreId(undefined, cleanTargetId), 'store');
+  const currentUid = auth.currentUser.uid;
+  let isOnline = await ensureFirestoreOnlineIfReachable();
+
+  syncUsersAndMembershipsFromLegacyTables(cleanTargetId);
+
+  const preAccess = isOnline
+    ? await hasVerifiedFirestoreAccessToBusiness(safeBizId)
+    : { hasAccess: false, via: 'none' as const, ownerUid: currentUid };
+  if (!preAccess.hasAccess && isOnline && isBusinessCloudMarkedUnlinked(safeBizId)) {
+    return { success: false, details: 'Workspace is unlinked from current Firebase account.' };
+  }
+
+  let resolvedParentOwnerUid = preAccess.ownerUid || currentUid;
+  let bizName = cleanTargetId;
+  try {
+    const localBizRes = runSql(
+      `SELECT name FROM businesses WHERE id = '${cleanBizId}'`,
+      'Cloud Staff Sync: Read business name',
+      true
+    );
+    if (localBizRes.success && Array.isArray(localBizRes.data) && localBizRes.data[0]?.name) {
+      bizName = String(localBizRes.data[0].name);
+    }
+    if (isOnline) {
+      const bizSnap = await getDoc(doc(db, 'businesses', safeBizId)).catch(() => null);
+      if (bizSnap && bizSnap.exists()) {
+        const bData = bizSnap.data();
+        resolvedParentOwnerUid = String(bData?.ownerUid || resolvedParentOwnerUid);
+        if (bData?.name) bizName = String(bData.name);
+        setBusinessCloudUnlinkedFlag(safeBizId, false);
+      }
+    }
+  } catch {}
+
+  const targetTables = ['staff', 'business_memberships', 'users'] as const;
+  const memRowsRes = runSql(
+    `SELECT * FROM business_memberships WHERE business_id = '${cleanBizId}'`,
+    'Cloud Staff Sync: Read business_memberships',
+    true
+  );
+  const memRows = memRowsRes.success && Array.isArray(memRowsRes.data) ? memRowsRes.data : [];
+
+  const existingLedgerSnaps = await Promise.all(
+    targetTables.map((tbl) =>
+      isOnline && !isFirestoreNetworkDisabled
+        ? getDoc(doc(db, 'businesses', safeBizId, 'ledgers', tbl)).catch(() => null)
+        : Promise.resolve(null)
+    )
+  );
+
+  // Sync ledgers/staff, ledgers/business_memberships, and ledgers/users in parallel
+  const ledgerWrites = targetTables.map(async (tableName, idx) => {
+    const tRes = runSql(
+      `SELECT * FROM ${tableName} WHERE business_id = '${cleanBizId}'`,
+      `Cloud Staff Sync: Read ${tableName}`,
+      true
+    );
+    const rawRows = (tRes.success && Array.isArray(tRes.data) ? tRes.data : []).map((r: any) => ({
+      ...r,
+      business_id: safeBizId,
+      store_id: String(r?.store_id || primaryStoreId),
+    }));
+    const boundedRecords = rawRows.slice(-500).map(sanitizeRecordMap);
+    const existingSnap = existingLedgerSnaps[idx];
+    const ledgerOwnerUid = existingSnap?.exists()
+      ? String(existingSnap.data()?.ownerUid || resolvedParentOwnerUid)
+      : resolvedParentOwnerUid;
+
+    if (boundedRecords.length === 0 && !existingSnap?.exists()) {
+      return;
+    }
+
+    const ledgerPath = `businesses/${safeBizId}/ledgers/${tableName}`;
+    try {
+      isOnline = await writeDocOfflineAware(
+        doc(db, 'businesses', safeBizId, 'ledgers', tableName),
+        {
+          id: tableName,
+          business_id: safeBizId,
+          store_id: primaryStoreId,
+          ownerUid: ledgerOwnerUid,
+          ledger_type: tableName,
+          record_count: boundedRecords.length,
+          records: boundedRecords,
+          updatedAt: serverTimestamp(),
+        },
+        ledgerPath,
+        isOnline
+      );
+    } catch (err: any) {
+      if (isNetworkOrOfflineAuthError(err)) {
+        lastAuthNetworkFailureAt = Date.now();
+        await setFirestoreOfflineMode();
+        isOnline = false;
+      } else {
+        console.warn(`[Cloud Staff Sync] Failed writing ${ledgerPath}:`, err?.message || err);
+      }
+    }
+  });
+
+  // Also publish/refresh membership + credential directory docs in parallel
+  const membershipWrites = memRows.map((mem: any) => {
+    let parsedBranches: string[] = [];
+    try {
+      const bParsed =
+        typeof mem.accessible_branches === 'string'
+          ? JSON.parse(mem.accessible_branches)
+          : mem.accessible_branches;
+      if (Array.isArray(bParsed)) parsedBranches = bParsed;
+    } catch {}
+    return publishCredentialMembershipToCloud({
+      businessId: safeBizId,
+      businessName: bizName,
+      membershipId: String(mem.id || ''),
+      userId: String(mem.user_id || ''),
+      email: String(mem.email || ''),
+      fullName: String(mem.full_name || mem.email || 'Member'),
+      role: mem.role === 'owner' || mem.role === 'manager' ? mem.role : 'sales',
+      password: String(mem.password || ''),
+      credentialHash: String(mem.credential_hash || ''),
+      storeId: String(mem.store_id || primaryStoreId),
+      accessibleBranches: parsedBranches,
+      permissionsJson: String(mem.permissions_json || '{}'),
+      status: String(mem.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE',
+    }).catch(() => ({ published: false, credId: '' }));
+  });
+
+  await Promise.all([...ledgerWrites, ...membershipWrites]);
+  return {
+    success: true,
+    details: `Synced ${memRows.length} staff/membership profile(s) to Cloud Firestore.`,
+  };
 }
 
 export async function revokeCredentialMembershipInCloud(params: {
@@ -3191,7 +3365,7 @@ export async function restoreFromCloud(
   const fetchedModStatus = String(bizData.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
   cacheBusinessModerationStatus(targetBizId, fetchedModStatus, String(bizData.suspended_reason || '') || undefined);
 
-  // Fetch all 8 subcollections in parallel instead of 8 sequential network waterfalls
+  // Fetch all subcollections (including owner-accessible memberships) in parallel
   const settingsPath = `businesses/${targetBizId}/settings/default`;
   const storesPath = `businesses/${targetBizId}/stores`;
   const productsPath = `businesses/${targetBizId}/products`;
@@ -3200,6 +3374,7 @@ export async function restoreFromCloud(
   const ordersPath = `businesses/${targetBizId}/orders`;
   const orderItemsPath = `businesses/${targetBizId}/order_items`;
   const ledgersPath = `businesses/${targetBizId}/ledgers`;
+  const parentBizOwnerUid = String(bizData?.ownerUid || currentUid);
 
   const handleReadErr = async (err: any, op: OperationType, path: string) => {
     if (isNetworkOrOfflineAuthError(err)) {
@@ -3211,7 +3386,7 @@ export async function restoreFromCloud(
     return null;
   };
 
-  const [settingsSnap, sSnap, pSnap, spSnap, cSnap, oSnap, oiSnap, lSnap] = await Promise.all([
+  const [settingsSnap, sSnap, pSnap, spSnap, cSnap, oSnap, oiSnap, lSnap, mSnap] = await Promise.all([
     getDoc(doc(db, 'businesses', targetBizId, 'settings', 'default')).catch(async (err: any) => {
       if (isNetworkOrOfflineAuthError(err)) {
         lastAuthNetworkFailureAt = Date.now();
@@ -3241,6 +3416,13 @@ export async function restoreFromCloud(
     getDocs(query(collection(db, 'businesses', targetBizId, 'ledgers'), where('business_id', '==', targetBizId))).catch(
       (err) => handleReadErr(err, OperationType.LIST, ledgersPath)
     ),
+    getDocs(
+      query(
+        collection(db, 'businesses', targetBizId, 'memberships'),
+        where('business_id', '==', targetBizId),
+        where('ownerUid', '==', parentBizOwnerUid)
+      )
+    ).catch(() => null),
   ]);
 
   // 1B. Apply Business Settings from Firestore subcollection
@@ -3477,6 +3659,28 @@ export async function restoreFromCloud(
         preserveOtherBusinesses: true,
       });
     }
+  }
+
+  // 7B. Merge any cloud memberships subcollection records into business_memberships
+  if (mSnap && !mSnap.empty) {
+    mSnap.forEach((docSnap) => {
+      const m = docSnap.data();
+      const mEmail = normalizeAuthEmail(m?.email || '');
+      if (!mEmail) return;
+      const mRole: 'owner' | 'manager' | 'sales' =
+        m.role === 'owner' || m.role === 'manager' ? m.role : 'sales';
+      upsertUserAndMembership({
+        id: String(m.id || docSnap.id),
+        businessId: targetBizId,
+        email: mEmail,
+        fullName: String(m.full_name || mEmail),
+        role: mRole,
+        storeId: String(m.store_id || restoredPrimaryStoreId),
+        accessibleBranches: Array.isArray(m.accessible_branches) ? m.accessible_branches : [],
+        permissionsJson: String(m.permissions_json || '{}'),
+        status: String(m.status || 'ACTIVE').toUpperCase() === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE',
+      });
+    });
   }
 
   // 8. Supplement optional Firebase Storage archives asynchronously in the background so missing Storage files never slow login

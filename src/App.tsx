@@ -50,6 +50,7 @@ import {
   prepareIdempotentCompanyRegistration,
   backupToCloud,
   restoreFromCloud,
+  syncStaffAndMembershipsToCloud,
   googleSignOut,
   checkBusinessCloudModerationStatus,
 } from './firebase';
@@ -530,7 +531,7 @@ export default function App() {
           setIsAuthenticatedSession(true);
 
           // Wait for Firebase Auth state restoration, then read-only restore existing company data by permanentCompanyId
-          // NEVER create a company during refresh or startup initialization
+          // NEVER create a company during refresh or startup initialization, and never wipe local staff on 0-product shops
           const targetPermanentBizId = String(match.id);
           void (async () => {
             try {
@@ -542,9 +543,21 @@ export default function App() {
                   `SELECT COUNT(*) as cnt FROM products WHERE business_id = '${sqlEsc(targetPermanentBizId)}'`,
                   'Startup: Check local product count for permanent company'
                 );
+                const localStaffCountRes = runSql(
+                  `SELECT COUNT(*) as cnt FROM staff WHERE business_id = '${sqlEsc(targetPermanentBizId)}'`,
+                  'Startup: Check local staff count for permanent company'
+                );
+                const localOrderCountRes = runSql(
+                  `SELECT COUNT(*) as cnt FROM orders WHERE business_id = '${sqlEsc(targetPermanentBizId)}'`,
+                  'Startup: Check local order count for permanent company'
+                );
                 const localProdCnt = Number(localProdCountRes?.data?.[0]?.cnt || 0);
-                if (localProdCnt === 0) {
+                const localStaffCnt = Number(localStaffCountRes?.data?.[0]?.cnt || 0);
+                const localOrderCnt = Number(localOrderCountRes?.data?.[0]?.cnt || 0);
+                if (localProdCnt === 0 && localStaffCnt === 0 && localOrderCnt === 0) {
                   await restoreFromCloud(targetPermanentBizId, { silentIfUnlinked: true });
+                } else if (localStaffCnt > 0) {
+                  void syncStaffAndMembershipsToCloud(targetPermanentBizId).catch(() => {});
                 }
               }
             } catch {}

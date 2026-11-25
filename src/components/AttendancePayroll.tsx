@@ -9,7 +9,16 @@ import {
   syncAllAccountingSystems,
   logEmployeeAudit,
   getAllSelectableAccounts,
+  upsertUserAndMembership,
+  syncUsersAndMembershipsFromLegacyTables,
+  pushDatabaseToServer,
 } from '../db';
+import {
+  auth,
+  syncStaffAndMembershipsToCloud,
+  revokeCredentialMembershipInCloud,
+} from '../firebase';
+import { computeCredentialHashSync, normalizeAuthEmail } from '../multiTenantAuth';
 import { exportAndSharePdf } from '../androidUtils';
 import { jsPDF } from 'jspdf';
 import { DEFAULT_COMPANY_LOGO } from '../App';
@@ -249,6 +258,9 @@ export default function AttendancePayroll({ settings, userRole = 'owner', active
 
   const loadStaffMembers = () => {
     const activeBizId = getActiveBusinessId();
+    if (activeBizId) {
+      syncUsersAndMembershipsFromLegacyTables(activeBizId);
+    }
     const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
     const res = runSql(`SELECT * FROM staff WHERE ${bizCond}`, 'Staff: Fetch all registered profiles');
     if (res.success && Array.isArray(res.data)) {
@@ -436,9 +448,11 @@ export default function AttendancePayroll({ settings, userRole = 'owner', active
     };
     window.addEventListener('pos_data_updated', handleRefresh);
     window.addEventListener('local_db_restored', handleRefresh);
+    window.addEventListener('database-rehydrated', handleRefresh);
     return () => {
       window.removeEventListener('pos_data_updated', handleRefresh);
       window.removeEventListener('local_db_restored', handleRefresh);
+      window.removeEventListener('database-rehydrated', handleRefresh);
     };
   }, []);
 
@@ -482,80 +496,150 @@ export default function AttendancePayroll({ settings, userRole = 'owner', active
     setExtraPermsMeta({});
   };
 
-  const handleSaveStaff = (e: React.FormEvent) => {
+  const handleSaveStaff = async (e: React.FormEvent) => {
     e.preventDefault();
     if (userRole === 'sales') {
-      alert('Access Denied: Only Business Owners or Store Managers can configure staff accounts.');
+      notifyPayroll('error', 'Access Denied: Only Business Owners or Store Managers can configure staff accounts.');
       return;
     }
-    
-    if (!firstName || !surname || !contact || !email) {
-      alert('Please fill out first name, surname, contact and email address.');
+
+    const cleanFirst = firstName.trim();
+    const cleanSurname = surname.trim();
+    const cleanContact = contact.trim();
+    const cleanEmail = normalizeAuthEmail(email);
+
+    if (!cleanFirst || !cleanSurname || !cleanContact || !cleanEmail) {
+      notifyPayroll('error', 'Please fill out first name, surname, contact, and email address.');
       return;
     }
-    
+
     const salaryNum = parseFloat(basicSalary) || 0;
-    const permissionsString = JSON.stringify({ ...extraPermsMeta, ...perms });
-    const staffId = editingStaffId || `staff-${Math.floor(1000 + Math.random() * 9000)}`;
-    
+    const rawPass = String(password || '').trim() || '1234';
+    const fullStaffName = `${cleanFirst} ${cleanSurname}`.trim();
     const activeBizId = getActiveBusinessId();
-    const activeStoreId = getActiveStoreId(undefined, activeBizId);
+    const activeStoreId = getActiveStoreId(activeStore, activeBizId);
+    const derivedRole: 'manager' | 'sales' =
+      extraPermsMeta?.role === 'manager' || perms.staff?.manage_staff || perms.settings?.manage_settings
+        ? 'manager'
+        : 'sales';
+    const accessibleBranches: string[] =
+      Array.isArray(extraPermsMeta?.accessible_branches) && extraPermsMeta.accessible_branches.length > 0
+        ? extraPermsMeta.accessible_branches
+        : [activeStoreId];
+    const isSuspended = Boolean(extraPermsMeta?.suspended);
+
+    const permissionsString = JSON.stringify({
+      ...extraPermsMeta,
+      ...perms,
+      role: derivedRole,
+      password: rawPass,
+      accessible_branches: accessibleBranches,
+      suspended: isSuspended,
+    });
+    const staffId = editingStaffId || `staff-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
     const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
+    let saveRes: { success: boolean; error?: string };
     if (editingStaffId) {
       const sql = `
         UPDATE staff 
-        SET first_name = '${firstName.replace(/'/g, "''")}',
-            surname = '${surname.replace(/'/g, "''")}',
-            contact = '${contact.replace(/'/g, "''")}',
-            email = '${email.replace(/'/g, "''")}',
-            residential_address = '${resAddress.replace(/'/g, "''")}',
-            joining_date = '${joiningDate}',
-            nrc_file = '${nrcFile.replace(/'/g, "''")}',
-            nrc_filename = '${nrcFilename.replace(/'/g, "''")}',
-            contract_file = '${contractFile.replace(/'/g, "''")}',
-            contract_filename = '${contractFilename.replace(/'/g, "''")}',
+        SET name = '${sqlEsc(fullStaffName)}',
+            role = '${sqlEsc(derivedRole)}',
+            pin = '${sqlEsc(rawPass.slice(0, 6))}',
+            first_name = '${sqlEsc(cleanFirst)}',
+            surname = '${sqlEsc(cleanSurname)}',
+            contact = '${sqlEsc(cleanContact)}',
+            email = '${sqlEsc(cleanEmail)}',
+            residential_address = '${sqlEsc(resAddress.trim())}',
+            joining_date = '${sqlEsc(joiningDate)}',
+            nrc_file = '${sqlEsc(nrcFile)}',
+            nrc_filename = '${sqlEsc(nrcFilename)}',
+            contract_file = '${sqlEsc(contractFile)}',
+            contract_filename = '${sqlEsc(contractFilename)}',
             basic_salary = ${salaryNum},
-            permissions_json = '${permissionsString.replace(/'/g, "''")}',
-            password = '${password.replace(/'/g, "''")}'
+            permissions_json = '${sqlEsc(permissionsString)}',
+            password = '${sqlEsc(rawPass)}'
         WHERE id = '${sqlEsc(editingStaffId)}'${bizMatch}
       `;
-      const res = runSql(sql, `Staff: Update profile ${staffId}`);
-      if (res.success) {
-        alert(`✓ Staff Profile Updated: Changed details for ${firstName} ${surname}.`);
-      }
+      saveRes = runSql(sql, `Staff: Update profile ${staffId}`);
     } else {
       const sql = `
-        INSERT INTO staff (id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, store_id, password)
+        INSERT INTO staff (id, name, role, hourly_rate, pin, store_id, first_name, surname, contact, email, residential_address, joining_date, nrc_file, nrc_filename, contract_file, contract_filename, basic_salary, permissions_json, business_id, password)
         VALUES (
-          '${staffId}',
-          '${firstName.replace(/'/g, "''")}',
-          '${surname.replace(/'/g, "''")}',
-          '${contact.replace(/'/g, "''")}',
-          '${email.replace(/'/g, "''")}',
-          '${resAddress.replace(/'/g, "''")}',
-          '${joiningDate}',
-          '${nrcFile.replace(/'/g, "''")}',
-          '${nrcFilename.replace(/'/g, "''")}',
-          '${contractFile.replace(/'/g, "''")}',
-          '${contractFilename.replace(/'/g, "''")}',
-          ${salaryNum},
-          '${permissionsString.replace(/'/g, "''")}',
-          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(staffId)}',
+          '${sqlEsc(fullStaffName)}',
+          '${sqlEsc(derivedRole)}',
+          ${Math.round(salaryNum / 160) || 0},
+          '${sqlEsc(rawPass.slice(0, 6))}',
           '${sqlEsc(activeStoreId)}',
-          '${password.replace(/'/g, "''")}'
+          '${sqlEsc(cleanFirst)}',
+          '${sqlEsc(cleanSurname)}',
+          '${sqlEsc(cleanContact)}',
+          '${sqlEsc(cleanEmail)}',
+          '${sqlEsc(resAddress.trim())}',
+          '${sqlEsc(joiningDate)}',
+          '${sqlEsc(nrcFile)}',
+          '${sqlEsc(nrcFilename)}',
+          '${sqlEsc(contractFile)}',
+          '${sqlEsc(contractFilename)}',
+          ${salaryNum},
+          '${sqlEsc(permissionsString)}',
+          '${sqlEsc(activeBizId)}',
+          '${sqlEsc(rawPass)}'
         )
       `;
-      const res = runSql(sql, `Staff: Onboard new profile ${staffId}`);
-      if (res.success) {
-        alert(`✓ Staff Profile Registered: Successfully onboarded ${firstName} ${surname}.`);
-      }
+      saveRes = runSql(sql, `Staff: Onboard new profile ${staffId}`);
     }
-    
+
+    if (!saveRes.success) {
+      notifyPayroll('error', `Could not save staff account: ${saveRes.error || 'Database error'}`);
+      return;
+    }
+
+    if (activeBizId) {
+      upsertUserAndMembership({
+        id: `mem_staff_${staffId}_${activeBizId}`,
+        businessId: activeBizId,
+        email: cleanEmail,
+        fullName: fullStaffName,
+        password: rawPass,
+        credentialHash: computeCredentialHashSync(cleanEmail, rawPass),
+        role: derivedRole,
+        storeId: accessibleBranches[0] || activeStoreId,
+        accessibleBranches,
+        permissionsJson: permissionsString,
+        status: isSuspended ? 'SUSPENDED' : 'ACTIVE',
+      });
+    }
+
+    const wasEditing = Boolean(editingStaffId);
     resetForm();
     setShowRegisterModal(false);
     loadStaffMembers();
     persistTablesToStorage();
     window.dispatchEvent(new Event('pos_data_updated'));
+
+    notifyPayroll(
+      'success',
+      wasEditing
+        ? `Updated ${fullStaffName} locally — syncing to cloud...`
+        : `Registered ${fullStaffName} locally — syncing to cloud...`
+    );
+
+    if (activeBizId) {
+      const [fbSyncRes, sqlPushRes] = await Promise.all([
+        syncStaffAndMembershipsToCloud(activeBizId).catch(() => ({ success: false, details: '' })),
+        pushDatabaseToServer(activeBizId).catch(() => ({ success: false, details: '' })),
+      ]);
+      if (fbSyncRes.success || sqlPushRes.success) {
+        notifyPayroll(
+          'success',
+          wasEditing
+            ? `✓ Updated & saved ${fullStaffName} to cloud.`
+            : `✓ Onboarded & saved ${fullStaffName} to cloud.`
+        );
+      }
+    }
   };
 
   const handleEditStaff = (st: any) => {
@@ -600,21 +684,53 @@ export default function AttendancePayroll({ settings, userRole = 'owner', active
     setShowRegisterModal(true);
   };
 
-  const handleDeleteStaff = (id: string, name: string) => {
+  const handleDeleteStaff = (id: string, name: string, staffEmail?: string, staffPassword?: string) => {
     if (userRole === 'sales') {
-      alert('Access Denied: Only Business Owners can terminate rosters.');
+      notifyPayroll('error', 'Access Denied: Only Business Owners or Managers can remove staff accounts.');
       return;
     }
-    if (confirm(`Are you absolutely sure you want to delete staff member "${name}"? This removes their credentials permanently.`)) {
-      const activeBizId = getActiveBusinessId();
-      const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
-      const res = runSql(`DELETE FROM staff WHERE id = '${sqlEsc(id)}'${bizMatch}`, `Staff: Delete profile ${id}`);
-      if (res.success) {
-        alert(`Deleted staff member ${name}`);
-        loadStaffMembers();
-        persistTablesToStorage();
-      }
-    }
+    setPayrollConfirmAction({
+      title: 'Delete Staff Account',
+      message: `Are you sure you want to delete "${name}"? This removes their login credentials locally and from the cloud.`,
+      confirmLabel: 'Delete Staff',
+      tone: 'rose',
+      onConfirm: () => {
+        setPayrollConfirmAction(null);
+        const activeBizId = getActiveBusinessId();
+        const bizMatch = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+        const cleanEmail = normalizeAuthEmail(staffEmail || '');
+        const res = runSql(`DELETE FROM staff WHERE id = '${sqlEsc(id)}'${bizMatch}`, `Staff: Delete profile ${id}`);
+        if (res.success) {
+          if (activeBizId && cleanEmail) {
+            runSql(
+              `DELETE FROM business_memberships WHERE business_id = '${sqlEsc(activeBizId)}' AND LOWER(email) = '${sqlEsc(cleanEmail)}'`,
+              `Staff: Delete membership for ${cleanEmail}`
+            );
+          }
+          loadStaffMembers();
+          persistTablesToStorage();
+          window.dispatchEvent(new Event('pos_data_updated'));
+          notifyPayroll('success', `Deleted staff member ${name} — syncing removal to cloud...`);
+
+          if (activeBizId) {
+            void Promise.all([
+              auth.currentUser && cleanEmail
+                ? revokeCredentialMembershipInCloud({
+                    businessId: activeBizId,
+                    membershipId: `mem_staff_${id}_${activeBizId}`,
+                    email: cleanEmail,
+                    password: staffPassword || undefined,
+                  }).catch(() => {})
+                : Promise.resolve(),
+              syncStaffAndMembershipsToCloud(activeBizId).catch(() => ({ success: false })),
+              pushDatabaseToServer(activeBizId).catch(() => ({ success: false })),
+            ]).then(() => {
+              notifyPayroll('success', `✓ Removed ${name} locally & from cloud.`);
+            });
+          }
+        }
+      },
+    });
   };
 
   // Helper trigger action helper to download encoded attachments
@@ -2191,7 +2307,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner', active
                           <Edit size={13} />
                         </button>
                         <button
-                          onClick={() => handleDeleteStaff(st.id, `${st.first_name} ${st.surname}`)}
+                          onClick={() => handleDeleteStaff(st.id, `${st.first_name || st.name || ''} ${st.surname || ''}`.trim(), st.email, st.password)}
                           className="p-1 hover:bg-slate-100 text-rose-600 rounded cursor-pointer"
                           title="Delete Profile"
                         >

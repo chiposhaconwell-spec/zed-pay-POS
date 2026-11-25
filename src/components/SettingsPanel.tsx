@@ -50,6 +50,7 @@ import {
   getActiveStoreId,
   sqlEsc,
   upsertUserAndMembership,
+  syncUsersAndMembershipsFromLegacyTables,
 } from '../db';
 import { exportAndShareText } from '../androidUtils';
 import { StoreSettings, CustomPaymentMethod } from '../types';
@@ -75,6 +76,7 @@ import {
   registerOrSignInWithEmailPassword,
   publishCredentialMembershipToCloud,
   revokeCredentialMembershipInCloud,
+  syncStaffAndMembershipsToCloud,
   linkOwnerWorkspacesWithCurrentFirebaseAdmin,
 } from '../firebase';
 import { getZraConfig, saveZraConfig, subscribeZraConfig, switchZraConfigForBusiness, ZraConfig, ZraTaxTypeCode, ZRA_TAX_TYPES, ZRA_PACKAGING_UNITS, ZRA_QTY_UNITS } from '../zra/zraConfig';
@@ -456,6 +458,9 @@ export default function SettingsPanel({
 
   const loadUsersList = () => {
     const activeBizId = getActiveBusinessId();
+    if (activeBizId) {
+      syncUsersAndMembershipsFromLegacyTables(activeBizId);
+    }
     const staffWhere = activeBizId ? ` WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
     // 1. Fetch standard staff profiles
     const staffRes = runSql(`SELECT * FROM staff${staffWhere}`, 'Load staff directory for accounts management');
@@ -555,6 +560,19 @@ export default function SettingsPanel({
   useEffect(() => {
     loadUsersList();
     loadStoresList();
+
+    const handleUsersOrStoreSync = () => {
+      loadUsersList();
+      loadStoresList();
+    };
+    window.addEventListener('pos_data_updated', handleUsersOrStoreSync);
+    window.addEventListener('local_db_restored', handleUsersOrStoreSync);
+    window.addEventListener('database-rehydrated', handleUsersOrStoreSync);
+    return () => {
+      window.removeEventListener('pos_data_updated', handleUsersOrStoreSync);
+      window.removeEventListener('local_db_restored', handleUsersOrStoreSync);
+      window.removeEventListener('database-rehydrated', handleUsersOrStoreSync);
+    };
   }, []);
 
   useEffect(() => {
@@ -1329,7 +1347,7 @@ export default function SettingsPanel({
     return null;
   };
 
-  const handleSaveUser = (e: React.FormEvent) => {
+  const handleSaveUser = async (e: React.FormEvent) => {
     e.preventDefault();
     const emailLower = normalizeAuthEmail(userEmail);
 
@@ -1371,7 +1389,7 @@ export default function SettingsPanel({
       const salaryNum = parseFloat(userSalary) || 0;
       const targetStaffId = editingUserId && !isPrimaryBizOwnerEdit
         ? editingUserId
-        : `staff-${Math.floor(1000 + Math.random() * 9000)}`;
+        : `staff-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
       const idWhereClause = buildSqlIdWhereClause(targetStaffId);
       const staffBizAnd = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
 
@@ -1422,7 +1440,7 @@ export default function SettingsPanel({
       }
     }
 
-    // 3. Upsert into decoupled business_memberships + publish zero-plaintext invite to Firestore /credential_directory
+    // 3. Upsert into decoupled business_memberships
     const credHash = computeCredentialHashSync(emailLower, rawPass);
     const membershipRec = upsertUserAndMembership({
       businessId: activeBizId,
@@ -1437,24 +1455,6 @@ export default function SettingsPanel({
       status: isNowSuspended ? 'SUSPENDED' : 'ACTIVE',
     });
 
-    if (auth.currentUser && activeBizId) {
-      publishCredentialMembershipToCloud({
-        businessId: activeBizId,
-        businessName: storeName || activeBusiness?.name || activeBizId,
-        membershipId: String(membershipRec?.id || deriveMembershipId(activeBizId, deriveUserId(emailLower), userRole)),
-        userId: String(membershipRec?.user_id || deriveUserId(emailLower)),
-        email: emailLower,
-        fullName: fullStaffName,
-        role: userRole,
-        password: rawPass,
-        credentialHash: credHash,
-        storeId: primaryStore,
-        accessibleBranches: userRole === 'owner' ? [] : selectedBranches,
-        permissionsJson: permissionsString,
-        status: isNowSuspended ? 'SUSPENDED' : 'ACTIVE',
-      }).catch(() => {});
-    }
-
     // If editing the currently logged-in user's account, apply updated role & ticked permissions immediately
     const currentLoggedEmail = normalizeAuthEmail(localStorage.getItem('logged_in_user_email') || '');
     if (currentLoggedEmail && currentLoggedEmail === emailLower) {
@@ -1466,18 +1466,53 @@ export default function SettingsPanel({
     handleResetUserForm();
     loadUsersList();
     persistTablesToStorage();
-    pushDatabaseToServer(activeBizId).catch(() => {});
-    if (auth.currentUser) {
-      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
-    }
     window.dispatchEvent(new Event('pos_data_updated'));
+
     setUserActionFeedback({
       type: isNowSuspended ? 'warning' : 'success',
       text: isNowSuspended
-        ? `Saved profile for ${fullStaffName} (account status: SUSPENDED).`
-        : `✓ Security credentials, role permissions & settings access saved for ${fullStaffName}.`,
+        ? `Saved profile for ${fullStaffName} (SUSPENDED) — syncing to cloud...`
+        : `Saved ${fullStaffName} — syncing credentials & permissions to cloud...`,
     });
-    triggerNotify('✓ User security credentials, role permissions & settings access saved!');
+
+    const [fbSyncRes, sqlPushRes] = await Promise.all([
+      activeBizId
+        ? syncStaffAndMembershipsToCloud(activeBizId).catch(() => ({ success: false, details: '' }))
+        : Promise.resolve({ success: false, details: '' }),
+      activeBizId
+        ? pushDatabaseToServer(activeBizId).catch(() => ({ success: false, details: '' }))
+        : Promise.resolve({ success: false, details: '' }),
+      auth.currentUser && activeBizId
+        ? publishCredentialMembershipToCloud({
+            businessId: activeBizId,
+            businessName: storeName || activeBusiness?.name || activeBizId,
+            membershipId: String(membershipRec?.id || deriveMembershipId(activeBizId, deriveUserId(emailLower), userRole)),
+            userId: String(membershipRec?.user_id || deriveUserId(emailLower)),
+            email: emailLower,
+            fullName: fullStaffName,
+            role: userRole,
+            password: rawPass,
+            credentialHash: credHash,
+            storeId: primaryStore,
+            accessibleBranches: userRole === 'owner' ? [] : selectedBranches,
+            permissionsJson: permissionsString,
+            status: isNowSuspended ? 'SUSPENDED' : 'ACTIVE',
+          }).catch(() => ({ published: false, credId: '' }))
+        : Promise.resolve({ published: false, credId: '' }),
+    ]);
+
+    const cloudSynced = Boolean(fbSyncRes.success || sqlPushRes.success);
+    setUserActionFeedback({
+      type: isNowSuspended ? 'warning' : 'success',
+      text: isNowSuspended
+        ? `Saved profile for ${fullStaffName} (account status: SUSPENDED)${cloudSynced ? ' & synced to cloud.' : '.'}`
+        : `✓ Security credentials, role permissions & settings access saved${cloudSynced ? ' to cloud' : ''} for ${fullStaffName}.`,
+    });
+    triggerNotify(
+      cloudSynced
+        ? `✓ ${fullStaffName} saved locally & synced to cloud!`
+        : '✓ User security credentials, role permissions & settings access saved!'
+    );
   };
 
   const handleResetUserForm = () => {
@@ -1527,7 +1562,7 @@ export default function SettingsPanel({
     setConfirmRevokeUserKey(rowKey);
   };
 
-  const handleConfirmRevokeUser = (usr: any) => {
+  const handleConfirmRevokeUser = async (usr: any) => {
     const blockedReason = getProtectedPrimaryOwnerReason(usr, 'revoke');
     if (blockedReason) {
       setConfirmRevokeUserKey(null);
@@ -1554,13 +1589,6 @@ export default function SettingsPanel({
         `DELETE FROM business_memberships WHERE business_id = '${sqlEsc(activeBizId)}' AND LOWER(email) = '${sqlEsc(safeEmail)}'`,
         `SettingsPanel: Revoke membership record`
       );
-      if (auth.currentUser) {
-        revokeCredentialMembershipInCloud({
-          businessId: activeBizId,
-          email: safeEmail,
-          password: usr.password || undefined,
-        }).catch(() => {});
-      }
     }
 
     if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
@@ -1570,21 +1598,31 @@ export default function SettingsPanel({
     setConfirmRevokeUserKey(null);
     loadUsersList();
     persistTablesToStorage();
-    pushDatabaseToServer(activeBizId).catch(() => {});
-    if (auth.currentUser) {
-      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
-    }
     window.dispatchEvent(new Event('pos_data_updated'));
+
+    if (activeBizId) {
+      await Promise.all([
+        auth.currentUser && safeEmail
+          ? revokeCredentialMembershipInCloud({
+              businessId: activeBizId,
+              email: safeEmail,
+              password: usr.password || undefined,
+            }).catch(() => {})
+          : Promise.resolve(),
+        syncStaffAndMembershipsToCloud(activeBizId).catch(() => ({ success: false })),
+        pushDatabaseToServer(activeBizId).catch(() => ({ success: false })),
+      ]);
+    }
 
     const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
     setUserActionFeedback({
       type: 'success',
-      text: `Access revoked: "${fullName}" has been permanently removed from this workspace.`,
+      text: `Access revoked: "${fullName}" has been permanently removed locally and from the cloud.`,
     });
     triggerNotify(`Revoked access for ${fullName}!`);
   };
 
-  const handleToggleSuspendUser = (usr: any) => {
+  const handleToggleSuspendUser = async (usr: any) => {
     setConfirmRevokeUserKey(null);
     const blockedReason = getProtectedPrimaryOwnerReason(usr, 'suspend');
     if (blockedReason) {
@@ -1623,8 +1661,9 @@ export default function SettingsPanel({
     const usrPass = String(usr.password || parsedExisting.password || '').trim();
     const normUsrRole = normalizeRole(usr.role || parsedExisting.role);
     const fullName = `${usr.first_name || ''} ${usr.surname || ''}`.trim() || usr.email || 'User';
+    let memRec: any = null;
     if (activeBizId && cleanUsrEmail) {
-      const memRec = upsertUserAndMembership({
+      memRec = upsertUserAndMembership({
         businessId: activeBizId,
         email: cleanUsrEmail,
         fullName,
@@ -1636,22 +1675,6 @@ export default function SettingsPanel({
         permissionsJson: permsJsonStr,
         status: nextSuspended ? 'SUSPENDED' : 'ACTIVE',
       });
-      if (auth.currentUser && usrPass) {
-        publishCredentialMembershipToCloud({
-          businessId: activeBizId,
-          businessName: storeName || activeBusiness?.name || activeBizId,
-          membershipId: String(memRec?.id || deriveMembershipId(activeBizId, deriveUserId(cleanUsrEmail), normUsrRole)),
-          userId: String(memRec?.user_id || deriveUserId(cleanUsrEmail)),
-          email: cleanUsrEmail,
-          fullName,
-          role: normUsrRole,
-          password: usrPass,
-          storeId: String(usr.raw?.store_id || 'main'),
-          accessibleBranches: Array.isArray(usr.accessible_branches) ? usr.accessible_branches : [],
-          permissionsJson: permsJsonStr,
-          status: nextSuspended ? 'SUSPENDED' : 'ACTIVE',
-        }).catch(() => {});
-      }
     }
 
     if (editingUserId !== null && String(editingUserId) === String(usr.id)) {
@@ -1660,11 +1683,30 @@ export default function SettingsPanel({
 
     loadUsersList();
     persistTablesToStorage();
-    pushDatabaseToServer(activeBizId).catch(() => {});
-    if (auth.currentUser) {
-      backupToCloud(activeBizId, { silentIfNotOwner: true }).catch(() => {});
-    }
     window.dispatchEvent(new Event('pos_data_updated'));
+
+    if (activeBizId) {
+      await Promise.all([
+        auth.currentUser && cleanUsrEmail && usrPass
+          ? publishCredentialMembershipToCloud({
+              businessId: activeBizId,
+              businessName: storeName || activeBusiness?.name || activeBizId,
+              membershipId: String(memRec?.id || deriveMembershipId(activeBizId, deriveUserId(cleanUsrEmail), normUsrRole)),
+              userId: String(memRec?.user_id || deriveUserId(cleanUsrEmail)),
+              email: cleanUsrEmail,
+              fullName,
+              role: normUsrRole,
+              password: usrPass,
+              storeId: String(usr.raw?.store_id || 'main'),
+              accessibleBranches: Array.isArray(usr.accessible_branches) ? usr.accessible_branches : [],
+              permissionsJson: permsJsonStr,
+              status: nextSuspended ? 'SUSPENDED' : 'ACTIVE',
+            }).catch(() => ({ published: false, credId: '' }))
+          : Promise.resolve({ published: false, credId: '' }),
+        syncStaffAndMembershipsToCloud(activeBizId).catch(() => ({ success: false })),
+        pushDatabaseToServer(activeBizId).catch(() => ({ success: false })),
+      ]);
+    }
 
     setUserActionFeedback({
       type: nextSuspended ? 'warning' : 'success',
