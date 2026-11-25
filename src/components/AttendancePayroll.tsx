@@ -1,18 +1,30 @@
-import React, { useState, useEffect } from 'react';
-import { runSql, persistTablesToStorage, getActiveBusinessId, getActiveStoreId, sqlEsc } from '../db';
-import { safeSystemPrint } from '../androidUtils';
-import { 
-  Users, 
-  Clock, 
-  Printer, 
-  Search, 
-  Play, 
-  Square, 
-  Calculator, 
-  DollarSign, 
-  Layers, 
-  Plus, 
-  Coins, 
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  runSql,
+  persistTablesToStorage,
+  getActiveBusinessId,
+  getActiveStoreId,
+  sqlEsc,
+  ensurePayrollEntriesTable,
+  syncAllAccountingSystems,
+  logEmployeeAudit,
+  getAllSelectableAccounts,
+} from '../db';
+import { exportAndSharePdf } from '../androidUtils';
+import { jsPDF } from 'jspdf';
+import { DEFAULT_COMPANY_LOGO } from '../App';
+import {
+  Users,
+  Clock,
+  Printer,
+  Search,
+  Play,
+  Square,
+  Calculator,
+  DollarSign,
+  Layers,
+  Plus,
+  Coins,
   FileText,
   Upload,
   Shield,
@@ -21,7 +33,13 @@ import {
   Eye,
   Download,
   CheckSquare,
-  X
+  X,
+  Banknote,
+  PlusCircle,
+  MinusCircle,
+  CheckCircle2,
+  Calendar,
+  RefreshCw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { StoreSettings } from '../types';
@@ -29,6 +47,7 @@ import { StoreSettings } from '../types';
 interface AttendancePayrollProps {
   settings: StoreSettings;
   userRole?: string;
+  activeStore?: string;
 }
 
 interface TimesheetRecord {
@@ -44,7 +63,97 @@ interface TimesheetRecord {
   status: 'PENDING' | 'PAID';
 }
 
-export default function AttendancePayroll({ settings, userRole = 'owner' }: AttendancePayrollProps) {
+export interface PayrollLineItem {
+  id: string;
+  category: string;
+  description: string;
+  amount: number;
+}
+
+export interface PayrollEntry {
+  id: string;
+  staff_id: string;
+  employee_name: string;
+  employee_role: string;
+  pay_period: string;
+  payment_date: string;
+  basic_salary: number;
+  additions: PayrollLineItem[];
+  deductions: PayrollLineItem[];
+  total_additions: number;
+  total_deductions: number;
+  gross_salary: number;
+  net_salary: number;
+  payment_account_id: string;
+  status: 'DRAFT' | 'PAID';
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  store_id: string;
+}
+
+const ADDITION_CATEGORIES = [
+  'Bonus',
+  'Housing Allowance',
+  'Transport Allowance',
+  'Overtime Pay',
+  'Sales Commission',
+  'Meal / Airtime Allowance',
+  'Leave Encashment',
+  'Other Addition',
+];
+
+const DEDUCTION_CATEGORIES = [
+  'Salary Advance',
+  'PAYE Income Tax',
+  'NAPSA Pension',
+  'NHIMA Health',
+  'Staff Loan Repayment',
+  'Absence / Late Deduction',
+  'Shortage / Damage Recovery',
+  'Other Deduction',
+];
+
+const loadNormalizedPngImage = (src: string): Promise<{ dataUrl: string; width: number; height: number } | null> => {
+  return new Promise((resolve) => {
+    if (!src) return resolve(null);
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth || img.width || 160;
+        const h = img.naturalHeight || img.height || 160;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return resolve(null);
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve({ dataUrl: canvas.toDataURL('image/png'), width: w, height: h });
+      } catch {
+        if (src.startsWith('data:image/png') || src.startsWith('data:image/jpeg') || src.startsWith('data:image/jpg')) {
+          resolve({ dataUrl: src, width: 160, height: 160 });
+        } else {
+          resolve(null);
+        }
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+};
+
+const formatPayPeriodLabel = (ym: string) => {
+  const parts = String(ym || '').split('-');
+  if (parts.length !== 2) return ym || 'Current Period';
+  const y = Number(parts[0]);
+  const m = Number(parts[1]) - 1;
+  const d = new Date(y, m, 1);
+  if (isNaN(d.getTime())) return ym;
+  return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+};
+
+export default function AttendancePayroll({ settings, userRole = 'owner', activeStore }: AttendancePayrollProps) {
   const [records, setRecords] = useState<TimesheetRecord[]>([]);
   const [employeeNameInput, setEmployeeNameInput] = useState('');
   const [employeeRoleInput, setEmployeeRoleInput] = useState('Sales Person');
@@ -52,11 +161,54 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
   const [selectedStaff, setSelectedStaff] = useState<string>('');
   
   // Navigation & detailed staff views hooks
-  const [activeSubTab, setActiveSubTab] = useState<'clock' | 'roster'>('clock');
+  const [activeSubTab, setActiveSubTab] = useState<'clock' | 'payroll' | 'roster'>('payroll');
   const [staffList, setStaffList] = useState<any[]>([]);
   const [editingStaffId, setEditingStaffId] = useState<string | null>(null);
   const [showRegisterModal, setShowRegisterModal] = useState(false);
   const [viewingStaffDetail, setViewingStaffDetail] = useState<any | null>(null);
+
+  // Payroll Management state
+  const [selectedPayPeriod, setSelectedPayPeriod] = useState<string>(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  });
+  const [payrollEntries, setPayrollEntries] = useState<PayrollEntry[]>([]);
+  const [payrollSearch, setPayrollSearch] = useState('');
+  const [payrollStatusFilter, setPayrollStatusFilter] = useState<'ALL' | 'DRAFT' | 'PAID'>('ALL');
+  const [payrollFeedback, setPayrollFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [selectableAccounts, setSelectableAccounts] = useState(() => getAllSelectableAccounts());
+
+  // Add / Deduct Salary Modal states
+  const [editingPayroll, setEditingPayroll] = useState<PayrollEntry | null>(null);
+  const [draftBasicSalary, setDraftBasicSalary] = useState('');
+  const [draftAdditions, setDraftAdditions] = useState<PayrollLineItem[]>([]);
+  const [draftDeductions, setDraftDeductions] = useState<PayrollLineItem[]>([]);
+  const [draftPayAccount, setDraftPayAccount] = useState('acc_bank');
+  const [draftPayDate, setDraftPayDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [draftNotes, setDraftNotes] = useState('');
+
+  // Quick Add / Deduct item inputs inside editor
+  const [newAddCategory, setNewAddCategory] = useState(ADDITION_CATEGORIES[0]);
+  const [newAddDescription, setNewAddDescription] = useState('');
+  const [newAddAmount, setNewAddAmount] = useState('');
+  const [newDedCategory, setNewDedCategory] = useState(DEDUCTION_CATEGORIES[0]);
+  const [newDedDescription, setNewDedDescription] = useState('');
+  const [newDedAmount, setNewDedAmount] = useState('');
+
+  // Add custom/ad-hoc employee payroll modal
+  const [showAddCustomPayrollModal, setShowAddCustomPayrollModal] = useState(false);
+  const [customEmpName, setCustomEmpName] = useState('');
+  const [customEmpRole, setCustomEmpRole] = useState('Sales Person');
+  const [customEmpSalary, setCustomEmpSalary] = useState('5000');
+
+  // In-UI confirm modal
+  const [payrollConfirmAction, setPayrollConfirmAction] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    tone: 'emerald' | 'rose';
+    onConfirm: () => void;
+  } | null>(null);
 
   // Form states matching full requirements
   const [firstName, setFirstName] = useState('');
@@ -143,10 +295,156 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
     }
   };
 
+  const notifyPayroll = (type: 'success' | 'error', text: string) => {
+    setPayrollFeedback({ type, text });
+    setTimeout(() => setPayrollFeedback(null), 4500);
+  };
+
+  const parseLineItemsJson = (raw: any): PayrollLineItem[] => {
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (Array.isArray(parsed)) {
+        return parsed.map((item: any, idx: number) => ({
+          id: String(item.id || `li-${idx}-${Date.now()}`),
+          category: String(item.category || 'Adjustment'),
+          description: String(item.description || item.category || 'Adjustment'),
+          amount: Math.max(0, Number(item.amount || 0)),
+        }));
+      }
+    } catch {}
+    return [];
+  };
+
+  const loadPayrollEntries = (periodOverride?: string, syncStaffList?: any[]) => {
+    ensurePayrollEntriesTable();
+    const period = periodOverride || selectedPayPeriod;
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
+    const bizCond = activeBizId ? `business_id = '${sqlEsc(activeBizId)}'` : `(business_id IS NULL OR business_id = '')`;
+
+    // Optionally seed DRAFT entries for any registered staff missing for this period
+    const roster = syncStaffList || staffList;
+    if (Array.isArray(roster) && roster.length > 0) {
+      const existingRes = runSql(
+        `SELECT staff_id, employee_name FROM payroll_entries WHERE ${bizCond} AND pay_period = '${sqlEsc(period)}'`,
+        'Payroll: Check existing period entries',
+        true
+      );
+      const existingRows = existingRes.success && Array.isArray(existingRes.data) ? existingRes.data : [];
+      const existingStaffIds = new Set(existingRows.map((r: any) => String(r.staff_id || '')));
+      const existingNames = new Set(existingRows.map((r: any) => String(r.employee_name || '').toLowerCase().trim()));
+      let insertedAny = false;
+
+      roster.forEach((st: any) => {
+        const sid = String(st.id || '');
+        const fullName = `${st.first_name || st.name || 'Staff'} ${st.surname || ''}`.trim();
+        if ((sid && existingStaffIds.has(sid)) || existingNames.has(fullName.toLowerCase())) {
+          return;
+        }
+        const basic = Math.max(0, Number(st.basic_salary ?? 0));
+        const roleLabel =
+          String(st.role || '').trim() || (basic > 10000 ? 'Store Manager' : 'Staff Member');
+        const entryId = `PAY-${period.replace(/[^0-9]/g, '')}-${sid.replace(/[^a-zA-Z0-9_-]/g, '') || Math.floor(1000 + Math.random() * 9000)}`;
+        const nowIso = new Date().toISOString();
+        const stStore = String(st.store_id || resolvedStoreId);
+        runSql(
+          `INSERT INTO payroll_entries (id, staff_id, employee_name, employee_role, pay_period, payment_date, basic_salary, additions_json, deductions_json, total_additions, total_deductions, gross_salary, net_salary, payment_account_id, status, notes, created_at, updated_at, business_id, store_id) VALUES (
+            '${sqlEsc(entryId)}',
+            '${sqlEsc(sid)}',
+            '${sqlEsc(fullName)}',
+            '${sqlEsc(roleLabel)}',
+            '${sqlEsc(period)}',
+            '${nowIso.split('T')[0]}',
+            ${basic},
+            '[]',
+            '[]',
+            0,
+            0,
+            ${basic},
+            ${basic},
+            'acc_bank',
+            'DRAFT',
+            '',
+            '${nowIso}',
+            '${nowIso}',
+            '${sqlEsc(activeBizId)}',
+            '${sqlEsc(stStore)}'
+          )`,
+          `Payroll: Initialize draft payslip for ${fullName}`,
+          true
+        );
+        insertedAny = true;
+      });
+      if (insertedAny) {
+        persistTablesToStorage();
+      }
+    }
+
+    const res = runSql(
+      `SELECT * FROM payroll_entries WHERE ${bizCond} AND pay_period = '${sqlEsc(period)}' ORDER BY employee_name ASC`,
+      'Payroll: Fetch period entries',
+      true
+    );
+    if (res.success && Array.isArray(res.data)) {
+      const parsed: PayrollEntry[] = res.data.map((r: any) => {
+        const additions = parseLineItemsJson(r.additions_json);
+        const deductions = parseLineItemsJson(r.deductions_json);
+        const basic = Number(r.basic_salary || 0);
+        const totalAdd = additions.reduce((s, x) => s + x.amount, 0);
+        const totalDed = deductions.reduce((s, x) => s + x.amount, 0);
+        const gross = basic + totalAdd;
+        const net = gross - totalDed;
+        return {
+          id: String(r.id),
+          staff_id: String(r.staff_id || ''),
+          employee_name: String(r.employee_name || 'Employee'),
+          employee_role: String(r.employee_role || 'Staff'),
+          pay_period: String(r.pay_period || period),
+          payment_date: String(r.payment_date || new Date().toISOString().split('T')[0]),
+          basic_salary: basic,
+          additions,
+          deductions,
+          total_additions: totalAdd,
+          total_deductions: totalDed,
+          gross_salary: gross,
+          net_salary: net,
+          payment_account_id: String(r.payment_account_id || 'acc_bank'),
+          status: r.status === 'PAID' ? 'PAID' : 'DRAFT',
+          notes: String(r.notes || ''),
+          created_at: String(r.created_at || ''),
+          updated_at: String(r.updated_at || ''),
+          store_id: String(r.store_id || resolvedStoreId),
+        };
+      });
+      setPayrollEntries(parsed);
+    } else {
+      setPayrollEntries([]);
+    }
+  };
+
   useEffect(() => {
+    ensurePayrollEntriesTable();
     loadAttendance();
     loadStaffMembers();
+    setSelectableAccounts(getAllSelectableAccounts());
+
+    const handleRefresh = () => {
+      loadAttendance();
+      loadStaffMembers();
+      loadPayrollEntries();
+      setSelectableAccounts(getAllSelectableAccounts());
+    };
+    window.addEventListener('pos_data_updated', handleRefresh);
+    window.addEventListener('local_db_restored', handleRefresh);
+    return () => {
+      window.removeEventListener('pos_data_updated', handleRefresh);
+      window.removeEventListener('local_db_restored', handleRefresh);
+    };
   }, []);
+
+  useEffect(() => {
+    loadPayrollEntries(selectedPayPeriod, staffList);
+  }, [selectedPayPeriod, staffList.length]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, fileType: 'nrc' | 'contract') => {
     const file = e.target.files?.[0];
@@ -476,9 +774,801 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
 
   const totalCompanyOutstandingPayroll: number = Object.values(payrollSummary).reduce((sum: number, item: any) => sum + item.pendingWages, 0) as number;
 
-  const handlePrintPayrollPDF = () => {
-    // Print window triggers safe system print event
-    safeSystemPrint();
+  const handleSyncBasicSalariesFromStaff = () => {
+    if (userRole === 'sales') {
+      notifyPayroll('error', 'Access Denied: Only Business Owners or Store Managers can sync payroll.');
+      return;
+    }
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+    let updatedCount = 0;
+
+    staffList.forEach((st: any) => {
+      const sid = String(st.id || '');
+      const basic = Math.max(0, Number(st.basic_salary ?? 0));
+      const matchedDraft = payrollEntries.find(
+        (pe) => pe.status === 'DRAFT' && (pe.staff_id === sid || pe.employee_name.toLowerCase() === `${st.first_name || ''} ${st.surname || ''}`.trim().toLowerCase())
+      );
+      if (matchedDraft && matchedDraft.basic_salary !== basic) {
+        const gross = basic + matchedDraft.total_additions;
+        const net = gross - matchedDraft.total_deductions;
+        runSql(
+          `UPDATE payroll_entries SET basic_salary = ${basic}, gross_salary = ${gross}, net_salary = ${net}, updated_at = '${new Date().toISOString()}' WHERE id = '${sqlEsc(matchedDraft.id)}'${bizCond}`,
+          `Payroll: Sync basic salary for ${matchedDraft.employee_name}`
+        );
+        updatedCount++;
+      }
+    });
+
+    loadPayrollEntries(selectedPayPeriod, staffList);
+    persistTablesToStorage();
+    notifyPayroll(
+      'success',
+      updatedCount > 0
+        ? `Synced updated basic salaries for ${updatedCount} draft payslip(s).`
+        : 'All registered staff & basic salaries are up to date for this pay period.'
+    );
+  };
+
+  const openPayrollEditor = (entry: PayrollEntry) => {
+    setEditingPayroll(entry);
+    setDraftBasicSalary(String(entry.basic_salary ?? 0));
+    setDraftAdditions(entry.additions.map((x) => ({ ...x })));
+    setDraftDeductions(entry.deductions.map((x) => ({ ...x })));
+    setDraftPayAccount(entry.payment_account_id || 'acc_bank');
+    setDraftPayDate(entry.payment_date || new Date().toISOString().split('T')[0]);
+    setDraftNotes(entry.notes || '');
+    setNewAddCategory(ADDITION_CATEGORIES[0]);
+    setNewAddDescription('');
+    setNewAddAmount('');
+    setNewDedCategory(DEDUCTION_CATEGORIES[0]);
+    setNewDedDescription('');
+    setNewDedAmount('');
+  };
+
+  const handleAddAdditionItem = () => {
+    const amt = parseFloat(newAddAmount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      notifyPayroll('error', 'Enter a valid positive addition amount.');
+      return;
+    }
+    const label = newAddDescription.trim() || newAddCategory;
+    setDraftAdditions((prev) => [
+      ...prev,
+      {
+        id: `add-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        category: newAddCategory,
+        description: label,
+        amount: parseFloat(amt.toFixed(2)),
+      },
+    ]);
+    setNewAddDescription('');
+    setNewAddAmount('');
+  };
+
+  const handleAddDeductionItem = () => {
+    const amt = parseFloat(newDedAmount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      notifyPayroll('error', 'Enter a valid positive deduction amount.');
+      return;
+    }
+    const label = newDedDescription.trim() || newDedCategory;
+    setDraftDeductions((prev) => [
+      ...prev,
+      {
+        id: `ded-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        category: newDedCategory,
+        description: label,
+        amount: parseFloat(amt.toFixed(2)),
+      },
+    ]);
+    setNewDedDescription('');
+    setNewDedAmount('');
+  };
+
+  const savePayrollEditorChanges = (targetStatus?: 'DRAFT' | 'PAID'): PayrollEntry | null => {
+    if (!editingPayroll) return null;
+    if (userRole === 'sales') {
+      notifyPayroll('error', 'Access Denied: Only Business Owners or Store Managers can modify payroll.');
+      return null;
+    }
+    const basic = Math.max(0, parseFloat(draftBasicSalary) || 0);
+    const totalAdd = parseFloat(draftAdditions.reduce((s, x) => s + x.amount, 0).toFixed(2));
+    const totalDed = parseFloat(draftDeductions.reduce((s, x) => s + x.amount, 0).toFixed(2));
+    const gross = parseFloat((basic + totalAdd).toFixed(2));
+    const net = parseFloat((gross - totalDed).toFixed(2));
+    const finalStatus: 'DRAFT' | 'PAID' = targetStatus || editingPayroll.status;
+    const nowIso = new Date().toISOString();
+    const activeBizId = getActiveBusinessId();
+    const bizCond = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+
+    const res = runSql(
+      `UPDATE payroll_entries SET
+        basic_salary = ${basic},
+        additions_json = '${sqlEsc(JSON.stringify(draftAdditions))}',
+        deductions_json = '${sqlEsc(JSON.stringify(draftDeductions))}',
+        total_additions = ${totalAdd},
+        total_deductions = ${totalDed},
+        gross_salary = ${gross},
+        net_salary = ${net},
+        payment_account_id = '${sqlEsc(draftPayAccount)}',
+        payment_date = '${sqlEsc(draftPayDate)}',
+        status = '${finalStatus}',
+        notes = '${sqlEsc(draftNotes.trim())}',
+        updated_at = '${nowIso}'
+      WHERE id = '${sqlEsc(editingPayroll.id)}'${bizCond}`,
+      `Payroll: Save ${finalStatus} entry for ${editingPayroll.employee_name}`
+    );
+
+    if (!res.success) {
+      notifyPayroll('error', res.error || 'Failed to save payroll adjustments.');
+      return null;
+    }
+
+    const updatedEntry: PayrollEntry = {
+      ...editingPayroll,
+      basic_salary: basic,
+      additions: draftAdditions,
+      deductions: draftDeductions,
+      total_additions: totalAdd,
+      total_deductions: totalDed,
+      gross_salary: gross,
+      net_salary: net,
+      payment_account_id: draftPayAccount,
+      payment_date: draftPayDate,
+      status: finalStatus,
+      notes: draftNotes.trim(),
+      updated_at: nowIso,
+    };
+
+    logEmployeeAudit(
+      'PAYROLL',
+      finalStatus === 'PAID' ? 'Paid Employee Salary' : 'Updated Salary Adjustments',
+      `${updatedEntry.employee_name} (${updatedEntry.pay_period}): Basic ${settings.currency}${basic.toFixed(2)}, Additions +${settings.currency}${totalAdd.toFixed(2)}, Deductions -${settings.currency}${totalDed.toFixed(2)}, Net ${settings.currency}${net.toFixed(2)}`,
+      net,
+      updatedEntry.store_id,
+      userRole
+    );
+
+    syncAllAccountingSystems(`Payroll ${finalStatus} ${updatedEntry.employee_name}`);
+    persistTablesToStorage();
+    loadPayrollEntries(selectedPayPeriod, staffList);
+    setEditingPayroll(null);
+    try {
+      window.dispatchEvent(new Event('pos_data_updated'));
+    } catch {}
+    notifyPayroll(
+      'success',
+      finalStatus === 'PAID'
+        ? `Salary paid & posted to Finance Ledger for ${updatedEntry.employee_name} (${settings.currency}${net.toFixed(2)}).`
+        : `Payroll adjustments saved for ${updatedEntry.employee_name}.`
+    );
+    return updatedEntry;
+  };
+
+  const handleCreateCustomPayroll = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (userRole === 'sales') {
+      notifyPayroll('error', 'Access Denied: Only Owners or Managers can create payroll entries.');
+      return;
+    }
+    const empName = customEmpName.trim();
+    if (!empName) {
+      notifyPayroll('error', 'Please enter the employee full name.');
+      return;
+    }
+    const basic = Math.max(0, parseFloat(customEmpSalary) || 0);
+    const activeBizId = getActiveBusinessId();
+    const resolvedStoreId = getActiveStoreId(activeStore, activeBizId);
+    const nowIso = new Date().toISOString();
+    const entryId = `PAY-${selectedPayPeriod.replace(/[^0-9]/g, '')}-${Date.now()}`;
+
+    runSql(
+      `INSERT INTO payroll_entries (id, staff_id, employee_name, employee_role, pay_period, payment_date, basic_salary, additions_json, deductions_json, total_additions, total_deductions, gross_salary, net_salary, payment_account_id, status, notes, created_at, updated_at, business_id, store_id) VALUES (
+        '${sqlEsc(entryId)}',
+        '',
+        '${sqlEsc(empName)}',
+        '${sqlEsc(customEmpRole.trim() || 'Employee')}',
+        '${sqlEsc(selectedPayPeriod)}',
+        '${nowIso.split('T')[0]}',
+        ${basic},
+        '[]',
+        '[]',
+        0,
+        0,
+        ${basic},
+        ${basic},
+        'acc_bank',
+        'DRAFT',
+        '',
+        '${nowIso}',
+        '${nowIso}',
+        '${sqlEsc(activeBizId)}',
+        '${sqlEsc(resolvedStoreId)}'
+      )`,
+      `Payroll: Add custom employee entry for ${empName}`
+    );
+
+    persistTablesToStorage();
+    loadPayrollEntries(selectedPayPeriod, staffList);
+    setShowAddCustomPayrollModal(false);
+    setCustomEmpName('');
+    setCustomEmpRole('Sales Person');
+    setCustomEmpSalary('5000');
+    notifyPayroll('success', `Added ${empName} to ${formatPayPeriodLabel(selectedPayPeriod)} payroll.`);
+  };
+
+  const handleTogglePayStatus = (entry: PayrollEntry) => {
+    if (userRole === 'sales') {
+      notifyPayroll('error', 'Access Denied: Only Business Owners or Store Managers can mark payroll as paid.');
+      return;
+    }
+    const nextStatus = entry.status === 'PAID' ? 'DRAFT' : 'PAID';
+    const actionText =
+      nextStatus === 'PAID'
+        ? `Disburse net salary of ${settings.currency}${entry.net_salary.toFixed(2)} to ${entry.employee_name} and post to Finance Wages Expense?`
+        : `Revert ${entry.employee_name}'s payslip back to DRAFT so you can edit adjustments?`;
+
+    setPayrollConfirmAction({
+      title: nextStatus === 'PAID' ? 'Confirm Salary Payment' : 'Reopen Payslip to Draft',
+      message: actionText,
+      confirmLabel: nextStatus === 'PAID' ? 'Confirm & Mark Paid' : 'Reopen Draft',
+      tone: nextStatus === 'PAID' ? 'emerald' : 'rose',
+      onConfirm: () => {
+        const activeBizId = getActiveBusinessId();
+        const bizCond = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+        const nowIso = new Date().toISOString();
+        const payDate = nextStatus === 'PAID' ? nowIso.split('T')[0] : entry.payment_date;
+
+        runSql(
+          `UPDATE payroll_entries SET status = '${nextStatus}', payment_date = '${sqlEsc(payDate)}', updated_at = '${nowIso}' WHERE id = '${sqlEsc(entry.id)}'${bizCond}`,
+          `Payroll: Mark ${entry.employee_name} as ${nextStatus}`
+        );
+
+        logEmployeeAudit(
+          'PAYROLL',
+          nextStatus === 'PAID' ? 'Paid Employee Salary' : 'Reopened Payroll Draft',
+          `${entry.employee_name} (${entry.pay_period}): Net ${settings.currency}${entry.net_salary.toFixed(2)}`,
+          entry.net_salary,
+          entry.store_id,
+          userRole
+        );
+
+        syncAllAccountingSystems(`Payroll ${nextStatus} #${entry.id}`);
+        persistTablesToStorage();
+        loadPayrollEntries(selectedPayPeriod, staffList);
+        try {
+          window.dispatchEvent(new Event('pos_data_updated'));
+        } catch {}
+        notifyPayroll(
+          'success',
+          nextStatus === 'PAID'
+            ? `Salary paid for ${entry.employee_name} and synced to Finance.`
+            : `Payslip for ${entry.employee_name} reopened as Draft.`
+        );
+      },
+    });
+  };
+
+  const handleDeletePayrollEntry = (entry: PayrollEntry) => {
+    if (userRole === 'sales') return;
+    setPayrollConfirmAction({
+      title: 'Delete Payroll Entry',
+      message: `Remove ${entry.employee_name} from ${formatPayPeriodLabel(entry.pay_period)} payroll?`,
+      confirmLabel: 'Remove Entry',
+      tone: 'rose',
+      onConfirm: () => {
+        const activeBizId = getActiveBusinessId();
+        const bizCond = activeBizId ? ` AND business_id = '${sqlEsc(activeBizId)}'` : '';
+        runSql(`DELETE FROM payroll_entries WHERE id = '${sqlEsc(entry.id)}'${bizCond}`, 'Payroll: Delete entry');
+        syncAllAccountingSystems(`Deleted Payroll #${entry.id}`);
+        persistTablesToStorage();
+        loadPayrollEntries(selectedPayPeriod, staffList);
+        try {
+          window.dispatchEvent(new Event('pos_data_updated'));
+        } catch {}
+        notifyPayroll('success', `Removed ${entry.employee_name} from ${entry.pay_period} payroll.`);
+      },
+    });
+  };
+
+  const accountLabelLookup = useMemo(() => {
+    const map = new Map<string, string>();
+    selectableAccounts.forEach((a) => map.set(a.accountId, a.label));
+    return map;
+  }, [selectableAccounts]);
+
+  const filteredPayrollEntries = useMemo(() => {
+    const q = payrollSearch.trim().toLowerCase();
+    return payrollEntries.filter((entry) => {
+      if (payrollStatusFilter !== 'ALL' && entry.status !== payrollStatusFilter) return false;
+      if (q) {
+        const hay = `${entry.employee_name} ${entry.employee_role} ${entry.id}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [payrollEntries, payrollSearch, payrollStatusFilter]);
+
+  const payrollTotals = useMemo(() => {
+    return filteredPayrollEntries.reduce(
+      (acc, e) => {
+        acc.basic += e.basic_salary;
+        acc.additions += e.total_additions;
+        acc.deductions += e.total_deductions;
+        acc.gross += e.gross_salary;
+        acc.net += e.net_salary;
+        if (e.status === 'PAID') acc.paidCount += 1;
+        return acc;
+      },
+      { basic: 0, additions: 0, deductions: 0, gross: 0, net: 0, paidCount: 0 }
+    );
+  }, [filteredPayrollEntries]);
+
+  // Helper: Draw formal Company Header WITH Company Logo onto jsPDF
+  const drawCompanyPdfHeader = async (
+    doc: jsPDF,
+    documentTitle: string,
+    subtitle: string,
+    pageWidth = 210
+  ): Promise<number> => {
+    const margin = 15;
+    const logoSrc = settings.logoUrl || DEFAULT_COMPANY_LOGO;
+    let textStartX = margin;
+
+    try {
+      const normalizedLogo = await loadNormalizedPngImage(logoSrc);
+      if (normalizedLogo) {
+        const maxLogoDim = 18;
+        const ratio = Math.min(maxLogoDim / normalizedLogo.width, maxLogoDim / normalizedLogo.height);
+        const drawW = Math.max(9, normalizedLogo.width * ratio);
+        const drawH = Math.max(9, normalizedLogo.height * ratio);
+        doc.addImage(normalizedLogo.dataUrl, 'PNG', margin, 13, drawW, drawH);
+        textStartX = margin + drawW + 5;
+      }
+    } catch {
+      // Non-fatal fallback if logo cannot decode
+    }
+
+    const companyName = (settings.storeName || 'POS MERCHANT').toUpperCase();
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(15);
+    doc.setTextColor(15, 23, 42);
+    doc.text(companyName, textStartX, 19);
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(71, 85, 105);
+    const addrParts = [settings.billingAddress, settings.billingCity, settings.billingCountry].filter(Boolean).join(', ');
+    if (addrParts) {
+      doc.text(addrParts, textStartX, 24.5);
+    }
+    const contactLine = [
+      settings.tpin ? `TPIN: ${settings.tpin}` : '',
+      settings.billingPhone ? `Tel: ${settings.billingPhone}` : '',
+      settings.billingEmail ? `Email: ${settings.billingEmail}` : '',
+    ]
+      .filter(Boolean)
+      .join('  |  ');
+    if (contactLine) {
+      doc.text(contactLine, textStartX, addrParts ? 29.5 : 24.5);
+    }
+
+    // Document Title Banner on Right / Below
+    doc.setFillColor(30, 41, 59);
+    doc.rect(margin, 36, pageWidth - margin * 2, 13, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11.5);
+    doc.text(documentTitle.toUpperCase(), margin + 4, 43.5);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.text(subtitle, pageWidth - margin - 4, 43.5, { align: 'right' });
+
+    return 56;
+  };
+
+  // Generate Single Employee Formal Payslip PDF with Company Logo
+  const handleDownloadPayslipPdf = async (entry: PayrollEntry) => {
+    try {
+      const doc = new jsPDF({ format: 'a4', orientation: 'portrait' });
+      const curr = settings.currency || 'K';
+      const fmt = (n: number) =>
+        `${n < 0 ? '-' : ''}${curr}${Math.abs(n).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}`;
+
+      let y = await drawCompanyPdfHeader(
+        doc,
+        'OFFICIAL EMPLOYEE PAYSLIP',
+        `PAY PERIOD: ${formatPayPeriodLabel(entry.pay_period).toUpperCase()}`
+      );
+
+      // Employee Metadata Box
+      const staffProfile = staffList.find((s) => String(s.id) === entry.staff_id);
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(203, 213, 225);
+      doc.roundedRect(15, y, 180, 26, 2, 2, 'FD');
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text(`Employee: ${entry.employee_name}`, 20, y + 7);
+      doc.text(`Payslip Ref: ${entry.id}`, 190, y + 7, { align: 'right' });
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.5);
+      doc.setTextColor(51, 65, 85);
+      doc.text(`Designation: ${entry.employee_role}`, 20, y + 13.5);
+      doc.text(`Status: ${entry.status}`, 190, y + 13.5, { align: 'right' });
+
+      const contactInfo = [
+        staffProfile?.contact ? `Phone: ${staffProfile.contact}` : '',
+        staffProfile?.email ? `Email: ${staffProfile.email}` : '',
+      ]
+        .filter(Boolean)
+        .join('  |  ');
+      doc.text(contactInfo || `Staff ID: ${entry.staff_id || 'Ad-Hoc'}`, 20, y + 20);
+      const payMethodLabel = accountLabelLookup.get(entry.payment_account_id) || entry.payment_account_id;
+      doc.text(`Payment Date: ${entry.payment_date}  |  Method: ${payMethodLabel}`, 190, y + 20, { align: 'right' });
+
+      y += 35;
+
+      const writeLine = (label: string, amountStr: string, isBold = false, color: [number, number, number] = [30, 41, 59]) => {
+        if (y > 265) {
+          doc.addPage();
+          y = 20;
+        }
+        doc.setFont('helvetica', isBold ? 'bold' : 'normal');
+        doc.setFontSize(9.5);
+        doc.setTextColor(color[0], color[1], color[2]);
+        doc.text(label, 20, y);
+        doc.text(amountStr, 190, y, { align: 'right' });
+        doc.setDrawColor(241, 245, 249);
+        doc.line(18, y + 2, 192, y + 2);
+        y += 7;
+      };
+
+      // Section I: Earnings & Additions
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(10.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text('I. EARNINGS & SALARY ADDITIONS', 15, y);
+      doc.setDrawColor(16, 185, 129);
+      doc.line(15, y + 2, 195, y + 2);
+      y += 9;
+
+      writeLine('Basic Monthly Salary', fmt(entry.basic_salary), true);
+      if (entry.additions.length === 0) {
+        writeLine('Bonuses & Allowances (None recorded)', fmt(0), false, [100, 116, 139]);
+      } else {
+        entry.additions.forEach((add) => {
+          const desc = add.description && add.description !== add.category
+            ? `${add.category} — ${add.description}`
+            : add.category;
+          writeLine(`(+) ${desc}`, `+${fmt(add.amount)}`, false, [4, 120, 87]);
+        });
+      }
+
+      doc.setFillColor(236, 253, 245);
+      doc.rect(15, y - 1, 180, 9, 'F');
+      y += 5;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(6, 78, 59);
+      doc.text('GROSS SALARY (BASIC + ADDITIONS)', 20, y);
+      doc.text(fmt(entry.gross_salary), 190, y, { align: 'right' });
+      y += 12;
+
+      // Section II: Deductions
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(10.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text('II. DEDUCTIONS (ADVANCES, STATUTORY & OTHER)', 15, y);
+      doc.setDrawColor(244, 63, 94);
+      doc.line(15, y + 2, 195, y + 2);
+      y += 9;
+
+      if (entry.deductions.length === 0) {
+        writeLine('Salary Advances / Tax / Deductions (None recorded)', fmt(0), false, [100, 116, 139]);
+      } else {
+        entry.deductions.forEach((ded) => {
+          const desc = ded.description && ded.description !== ded.category
+            ? `${ded.category} — ${ded.description}`
+            : ded.category;
+          writeLine(`(-) ${desc}`, `-${fmt(ded.amount)}`, false, [190, 18, 60]);
+        });
+      }
+
+      doc.setFillColor(255, 241, 242);
+      doc.rect(15, y - 1, 180, 9, 'F');
+      y += 5;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(159, 18, 57);
+      doc.text('TOTAL DEDUCTIONS', 20, y);
+      doc.text(`-${fmt(entry.total_deductions)}`, 190, y, { align: 'right' });
+      y += 14;
+
+      // Net Salary Highlight Box
+      doc.setFillColor(30, 41, 59);
+      doc.rect(15, y, 180, 14, 'F');
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.setTextColor(255, 255, 255);
+      doc.text('NET SALARY PAYABLE (TAKE-HOME)', 20, y + 9);
+      doc.text(fmt(entry.net_salary), 190, y + 9, { align: 'right' });
+      y += 22;
+
+      if (entry.notes) {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8.5);
+        doc.setTextColor(71, 85, 105);
+        doc.text('Payroll Remarks / Notes:', 15, y);
+        y += 5;
+        doc.setFont('helvetica', 'normal');
+        const splitNotes = doc.splitTextToSize(entry.notes, 180);
+        doc.text(splitNotes, 15, y);
+        y += splitNotes.length * 4.5 + 8;
+      } else {
+        y += 10;
+      }
+
+      if (y > 250) {
+        doc.addPage();
+        y = 30;
+      }
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.5);
+      doc.setTextColor(100, 116, 139);
+      doc.text('Authorized Employer Signature: ________________________', 15, y);
+      doc.text('Employee Signature: ________________________', 112, y);
+      y += 10;
+      doc.setFontSize(7.5);
+      doc.text(`Generated by ${(settings.storeName || 'POS System')} on ${new Date().toLocaleString()}`, 15, y);
+
+      const safeName = entry.employee_name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      await exportAndSharePdf(`Payslip_${safeName}_${entry.pay_period}.pdf`, doc);
+      notifyPayroll('success', `Payslip PDF generated for ${entry.employee_name}.`);
+    } catch (err) {
+      notifyPayroll('error', `Could not generate Payslip PDF: ${String(err)}`);
+    }
+  };
+
+  // Generate Complete Payroll Summary Register PDF with Company Logo
+  const handleDownloadPayrollRegisterPdf = async () => {
+    try {
+      const doc = new jsPDF({ format: 'a4', orientation: 'landscape' });
+      const curr = settings.currency || 'K';
+      const fmt = (n: number) =>
+        `${n < 0 ? '-' : ''}${curr}${Math.abs(n).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}`;
+
+      let y = await drawCompanyPdfHeader(
+        doc,
+        'COMPANY PAYROLL REGISTER & SALARY SCHEDULE',
+        `PERIOD: ${formatPayPeriodLabel(selectedPayPeriod).toUpperCase()}  |  STAFF: ${filteredPayrollEntries.length}`,
+        297
+      );
+
+      // Summary Boxes
+      const cards = [
+        { label: 'TOTAL BASIC SALARIES', val: fmt(payrollTotals.basic) },
+        { label: 'TOTAL ADDITIONS (+)', val: `+${fmt(payrollTotals.additions)}` },
+        { label: 'TOTAL DEDUCTIONS (-)', val: `-${fmt(payrollTotals.deductions)}` },
+        { label: 'TOTAL NET PAYROLL', val: fmt(payrollTotals.net) },
+      ];
+      cards.forEach((c, idx) => {
+        const bx = 15 + idx * 68;
+        doc.setFillColor(idx === 3 ? 30 : 248, idx === 3 ? 41 : 250, idx === 3 ? 59 : 252);
+        doc.setDrawColor(203, 213, 225);
+        doc.roundedRect(bx, y, 64, 15, 1.5, 1.5, 'FD');
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7);
+        doc.setTextColor(idx === 3 ? 203 : 100, idx === 3 ? 213 : 116, idx === 3 ? 225 : 139);
+        doc.text(c.label, bx + 3, y + 5);
+        doc.setFontSize(10);
+        doc.setTextColor(idx === 3 ? 255 : 15, idx === 3 ? 255 : 23, idx === 3 ? 255 : 42);
+        doc.text(c.val, bx + 3, y + 11.5);
+      });
+
+      y += 22;
+
+      const drawTableHeader = () => {
+        doc.setFillColor(241, 245, 249);
+        doc.rect(15, y, 267, 8, 'F');
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7.5);
+        doc.setTextColor(51, 65, 85);
+        doc.text('EMPLOYEE NAME', 18, y + 5.5);
+        doc.text('BASIC', 90, y + 5.5, { align: 'right' });
+        doc.text('ADDITIONS (BONUSES / ALLOW.)', 95, y + 5.5);
+        doc.text('DEDUCTIONS (ADVANCES / TAX)', 168, y + 5.5);
+        doc.text('NET PAY', 252, y + 5.5, { align: 'right' });
+        doc.text('STATUS', 279, y + 5.5, { align: 'right' });
+        y += 10;
+      };
+
+      drawTableHeader();
+
+      if (filteredPayrollEntries.length === 0) {
+        doc.setFont('helvetica', 'italic');
+        doc.setFontSize(9);
+        doc.setTextColor(100, 116, 139);
+        doc.text('No payroll entries recorded for this pay period.', 18, y + 4);
+        y += 12;
+      } else {
+        filteredPayrollEntries.forEach((entry) => {
+          const addText =
+            entry.additions.length > 0
+              ? entry.additions.map((a) => `${a.category}: +${fmt(a.amount)}`).join(', ')
+              : 'None';
+          const dedText =
+            entry.deductions.length > 0
+              ? entry.deductions.map((d) => `${d.category}: -${fmt(d.amount)}`).join(', ')
+              : 'None';
+
+          const addLines = doc.splitTextToSize(addText, 68);
+          const dedLines = doc.splitTextToSize(dedText, 64);
+          const rowLines = Math.max(1, addLines.length, dedLines.length);
+          const rowHeight = Math.max(8, rowLines * 4 + 4);
+
+          if (y + rowHeight > 185) {
+            doc.addPage();
+            y = 18;
+            drawTableHeader();
+          }
+
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(8);
+          doc.setTextColor(15, 23, 42);
+          doc.text(entry.employee_name.slice(0, 28), 18, y + 4);
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(7);
+          doc.setTextColor(100, 116, 139);
+          doc.text(entry.employee_role.slice(0, 26), 18, y + 7.8);
+
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(8);
+          doc.setTextColor(30, 41, 59);
+          doc.text(fmt(entry.basic_salary), 90, y + 4.5, { align: 'right' });
+
+          doc.setFontSize(7.2);
+          doc.setTextColor(4, 120, 87);
+          doc.text(addLines, 95, y + 4);
+
+          doc.setTextColor(190, 18, 60);
+          doc.text(dedLines, 168, y + 4);
+
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(8.5);
+          doc.setTextColor(15, 23, 42);
+          doc.text(fmt(entry.net_salary), 252, y + 4.5, { align: 'right' });
+
+          doc.setFontSize(7.5);
+          doc.setTextColor(entry.status === 'PAID' ? 4 : 180, entry.status === 'PAID' ? 120 : 83, entry.status === 'PAID' ? 87 : 9);
+          doc.text(entry.status, 279, y + 4.5, { align: 'right' });
+
+          doc.setDrawColor(226, 232, 240);
+          doc.line(15, y + rowHeight, 282, y + rowHeight);
+          y += rowHeight + 1.5;
+        });
+      }
+
+      if (y > 175) {
+        doc.addPage();
+        y = 22;
+      }
+      y += 4;
+      doc.setFillColor(241, 245, 249);
+      doc.rect(15, y, 267, 9, 'F');
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(8.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text('GRAND TOTALS', 18, y + 6);
+      doc.text(fmt(payrollTotals.basic), 90, y + 6, { align: 'right' });
+      doc.setTextColor(4, 120, 87);
+      doc.text(`+${fmt(payrollTotals.additions)}`, 95, y + 6);
+      doc.setTextColor(190, 18, 60);
+      doc.text(`-${fmt(payrollTotals.deductions)}`, 168, y + 6);
+      doc.setTextColor(15, 23, 42);
+      doc.text(fmt(payrollTotals.net), 252, y + 6, { align: 'right' });
+
+      y += 18;
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.5);
+      doc.setTextColor(100, 116, 139);
+      doc.text('Prepared By (HR / Payroll): ____________________________', 15, y);
+      doc.text('Approved By (Managing Director): ____________________________', 150, y);
+
+      await exportAndSharePdf(`Payroll_Register_${selectedPayPeriod}.pdf`, doc);
+      notifyPayroll('success', `Payroll Register PDF generated for ${formatPayPeriodLabel(selectedPayPeriod)}.`);
+    } catch (err) {
+      notifyPayroll('error', `Could not export Payroll Register PDF: ${String(err)}`);
+    }
+  };
+
+  // Generate Attendance Shifts or Staff Roster PDF with Company Logo
+  const handlePrintPayrollPDF = async () => {
+    if (activeSubTab === 'payroll') {
+      await handleDownloadPayrollRegisterPdf();
+      return;
+    }
+    try {
+      const doc = new jsPDF({ format: 'a4', orientation: 'portrait' });
+      const curr = settings.currency || 'K';
+      const title =
+        activeSubTab === 'clock'
+          ? 'STAFF SHIFT ATTENDANCE & HOURLY WAGES REPORT'
+          : 'CORPORATE STAFF DIRECTORY & PAYROLL ROSTER';
+      let y = await drawCompanyPdfHeader(doc, title, `GENERATED: ${new Date().toLocaleDateString()}`);
+
+      if (activeSubTab === 'clock') {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8.5);
+        doc.setTextColor(51, 65, 85);
+        doc.text('STAFF NAME', 18, y);
+        doc.text('DATE', 75, y);
+        doc.text('HOURS', 115, y, { align: 'right' });
+        doc.text('WAGES', 155, y, { align: 'right' });
+        doc.text('STATUS', 190, y, { align: 'right' });
+        y += 3;
+        doc.line(15, y, 195, y);
+        y += 5;
+
+        records.forEach((rec) => {
+          if (y > 272) {
+            doc.addPage();
+            y = 20;
+          }
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(8.5);
+          doc.setTextColor(30, 41, 59);
+          doc.text(String(rec.employee_name || '').slice(0, 30), 18, y);
+          doc.text(String(rec.date || ''), 75, y);
+          doc.text(`${Number(rec.hours_worked || 0).toFixed(2)}h`, 115, y, { align: 'right' });
+          doc.text(`${curr}${Number(rec.gross_payment || 0).toFixed(2)}`, 155, y, { align: 'right' });
+          doc.text(String(rec.status || 'PENDING'), 190, y, { align: 'right' });
+          y += 6;
+        });
+      } else {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(8.5);
+        doc.setTextColor(51, 65, 85);
+        doc.text('STAFF NAME', 18, y);
+        doc.text('CONTACT', 80, y);
+        doc.text('JOINED', 140, y);
+        doc.text('BASIC SALARY', 190, y, { align: 'right' });
+        y += 3;
+        doc.line(15, y, 195, y);
+        y += 5;
+
+        staffList.forEach((st) => {
+          if (y > 272) {
+            doc.addPage();
+            y = 20;
+          }
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(8.5);
+          doc.setTextColor(30, 41, 59);
+          doc.text(`${st.first_name || st.name || ''} ${st.surname || ''}`.trim().slice(0, 28), 18, y);
+          doc.text(String(st.contact || st.email || '').slice(0, 26), 80, y);
+          doc.text(String(st.joining_date || ''), 140, y);
+          doc.text(`${curr}${Number(st.basic_salary || 0).toFixed(2)}`, 190, y, { align: 'right' });
+          y += 6;
+        });
+      }
+
+      await exportAndSharePdf(
+        `${activeSubTab === 'clock' ? 'Attendance_Report' : 'Staff_Roster'}_${new Date().toISOString().split('T')[0]}.pdf`,
+        doc
+      );
+    } catch (err) {
+      notifyPayroll('error', `Could not generate PDF: ${String(err)}`);
+    }
   };
 
   return (
@@ -488,16 +1578,30 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
       <div className="px-5 py-4 bg-white border-b border-slate-200 flex flex-wrap justify-between items-center gap-3">
         <div className="flex items-center gap-2.5">
           <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
-            <Clock size={20} />
+            <Users size={20} />
           </div>
           <div>
-            <h2 className="text-md font-bold text-slate-800">Time Clock, Payroll & Roles</h2>
-            <p className="text-[11px] text-slate-400 font-semibold uppercase tracking-wider">Attendance Ledger & Dual Dynamic Permissions Matrix</p>
+            <h2 className="text-md font-bold text-slate-800">Staff Management, Payroll & Roles</h2>
+            <p className="text-[11px] text-slate-400 font-semibold uppercase tracking-wider">Salary Adjustments, Payslips, Attendance & Permissions</p>
           </div>
         </div>
 
         {/* Tab Navigation selectors */}
-        <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200/60 max-w-full">
+        <div className="flex flex-wrap bg-slate-100 p-1 rounded-xl border border-slate-200/60 max-w-full gap-1">
+          <button
+            onClick={() => {
+              loadPayrollEntries(selectedPayPeriod, staffList);
+              setActiveSubTab('payroll');
+            }}
+            className={`px-4 py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+              activeSubTab === 'payroll'
+                ? 'bg-white text-indigo-600 shadow-sm'
+                : 'text-slate-500 hover:text-slate-900'
+            }`}
+          >
+            <Banknote size={13} />
+            Salary Payroll & Payslips
+          </button>
           <button
             onClick={() => setActiveSubTab('clock')}
             className={`px-4 py-2 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
@@ -507,7 +1611,7 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
             }`}
           >
             <Clock size={13} />
-            Shifts & Payouts
+            Shifts & Duty Clock
           </button>
           <button
             onClick={() => {
@@ -528,12 +1632,27 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
 
         <button
           onClick={handlePrintPayrollPDF}
-          className="flex items-center gap-1.5 px-3.5 py-2 border border-slate-250 hover:bg-slate-50 text-slate-600 rounded-lg text-xs font-bold cursor-pointer"
+          className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-xs font-bold cursor-pointer shadow-xs"
         >
           <Printer size={13} />
-          PRINT REPORT (PDF)
+          {activeSubTab === 'payroll' ? 'PAYROLL PDF (WITH LOGO)' : 'EXPORT REPORT PDF'}
         </button>
       </div>
+
+      {payrollFeedback && (
+        <div
+          className={`mx-5 mt-3 px-4 py-2.5 rounded-xl border text-xs font-bold flex items-center justify-between ${
+            payrollFeedback.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-rose-50 border-rose-200 text-rose-800'
+          }`}
+        >
+          <span>{payrollFeedback.text}</span>
+          <button onClick={() => setPayrollFeedback(null)} className="p-0.5 hover:opacity-70 cursor-pointer">
+            <X size={14} />
+          </button>
+        </div>
+      )}
 
       {successNote && (
         <div className="mx-5 mt-4 p-3.5 bg-indigo-900 text-amber-300 font-bold text-xs rounded-xl shadow-md animate-bounce flex items-center gap-2">
@@ -752,6 +1871,258 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
           </div>
 
         </div>
+      ) : activeSubTab === 'payroll' ? (
+        /* SALARY PAYROLL & ADJUSTMENTS TAB SECTION */
+        <div className="flex-1 p-5 overflow-y-auto flex flex-col gap-4">
+          {/* Top Controls Bar */}
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-3xs flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2 bg-slate-50 border border-slate-300 rounded-xl px-3 py-1.5">
+                <Calendar size={14} className="text-indigo-600" />
+                <span className="text-[10px] font-black uppercase text-slate-500">Pay Period:</span>
+                <input
+                  type="month"
+                  value={selectedPayPeriod}
+                  onChange={(e) => setSelectedPayPeriod(e.target.value)}
+                  className="bg-transparent text-xs font-black text-slate-800 focus:outline-hidden cursor-pointer"
+                />
+              </div>
+
+              <div className="relative">
+                <Search size={13} className="absolute left-2.5 top-2.5 text-slate-400" />
+                <input
+                  type="text"
+                  value={payrollSearch}
+                  onChange={(e) => setPayrollSearch(e.target.value)}
+                  placeholder="Search employee..."
+                  className="pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-semibold text-slate-800 focus:outline-hidden w-48"
+                />
+              </div>
+
+              <select
+                value={payrollStatusFilter}
+                onChange={(e) => setPayrollStatusFilter(e.target.value as 'ALL' | 'DRAFT' | 'PAID')}
+                className="bg-slate-50 border border-slate-300 rounded-xl px-3 py-1.5 text-xs font-bold text-slate-700"
+              >
+                <option value="ALL">All Statuses</option>
+                <option value="DRAFT">Draft / Pending</option>
+                <option value="PAID">Paid</option>
+              </select>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleSyncBasicSalariesFromStaff}
+                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw size={13} />
+                <span>Sync Staff Salaries</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowAddCustomPayrollModal(true)}
+                className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-extrabold flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <Plus size={14} />
+                <span>Add Employee Payroll</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadPayrollRegisterPdf}
+                className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-extrabold flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <Download size={14} />
+                <span>Full Payroll PDF</span>
+              </button>
+            </div>
+          </div>
+
+          {/* 4 Summary KPI Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-3xs">
+              <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block">
+                Total Basic Salaries ({filteredPayrollEntries.length} staff)
+              </span>
+              <span className="text-xl font-black font-mono text-slate-900 mt-1 block">
+                {settings.currency}{payrollTotals.basic.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-emerald-200 shadow-3xs">
+              <span className="text-[10px] font-black uppercase text-emerald-700 tracking-wider block">
+                Total Additions (Bonuses & Allowances)
+              </span>
+              <span className="text-xl font-black font-mono text-emerald-700 mt-1 block">
+                +{settings.currency}{payrollTotals.additions.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </div>
+
+            <div className="bg-white p-4 rounded-xl border border-rose-200 shadow-3xs">
+              <span className="text-[10px] font-black uppercase text-rose-700 tracking-wider block">
+                Total Deductions (Advances, Tax, Loans)
+              </span>
+              <span className="text-xl font-black font-mono text-rose-700 mt-1 block">
+                -{settings.currency}{payrollTotals.deductions.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </div>
+
+            <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-800 shadow-md">
+              <span className="text-[10px] font-black uppercase text-emerald-300 tracking-wider block">
+                Net Payroll Payable ({payrollTotals.paidCount}/{filteredPayrollEntries.length} Paid)
+              </span>
+              <span className="text-xl font-black font-mono text-white mt-1 block">
+                {settings.currency}{payrollTotals.net.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </div>
+          </div>
+
+          {/* Payroll Table */}
+          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-3xs flex flex-col gap-3">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+              <div>
+                <h3 className="text-xs font-black text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
+                  <Banknote size={14} className="text-indigo-600" />
+                  <span>{formatPayPeriodLabel(selectedPayPeriod)} — Employee Salaries, Additions & Deductions</span>
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  Add bonuses, housing/transport allowances, overtime or deduct salary advances, PAYE, NAPSA, and loans before generating official payslip PDFs.
+                </p>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-100 text-slate-600 font-black uppercase text-[10px] border-b border-slate-200">
+                    <th className="py-2.5 px-3">Employee</th>
+                    <th className="py-2.5 px-3 text-right">Basic Salary</th>
+                    <th className="py-2.5 px-3">Additions (+)</th>
+                    <th className="py-2.5 px-3">Deductions (-)</th>
+                    <th className="py-2.5 px-3 text-right">Net Salary</th>
+                    <th className="py-2.5 px-3">Account & Status</th>
+                    <th className="py-2.5 px-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
+                  {filteredPayrollEntries.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-10 text-center text-slate-400 text-xs">
+                        <div className="flex flex-col items-center gap-2">
+                          <Banknote size={28} className="text-slate-300" />
+                          <span>
+                            No payroll entries yet for {formatPayPeriodLabel(selectedPayPeriod)}. Onboard staff in Staff Directory or click &ldquo;Add Employee Payroll&rdquo;.
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredPayrollEntries.map((entry) => {
+                      const accLabel = accountLabelLookup.get(entry.payment_account_id) || entry.payment_account_id;
+                      return (
+                        <tr key={entry.id} className="hover:bg-slate-50/70 align-top">
+                          <td className="py-3 px-3">
+                            <div className="font-black text-slate-900">{entry.employee_name}</div>
+                            <div className="text-[10px] text-slate-500 font-medium">{entry.employee_role}</div>
+                          </td>
+                          <td className="py-3 px-3 text-right font-mono font-bold text-slate-800 whitespace-nowrap">
+                            {settings.currency}{entry.basic_salary.toFixed(2)}
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-mono font-black text-emerald-700">
+                              +{settings.currency}{entry.total_additions.toFixed(2)}
+                            </div>
+                            {entry.additions.length > 0 && (
+                              <div className="text-[10px] text-emerald-800/80 space-y-0.5 mt-1">
+                                {entry.additions.map((a) => (
+                                  <div key={a.id} className="truncate max-w-[200px]">
+                                    • {a.description}: +{settings.currency}{a.amount.toFixed(2)}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-mono font-black text-rose-700">
+                              -{settings.currency}{entry.total_deductions.toFixed(2)}
+                            </div>
+                            {entry.deductions.length > 0 && (
+                              <div className="text-[10px] text-rose-800/80 space-y-0.5 mt-1">
+                                {entry.deductions.map((d) => (
+                                  <div key={d.id} className="truncate max-w-[200px]">
+                                    • {d.description}: -{settings.currency}{d.amount.toFixed(2)}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right font-mono font-black text-slate-900 text-sm whitespace-nowrap">
+                            {settings.currency}{entry.net_salary.toFixed(2)}
+                          </td>
+                          <td className="py-3 px-3">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                entry.status === 'PAID'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : 'bg-amber-100 text-amber-800'
+                              }`}
+                            >
+                              {entry.status === 'PAID' ? <CheckCircle2 size={10} /> : null}
+                              {entry.status}
+                            </span>
+                            <div className="text-[10px] text-slate-500 mt-1 truncate max-w-[140px]">{accLabel}</div>
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => openPayrollEditor(entry)}
+                                className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-[10.5px] font-extrabold cursor-pointer flex items-center gap-1"
+                              >
+                                <Calculator size={11} />
+                                <span>Add / Deduct</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDownloadPayslipPdf(entry)}
+                                className="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-lg text-[10.5px] font-extrabold cursor-pointer flex items-center gap-1"
+                                title="Download Employee Payslip PDF with Company Logo"
+                              >
+                                <FileText size={11} />
+                                <span>Payslip PDF</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleTogglePayStatus(entry)}
+                                className={`px-2.5 py-1.5 rounded-lg text-[10.5px] font-extrabold cursor-pointer border ${
+                                  entry.status === 'PAID'
+                                    ? 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200'
+                                    : 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-600'
+                                }`}
+                              >
+                                {entry.status === 'PAID' ? 'Paid ✓' : 'Mark Paid'}
+                              </button>
+                              {entry.status === 'DRAFT' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeletePayrollEntry(entry)}
+                                  className="p-1.5 text-rose-500 hover:bg-rose-50 rounded-lg cursor-pointer"
+                                  title="Remove Draft Entry"
+                                >
+                                  <Trash size={12} />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       ) : (
         /* ROSTER DIRECTORY TAB SECTION */
         <div className="flex-1 p-5 overflow-y-auto flex flex-col gap-4">
@@ -798,10 +2169,20 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
                       <div>
                         <h4 className="text-sm font-black text-slate-800">{st.first_name || st.name || 'Staff'} {st.surname || ''}</h4>
                         <span className="text-[10px] bg-indigo-50 font-semibold px-2 py-0.5 text-indigo-700 rounded-full mt-1 inline-block uppercase">
-                          K{st.basic_salary ?? 0}/mo Basic
+                          {settings.currency}{st.basic_salary ?? 0}/mo Basic
                         </span>
                       </div>
                       <div className="flex gap-1">
+                        <button
+                          onClick={() => {
+                            loadPayrollEntries(selectedPayPeriod, staffList);
+                            setActiveSubTab('payroll');
+                          }}
+                          className="p-1 hover:bg-emerald-50 text-emerald-700 rounded cursor-pointer"
+                          title="Open Payroll & Payslip"
+                        >
+                          <Banknote size={13} />
+                        </button>
                         <button
                           onClick={() => handleEditStaff(st)}
                           className="p-1 hover:bg-slate-100 text-indigo-600 rounded cursor-pointer"
@@ -1492,6 +2873,431 @@ export default function AttendancePayroll({ settings, userRole = 'owner' }: Atte
               </button>
             </div>
           </motion.div>
+        </div>
+      )}
+
+      {/* SALARY ADDITIONS & DEDUCTIONS EDITOR MODAL */}
+      {editingPayroll && (
+        <div className="absolute inset-0 bg-slate-950/75 backdrop-blur-3xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <motion.div
+            initial={{ scale: 0.96, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="w-full max-w-4xl bg-white border border-slate-200 rounded-2xl p-5 flex flex-col gap-4 shadow-2xl max-h-[92vh] overflow-y-auto"
+          >
+            <div className="flex justify-between items-start border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-2">
+                  <Calculator size={16} className="text-indigo-600" />
+                  <span>Salary Adjustments — {editingPayroll.employee_name}</span>
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {editingPayroll.employee_role} • Pay Period: <span className="font-bold text-slate-700">{formatPayPeriodLabel(editingPayroll.pay_period)}</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingPayroll(null)}
+                className="p-1.5 text-slate-400 hover:text-slate-900 bg-slate-100 rounded-lg cursor-pointer"
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            {/* Basic Salary & Payment Details */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs">
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">
+                  Basic Monthly Salary ({settings.currency})
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  value={draftBasicSalary}
+                  onChange={(e) => setDraftBasicSalary(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 font-mono font-black text-slate-900"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">
+                  Disbursement Account
+                </label>
+                <select
+                  value={draftPayAccount}
+                  onChange={(e) => setDraftPayAccount(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 font-bold text-slate-800"
+                >
+                  {selectableAccounts.map((acc) => (
+                    <option key={acc.accountId} value={acc.accountId}>
+                      {acc.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">
+                  Payment Date
+                </label>
+                <input
+                  type="date"
+                  value={draftPayDate}
+                  onChange={(e) => setDraftPayDate(e.target.value)}
+                  className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 font-bold text-slate-800"
+                />
+              </div>
+            </div>
+
+            {/* Two-Column Additions & Deductions Builders */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* ADDITIONS (+) */}
+              <div className="bg-emerald-50/40 border border-emerald-200 rounded-xl p-4 flex flex-col gap-3">
+                <div className="flex items-center justify-between border-b border-emerald-200/70 pb-2">
+                  <span className="text-xs font-black uppercase text-emerald-900 flex items-center gap-1.5">
+                    <PlusCircle size={14} className="text-emerald-600" />
+                    Add to Salary (Bonuses & Allowances)
+                  </span>
+                  <span className="font-mono font-black text-xs text-emerald-700">
+                    +{settings.currency}{draftAdditions.reduce((s, x) => s + x.amount, 0).toFixed(2)}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                  <select
+                    value={newAddCategory}
+                    onChange={(e) => setNewAddCategory(e.target.value)}
+                    className="bg-white border border-emerald-200 rounded-lg px-2 py-1.5 font-bold text-slate-800"
+                  >
+                    {ADDITION_CATEGORIES.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    placeholder="Note (optional)"
+                    value={newAddDescription}
+                    onChange={(e) => setNewAddDescription(e.target.value)}
+                    className="bg-white border border-emerald-200 rounded-lg px-2.5 py-1.5 text-slate-800"
+                  />
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="Amount"
+                      value={newAddAmount}
+                      onChange={(e) => setNewAddAmount(e.target.value)}
+                      className="w-full bg-white border border-emerald-200 rounded-lg px-2 py-1.5 font-mono font-bold text-slate-900"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAddAdditionItem}
+                      className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-black cursor-pointer shrink-0"
+                    >
+                      + Add
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 max-h-44 overflow-y-auto">
+                  {draftAdditions.length === 0 ? (
+                    <p className="text-[11px] text-slate-400 italic py-2">
+                      No bonuses or allowances added yet.
+                    </p>
+                  ) : (
+                    draftAdditions.map((item) => (
+                      <div
+                        key={item.id}
+                        className="flex items-center justify-between bg-white border border-emerald-100 rounded-lg px-3 py-1.5 text-xs"
+                      >
+                        <div>
+                          <span className="font-bold text-slate-800">{item.category}</span>
+                          {item.description !== item.category && (
+                            <span className="text-slate-500 ml-1.5">({item.description})</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-black text-emerald-700">
+                            +{settings.currency}{item.amount.toFixed(2)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setDraftAdditions((prev) => prev.filter((x) => x.id !== item.id))}
+                            className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* DEDUCTIONS (-) */}
+              <div className="bg-rose-50/40 border border-rose-200 rounded-xl p-4 flex flex-col gap-3">
+                <div className="flex items-center justify-between border-b border-rose-200/70 pb-2">
+                  <span className="text-xs font-black uppercase text-rose-900 flex items-center gap-1.5">
+                    <MinusCircle size={14} className="text-rose-600" />
+                    Deduct from Salary (Advances, Tax, Loans)
+                  </span>
+                  <span className="font-mono font-black text-xs text-rose-700">
+                    -{settings.currency}{draftDeductions.reduce((s, x) => s + x.amount, 0).toFixed(2)}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                  <select
+                    value={newDedCategory}
+                    onChange={(e) => setNewDedCategory(e.target.value)}
+                    className="bg-white border border-rose-200 rounded-lg px-2 py-1.5 font-bold text-slate-800"
+                  >
+                    {DEDUCTION_CATEGORIES.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    placeholder="Note (optional)"
+                    value={newDedDescription}
+                    onChange={(e) => setNewDedDescription(e.target.value)}
+                    className="bg-white border border-rose-200 rounded-lg px-2.5 py-1.5 text-slate-800"
+                  />
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      step="0.01"
+                      placeholder="Amount"
+                      value={newDedAmount}
+                      onChange={(e) => setNewDedAmount(e.target.value)}
+                      className="w-full bg-white border border-rose-200 rounded-lg px-2 py-1.5 font-mono font-bold text-slate-900"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAddDeductionItem}
+                      className="px-2.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg font-black cursor-pointer shrink-0"
+                    >
+                      - Deduct
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 max-h-44 overflow-y-auto">
+                  {draftDeductions.length === 0 ? (
+                    <p className="text-[11px] text-slate-400 italic py-2">
+                      No salary advances or deductions applied yet.
+                    </p>
+                  ) : (
+                    draftDeductions.map((item) => (
+                      <div
+                        key={item.id}
+                        className="flex items-center justify-between bg-white border border-rose-100 rounded-lg px-3 py-1.5 text-xs"
+                      >
+                        <div>
+                          <span className="font-bold text-slate-800">{item.category}</span>
+                          {item.description !== item.category && (
+                            <span className="text-slate-500 ml-1.5">({item.description})</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-black text-rose-700">
+                            -{settings.currency}{item.amount.toFixed(2)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setDraftDeductions((prev) => prev.filter((x) => x.id !== item.id))}
+                            className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Notes & Live Summary Strip */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-center">
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">
+                  Payslip Remarks / Notes (Printed on PDF)
+                </label>
+                <input
+                  type="text"
+                  value={draftNotes}
+                  onChange={(e) => setDraftNotes(e.target.value)}
+                  placeholder="e.g. Monthly salary settlement including sales bonus & advance recovery"
+                  className="w-full bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800"
+                />
+              </div>
+
+              {(() => {
+                const b = Math.max(0, parseFloat(draftBasicSalary) || 0);
+                const a = draftAdditions.reduce((s, x) => s + x.amount, 0);
+                const d = draftDeductions.reduce((s, x) => s + x.amount, 0);
+                const g = b + a;
+                const net = g - d;
+                return (
+                  <div className="bg-slate-900 text-white rounded-xl px-4 py-3 flex items-center justify-between">
+                    <div className="text-[11px] space-y-0.5 text-slate-300">
+                      <div>Gross: <span className="font-mono font-bold text-white">{settings.currency}{g.toFixed(2)}</span></div>
+                      <div>Deductions: <span className="font-mono font-bold text-rose-300">-{settings.currency}{d.toFixed(2)}</span></div>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[10px] font-black uppercase text-emerald-300 block">Net Take-Home</span>
+                      <span className="text-xl font-black font-mono text-white">
+                        {settings.currency}{net.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setEditingPayroll(null)}
+                className="px-4 py-2 border border-slate-200 text-slate-600 rounded-xl text-xs font-bold hover:bg-slate-50 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => savePayrollEditorChanges()}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-extrabold cursor-pointer"
+              >
+                Save Changes
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const saved = savePayrollEditorChanges();
+                  if (saved) await handleDownloadPayslipPdf(saved);
+                }}
+                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-extrabold cursor-pointer flex items-center gap-1.5"
+              >
+                <FileText size={13} />
+                <span>Save & Payslip PDF</span>
+              </button>
+              {editingPayroll.status !== 'PAID' && (
+                <button
+                  type="button"
+                  onClick={() => savePayrollEditorChanges('PAID')}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-extrabold cursor-pointer"
+                >
+                  Save & Mark Paid
+                </button>
+              )}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* ADD AD-HOC EMPLOYEE PAYROLL MODAL */}
+      {showAddCustomPayrollModal && (
+        <div className="absolute inset-0 bg-slate-950/75 backdrop-blur-3xs flex items-center justify-center p-4 z-50">
+          <form
+            onSubmit={handleCreateCustomPayroll}
+            className="w-full max-w-md bg-white border border-slate-200 rounded-2xl p-5 shadow-2xl space-y-4"
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+              <h3 className="text-sm font-black uppercase text-slate-900">
+                Add Employee to {formatPayPeriodLabel(selectedPayPeriod)} Payroll
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowAddCustomPayrollModal(false)}
+                className="p-1 bg-slate-100 rounded-lg text-slate-500 cursor-pointer"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">Employee Full Name *</label>
+                <input
+                  type="text"
+                  required
+                  value={customEmpName}
+                  onChange={(e) => setCustomEmpName(e.target.value)}
+                  placeholder="e.g. Chanda Mulenga"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 font-bold text-slate-900"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">Role / Designation</label>
+                <input
+                  type="text"
+                  value={customEmpRole}
+                  onChange={(e) => setCustomEmpRole(e.target.value)}
+                  placeholder="e.g. Cashier / Driver"
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 font-semibold text-slate-800"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-black uppercase text-slate-500 mb-1">
+                  Basic Monthly Salary ({settings.currency}) *
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  required
+                  value={customEmpSalary}
+                  onChange={(e) => setCustomEmpSalary(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 font-mono font-black text-slate-900"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowAddCustomPayrollModal(false)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-extrabold cursor-pointer"
+              >
+                Add to Payroll
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* IN-UI CONFIRMATION MODAL FOR PAYROLL ACTIONS */}
+      {payrollConfirmAction && (
+        <div className="absolute inset-0 bg-slate-950/75 backdrop-blur-3xs flex items-center justify-center p-4 z-50">
+          <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl p-5 shadow-2xl space-y-4">
+            <h3 className="text-sm font-black uppercase text-slate-900">{payrollConfirmAction.title}</h3>
+            <p className="text-xs text-slate-600 leading-relaxed">{payrollConfirmAction.message}</p>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setPayrollConfirmAction(null)}
+                className="px-4 py-2 border border-slate-200 rounded-xl text-xs font-bold text-slate-600 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const fn = payrollConfirmAction.onConfirm;
+                  setPayrollConfirmAction(null);
+                  fn();
+                }}
+                className={`px-4 py-2 text-white rounded-xl text-xs font-extrabold cursor-pointer ${
+                  payrollConfirmAction.tone === 'emerald'
+                    ? 'bg-emerald-600 hover:bg-emerald-700'
+                    : 'bg-rose-600 hover:bg-rose-700'
+                }`}
+              >
+                {payrollConfirmAction.confirmLabel}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

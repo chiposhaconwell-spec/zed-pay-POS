@@ -2500,7 +2500,7 @@ export default function App() {
                     transition={{ duration: 0.15 }}
                     className="flex-1 flex flex-col overflow-hidden"
                   >
-                    <AttendancePayroll settings={settings} userRole={userRole} />
+                    <AttendancePayroll settings={settings} userRole={userRole} activeStore={activeStore} />
                   </motion.div>
                 )}
 
@@ -3132,10 +3132,10 @@ export default function App() {
                       <div className="p-1.5 rounded-lg bg-emerald-700 text-white shadow-xs group-hover:scale-105 transition-transform">
                         <FileText size={16} />
                       </div>
-                      <span>Profit & Loss Statements</span>
+                      <span>Financial Statements</span>
                     </div>
                     <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 text-[9px] font-extrabold rounded-full font-mono">
-                      P&L
+                      FIN
                     </span>
                   </button>
 

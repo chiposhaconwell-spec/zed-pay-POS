@@ -113,6 +113,9 @@ interface FinancialSummary {
   totalRevenue: number;
   totalCogs: number;
   grossProfit: number;
+  rentExpense: number;
+  utilitiesExpense: number;
+  generalOperatingExpense: number;
   totalOperatingExpenses: number;
   totalPayroll: number;
   totalExpenses: number;
@@ -136,6 +139,8 @@ interface FinancialSummary {
   investingCashFlow: number;
   financingCashFlow: number;
   netCashFlow: number;
+  beginningCashBalance: number;
+  closingCashBalance: number;
 }
 
 const ASSET_CLASSES: Asset['type'][] = [
@@ -164,6 +169,9 @@ const EMPTY_FINANCIALS: FinancialSummary = {
   totalRevenue: 0,
   totalCogs: 0,
   grossProfit: 0,
+  rentExpense: 0,
+  utilitiesExpense: 0,
+  generalOperatingExpense: 0,
   totalOperatingExpenses: 0,
   totalPayroll: 0,
   totalExpenses: 0,
@@ -187,6 +195,8 @@ const EMPTY_FINANCIALS: FinancialSummary = {
   investingCashFlow: 0,
   financingCashFlow: 0,
   netCashFlow: 0,
+  beginningCashBalance: 0,
+  closingCashBalance: 0,
 };
 
 export default function FinanceDashboard({ settings, userRole, activeStore }: FinanceDashboardProps) {
@@ -270,6 +280,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
   const [statementItems, setStatementItems] = useState<any[]>([]);
   const [statementProducts, setStatementProducts] = useState<any[]>([]);
   const [statementAttendance, setStatementAttendance] = useState<any[]>([]);
+  const [statementPayrollEntries, setStatementPayrollEntries] = useState<any[]>([]);
 
   // Standardized Asset Form states (Add & Edit)
   const [showAssetForm, setShowAssetForm] = useState<boolean>(false);
@@ -448,6 +459,13 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       'Finance: Fetch paid payroll'
     );
     if (attRes.success && Array.isArray(attRes.data)) setStatementAttendance(attRes.data);
+
+    const payRes = runSql(
+      `SELECT * FROM payroll_entries WHERE status = 'PAID' ${bizAnd}`,
+      'Finance: Fetch paid salary payroll entries',
+      true
+    );
+    if (payRes.success && Array.isArray(payRes.data)) setStatementPayrollEntries(payRes.data);
 
     // 5. Load Live Account Balances scoped to active business
     setAccountBalances(getTenantAccountBalances(activeBizId));
@@ -1246,31 +1264,6 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       totalEquityVal: sumRowField('total_equity'),
     };
 
-    // 2. If All-Time and snapshot rows exist, use exact synchronized ledger numbers
-    if (selectedPeriod === 'all_time' && matchingStmtRows.length > 0) {
-      const opEx = sumRowField('operating_expenses');
-      const payroll = sumRowField('payroll_expenses');
-      return {
-        grossSales: sumRowField('gross_sales_revenue'),
-        salesRefunds: sumRowField('sales_returns_refunds'),
-        discountsAllowed: sumRowField('discounts_allowed'),
-        vatCollected: sumRowField('vat_tax_collected'),
-        totalRevenue: sumRowField('net_sales_revenue'),
-        totalCogs: sumRowField('cost_of_goods_sold'),
-        grossProfit: sumRowField('gross_profit'),
-        totalOperatingExpenses: opEx,
-        totalPayroll: payroll,
-        totalExpenses: opEx + payroll,
-        netProfit: sumRowField('net_operating_income'),
-        ...balanceSheetPart,
-        operatingCashFlow: sumRowField('operating_cash_flow'),
-        investingCashFlow: sumRowField('investing_cash_flow'),
-        financingCashFlow: sumRowField('financing_cash_flow'),
-        netCashFlow: sumRowField('net_cash_flow'),
-      };
-    }
-
-    // 3. Period-filtered P&L & Cash Flow (This Month / Last Month / Quarter / Year / Custom Date Range)
     const isInPeriod = (rawDate: any) => {
       if (periodMeta.startMs === null && periodMeta.endMs === null) return true;
       const ms = Date.parse(String(rawDate || ''));
@@ -1280,6 +1273,68 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       return true;
     };
 
+    const computeExpenseBreakdown = (expectedOpExTotal: number, filterByPeriod: boolean) => {
+      let rentRaw = 0;
+      let utilRaw = 0;
+      allExpensesRaw.forEach((ex) => {
+        if (!matchScope(ex.store_id)) return;
+        if (filterByPeriod && !isInPeriod(ex.expense_date || ex.created_at)) return;
+        const amt = Number(ex.amount || 0);
+        const cat = String(ex.category || '').toLowerCase();
+        if (cat.includes('rent') || cat.includes('premises')) {
+          rentRaw += amt;
+        } else if (
+          cat.includes('utilit') ||
+          cat.includes('electric') ||
+          cat.includes('water') ||
+          cat.includes('internet') ||
+          cat.includes('telecom')
+        ) {
+          utilRaw += amt;
+        }
+      });
+      const rentExpense = Math.min(expectedOpExTotal, rentRaw);
+      const utilitiesExpense = Math.min(Math.max(0, expectedOpExTotal - rentExpense), utilRaw);
+      const generalOperatingExpense = Math.max(0, expectedOpExTotal - rentExpense - utilitiesExpense);
+      return { rentExpense, utilitiesExpense, generalOperatingExpense };
+    };
+
+    // 2. If All-Time and snapshot rows exist, use exact synchronized ledger numbers
+    if (selectedPeriod === 'all_time' && matchingStmtRows.length > 0) {
+      const opEx = sumRowField('operating_expenses');
+      const payroll = sumRowField('payroll_expenses');
+      const opCash = sumRowField('operating_cash_flow');
+      const invCash = sumRowField('investing_cash_flow');
+      const finCash = sumRowField('financing_cash_flow');
+      const netCash = sumRowField('net_cash_flow');
+      const closingCashBalance = balanceSheetPart.cashAndEquivalents;
+      const beginningCashBalance = closingCashBalance - netCash;
+      const expBreakdown = computeExpenseBreakdown(opEx, false);
+
+      return {
+        grossSales: sumRowField('gross_sales_revenue'),
+        salesRefunds: sumRowField('sales_returns_refunds'),
+        discountsAllowed: sumRowField('discounts_allowed'),
+        vatCollected: sumRowField('vat_tax_collected'),
+        totalRevenue: sumRowField('net_sales_revenue'),
+        totalCogs: sumRowField('cost_of_goods_sold'),
+        grossProfit: sumRowField('gross_profit'),
+        ...expBreakdown,
+        totalOperatingExpenses: opEx,
+        totalPayroll: payroll,
+        totalExpenses: opEx + payroll,
+        netProfit: sumRowField('net_operating_income'),
+        ...balanceSheetPart,
+        operatingCashFlow: opCash,
+        investingCashFlow: invCash,
+        financingCashFlow: finCash,
+        netCashFlow: netCash,
+        beginningCashBalance,
+        closingCashBalance,
+      };
+    }
+
+    // 3. Period-filtered P&L & Cash Flow (This Month / Last Month / Quarter / Year / Custom Date Range)
     let grossSales = 0;
     let salesRefunds = 0;
     let discountsAllowed = 0;
@@ -1315,10 +1370,16 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
     const totalOperatingExpenses = allExpensesRaw
       .filter((ex) => matchScope(ex.store_id) && isInPeriod(ex.expense_date || ex.created_at))
       .reduce((s, ex) => s + Number(ex.amount || 0), 0);
-    const totalPayroll = statementAttendance
+    const expBreakdown = computeExpenseBreakdown(totalOperatingExpenses, true);
+    const attendancePayroll = statementAttendance
       .filter(() => matchScope(defaultFallbackStore))
       .filter((a) => isInPeriod(a.date || a.created_at))
       .reduce((s, a) => s + Number(a.gross_payment || 0), 0);
+    const salaryPayroll = statementPayrollEntries
+      .filter((p) => matchScope(p.store_id))
+      .filter((p) => isInPeriod(p.payment_date || p.updated_at || p.created_at))
+      .reduce((s, p) => s + Math.max(0, Number(p.net_salary || 0)), 0);
+    const totalPayroll = attendancePayroll + salaryPayroll;
     const totalExpenses = totalOperatingExpenses + totalPayroll;
     const netProfit = grossProfit - totalExpenses;
 
@@ -1335,6 +1396,8 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       .filter((cf) => cf.activity_type === 'FINANCING')
       .reduce((s, cf) => s + Number(cf.net_cash_change || 0), 0);
     const netCashFlow = operatingCashFlow + investingCashFlow + financingCashFlow;
+    const closingCashBalance = balanceSheetPart.cashAndEquivalents;
+    const beginningCashBalance = closingCashBalance - netCashFlow;
 
     return {
       grossSales,
@@ -1344,6 +1407,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       totalRevenue,
       totalCogs,
       grossProfit,
+      ...expBreakdown,
       totalOperatingExpenses,
       totalPayroll,
       totalExpenses,
@@ -1353,100 +1417,204 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
       investingCashFlow,
       financingCashFlow,
       netCashFlow,
+      beginningCashBalance,
+      closingCashBalance,
     };
   };
 
   const financials = calculateFinancialsForScope(activeScopeBranches);
 
-  const branchBreakdownRows = useMemo(() => {
-    const targetBranches =
-      activeScopeBranches === 'all'
-        ? storesList.map((s) => s.id)
-        : activeScopeBranches;
-    if (targetBranches.length <= 1) return [];
-    return targetBranches.map((branchId) => ({
-      branchId,
-      branchName: getBranchLabel(branchId),
-      metrics: calculateFinancialsForScope([branchId]),
-    }));
-  }, [
-    activeScopeBranches,
-    storesList,
-    allStatementRows,
-    selectedPeriod,
-    customDateFrom,
-    customDateTo,
-    statementOrders,
-    allExpensesRaw,
-    statementAttendance,
-    allCashFlowRows,
-  ]);
-
-  // Export Financial Statements PDF
+  // Export Financial Statements PDF (Formal 3-Page Financial Report Format)
   const handleExportPDF = () => {
     try {
       const doc = new jsPDF();
-      const ensureSpace = (needed = 16) => {
-        if (y + needed > 278) {
-          doc.addPage();
-          y = 18;
-        }
+      const storeName = (settings.storeName || 'POS MERCHANT').toUpperCase();
+      const curr = settings.currency || 'K';
+      const fmt = (n: number) =>
+        `${n < 0 ? '-' : ''}${curr}${Math.abs(n).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}`;
+
+      let y = 0;
+      const writeRow = (label: string, val: string, isBold = false) => {
+        doc.setFont('helvetica', isBold ? 'bold' : 'normal');
+        doc.setFontSize(9.5);
+        doc.setTextColor(30, 41, 59);
+        doc.text(label, 20, y);
+        doc.text(val, 190, y, { align: 'right' });
+        y += 6.5;
       };
 
+      // ================= PAGE 1: PROFIT & LOSS (INCOME STATEMENT) =================
+      doc.setFillColor(30, 41, 59);
+      doc.rect(0, 0, 210, 42, 'F');
+      doc.setTextColor(255, 255, 255);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(17);
+      doc.text(`${storeName} - FINANCIAL REPORT`, 15, 16);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      doc.text('FINANCIAL STATEMENTS (P&L, BALANCE SHEET & CASH FLOW)', 15, 23);
+      doc.text(
+        `REPORT PERIOD: ${periodMeta.label.toUpperCase()}  |  SCOPE: ${activeScopeLabel.toUpperCase()}`,
+        15,
+        30
+      );
+      doc.text(`GENERATED STAMP: ${new Date().toLocaleString()}`, 15, 36);
+
+      y = 54;
+      doc.setTextColor(30, 41, 59);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.text('I. PROFIT & LOSS ACCOUNT (INCOME STATEMENT)', 15, y);
+      doc.setDrawColor(203, 213, 225);
+      doc.line(15, y + 2, 195, y + 2);
+      y += 10;
+
+      writeRow('Gross POS Sales Revenue', fmt(financials.grossSales), true);
+      writeRow('Less: Sales Returns & Refunds', `(${fmt(financials.salesRefunds)})`);
+      writeRow('Less: Discounts Allowed', `(${fmt(financials.discountsAllowed)})`);
+      writeRow('Less: Output VAT Collected', `(${fmt(financials.vatCollected)})`);
+      writeRow('Net Sales Revenue', fmt(financials.totalRevenue), true);
+      writeRow('Less: Cost of Goods Sold (COGS)', `(${fmt(financials.totalCogs)})`);
+
+      doc.setDrawColor(148, 163, 184);
+      doc.line(15, y - 2, 195, y - 2);
+      y += 2;
+      writeRow('GROSS TRADING PROFIT', fmt(financials.grossProfit), true);
+      y += 4;
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9.5);
+      doc.setTextColor(71, 85, 105);
+      doc.text('OPERATING EXPENSES & OVERHEADS:', 20, y);
+      y += 6.5;
+
+      writeRow('Staff Payroll & Salaries Paid', `(${fmt(financials.totalPayroll)})`);
+      writeRow('Rent & Premises Allocations', `(${fmt(financials.rentExpense)})`);
+      writeRow('Electricity, Water & Utilities', `(${fmt(financials.utilitiesExpense)})`);
+      writeRow('General Operating & Administrative Expenses', `(${fmt(financials.generalOperatingExpense)})`);
+      writeRow('Total Operating Expenses & Payroll', `(${fmt(financials.totalExpenses)})`, true);
+
+      doc.setFillColor(241, 245, 249);
+      doc.rect(15, y - 1, 180, 11, 'F');
+      y += 6.5;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(11);
+      doc.setTextColor(15, 23, 42);
+      doc.text('NET OPERATING PROFIT / (LOSS)', 20, y);
+      doc.text(fmt(financials.netProfit), 190, y, { align: 'right' });
+
+      // ================= PAGE 2: STATEMENT OF FINANCIAL POSITION (BALANCE SHEET) =================
+      doc.addPage();
+      doc.setFillColor(30, 41, 59);
+      doc.rect(0, 0, 210, 30, 'F');
+      doc.setTextColor(255, 255, 255);
+      doc.setFont('helvetica', 'bold');
       doc.setFontSize(15);
-      doc.text(`${settings.storeName || 'POS Merchant'} — Financial Statements`, 14, 18);
-      doc.setFontSize(10);
-      doc.text(`Branch Scope: ${activeScopeLabel}`, 14, 25);
-      doc.text(`Period: ${periodMeta.label} | Generated: ${new Date().toLocaleString()}`, 14, 31);
+      doc.text('STATEMENT OF FINANCIAL POSITION (BALANCE SHEET)', 15, 18);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.5);
+      doc.text(`${storeName}  |  AS OF: ${new Date().toLocaleDateString()}  |  SCOPE: ${activeScopeLabel.toUpperCase()}`, 15, 24);
 
-      let y = 41;
+      y = 42;
+      doc.setTextColor(30, 41, 59);
+      doc.setFont('helvetica', 'bold');
       doc.setFontSize(11);
-      doc.text('I. PROFIT & LOSS (INCOME STATEMENT)', 14, y);
-      y += 6;
-      doc.setFontSize(9);
-      doc.text(`Gross Sales Revenue: ${settings.currency}${financials.grossSales.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`(-) Sales Returns & Refunds: -${settings.currency}${financials.salesRefunds.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`(-) Discounts & Output VAT: -${settings.currency}${(financials.discountsAllowed + financials.vatCollected).toFixed(2)}`, 18, y); y += 5;
-      doc.text(`Net Sales Revenue: ${settings.currency}${financials.totalRevenue.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`(-) Cost of Goods Sold (COGS): -${settings.currency}${financials.totalCogs.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`GROSS PROFIT: ${settings.currency}${financials.grossProfit.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`(-) Operating Expenses & Payroll: -${settings.currency}${financials.totalExpenses.toFixed(2)}`, 18, y); y += 6;
-      doc.text(`NET OPERATING PROFIT: ${settings.currency}${financials.netProfit.toFixed(2)}`, 18, y); y += 10;
+      doc.text('II. BALANCE SHEET — ASSETS', 15, y);
+      doc.setDrawColor(203, 213, 225);
+      doc.line(15, y + 2, 195, y + 2);
+      y += 9;
 
-      ensureSpace(45);
+      writeRow('Cash in Counter Drawer', fmt(financials.cashDrawerBalance));
+      writeRow('Mobile Money Wallets', fmt(financials.mobileMoneyBalance));
+      writeRow('Commercial Bank & Card Settlement', fmt(financials.bankCardBalance));
+      writeRow('Inventory Stock Asset Valuation (At Cost)', fmt(financials.inventoryAssetValue));
+      writeRow('Goods in Transit Asset', fmt(financials.goodsInTransitValue));
+      writeRow('Fixed Equipment & Property Assets (Net Book Value)', fmt(financials.fixedAssetsValue));
+      doc.line(15, y - 2, 195, y - 2);
+      y += 2;
+      writeRow('TOTAL ASSETS', fmt(financials.totalAssetVal), true);
+
+      y += 10;
+      doc.setFont('helvetica', 'bold');
       doc.setFontSize(11);
-      doc.text('II. BALANCE SHEET STATEMENT (POINT-IN-TIME POSITION)', 14, y); y += 6;
-      doc.setFontSize(9);
-      doc.text(`Cash Drawer: ${settings.currency}${financials.cashDrawerBalance.toFixed(2)} | Mobile Money: ${settings.currency}${financials.mobileMoneyBalance.toFixed(2)} | Bank/Card: ${settings.currency}${financials.bankCardBalance.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`Inventory Asset Valuation: ${settings.currency}${financials.inventoryAssetValue.toFixed(2)} | Goods in Transit: ${settings.currency}${financials.goodsInTransitValue.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`Fixed Assets (Net Book Value): ${settings.currency}${financials.fixedAssetsValue.toFixed(2)} | TOTAL ASSETS: ${settings.currency}${financials.totalAssetVal.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`Total Liabilities (VAT, Laybys, Loans): ${settings.currency}${financials.totalLiabilitiesVal.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`Total Equity (Owner Capital ${settings.currency}${financials.ownerCapitalEquity.toFixed(2)} + Retained Earnings ${settings.currency}${financials.retainedEarnings.toFixed(2)}): ${settings.currency}${financials.totalEquityVal.toFixed(2)}`, 18, y); y += 10;
+      doc.text('LIABILITIES & OWNER EQUITY', 15, y);
+      doc.line(15, y + 2, 195, y + 2);
+      y += 9;
 
-      ensureSpace(30);
+      writeRow('VAT / Tax Output Payable', fmt(financials.vatPayableLiability));
+      writeRow('Customer Layby Unearned Deposits', fmt(financials.laybyDepositsLiability));
+      writeRow('Working Capital Loans Payable', fmt(financials.loansPayableLiability));
+      writeRow('Total Liabilities', fmt(financials.totalLiabilitiesVal), true);
+      y += 2;
+
+      writeRow('Owner / Contributed Capital Equity', fmt(financials.ownerCapitalEquity));
+      writeRow('Retained Earnings & Reserves', fmt(financials.retainedEarnings));
+      writeRow('Total Owner Equity', fmt(financials.totalEquityVal), true);
+
+      doc.setFillColor(241, 245, 249);
+      doc.rect(15, y - 1, 180, 11, 'F');
+      y += 6.5;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(10.5);
+      doc.setTextColor(15, 23, 42);
+      doc.text('TOTAL LIABILITIES & EQUITY FUND BALANCE', 20, y);
+      doc.text(fmt(financials.totalLiabilitiesVal + financials.totalEquityVal), 190, y, { align: 'right' });
+
+      // ================= PAGE 3: CASH FLOW STATEMENT & SIGNATURES =================
+      doc.addPage();
+      doc.setFillColor(30, 41, 59);
+      doc.rect(0, 0, 210, 30, 'F');
+      doc.setTextColor(255, 255, 255);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(15);
+      doc.text('AUDITED CASH FLOW RECONCILIATION STATEMENT', 15, 18);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.5);
+      doc.text(`${storeName}  |  PERIOD: ${periodMeta.label.toUpperCase()}  |  SCOPE: ${activeScopeLabel.toUpperCase()}`, 15, 24);
+
+      y = 42;
+      doc.setTextColor(30, 41, 59);
+      doc.setFont('helvetica', 'bold');
       doc.setFontSize(11);
-      doc.text('III. CASH FLOW STATEMENT', 14, y); y += 6;
-      doc.setFontSize(9);
-      doc.text(`Operating Cash Flow: ${settings.currency}${financials.operatingCashFlow.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`Investing Cash Flow: ${settings.currency}${financials.investingCashFlow.toFixed(2)} | Financing Cash Flow: ${settings.currency}${financials.financingCashFlow.toFixed(2)}`, 18, y); y += 5;
-      doc.text(`NET CASH FLOW: ${settings.currency}${financials.netCashFlow.toFixed(2)}`, 18, y); y += 10;
+      doc.text('III. CASH FLOW STATEMENT (DIRECT METHOD)', 15, y);
+      doc.setDrawColor(203, 213, 225);
+      doc.line(15, y + 2, 195, y + 2);
+      y += 10;
 
-      if (branchBreakdownRows.length > 1) {
-        ensureSpace(25);
-        doc.setFontSize(11);
-        doc.text('IV. BRANCH-BY-BRANCH BREAKDOWN', 14, y);
-        y += 6;
-        doc.setFontSize(8.5);
-        branchBreakdownRows.forEach((row) => {
-          ensureSpace(10);
-          doc.text(
-            `${row.branchName}: Net Sales ${settings.currency}${row.metrics.totalRevenue.toFixed(2)} | Gross Profit ${settings.currency}${row.metrics.grossProfit.toFixed(2)} | Net Profit ${settings.currency}${row.metrics.netProfit.toFixed(2)} | Assets ${settings.currency}${row.metrics.totalAssetVal.toFixed(2)}`,
-            16,
-            y
-          );
-          y += 5;
-        });
-      }
+      writeRow('Net Cash Flow from Operating Activities', fmt(financials.operatingCashFlow));
+      writeRow('Net Cash Flow from Investing Activities', fmt(financials.investingCashFlow));
+      writeRow('Net Cash Flow from Financing Activities', fmt(financials.financingCashFlow));
+
+      doc.setDrawColor(30, 41, 59);
+      doc.setLineWidth(0.5);
+      doc.line(15, y - 2, 195, y - 2);
+      doc.setLineWidth(0.2);
+      y += 3;
+
+      writeRow('NET CHANGE IN CASH RESERVES', fmt(financials.netCashFlow), true);
+      writeRow('Cash Balance at Beginning of Period', fmt(financials.beginningCashBalance));
+
+      doc.setFillColor(236, 253, 245);
+      doc.rect(15, y - 1, 180, 12, 'F');
+      y += 7.5;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(11);
+      doc.setTextColor(6, 78, 59);
+      doc.text('CLOSING CASH & EQUIVALENTS BALANCE', 20, y);
+      doc.text(fmt(financials.closingCashBalance), 190, y, { align: 'right' });
+
+      y += 28;
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      doc.setTextColor(100, 116, 139);
+      doc.text('Prepared By / Store Accountant: ___________________________', 15, y);
+      doc.text('Date: ______________', 145, y);
+      y += 14;
+      doc.text('Managing Director / Store Representative: ___________________', 15, y);
+      doc.text('Date: ______________', 145, y);
 
       exportAndSharePdf(`Financial_Statements_${new Date().toISOString().split('T')[0]}.pdf`, doc);
       notifyFinance('success', 'Financial Statements PDF exported.');
@@ -1759,7 +1927,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
           }`}
         >
           <FileText size={14} />
-          <span>P&L, Balance Sheet & Cash Flow</span>
+          <span>Financial Statements</span>
         </button>
 
         <button
@@ -1863,7 +2031,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                 <div>
                   <h2 className="text-base md:text-lg font-black tracking-tight text-slate-900 uppercase flex items-center gap-2">
                     <FileText className="text-indigo-600" size={20} />
-                    <span>P&L Statement, Balance Sheet & Cash Flow</span>
+                    <span>Financial Statements (P&L, Balance Sheet & Cash Flow)</span>
                   </h2>
                   <p className="text-xs text-slate-500 font-medium">
                     Scope: <span className="font-bold text-indigo-700">{activeScopeLabel}</span> • Period:{' '}
@@ -2157,6 +2325,18 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     <span className="font-sans font-medium">(-) Staff Payroll & Wages Paid</span>
                     <span className="font-extrabold">-{settings.currency}{financials.totalPayroll.toFixed(2)}</span>
                   </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 text-rose-600 pl-3">
+                    <span className="font-sans font-medium">(-) Rent & Premises Allocations</span>
+                    <span className="font-extrabold">-{settings.currency}{financials.rentExpense.toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 text-rose-600 pl-3">
+                    <span className="font-sans font-medium">(-) Electricity, Water & Utilities</span>
+                    <span className="font-extrabold">-{settings.currency}{financials.utilitiesExpense.toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 text-rose-600 pl-3">
+                    <span className="font-sans font-medium">(-) General Operating & Admin Expenses</span>
+                    <span className="font-extrabold">-{settings.currency}{financials.generalOperatingExpense.toFixed(2)}</span>
+                  </div>
                   <div className={`flex justify-between py-2.5 px-3.5 rounded-xl font-black text-xs ${
                     financials.netProfit >= 0 ? 'bg-emerald-100 text-emerald-950 border border-emerald-300' : 'bg-rose-100 text-rose-950 border border-rose-300'
                   }`}>
@@ -2168,39 +2348,50 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
 
               {/* 2. BALANCE SHEET STATEMENT */}
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs space-y-3">
-                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5 gap-2">
                   <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">
                     2. BALANCE SHEET STATEMENT
                   </h3>
-                  <span className="text-[10px] font-bold px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-md border border-indigo-200">
-                    ASSETS = LIABILITIES + EQUITY
-                  </span>
+                  <div className="flex items-center gap-1.5">
+                    {Math.abs(financials.totalAssetVal - (financials.totalLiabilitiesVal + financials.totalEquityVal)) < 10 ? (
+                      <span className="text-[10px] font-black px-2 py-0.5 bg-emerald-50 text-emerald-700 rounded-md border border-emerald-200">
+                        BALANCED
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-black px-2 py-0.5 bg-amber-50 text-amber-700 rounded-md border border-amber-200">
+                        DISPARITY
+                      </span>
+                    )}
+                    <span className="text-[10px] font-bold px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-md border border-indigo-200">
+                      ASSETS = L + E
+                    </span>
+                  </div>
                 </div>
 
                 <div className="space-y-2 font-mono text-xs">
                   <div className="text-[10px] font-sans font-black uppercase text-slate-400 tracking-wider">Current & Fixed Assets</div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">💵 Cash in Counter Drawer (acc_cash)</span>
+                    <span className="font-sans font-medium text-slate-700">Cash in Counter Drawer</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.cashDrawerBalance.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">📱 Mobile Money Wallets (Airtel / MTN / Custom)</span>
+                    <span className="font-sans font-medium text-slate-700">Mobile Money Wallets</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.mobileMoneyBalance.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">🏦 Commercial Bank & Card Settlement</span>
+                    <span className="font-sans font-medium text-slate-700">Commercial Bank & Card Settlement</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.bankCardBalance.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">📦 Store Merchandise Inventory (At Cost)</span>
+                    <span className="font-sans font-medium text-slate-700">Store Merchandise Inventory (At Cost)</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.inventoryAssetValue.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">🚚 Goods in Transit Asset</span>
+                    <span className="font-sans font-medium text-slate-700">Goods in Transit Asset</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.goodsInTransitValue.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">🏢 Fixed Equipment & Property Assets</span>
+                    <span className="font-sans font-medium text-slate-700">Fixed Equipment & Property Assets</span>
                     <span className="font-bold text-slate-900">{settings.currency}{financials.fixedAssetsValue.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-2 bg-indigo-50 px-3 rounded-lg font-black text-indigo-950">
@@ -2210,7 +2401,7 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
 
                   <div className="text-[10px] font-sans font-black uppercase text-slate-400 tracking-wider pt-1">Liabilities & Owner Equity</div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">VAT / Tax Output Payable (ZRA)</span>
+                    <span className="font-sans font-medium text-slate-700">VAT / Tax Output Payable</span>
                     <span className="font-bold text-rose-700">{settings.currency}{financials.vatPayableLiability.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
@@ -2222,8 +2413,12 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
                     <span className="font-bold text-rose-700">{settings.currency}{financials.loansPayableLiability.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
-                    <span className="font-sans font-medium text-slate-700">Owner Capital & Retained Earnings</span>
-                    <span className="font-bold text-emerald-700">{settings.currency}{financials.totalEquityVal.toFixed(2)}</span>
+                    <span className="font-sans font-medium text-slate-700">Owner / Contributed Capital Equity</span>
+                    <span className="font-bold text-emerald-700">{settings.currency}{financials.ownerCapitalEquity.toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-slate-100 pl-2">
+                    <span className="font-sans font-medium text-slate-700">Retained Earnings & Reserves</span>
+                    <span className="font-bold text-emerald-700">{settings.currency}{financials.retainedEarnings.toFixed(2)}</span>
                   </div>
                   <div className="flex justify-between py-2 bg-slate-900 text-white px-3 rounded-lg font-black">
                     <span className="font-sans">TOTAL LIABILITIES & EQUITY</span>
@@ -2233,131 +2428,54 @@ export default function FinanceDashboard({ settings, userRole, activeStore }: Fi
               </div>
             </div>
 
-            {/* 3. CASH FLOW STATEMENT SUMMARY */}
+            {/* 3. CASH FLOW STATEMENT (DIRECT METHOD) */}
             <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs space-y-3">
               <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                 <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">
-                  3. DIRECT CASH FLOW STATEMENT SUMMARY
+                  3. CASH FLOW STATEMENT (DIRECT METHOD)
                 </h3>
-                <button
-                  onClick={() => setSubTab('cash_flow')}
-                  className="text-xs font-extrabold text-indigo-600 hover:underline cursor-pointer"
-                >
-                  View Full Cash Flow Ledger →
-                </button>
+                <span className="text-[10px] font-bold px-2 py-0.5 bg-slate-100 text-slate-600 rounded-md">
+                  {periodMeta.label}
+                </span>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                   <span className="text-[10px] font-black uppercase text-slate-400 block">Operating Cash Flow</span>
-                  <span className="text-base font-black text-slate-900 mt-1 block">
+                  <span className="text-base font-black text-slate-900 mt-1 block font-mono">
                     {settings.currency}{financials.operatingCashFlow.toFixed(2)}
                   </span>
                   <span className="text-[10px] text-slate-500">Sales & Laybys minus Refunds, POs & Expenses</span>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                   <span className="text-[10px] font-black uppercase text-slate-400 block">Investing Cash Flow</span>
-                  <span className="text-base font-black text-indigo-700 mt-1 block">
+                  <span className="text-base font-black text-indigo-700 mt-1 block font-mono">
                     {settings.currency}{financials.investingCashFlow.toFixed(2)}
                   </span>
                   <span className="text-[10px] text-slate-500">Asset Acquisitions & Disposals</span>
                 </div>
                 <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                   <span className="text-[10px] font-black uppercase text-slate-400 block">Financing Cash Flow</span>
-                  <span className="text-base font-black text-emerald-700 mt-1 block">
+                  <span className="text-base font-black text-emerald-700 mt-1 block font-mono">
                     {settings.currency}{financials.financingCashFlow.toFixed(2)}
                   </span>
                   <span className="text-[10px] text-slate-500">Capital Injections, Drawings & Loans</span>
                 </div>
-                <div className="p-3 rounded-xl bg-slate-900 text-white border border-slate-800">
-                  <span className="text-[10px] font-black uppercase text-slate-300 block">Net Cash Flow</span>
-                  <span className="text-base font-black mt-1 block">
-                    {settings.currency}{financials.netCashFlow.toFixed(2)}
-                  </span>
-                  <span className="text-[10px] text-slate-300">Combined Cash Position Change</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs pt-1">
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between">
+                  <span className="font-bold text-slate-600">Net Change in Cash Reserves</span>
+                  <span className="font-mono font-black text-slate-900">{settings.currency}{financials.netCashFlow.toFixed(2)}</span>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between">
+                  <span className="font-bold text-slate-600">Cash at Beginning of Period</span>
+                  <span className="font-mono font-black text-slate-700">{settings.currency}{financials.beginningCashBalance.toFixed(2)}</span>
+                </div>
+                <div className="p-3 rounded-xl bg-emerald-950 text-white border border-emerald-800 flex items-center justify-between">
+                  <span className="font-black uppercase text-[11px] text-emerald-200">Closing Cash & Equivalents</span>
+                  <span className="font-mono font-black text-base text-white">{settings.currency}{financials.closingCashBalance.toFixed(2)}</span>
                 </div>
               </div>
             </div>
-
-            {/* 4. BRANCH-BY-BRANCH FINANCIAL COMPARISON TABLE */}
-            {branchBreakdownRows.length > 1 && (
-              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs space-y-3">
-                <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-                  <div>
-                    <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">
-                      4. BRANCH-BY-BRANCH FINANCIAL COMPARISON
-                    </h3>
-                    <p className="text-[11px] text-slate-500">
-                      Side-by-side breakdown for the {branchBreakdownRows.length} branches included in this statement ({periodMeta.label}).
-                    </p>
-                  </div>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-xs">
-                    <thead>
-                      <tr className="bg-slate-100 text-slate-600 uppercase font-black border-b border-slate-200">
-                        <th className="p-2.5">Branch</th>
-                        <th className="p-2.5 text-right">Net Sales</th>
-                        <th className="p-2.5 text-right">COGS</th>
-                        <th className="p-2.5 text-right">Gross Profit</th>
-                        <th className="p-2.5 text-right">Expenses & Payroll</th>
-                        <th className="p-2.5 text-right">Net Profit</th>
-                        <th className="p-2.5 text-right">Fixed Assets</th>
-                        <th className="p-2.5 text-right">Total Assets</th>
-                        <th className="p-2.5 text-right">Net Cash Flow</th>
-                        <th className="p-2.5 text-center">Inspect</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {branchBreakdownRows.map((row) => (
-                        <tr key={row.branchId} className="hover:bg-slate-50">
-                          <td className="p-2.5 font-black text-slate-900">{row.branchName}</td>
-                          <td className="p-2.5 text-right font-mono font-bold text-slate-800">
-                            {settings.currency}{row.metrics.totalRevenue.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-right font-mono text-rose-600">
-                            -{settings.currency}{row.metrics.totalCogs.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-right font-mono font-bold text-emerald-700">
-                            {settings.currency}{row.metrics.grossProfit.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-right font-mono text-rose-600">
-                            -{settings.currency}{row.metrics.totalExpenses.toFixed(2)}
-                          </td>
-                          <td
-                            className={`p-2.5 text-right font-mono font-black ${
-                              row.metrics.netProfit >= 0 ? 'text-emerald-700' : 'text-rose-700'
-                            }`}
-                          >
-                            {settings.currency}{row.metrics.netProfit.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-right font-mono text-slate-700">
-                            {settings.currency}{row.metrics.fixedAssetsValue.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-right font-mono font-bold text-indigo-700">
-                            {settings.currency}{row.metrics.totalAssetVal.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-right font-mono font-bold text-slate-800">
-                            {settings.currency}{row.metrics.netCashFlow.toFixed(2)}
-                          </td>
-                          <td className="p-2.5 text-center">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setStatementBranchMode('single');
-                                setStatementStoreFilter(row.branchId);
-                              }}
-                              className="px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-black uppercase cursor-pointer"
-                            >
-                              Focus
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
           </motion.div>
         )}
 

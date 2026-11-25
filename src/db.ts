@@ -444,6 +444,9 @@ export const ALL_TABLE_NAMES = [
   'laybys',
   'layby_installments',
   'time_attendance',
+  'payroll_entries',
+  'business_tasks',
+  'workspace_notes',
   'staff',
   'store_products',
   'stock_transfers',
@@ -1146,6 +1149,9 @@ export function rehydrateAlasqlFromRecords(
     'transactions',
     'ledger_entries',
     'time_attendance',
+    'payroll_entries',
+    'business_tasks',
+    'workspace_notes',
     'loans',
     'loan_amortization_schedule',
     'automated_deduction_logs',
@@ -1504,6 +1510,86 @@ function hasAnyUserCreatedData(recovered: Record<string, any[]>): boolean {
 
 let isDbSchemaCreated = false;
 
+export function ensurePayrollEntriesTable() {
+  if (alasql?.tables && alasql.tables.payroll_entries) return;
+  runSql(
+    `
+    CREATE TABLE IF NOT EXISTS payroll_entries (
+      id STRING PRIMARY KEY,
+      staff_id STRING,
+      employee_name STRING,
+      employee_role STRING,
+      pay_period STRING,
+      payment_date STRING,
+      basic_salary NUMERIC,
+      additions_json STRING,
+      deductions_json STRING,
+      total_additions NUMERIC,
+      total_deductions NUMERIC,
+      gross_salary NUMERIC,
+      net_salary NUMERIC,
+      payment_account_id STRING,
+      status STRING,
+      notes STRING,
+      created_at STRING,
+      updated_at STRING,
+      business_id STRING,
+      store_id STRING
+    )
+  `,
+    'Ensure PAYROLL_ENTRIES table exists',
+    true
+  );
+}
+
+export function ensureWorkspaceTables() {
+  if (alasql?.tables && !alasql.tables.business_tasks) {
+    runSql(
+      `
+      CREATE TABLE IF NOT EXISTS business_tasks (
+        id STRING PRIMARY KEY,
+        title STRING,
+        description STRING,
+        assignee_id STRING,
+        assignee_name STRING,
+        assignee_email STRING,
+        priority STRING,
+        due_date STRING,
+        status STRING,
+        archived INT,
+        google_task_id STRING,
+        created_by STRING,
+        created_at STRING,
+        updated_at STRING,
+        completed_at STRING,
+        business_id STRING,
+        store_id STRING
+      )
+    `,
+      'Ensure BUSINESS_TASKS table exists',
+      true
+    );
+  }
+  if (alasql?.tables && !alasql.tables.workspace_notes) {
+    runSql(
+      `
+      CREATE TABLE IF NOT EXISTS workspace_notes (
+        id STRING PRIMARY KEY,
+        title STRING,
+        content STRING,
+        color STRING,
+        google_task_id STRING,
+        updated_at STRING,
+        business_id STRING,
+        store_id STRING
+      )
+    `,
+      'Ensure WORKSPACE_NOTES table exists',
+      true
+    );
+  }
+}
+
 export function initializeDatabase(template: SeedTemplate = 'blank', forceReset: boolean = false) {
   if (!forceReset && isDbSchemaCreated && alasql.tables && alasql.tables.businesses && alasql.tables.accounts) {
     // Ensure moderation/plan columns exist on already-initialized businesses table
@@ -1528,6 +1614,8 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       }
     }
     dedupeAndCleanBusinessesTable();
+    ensurePayrollEntriesTable();
+    ensureWorkspaceTables();
     return;
   }
   if (isDbInitializing) return;
@@ -1547,6 +1635,9 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
     runSql('DROP TABLE IF EXISTS laybys', 'Clean database: Drops old laybys');
     runSql('DROP TABLE IF EXISTS layby_installments', 'Clean database: Drops old layby installments');
     runSql('DROP TABLE IF EXISTS time_attendance', 'Clean database: Drops old attendance logs');
+    runSql('DROP TABLE IF EXISTS payroll_entries', 'Clean database: Drops old payroll entries');
+    runSql('DROP TABLE IF EXISTS business_tasks', 'Clean database: Drops old business tasks');
+    runSql('DROP TABLE IF EXISTS workspace_notes', 'Clean database: Drops old workspace notes');
     runSql('DROP TABLE IF EXISTS staff', 'Clean database: Drops old staff directory');
     runSql('DROP TABLE IF EXISTS store_products', 'Clean database: Drops old branch stock levels');
     runSql('DROP TABLE IF EXISTS stock_transfers', 'Clean database: Drops old stock transfer notes');
@@ -1852,6 +1943,66 @@ export function initializeDatabase(template: SeedTemplate = 'blank', forceReset:
       store_id STRING
     )
   `, 'Durable Schema: Create TIME_ATTENDANCE payroll sync table');
+
+  runSql(`
+    CREATE TABLE payroll_entries (
+      id STRING PRIMARY KEY,
+      staff_id STRING,
+      employee_name STRING,
+      employee_role STRING,
+      pay_period STRING,
+      payment_date STRING,
+      basic_salary NUMERIC,
+      additions_json STRING,
+      deductions_json STRING,
+      total_additions NUMERIC,
+      total_deductions NUMERIC,
+      gross_salary NUMERIC,
+      net_salary NUMERIC,
+      payment_account_id STRING,
+      status STRING,
+      notes STRING,
+      created_at STRING,
+      updated_at STRING,
+      business_id STRING,
+      store_id STRING
+    )
+  `, 'Durable Schema: Create PAYROLL_ENTRIES table');
+
+  runSql(`
+    CREATE TABLE business_tasks (
+      id STRING PRIMARY KEY,
+      title STRING,
+      description STRING,
+      assignee_id STRING,
+      assignee_name STRING,
+      assignee_email STRING,
+      priority STRING,
+      due_date STRING,
+      status STRING,
+      archived INT,
+      google_task_id STRING,
+      created_by STRING,
+      created_at STRING,
+      updated_at STRING,
+      completed_at STRING,
+      business_id STRING,
+      store_id STRING
+    )
+  `, 'Durable Schema: Create BUSINESS_TASKS table');
+
+  runSql(`
+    CREATE TABLE workspace_notes (
+      id STRING PRIMARY KEY,
+      title STRING,
+      content STRING,
+      color STRING,
+      google_task_id STRING,
+      updated_at STRING,
+      business_id STRING,
+      store_id STRING
+    )
+  `, 'Durable Schema: Create WORKSPACE_NOTES table');
 
   runSql(`
     CREATE TABLE staff (
@@ -2815,7 +2966,7 @@ export function getCentralBranches(businessId?: string): Array<{
 // CENTRALIZED EMPLOYEE AUDIT TRAIL LOGGING
 // ==========================================
 export function logEmployeeAudit(
-  module: 'SALES' | 'LAYBY' | 'PURCHASE' | 'EXPENSES' | 'STOCK' | 'FINANCE' | 'TRANSFER' | 'LOAN' | 'PROCUREMENT' | 'EXPENSE',
+  module: 'SALES' | 'LAYBY' | 'PURCHASE' | 'EXPENSES' | 'STOCK' | 'FINANCE' | 'TRANSFER' | 'LOAN' | 'PROCUREMENT' | 'EXPENSE' | 'PAYROLL',
   action: string,
   details: string,
   amount: number = 0,
@@ -3447,6 +3598,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     const laybyInstRes = runSql(`SELECT * FROM layby_installments ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Layby Installments', true);
     const expensesRes = runSql(`SELECT * FROM expenses ${whereBiz} ORDER BY expense_date ASC`, 'Accounting Sync: Expenses', true);
     const attendanceRes = runSql(`SELECT * FROM time_attendance WHERE status = 'PAID' ${andBiz}`, 'Accounting Sync: Paid Payroll', true);
+    const payrollRes = runSql(`SELECT * FROM payroll_entries WHERE status = 'PAID' ${andBiz}`, 'Accounting Sync: Paid Salary Payroll', true);
     const transfersRes = runSql(`SELECT * FROM money_transfers ${whereBiz} ORDER BY transfer_date ASC`, 'Accounting Sync: Transfers', true);
     const transitRes = runSql(`SELECT * FROM transit_purchases ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Transit POs', true);
     const purchasesTransitRes = runSql(`SELECT * FROM purchases_transit ${whereBiz} ORDER BY created_at ASC`, 'Accounting Sync: Supply Management POs', true);
@@ -3466,6 +3618,7 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
     const laybyInstallments: any[] = (laybyInstRes.success && Array.isArray(laybyInstRes.data)) ? laybyInstRes.data : [];
     const expenses: any[] = (expensesRes.success && Array.isArray(expensesRes.data)) ? expensesRes.data : [];
     const paidAttendance: any[] = (attendanceRes.success && Array.isArray(attendanceRes.data)) ? attendanceRes.data : [];
+    const paidPayrollEntries: any[] = (payrollRes.success && Array.isArray(payrollRes.data)) ? payrollRes.data : [];
     const transfers: any[] = (transfersRes.success && Array.isArray(transfersRes.data)) ? transfersRes.data : [];
     const transitPos: any[] = (transitRes.success && Array.isArray(transitRes.data)) ? transitRes.data : [];
     const supplyPos: any[] = (purchasesTransitRes.success && Array.isArray(purchasesTransitRes.data)) ? purchasesTransitRes.data : [];
@@ -4345,6 +4498,49 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       });
     });
 
+    // D2. Process Paid Staff Salary Payroll Runs (payroll_entries WHERE status = 'PAID')
+    paidPayrollEntries.forEach((pr, idx) => {
+      const prId = String(pr.id || `PAYRUN-${idx}`);
+      const amt = Math.max(0, Number(pr.net_salary || 0));
+      if (amt <= 0) return;
+      const dateStr = pr.payment_date || pr.updated_at || nowIso;
+      const payAcc = String(pr.payment_account_id || 'acc_cash');
+      const prStore = String(pr.store_id || defaultFallbackStore);
+      const methodBucket = resolvePaymentMethodBucket(payAcc).bucket;
+
+      addJournalPair(
+        `PAYROLL_RUN_${prId}`,
+        dateStr,
+        prId,
+        `Salary Payroll Paid: ${pr.employee_name} (${pr.pay_period || ''})`,
+        'acc_exp_wages',
+        payAcc,
+        amt,
+        undefined,
+        prStore
+      );
+
+      addMethodStat(prStore, methodBucket, 'expenses_out', amt, false);
+
+      cashFlowRows.push({
+        id: `CF_PAYRUN_${prId}`,
+        date: dateStr,
+        store_id: prStore,
+        activity_type: 'OPERATING',
+        category: 'Staff Payroll & Salaries',
+        direction: 'OUTFLOW',
+        payment_method: methodBucket,
+        account_id: payAcc,
+        inflow_amount: 0,
+        outflow_amount: amt,
+        net_cash_change: -amt,
+        reference_id: prId,
+        description: `Salary Payroll Disbursement to ${pr.employee_name} (${pr.pay_period || ''})`,
+        performed_by: 'Payroll Admin',
+        created_at: dateStr
+      });
+    });
+
     // E. Process Inter-Account Money Transfers
     transfers.forEach((tr, idx) => {
       const trId = String(tr.id || `TRF-${idx}`);
@@ -4727,9 +4923,13 @@ export function syncAllAccountingSystems(triggerReason: string = 'Immediate POS 
       const stExpenses = expenses
         .filter(e => matchStore(e.store_id))
         .reduce((s, e) => s + Number(e.amount || 0), 0);
-      const stPayroll = (st === 'all' || st === defaultFallbackStore)
+      const stAttendancePayroll = (st === 'all' || st === defaultFallbackStore)
         ? paidAttendance.reduce((s, a) => s + Number(a.gross_payment || 0), 0)
         : 0;
+      const stSalaryPayroll = paidPayrollEntries
+        .filter(p => matchStore(p.store_id))
+        .reduce((s, p) => s + Math.max(0, Number(p.net_salary || 0)), 0);
+      const stPayroll = stAttendancePayroll + stSalaryPayroll;
 
       const netOperatingIncome = grossProfit - stExpenses - stPayroll;
 

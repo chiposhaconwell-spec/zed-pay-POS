@@ -85,7 +85,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   const [deductions, setDeductions] = useState<AutomatedDeductionLog[]>([]);
 
   // Sub-navigation navigation tab state
-  const [subTab, setSubTab] = useState<'procurement' | 'expenses' | 'transfers' | 'statements' | 'loans' | 'assets_equity'>(
+  const [subTab, setSubTab] = useState<'procurement' | 'expenses' | 'transfers' | 'loans' | 'assets_equity'>(
     mode === 'credit_risk' ? 'loans' : 'procurement'
   );
 
@@ -206,17 +206,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   const [supplierFormPayMethod, setSupplierFormPayMethod] = useState('BANK_TRANSFER');
   const [supplierFormNotes, setSupplierFormNotes] = useState('');
 
-  // Selected period for financial statements
-  const [selectedPeriod, setSelectedPeriod] = useState<'this_month' | 'last_month' | 'this_quarter' | 'this_year' | 'all_time'>('all_time');
-
   // Dynamic Assets & Equity List states
   const [assets, setAssets] = useState<Asset[]>([]);
   const [equity, setEquity] = useState<{ id: string; name: string; value: number; linkedAssetId?: string }[]>([]);
-
-  // DB raw tables loaded for Financial Statements
-  const [statementOrders, setStatementOrders] = useState<any[]>([]);
-  const [statementItems, setStatementItems] = useState<any[]>([]);
-  const [statementAttendance, setStatementAttendance] = useState<any[]>([]);
 
   // Asset Creation Form states
   const [newAssetName, setNewAssetName] = useState('');
@@ -312,68 +304,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       void bizAnd;
     } catch (e) {
       console.error('Error reading loans records', e);
-    }
-  };
-
-  // Date period helper
-  const isDateInPeriod = (dateStr: string) => {
-    if (!dateStr) return false;
-    // Strip timestamps safely
-    const d = new Date(dateStr);
-    if (isNaN(d.getTime())) return false;
-    const now = new Date();
-    
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-    
-    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
-    
-    const currentQuarter = Math.floor(now.getMonth() / 3);
-    const startOfQuarter = new Date(now.getFullYear(), currentQuarter * 3, 1);
-    const endOfQuarter = new Date(now.getFullYear(), (currentQuarter + 1) * 3, 0, 23, 59, 59, 999);
-    
-    const startOfYear = new Date(now.getFullYear(), 0, 1);
-    const endOfYear = new Date(now.getFullYear(), 12, 0, 23, 59, 59, 999);
-    
-    switch (selectedPeriod) {
-      case 'this_month':
-        return d >= startOfMonth && d <= endOfMonth;
-      case 'last_month':
-        return d >= startOfLastMonth && d <= endOfLastMonth;
-      case 'this_quarter':
-        return d >= startOfQuarter && d <= endOfQuarter;
-      case 'this_year':
-        return d >= startOfYear && d <= endOfYear;
-      case 'all_time':
-      default:
-        return true;
-    }
-  };
-
-  // Preload Statement records from dynamic tables
-  const loadStatementData = () => {
-    try {
-      const activeBizId = getActiveBusinessId();
-      const bizFilter = activeBizId ? `AND business_id = '${sqlEsc(activeBizId)}'` : '';
-      const bizWhere = activeBizId ? `WHERE business_id = '${sqlEsc(activeBizId)}'` : '';
-
-      const ordRes = runSql(`SELECT * FROM orders WHERE (status = 'COMPLETED' OR status = 'SUCCESS' OR status = 'ACTIVE' OR status = 'PAID') ${bizFilter}`, 'Statement: Fetch completed store orders');
-      if (ordRes.success && Array.isArray(ordRes.data)) {
-        setStatementOrders(ordRes.data);
-      }
-
-      const itemRes = runSql(`SELECT oi.*, p.cost, p.name FROM order_items oi JOIN products p ON oi.productId = p.id ${activeBizId ? `WHERE oi.business_id = '${sqlEsc(activeBizId)}' AND p.business_id = '${sqlEsc(activeBizId)}'` : ''}`, 'Statement: Fetch items');
-      if (itemRes.success && Array.isArray(itemRes.data)) {
-        setStatementItems(itemRes.data);
-      }
-
-      const attRes = runSql(`SELECT * FROM time_attendance ${bizWhere}`, 'Statement: Fetch payroll entries');
-      if (attRes.success && Array.isArray(attRes.data)) {
-        setStatementAttendance(attRes.data);
-      }
-    } catch (e) {
-      console.error('Error loading statement structures:', e);
     }
   };
 
@@ -601,11 +531,9 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
   // Main loads triggers
   useEffect(() => {
     loadData();
-    loadStatementData();
 
     const handleUpdate = () => {
       loadData();
-      loadStatementData();
     };
 
     window.addEventListener('pos_sale_completed', handleUpdate);
@@ -617,7 +545,7 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       window.removeEventListener('pos_data_updated', handleUpdate);
       window.removeEventListener('storage', handleUpdate);
     };
-  }, [selectedLoanId, selectedPeriod, subTab, activeStore]);
+  }, [selectedLoanId, subTab, activeStore]);
 
   // Computed totals for stats panel
   const activeLoan = loans.find(l => l.id === selectedLoanId) || loans.find(l => l.status === 'ACTIVE') || loans[0];
@@ -696,7 +624,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     persistTablesToStorage();
     loadData();
-    loadStatementData();
 
     setExpenseAmount('');
     setExpenseDescription('');
@@ -711,7 +638,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
       runSql(`DELETE FROM expenses WHERE id = '${sqlEsc(id)}'${bizAnd}`, 'Expenses: Delete record');
       persistTablesToStorage();
       loadData();
-      loadStatementData();
     }
   };
 
@@ -767,7 +693,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
 
     persistTablesToStorage();
     loadData();
-    loadStatementData();
 
     setTransferAmount('');
     setTransferRef('');
@@ -1076,7 +1001,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     syncAllAccountingSystems(`Purchase Order #${transitId}`);
     persistTablesToStorage();
     loadData();
-    loadStatementData();
     try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
 
     setShowNewTransitModal(false);
@@ -1201,7 +1125,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     syncAllAccountingSystems(`Updated Landing Cost PO #${editingLandingPo.id}`);
     persistTablesToStorage();
     loadData();
-    loadStatementData();
     try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
 
     const updatedId = editingLandingPo.id;
@@ -1378,7 +1301,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     syncAllAccountingSystems(`Stock Received PO #${po.id}`);
     persistTablesToStorage();
     loadData();
-    loadStatementData();
     try { window.dispatchEvent(new Event('pos_data_updated')); } catch {}
 
     setConfirmReceivePoId(null);
@@ -1635,363 +1557,8 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
     }
   };
 
-  // --- START OF FINANCIAL REPORT ENGINE COMPUTATIONS ---
-  // Filtering logic
-  const filteredOrders = statementOrders.filter(o => {
-    const matchesStore = !activeStore || o.store_id === activeStore;
-    const matchesPeriod = isDateInPeriod(o.orderDate);
-    return matchesStore && matchesPeriod;
-  });
-
-  const filteredOrderIds = filteredOrders.map(o => o.id);
-  const filteredItems = statementItems.filter(item => filteredOrderIds.includes(item.orderId));
-
-  // 1. Profit & Loss: Sales Revenues
-  const grossSales = filteredOrders.reduce((sum, o) => sum + Number(o.subtotal || 0), 0);
-  const totalDiscounts = filteredOrders.reduce((sum, o) => sum + Number(o.discount || 0), 0);
-  const netRevenue = Math.max(0, grossSales - totalDiscounts);
-
-  // 2. Cost of Goods Sold (COGS)
-  const totalCogs = filteredItems.reduce((sum, item) => {
-    const qty = Number(item.quantity || 0);
-    const cost = Number(item.cost || 0);
-    return sum + (qty * cost);
-  }, 0);
-
-  // 3. Gross Profit
-  const grossProfit = Math.max(0, netRevenue - totalCogs);
-
-  // 4. Operating Expenses
-  const filteredAttendance = statementAttendance.filter(at => isDateInPeriod(at.date));
-  const payrollExpense = filteredAttendance.reduce((sum, at) => sum + Number(at.gross_payment || 0), 0);
-
-  const filteredExpenses = expensesList.filter(ex => {
-    const matchesStore = !activeStore || ex.store_id === activeStore;
-    const matchesPeriod = isDateInPeriod(ex.expense_date || ex.created_at);
-    return matchesStore && matchesPeriod;
-  });
-
-  const recordedExpensesTotal = filteredExpenses.reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
-
-  const rentExpense = filteredExpenses
-    .filter(ex => String(ex.category || '').toLowerCase().includes('rent'))
-    .reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
-  const utilitiesExpense = filteredExpenses
-    .filter(ex => /utilit|power|water|electric|internet/i.test(String(ex.category || '')))
-    .reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
-  const generalOfficeExpense = filteredExpenses
-    .filter(ex => !String(ex.category || '').toLowerCase().includes('rent') && !/utilit|power|water|electric|internet/i.test(String(ex.category || '')))
-    .reduce((sum, ex) => sum + Number(ex.amount || 0), 0);
-
-  const totalExpenses = recordedExpensesTotal + payrollExpense;
-
-  // 5. Finance Costs
-  const activeLoansOfStore = loans.filter(l => l.status === 'ACTIVE' || l.status === 'PAID_OFF');
-  const totalInterestCosts = activeLoansOfStore.reduce((sum, l) => {
-    if (isDateInPeriod(l.created_at)) {
-      return sum + Number(l.interest_amount || 0);
-    }
-    return sum;
-  }, 0);
-
-  // 6. Net Profit
-  const netProfit = grossProfit - totalExpenses - totalInterestCosts;
-
-  // --- BALANCE SHEET CALCULATIONS ---
-  // A. Assets
-  let ledgersCash = 0;
-  const balanceAccounts: any[] = [];
   const activeBizIdForBal = getActiveBusinessId();
   const tenantBalances = getTenantAccountBalances(activeBizIdForBal);
-  tenantBalances.forEach((acc) => {
-    const bal = Number(acc.current_balance || 0);
-    balanceAccounts.push({
-      id: acc.account_id,
-      name: acc.account_name,
-      balance: bal
-    });
-    if (
-      acc.account_id === 'acc_cash' ||
-      acc.account_id === 'acc_airtel' ||
-      acc.account_id === 'acc_mtn' ||
-      acc.account_id === 'acc_momo' ||
-      acc.account_id === 'acc_bank' ||
-      String(acc.account_id || '').startsWith('acc_pm_')
-    ) {
-      ledgersCash += bal;
-    }
-  });
-
-  const computedCash = ledgersCash;
-
-  // Inventory Value
-  const prodRes = runSql(`SELECT SUM(stock * cost) AS stock_value FROM products ${activeBizIdForBal ? `WHERE business_id = '${sqlEsc(activeBizIdForBal)}'` : ''}`, 'Balance Sheet: Inventory pricing', true);
-  const inventoryValuation = prodRes.success && prodRes.data[0]?.stock_value ? Number(prodRes.data[0].stock_value) : 0;
-
-  // Custom Assets registries using Net Book Value (NBV = cost - accumulated depreciation)
-  const customCurrentAssetsSum = assets
-    .filter(a => a.category === 'Current' && a.status !== 'Written Off')
-    .reduce((sum, a) => {
-      const financials = getAssetFinancials(a);
-      return sum + financials.nbv;
-    }, 0);
-
-  const customFixedAssetsSum = assets
-    .filter(a => a.category === 'Fixed' && a.status !== 'Written Off')
-    .reduce((sum, a) => {
-      const financials = getAssetFinancials(a);
-      return sum + financials.nbv;
-    }, 0);
-
-  const customFixedAssetsPeriodAcquisition = assets
-    .filter(a => a.category === 'Fixed' && a.status !== 'Written Off' && isDateInPeriod(a.purchaseDate))
-    .reduce((sum, a) => sum + Number(a.value || 0), 0);
-
-  const totalAssetsSum = computedCash + inventoryValuation + customCurrentAssetsSum + customFixedAssetsSum;
-
-  // B. Liabilities
-  const outstandingDebtSum = loans
-    .filter(l => l.status === 'ACTIVE' || l.status === 'DEFAULTED')
-    .reduce((sum, ln) => {
-      const settledDecks = deductions
-        .filter(d => d.loan_id === ln.id && d.status === 'SUCCESS')
-        .reduce((s, curr) => s + Number(curr.amount_deducted || 0), 0);
-      return sum + Math.max(0, Number(ln.total_repayable) - settledDecks);
-    }, 0);
-
-  const collectedVatLiability = filteredOrders.reduce((sum, o) => sum + Number(o.tax || 0), 0);
-  const totalLiabilities = outstandingDebtSum + collectedVatLiability;
-
-  // C. Equity
-  const contributedEquitySum = equity.reduce((sum, eq) => sum + Number(eq.value || 0), 0);
-  
-  // Balancing reserve: Captures prior periods accum to strictly maintain accounting equation
-  const historicalRetainedEarnings = Math.max(0, totalAssetsSum - (totalLiabilities + contributedEquitySum + netProfit));
-  const displayedRetainedEarnings = netProfit + historicalRetainedEarnings;
-
-  const totalLiabilitiesAndEquity = totalLiabilities + contributedEquitySum + historicalRetainedEarnings + netProfit;
-  const balanceDifference = totalAssetsSum - totalLiabilitiesAndEquity;
-
-  // --- CASH FLOW STATEMENTS ---
-  const cashOperatingInflow = netRevenue + collectedVatLiability;
-  const cashOperatingOutflow = totalCogs + payrollExpense + (rentExpense + utilitiesExpense + generalOfficeExpense);
-  const netOperatingCash = cashOperatingInflow - cashOperatingOutflow;
-
-  const netInvestingCash = -customFixedAssetsPeriodAcquisition; // Period-specific acquisitions treated as outflows
-
-  const loanPrincipalDisbursedInperiod = activeLoansOfStore.reduce((sum, l) => {
-    if (isDateInPeriod(l.disbursed_at || l.created_at)) {
-      return sum + Number(l.principal_amount || 0);
-    }
-    return sum;
-  }, 0);
-
-  const sweepRepaymentsProcessedInperiod = deductions
-    .filter(d => d.status === 'SUCCESS' && isDateInPeriod(d.created_at))
-    .reduce((sum, d) => sum + Number(d.amount_deducted || 0), 0);
-
-  const netFinancingCash = loanPrincipalDisbursedInperiod - sweepRepaymentsProcessedInperiod + contributedEquitySum;
-  const netChangeInCash = netOperatingCash + netInvestingCash + netFinancingCash;
-
-  const startingPeriodCash = Math.max(0, computedCash - netChangeInCash);
-  const closingPeriodCash = startingPeriodCash + netChangeInCash;
-
-  // --- FINANCIAL REPORT PDF EXPORTER ---
-  const handlePrintFinancialReportPDF = () => {
-    try {
-      const doc = new jsPDF({ format: 'a4', orientation: 'portrait' });
-      
-      // Slate background header banner
-      doc.setFillColor(30, 41, 59);
-      doc.rect(0, 0, 210, 42, 'F');
-      
-      doc.setTextColor(255, 255, 255);
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(18);
-      doc.text(settings.storeName.toUpperCase() + ' - FINANCIAL REPORT', 20, 20);
-      
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
-      doc.text(`ZAMBIA SME INTEGRATED FINANCIAL AUDIT STATEMENT`, 20, 27);
-      doc.text(`REPORT PERIOD: ${selectedPeriod.toUpperCase().replace('_', ' ')} | OUTLET BRANCH: ${activeStore ? activeStore.toUpperCase() : 'ALL OUTLETS'}`, 20, 33);
-      doc.text(`GENERATED STAMP: ${new Date().toLocaleString()}`, 20, 38);
-      
-      // Page 1: Profit & Loss Statement
-      doc.setTextColor(15, 23, 42);
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(12);
-      doc.text('I. PROFIT & LOSS ACCOUNT (INCOME STATEMENT)', 20, 55);
-      doc.setDrawColor(226, 232, 240);
-      doc.setLineWidth(0.5);
-      doc.line(20, 58, 190, 58);
-      
-      doc.setFontSize(9);
-      let y = 67;
-      const writeRow = (label: string, value: number, isBold = false) => {
-        if (isBold) doc.setFont('helvetica', 'bold');
-        else doc.setFont('helvetica', 'normal');
-        doc.text(label, 20, y);
-        const prefix = value < 0 ? '-' : '';
-        doc.text(`${settings.currency}${prefix}${Math.abs(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, 190, y, { align: 'right' });
-        y += 7;
-      };
-      
-      writeRow('Gross Sales Cash Receivables (POS Checkout)', grossSales);
-      writeRow('Less: Customer Discounts & Concessions', -totalDiscounts);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('NET SALES REVENUE', netRevenue, true);
-      y += 2;
-      
-      writeRow('Cost of Goods Sold (COGS)', -totalCogs);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('GROSS OPERATING MARGIN', grossProfit, true);
-      y += 4;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('Operating Overheads & Deductions:', 20, y);
-      y += 7;
-      writeRow('  Staff Payroll & Salaries Paid', -payrollExpense);
-      writeRow('  Rent Allocations', -rentExpense);
-      writeRow('  Electricity & Water Utilities', -utilitiesExpense);
-      writeRow('  General Office & Administrative Packaging', -generalOfficeExpense);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('TOTAL OPERATING OVERHEADS', -totalExpenses, true);
-      y += 4;
-      
-      writeRow('Finance costs (SME Capital Advance Interest)', -totalInterestCosts);
-      doc.line(20, y - 4, 190, y - 4);
-      
-      // Highlight row for Net Retained Earnings
-      doc.setFillColor(241, 245, 249);
-      doc.rect(20, y - 5, 170, 8, 'F');
-      writeRow('NET RETAINED PROFIT / (LOSS)', netProfit, true);
-      
-      // Page 2: Statement of Financial Position (Balance Sheet)
-      doc.addPage();
-      doc.setFillColor(30, 41, 59);
-      doc.rect(0, 0, 210, 20, 'F');
-      doc.setTextColor(255, 255, 255);
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(11);
-      doc.text('STATEMENT OF FINANCIAL POSITION (BALANCE SHEET)', 20, 13);
-      
-      doc.setTextColor(15, 23, 42);
-      y = 35;
-      doc.setFontSize(12);
-      doc.text('II. BALANCE SHEET', 20, y);
-      y += 3;
-      doc.setFontSize(9);
-      doc.line(20, y, 190, y);
-      y += 8;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('ASSETS (Working & Long-Term Capital)', 20, y);
-      y += 7;
-      writeRow('  Cash & Mobile Money Reserves', computedCash);
-      writeRow('  Inventory Stock Asset Valuation', inventoryValuation);
-      writeRow('  Custom Registered Current Assets', customCurrentAssetsSum);
-      writeRow('  Custom Registered Long-Term/Fixed Assets', customFixedAssetsSum);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('TOTAL ASSETS', totalAssetsSum, true);
-      y += 5;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('LIABILITIES', 20, y);
-      y += 7;
-      writeRow('  Outstanding Capital Sweep Agreements Debt', outstandingDebtSum);
-      writeRow('  Accrued VAT Tax payable to ZRA', collectedVatLiability);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('TOTAL LIABILITIES', totalLiabilities, true);
-      y += 5;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('EQUITY CAPITAL MAPPINGS', 20, y);
-      y += 7;
-      writeRow('  Contributed Capital Accounts', contributedEquitySum);
-      writeRow('  Historical Retained Earnings Reserves', historicalRetainedEarnings);
-      writeRow('  Current Retained Profit / (Loss)', netProfit, true);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('TOTAL CAPITAL EQUITY', contributedEquitySum + historicalRetainedEarnings + netProfit, true);
-      
-      doc.line(20, y - 4, 190, y - 4);
-      doc.setFillColor(241, 245, 249);
-      doc.rect(20, y - 5, 170, 8, 'F');
-      writeRow('TOTAL LIABILITIES & EQUITY FUND BALANCE', totalLiabilitiesAndEquity, true);
-      
-      // Page 3: Cash Flow Statement
-      doc.addPage();
-      doc.setFillColor(30, 41, 59);
-      doc.rect(0, 0, 210, 20, 'F');
-      doc.setTextColor(255, 255, 255);
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(11);
-      doc.text('AUDITED CASH FLOW RECONCILIATION STATEMENT', 20, 13);
-      
-      doc.setTextColor(15, 23, 42);
-      y = 35;
-      doc.setFontSize(12);
-      doc.text('III. CASH FLOW STATEMENT (DIRECT METHOD)', 20, y);
-      y += 3;
-      doc.setFontSize(9);
-      doc.line(20, y, 190, y);
-      y += 8;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('Cash Flow from Operating Activities', 20, y);
-      y += 7;
-      writeRow('  Operating Inflow from Customer Receipts (incl. VAT)', cashOperatingInflow);
-      writeRow('  Operating Outflows (Stock COGS, Overheads, Salaries)', -cashOperatingOutflow);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('NET CASH FROM OPERATING ACTIVITIES', netOperatingCash, true);
-      y += 5;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('Cash Flow from Investing Activities', 20, y);
-      y += 7;
-      writeRow('  Custom Fixed Asset Capital Acquisitions', netInvestingCash);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('NET CASH FROM INVESTING ACTIVITIES', netInvestingCash, true);
-      y += 5;
-      
-      doc.setFont('helvetica', 'bold');
-      doc.text('Cash Flow from Financing Activities', 20, y);
-      y += 7;
-      writeRow('  Capital Advances Disbursed receipts', loanPrincipalDisbursedInperiod);
-      writeRow('  Automatic Sweeps debt repayments', -sweepRepaymentsProcessedInperiod);
-      writeRow('  Share Capital Contributions', contributedEquitySum);
-      doc.line(20, y - 4, 190, y - 4);
-      writeRow('NET CASH FROM FINANCING ACTIVITIES', netFinancingCash, true);
-      y += 8;
-      
-      doc.setLineWidth(1.0);
-      doc.line(20, y, 190, y);
-      y += 7;
-      writeRow('NET ACCUMULATED INCREASE IN CASH RESERVES', netChangeInCash, true);
-      writeRow('Cash at beginning of Period', startingPeriodCash);
-      doc.setFillColor(236, 253, 245);
-      doc.rect(20, y - 5, 170, 8, 'F');
-      writeRow('CASH BALANCE AT END OF REPORTING FRAME', closingPeriodCash, true);
-      
-      // Signatures
-      y += 20;
-      doc.setFontSize(8.5);
-      doc.text('____________________________________', 20, y);
-      doc.text('ZAMBIA REVENUE AUTHORITY Audit Officer', 20, y + 4);
-      
-      doc.text('____________________________________', 120, y);
-      doc.text('Managing Director / Store Representative', 120, y + 4);
-      
-      doc.setFont('helvetica', 'italic');
-      doc.setFontSize(7.5);
-      doc.text('This co-signed accounting PDF complies with the Microfinance Interest Cap and ZRA VAT compliance code ZM-55B.', 20, y + 20);
-      
-      exportAndSharePdf(`FINANCIAL_REPORT_${selectedPeriod}_${activeStore}.pdf`, doc);
-    } catch (e) {
-      console.error(e);
-      alert('Error rendering statements PDF document: ' + String(e));
-    }
-  };
-  // --- END OF FINANCIAL REPORT ENGINE
   return (
     <div className="flex-1 flex overflow-hidden flex-col bg-slate-50 text-slate-800 p-4 md:p-6 select-text">
       
@@ -2046,19 +1613,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
           >
             <RefreshCw size={14} />
             <span>Accounts & Transfers</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setSubTab('statements')}
-            className={`px-3.5 py-2 text-xs font-black uppercase tracking-wider border-b-2 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-              subTab === 'statements'
-                ? 'border-indigo-600 text-indigo-700 font-extrabold bg-indigo-50/50 rounded-t-lg'
-                : 'border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-t-lg'
-            }`}
-          >
-            <FileText size={14} />
-            <span>Financial Statements</span>
           </button>
 
           <button
@@ -3519,340 +3073,6 @@ export default function LoanDashboard({ settings, userRole, activeStore, mode = 
                   </div>
                 )}
               </div>
-            </div>
-          </motion.div>
-        )}
-
-        {subTab === 'statements' && (
-          <motion.div
-            key="statements-tab"
-            initial={{ opacity: 0, y: 5 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -5 }}
-            className="flex-1 flex flex-col overflow-hidden gap-4"
-          >
-            {/* STATEMENTS CONTROLS BAR */}
-            <div className="bg-white p-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 shrink-0 shadow-2xs select-none">
-              <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-indigo-50 text-indigo-705 rounded-xl">
-                  <FileText size={18} />
-                </div>
-                <div>
-                  <h3 className="text-sm font-black text-slate-900 uppercase">SME Financial Statements Unit</h3>
-                  <p className="text-[11px] text-slate-500 font-medium">Generate Profit & Loss accounts, Balance Sheets, and Cash Flow reconciliations below.</p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3 w-full sm:w-auto">
-                <select
-                  value={selectedPeriod}
-                  onChange={(e: any) => setSelectedPeriod(e.target.value)}
-                  className="px-3 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-250 text-xs font-bold text-slate-700 rounded-lg uppercase tracking-wider outline-none cursor-pointer"
-                >
-                  <option value="this_month">This Month</option>
-                  <option value="last_month">Last Month</option>
-                  <option value="this_quarter">This Quarter</option>
-                  <option value="this_year">This Year</option>
-                  <option value="all_time">All Time (Full Ledger)</option>
-                </select>
-
-                <button
-                  onClick={handlePrintFinancialReportPDF}
-                  className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-705 active:bg-indigo-805 text-white font-extrabold text-xs rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-all shadow-3xs cursor-pointer block shrink-0"
-                >
-                  <Download size={13} />
-                  <span>Download Report PDF</span>
-                </button>
-              </div>
-            </div>
-
-            {/* THREE COLUMN GRID */}
-            <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 flex-1 overflow-y-auto pb-4 pr-1">
-              
-              {/* STATEMENT 1: PROFIT & LOSS */}
-              <div className="bg-white rounded-2xl border border-slate-200 p-5 flex flex-col shadow-2xs max-h-[500px] overflow-hidden">
-                <div className="border-b border-slate-100 pb-2 mb-3 flex justify-between items-center select-none">
-                  <h4 className="text-xs font-black text-slate-900 uppercase tracking-widest flex items-center gap-1">
-                    <span className="p-1 bg-amber-50 text-amber-700 rounded"><TrendingUp size={12} /></span>
-                    Profit & Loss Account
-                  </h4>
-                  <span className="text-[9px] font-bold text-slate-450 uppercase font-mono">Income Statement</span>
-                </div>
-
-                <div className="flex-1 overflow-y-auto space-y-3 pr-1 text-xs">
-                  <div className="space-y-1.5">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">Revenues</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-600">Gross POS Checkout Sales</span>
-                      <span className="font-semibold">{settings.currency}{grossSales.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 text-rose-600">
-                      <span>Less: Cash Discounts Applied</span>
-                      <span>-{settings.currency}{totalDiscounts.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-bold py-1 text-slate-850">
-                      <span>NET OPERATING REVENUE</span>
-                      <span>{settings.currency}{netRevenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5 mt-2 bg-slate-50/50 p-2.5 rounded-xl border border-dashed border-slate-150">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">Direct Cost Input</span>
-                    <div className="flex justify-between font-medium py-1">
-                      <span className="text-slate-600">Cost of Goods Sold (COGS)</span>
-                      <span>-{settings.currency}{totalCogs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="border-t border-slate-200 my-1"></div>
-                    <div className="flex justify-between font-black text-slate-900 text-[12.5px]">
-                      <span>GROSS TRADING PROFIT</span>
-                      <span className="text-indigo-650">{settings.currency}{grossProfit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5 mt-2">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">Operating Expenses (Overheads)</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650">Counter Staff Payroll & Salaries</span>
-                      <span>{settings.currency}{payrollExpense.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650">Indirect Rent Lease allocations</span>
-                      <span>{settings.currency}{rentExpense.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650">Water & Power Utilities</span>
-                      <span>{settings.currency}{utilitiesExpense.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650">General Office Packaging</span>
-                      <span>{settings.currency}{generalOfficeExpense.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-bold py-1 border-b border-slate-200">
-                      <span>Cumulative Operating Expenses</span>
-                      <span>{settings.currency}{totalExpenses.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5 mt-2">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">Finance Factors</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 text-rose-650">
-                      <span>Microlending Advance Interest Charges</span>
-                      <span>-{settings.currency}{totalInterestCosts.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  <div className="mt-4 p-3 bg-indigo-900 rounded-xl text-white select-none shrink-0 font-mono flex justify-between items-center">
-                    <span className="text-[10px] font-black uppercase">RETAINED PERIOD NET PROFIT</span>
-                    <span className="text-sm font-black text-amber-300">
-                      {netProfit >= 0 ? '' : '-'}{settings.currency}{Math.abs(netProfit).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* STATEMENT 2: BALANCE SHEET */}
-              <div className="bg-white rounded-2xl border border-slate-200 p-5 flex flex-col shadow-2xs max-h-[500px] overflow-hidden">
-                <div className="border-b border-slate-100 pb-2 mb-3 flex justify-between items-center select-none">
-                  <h4 className="text-xs font-black text-slate-900 uppercase tracking-widest flex items-center gap-1">
-                    <span className="p-1 bg-indigo-50 text-indigo-700 rounded"><Briefcase size={12} /></span>
-                    Balance Sheet
-                  </h4>
-                  {Math.abs(balanceDifference) < 10 ? (
-                    <span className="text-[8px] font-black text-emerald-805 bg-emerald-100 py-0.5 px-2 rounded-full uppercase border border-emerald-200 tracking-wider">BALANCED</span>
-                  ) : (
-                    <span className="text-[8px] font-black text-rose-805 bg-rose-100 py-0.5 px-2 rounded-full uppercase tracking-wider">DISPARITY</span>
-                  )}
-                </div>
-
-                <div className="flex-1 overflow-y-auto space-y-3.5 pr-1 text-xs">
-                  {/* ASSETS SECT */}
-                  <div className="space-y-1.5">
-                    <span className="text-[9px] text-slate-400 font-black uppercase tracking-wider block">1. ASSETS</span>
-                    
-                    {/* Dynamic view_account_balances list */}
-                    {balanceAccounts.length > 0 ? (
-                      <div className="bg-slate-50/50 p-2.5 rounded-xl border border-dashed border-slate-150 space-y-1">
-                        <span className="text-[8px] text-slate-400 font-extrabold uppercase">Live Ledger balances (view_account_balances):</span>
-                        {balanceAccounts.map((acc: any) => (
-                          <div key={acc.id} className="flex justify-between font-mono text-[10.5px] py-0.5 text-slate-650">
-                            <span className="truncate max-w-[170px]">• {acc.name}</span>
-                            <span className="font-bold">{settings.currency}{acc.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                        <span className="text-slate-600 font-medium">Bank & Cash Clearing reserves</span>
-                        <span>{settings.currency}{computedCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                      </div>
-                    )}
-
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 mt-1">
-                      <span className="text-slate-600 font-medium">Inventory on Hand Valuation</span>
-                      <span>{settings.currency}{inventoryValuation.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-
-                    <div className="bg-indigo-50/50 p-2.5 rounded-xl border border-dashed border-indigo-150 space-y-1.5">
-                      <span className="text-[8.5px] text-indigo-505 font-bold uppercase block">Asset Register Items (Net Book Value):</span>
-                      {assets.map((a: Asset) => {
-                        const financials = getAssetFinancials(a);
-                        return (
-                          <div key={a.id} className="flex justify-between text-[10px] text-slate-605">
-                            <span className="truncate max-w-[155px]">⚙️ {a.name} <span className="text-[8px] font-mono text-indigo-405">({a.category})</span></span>
-                            <span className="font-bold">{settings.currency}{financials.nbv.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                          </div>
-                        );
-                      })}
-                      <div className="border-t border-indigo-150/60 my-1 pt-1 flex justify-between text-[10.5px] font-extrabold text-indigo-950">
-                        <span>Current Assets NBV</span>
-                        <span>{settings.currency}{customCurrentAssetsSum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                      </div>
-                      <div className="flex justify-between text-[10.5px] font-extrabold text-indigo-950">
-                        <span>Fixed Assets NBV</span>
-                        <span>{settings.currency}{customFixedAssetsSum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                      </div>
-                    </div>
-
-                    <div className="flex justify-between font-black text-indigo-950 py-1.5 bg-indigo-50 px-2.5 rounded mt-2">
-                      <span>CUMULATIVE TOTAL ASSETS</span>
-                      <span>{settings.currency}{totalAssetsSum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  {/* LIABILITIES SECT */}
-                  <div className="space-y-1.5 mt-3">
-                    <span className="text-[9px] text-slate-400 font-black uppercase tracking-wider block">2. LIABILITIES</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-600">Outstanding Sweep Credit Advances</span>
-                      <span>{settings.currency}{outstandingDebtSum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-600">Accrued VAT Tax payable to ZRA</span>
-                      <span>{settings.currency}{collectedVatLiability.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-bold text-slate-800 py-1 border-b border-slate-200">
-                      <span>Cumulative Liabilities Book</span>
-                      <span>{settings.currency}{totalLiabilities.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  {/* EQUITY SECT */}
-                  <div className="space-y-1.5 mt-3">
-                    <span className="text-[9px] text-slate-400 font-black uppercase tracking-wider block">3. PROPRIETARY EQUITY CAPITAL</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650">Contributed Capital registry</span>
-                      <span>{settings.currency}{contributedEquitySum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650 font-semibold italic text-emerald-805">Accumulated Profit Reservoirs</span>
-                      <span>{settings.currency}{historicalRetainedEarnings.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-650 font-bold">Current Period Net Revenue</span>
-                      <span>{settings.currency}{netProfit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-black text-rose-900 py-1 bg-rose-50/50 px-2 rounded leading-none mt-1">
-                      <span>TOTAL proprietary EQUITY</span>
-                      <span>{settings.currency}{(contributedEquitySum + historicalRetainedEarnings + netProfit).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  {/* DOUBLE ENTRY RECONCILATION CHECK BAR */}
-                  <div className="border-t border-slate-250 pt-2.5">
-                    <div className="p-2.5 bg-emerald-600 text-white rounded-xl text-center select-none font-bold text-[10px] uppercase font-mono flex justify-between items-center">
-                      <span>LIABILITIES & EQUITY SUM:</span>
-                      <span>{settings.currency}{totalLiabilitiesAndEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <span className="text-[8.5px] text-slate-400 block text-center mt-1 font-medium">Double-entry status: Assets match Liabilities + Equity perfectly.</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* STATEMENT 3: CASH FLOW STATEMENT */}
-              <div className="bg-white rounded-2xl border border-slate-200 p-5 flex flex-col shadow-2xs max-h-[500px] overflow-hidden">
-                <div className="border-b border-slate-100 pb-2 mb-3 flex justify-between items-center select-none">
-                  <h4 className="text-xs font-black text-slate-900 uppercase tracking-widest flex items-center gap-1">
-                    <span className="p-1 bg-emerald-50 text-emerald-705 rounded"><Coins size={12} /></span>
-                    Cash Flow Statement
-                  </h4>
-                  <span className="text-[9px] font-bold text-slate-450 uppercase font-mono">Direct Flow Method</span>
-                </div>
-
-                <div className="flex-1 overflow-y-auto space-y-3.5 pr-1 text-xs">
-                  {/* OPERATING CASH ACTIVITES */}
-                  <div className="space-y-1.5">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">A. OPERATING FLOWS</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-600">POS Sales receipts & VAT collected</span>
-                      <span className="text-emerald-700">+{settings.currency}{cashOperatingInflow.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-600">Less: Outflows for stock purchases</span>
-                      <span className="text-rose-600">-{settings.currency}{totalCogs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50">
-                      <span className="text-slate-600">Less: Wages & operating invoices paid</span>
-                      <span className="text-rose-600">-{settings.currency}{(payrollExpense + rentExpense + utilitiesExpense + generalOfficeExpense).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-black text-slate-900 py-1 px-1 mt-0.5">
-                      <span>Net Cash from Operating Activities</span>
-                      <span>{netOperatingCash >= 0 ? '+' : ''}{settings.currency}{netOperatingCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  {/* INVESTING CASH ACTIVITES */}
-                  <div className="space-y-1.5 mt-2">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">B. INVESTING FLOWS</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 text-rose-600">
-                      <span>Acquisitions of Custom Fixed Assets</span>
-                      <span>-{settings.currency}{customFixedAssetsSum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-semibold py-1 px-1">
-                      <span>Net Cash used in Investing Activities</span>
-                      <span className="text-rose-700">-{settings.currency}{customFixedAssetsSum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  {/* FINANCING CASH ACTIVITES */}
-                  <div className="space-y-1.5 mt-2">
-                    <span className="text-[9px] text-slate-400 font-extrabold uppercase">C. FINANCING FLOWS</span>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 text-emerald-705">
-                      <span>Credit Advances capital received</span>
-                      <span>+{settings.currency}{loanPrincipalDisbursedInperiod.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 text-rose-650">
-                      <span>POS deductions swept (loan repayment)</span>
-                      <span>-{settings.currency}{sweepRepaymentsProcessedInperiod.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-medium py-1 border-b border-slate-50 text-emerald-705">
-                      <span>Proprietary capital injection/equity</span>
-                      <span>+{settings.currency}{contributedEquitySum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between font-semibold text-slate-900 py-1 px-1">
-                      <span>Net Cash from Financing Activities</span>
-                      <span>{netFinancingCash >= 0 ? '+' : ''}{settings.currency}{netFinancingCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-
-                  {/* SUMMARY SECTION */}
-                  <div className="mt-4 bg-slate-900 text-slate-100 p-3 rounded-xl space-y-1 select-none shrink-0 font-mono text-[10.5px]">
-                    <div className="flex justify-between font-bold">
-                      <span className="text-slate-400 uppercase">Net change in Period Cash</span>
-                      <span className="text-amber-400">{netChangeInCash >= 0 ? '▲' : '▼'} {settings.currency}{netChangeInCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Period Beginning Balance</span>
-                      <span>{settings.currency}{startingPeriodCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                    <div className="border-t border-slate-800 my-1"></div>
-                    <div className="flex justify-between font-extrabold text-[11px] text-white">
-                      <span className="uppercase text-emerald-400">Closing Cash equivalent Balance</span>
-                      <span>{settings.currency}{closingPeriodCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
             </div>
           </motion.div>
         )}
